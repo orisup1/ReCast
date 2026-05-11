@@ -15,16 +15,16 @@ use crate::types::AppControl;
 /// the main thread.
 #[allow(unused_assignments)]
 pub fn run(control: Arc<AppControl>) {
-    #[allow(unused_mut)]
     let mut builder = EventLoopBuilder::new();
+    #[allow(unused_mut)]
+    let mut event_loop = builder.build();
     #[cfg(target_os = "macos")]
     {
-        use tao::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         // Accessory keeps the app out of the Dock and the Cmd-Tab switcher —
-        // it lives only in the menubar.
-        builder.with_activation_policy(ActivationPolicy::Accessory);
+        // it lives only in the menubar. Must be set before `run()`.
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
-    let event_loop = builder.build();
 
     let menu = Menu::new();
     let toggle_item = MenuItem::new(toggle_label(control.is_enabled()), true, None);
