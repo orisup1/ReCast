@@ -1,5 +1,6 @@
 use std::process;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -7,6 +8,9 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::types::AppControl;
+
+/// How often the menu's "Fixed: N" counter is refreshed while idle.
+const STATUS_REFRESH: Duration = Duration::from_millis(750);
 
 /// Run the menubar (macOS) / tray (Windows) on the calling thread.
 ///
@@ -27,14 +31,21 @@ pub fn run(control: Arc<AppControl>) {
     }
 
     let menu = Menu::new();
+    // Disabled informational row mirroring the Linux GUI's fixed-word counter.
+    let status_item = MenuItem::new(status_label(control.fixed_count()), false, None);
     let toggle_item = MenuItem::new(toggle_label(control.is_enabled()), true, None);
     let quit_item = MenuItem::new("Quit", true, None);
+    menu.append(&status_item).expect("append status");
     menu.append(&toggle_item).expect("append toggle");
     menu.append(&quit_item).expect("append quit");
 
     let toggle_id = toggle_item.id().clone();
     let quit_id = quit_item.id().clone();
     let menu_channel = MenuEvent::receiver();
+
+    // Track the last rendered count so we only rewrite the label when it
+    // changes, avoiding needless native menu churn on every timer wake.
+    let mut last_count = control.fixed_count();
 
     // tray-icon (macOS) requires that the TrayIcon be created after the
     // NSApplication has finished launching — i.e. inside the run loop, on
@@ -45,7 +56,16 @@ pub fn run(control: Arc<AppControl>) {
     let mut _tray: Option<TrayIcon> = None;
 
     event_loop.run(move |event, _target, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        // Wake periodically to refresh the fixed-word counter; menu/tray
+        // events still wake us immediately in between.
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + STATUS_REFRESH);
+
+        // Keep the counter in sync with the listener's running total.
+        let count = control.fixed_count();
+        if count != last_count {
+            last_count = count;
+            status_item.set_text(status_label(count));
+        }
 
         if let Event::NewEvents(StartCause::Init) = event {
             if let Some(menu) = pending_menu.take() {
@@ -77,6 +97,10 @@ pub fn run(control: Arc<AppControl>) {
 
 fn toggle_label(enabled: bool) -> &'static str {
     if enabled { "Disable" } else { "Enable" }
+}
+
+fn status_label(fixed: u64) -> String {
+    format!("Fixed: {}", fixed)
 }
 
 fn placeholder_icon() -> Icon {

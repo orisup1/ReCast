@@ -1,3 +1,12 @@
+// Release builds on Windows run as a GUI app (no console window) so launching
+// from Explorer behaves like a normal menubar/tray app — parity with macOS,
+// which already lives only in the menubar. Debug builds keep the console so
+// `println!` diagnostics remain visible during development.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod dictionary;
 #[cfg(target_os = "linux")]
 mod gui;

@@ -276,8 +276,21 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                 st.keys.pop();
             }
         }
-        Key::Tab | Key::Escape | Key::LeftArrow | Key::RightArrow | Key::UpArrow
-        | Key::DownArrow => {
+        // Cursor / focus-shifting keys end the current word without checking
+        // it, so a stale buffer doesn't leak into the next word. Kept in sync
+        // with the Windows and Linux listeners.
+        Key::Tab
+        | Key::Escape
+        | Key::LeftArrow
+        | Key::RightArrow
+        | Key::UpArrow
+        | Key::DownArrow
+        | Key::Home
+        | Key::End
+        | Key::PageUp
+        | Key::PageDown
+        | Key::Insert
+        | Key::Delete => {
             if st.is_replacing {
                 st.buffered_keys.clear();
             } else {
