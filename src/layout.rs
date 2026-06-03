@@ -219,6 +219,8 @@ extern "C" {
 
 #[cfg(target_os = "macos")]
 pub fn switch_layout_to(lang: Language) -> bool {
+    use std::time::{Duration, Instant};
+
     let code = match lang {
         Language::English => "en",
         Language::Hebrew => "he",
@@ -230,28 +232,56 @@ pub fn switch_layout_to(lang: Language) -> bool {
             eprintln!("No input source found for language code '{}'", code);
             return false;
         }
+
+        // Already on the target layout — nothing to switch, and (matching the
+        // Linux/Windows early-exit) report "no switch performed".
         let current_src = TISCopyCurrentKeyboardInputSource();
-        let mut switched = false;
-        if current_src.is_null()
-            || core_foundation_sys::base::CFEqual(
-                src as CFTypeRef,
-                current_src as CFTypeRef,
-            ) == 0
-        {
-            let status = TISSelectInputSource(src);
-            if status != 0 {
-                eprintln!(
-                    "TISSelectInputSource failed for '{}' with status {}",
-                    code, status
-                );
-            } else {
-                switched = true;
-            }
-        }
+        let already_target = !current_src.is_null()
+            && core_foundation_sys::base::CFEqual(src as CFTypeRef, current_src as CFTypeRef) != 0;
         if !current_src.is_null() {
             CFRelease(current_src as CFTypeRef);
         }
+        if already_target {
+            CFRelease(src as CFTypeRef);
+            return false;
+        }
+
+        let status = TISSelectInputSource(src);
+        if status != 0 {
+            eprintln!(
+                "TISSelectInputSource failed for '{}' with status {}",
+                code, status
+            );
+            CFRelease(src as CFTypeRef);
+            return false;
+        }
+
+        // TISSelectInputSource is asynchronous: the focused app does not see
+        // the new layout the instant the call returns. If we retype before the
+        // switch propagates, the injected keys are interpreted under the OLD
+        // layout and the "corrected" word comes out as garbage. Poll the
+        // current input source until it actually equals the target (or a
+        // deadline elapses), so callers can retype immediately afterwards —
+        // parity with the Linux/Windows pollers.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut landed = false;
+        loop {
+            let cur = TISCopyCurrentKeyboardInputSource();
+            landed = !cur.is_null()
+                && core_foundation_sys::base::CFEqual(src as CFTypeRef, cur as CFTypeRef) != 0;
+            if !cur.is_null() {
+                CFRelease(cur as CFTypeRef);
+            }
+            if landed || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
         CFRelease(src as CFTypeRef);
-        switched
+        // Only report success once the switch is confirmed. On timeout, return
+        // false so the caller skips the retype rather than typing the word out
+        // under the old layout (garbage) — parity with the Windows poller.
+        landed
     }
 }

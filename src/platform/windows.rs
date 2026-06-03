@@ -14,6 +14,14 @@ use crate::types::AppControl;
 /// release the keys we are about to retype before injecting anyway.
 const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// Gap between a synthetic key-down and its key-up, and between consecutive
+/// keys. `SendInput` (used by rdev) is synchronous and reliable, so this can
+/// be tighter than the macOS pacing, but the previous 50µs spacing was tight
+/// enough that a backspace could be dropped in slow apps (leaving the original
+/// first letter behind). 1ms gives a safe margin while staying fast.
+const KEY_PRESS_GAP: Duration = Duration::from_millis(1);
+const INTER_KEY_GAP: Duration = Duration::from_millis(1);
+
 pub struct AppState {
     pub keys: Vec<Key>,
     pub is_replacing: bool,
@@ -192,27 +200,25 @@ fn replace_word(
         st.buffered_keys.clone()
     };
 
+    // Press + release a single key with pacing the OS won't drop.
+    let tap_key = |k: Key| {
+        let _ = simulate(&EventType::KeyPress(k));
+        thread::sleep(KEY_PRESS_GAP);
+        let _ = simulate(&EventType::KeyRelease(k));
+        thread::sleep(INTER_KEY_GAP);
+    };
+
     // +1 for the terminator the user physically typed.
     let delete_count = keys.len() + 1 + buf.len();
     for _ in 0..delete_count {
-        let _ = simulate(&EventType::KeyPress(Key::Backspace));
-        let _ = simulate(&EventType::KeyRelease(Key::Backspace));
-        thread::sleep(Duration::from_micros(50));
+        tap_key(Key::Backspace);
     }
-
     for k in &keys {
-        let _ = simulate(&EventType::KeyPress(*k));
-        let _ = simulate(&EventType::KeyRelease(*k));
-        thread::sleep(Duration::from_micros(50));
+        tap_key(*k);
     }
-
-    let _ = simulate(&EventType::KeyPress(terminator));
-    let _ = simulate(&EventType::KeyRelease(terminator));
-
+    tap_key(terminator);
     for k in buf.iter() {
-        let _ = simulate(&EventType::KeyPress(*k));
-        let _ = simulate(&EventType::KeyRelease(*k));
-        thread::sleep(Duration::from_micros(50));
+        tap_key(*k);
     }
 
     let mut st = state_mutex.lock().unwrap();
