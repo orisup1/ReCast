@@ -1,6 +1,6 @@
-# typeLan
+# ReCast
 
-typeLan is a small background helper that watches what you type, checks each finished word
+ReCast is a small background helper that watches what you type, checks each finished word
 against language dictionaries, and automatically switches the keyboard layout between
 English and Hebrew when it looks like you are typing in the wrong layout — then retypes the
 mistyped word in the correct layout.
@@ -25,7 +25,7 @@ mistyped word in the correct layout.
 | Windows | `rdev`        | `LoadKeyboardLayoutW` + `WM_INPUTLANGCHANGEREQUEST` |
 
 Linux additionally requires the user to be in the `input` group (for `evdev` read access)
-and creates a `uinput` virtual device named `typeLan-injector` to replay corrected words.
+and creates a `uinput` virtual device named `recast-injector` to replay corrected words.
 
 ## Setup
 
@@ -40,8 +40,8 @@ files or wrapper scripts to install.
 ## Linux: full install + autostart
 
 One-shot setup. Adds your user to the `input` group (required for `evdev` access),
-builds in release mode, installs the binary to `~/.local/bin/typeLan`, and registers a
-`systemd --user` unit that starts typeLan at login:
+builds in release mode, installs the binary to `~/.local/bin/recast`, and registers a
+`systemd --user` unit that starts ReCast at login:
 
 ```bash
 sudo usermod -aG input $USER && exec newgrp input <<< 'make service'
@@ -54,9 +54,9 @@ is on your `PATH`.
 Manage the service:
 
 ```bash
-systemctl --user status  typeLan       # health check
-systemctl --user restart typeLan       # apply a rebuild
-journalctl  --user -u    typeLan -f    # logs
+systemctl --user status  recast       # health check
+systemctl --user restart recast       # apply a rebuild
+journalctl  --user -u    recast -f    # logs
 make service-uninstall                  # stop + remove the unit
 ```
 
@@ -71,7 +71,7 @@ make run ARGS=-g  # cargo run with the GUI flag
 make help         # full target list
 ```
 
-Override the install root with `PREFIX=`, e.g. `make install PREFIX=/opt/typeLan`.
+Override the install root with `PREFIX=`, e.g. `make install PREFIX=/opt/recast`.
 
 ## macOS
 
@@ -79,7 +79,7 @@ Override the install root with `PREFIX=`, e.g. `make install PREFIX=/opt/typeLan
 make service
 ```
 
-Writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.typeLan.plist` and starts it.
+Writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.recast.plist` and starts it.
 You will need to grant the binary **Input Monitoring** and **Accessibility** permissions
 in System Settings → Privacy & Security the first time it runs.
 
@@ -92,7 +92,7 @@ PowerShell:
 ```
 
 Builds, installs to `%USERPROFILE%\.local\bin`, and registers a Scheduled Task that
-runs typeLan at logon. `.\deploy.ps1 -Target help` lists every target.
+runs ReCast at logon. `.\deploy.ps1 -Target help` lists every target.
 
 ## Running directly
 
@@ -103,11 +103,11 @@ Pass `-g` (Linux only) to launch a small control window with an enable/disable
 switch and a counter of words fixed since startup:
 
 ```bash
-typeLan -g
+recast -g
 ```
 
-Set `TYPELAN_DEBUG=1` to print every word check and switch decision:
+Set `RECAST_DEBUG=1` to print every word check and switch decision:
 
 ```bash
-TYPELAN_DEBUG=1 typeLan
+RECAST_DEBUG=1 recast
 ```

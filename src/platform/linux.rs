@@ -28,7 +28,7 @@ pub struct AppState {
 }
 
 pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppControl>) {
-    println!("Starting typeLan keyboard watcher (Linux/Wayland)...");
+    println!("Starting recast keyboard watcher (Linux/Wayland)...");
 
     // Persistent virtual device strictly for injecting backspaces and
     // corrected words.  Created once so Wayland has time to recognise it.
@@ -45,7 +45,7 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
         }
     };
 
-    let injector = match builder.name("typeLan-injector").with_keys(&all_keys) {
+    let injector = match builder.name("recast-injector").with_keys(&all_keys) {
         Ok(b) => match b.build() {
             Ok(d) => d,
             Err(e) => {
@@ -68,7 +68,7 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
     // macOS / Windows ButtonPress handler).
     let device_paths: Vec<std::path::PathBuf> = evdev::enumerate()
         .filter_map(|(path, dev)| {
-            if dev.name() == Some("typeLan-injector") {
+            if dev.name() == Some("recast-injector") {
                 return None;
             }
             let keys = dev.supported_keys();
@@ -272,25 +272,12 @@ fn replace_word(
 ) {
     use evdev::{EventType, InputEvent, KeyCode as KC, SynchronizationCode};
 
-    let emit = |kc: KC, val: i32| {
-        let evs = [
-            InputEvent::new(EventType::KEY.0, kc.0, val),
-            InputEvent::new(
-                EventType::SYNCHRONIZATION.0,
-                SynchronizationCode::SYN_REPORT.0,
-                0,
-            ),
-        ];
-        if let Ok(mut dev) = injector.lock() {
-            let _ = dev.emit(&evs);
-        }
-    };
-
-    let press_release = |kc: KC| {
-        emit(kc, 1);
-        thread::sleep(Duration::from_micros(50));
-        emit(kc, 0);
-        thread::sleep(Duration::from_micros(50));
+    let syn = || {
+        InputEvent::new(
+            EventType::SYNCHRONIZATION.0,
+            SynchronizationCode::SYN_REPORT.0,
+            0,
+        )
     };
 
     // 1a. Wait for the user to physically release the terminator and any of
@@ -330,31 +317,38 @@ fn replace_word(
         st.buffered_keys.clone()
     };
 
-    // 2. Erase the word (+1 for the terminator the user physically typed) + buffered keys.
-    let delete_count = keys.len() + 1 + buffered.len();
-    for _ in 0..delete_count {
-        press_release(KC::KEY_BACKSPACE);
-    }
+    // Build the whole erase+retype sequence as one event batch and emit it in
+    // a single locked write. Each key is press / SYN / release / SYN so the
+    // compositor still sees distinct keystroke frames, but there are no
+    // inter-key sleeps and the injector lock is taken once instead of twice
+    // per event — the dominant cost of retyping.
+    let delete_count = keys.len() + 1 + buffered.len(); // +1 = physical terminator
+    let total_keys = delete_count + keys.len() + 1 + buffered.len();
+    let mut evs: Vec<InputEvent> = Vec::with_capacity(total_keys * 4);
+    let mut push_key = |kc: KC| {
+        evs.push(InputEvent::new(EventType::KEY.0, kc.0, 1));
+        evs.push(syn());
+        evs.push(InputEvent::new(EventType::KEY.0, kc.0, 0));
+        evs.push(syn());
+    };
 
+    // 2. Erase the word + buffered keys.
+    for _ in 0..delete_count {
+        push_key(KC::KEY_BACKSPACE);
+    }
     // 3. Retype the physical keys.
     for key in &keys {
-        press_release(*key);
+        push_key(*key);
     }
-
-    // Brief pause so the destination app has finished consuming the last
-    // word character before the terminator arrives. Without this gap the
-    // terminator is occasionally swallowed.
-    // reduced pause, usually unnecessary
-
-    // 4. Retype the terminator (space/enter). Lock is NOT held here so the
-    //    resulting handle_key call can acquire it without deadlocking.
-    press_release(terminator);
-
-    // reduced pause, usually unnecessary
-
+    // 4. Retype the terminator (space/enter).
+    push_key(terminator);
     // 5. Retype buffered keys.
     for key in &buffered {
-        press_release(*key);
+        push_key(*key);
+    }
+
+    if let Ok(mut dev) = injector.lock() {
+        let _ = dev.emit(&evs);
     }
 
     // Re-acquire the lock only to clean up state.

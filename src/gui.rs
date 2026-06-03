@@ -18,7 +18,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(8.0);
-                ui.heading("typeLan");
+                ui.heading("ReCast");
                 ui.add_space(12.0);
 
                 let mut enabled = self.control.is_enabled();
@@ -45,7 +45,7 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
         ..Default::default()
     };
     eframe::run_native(
-        "typeLan",
+        "ReCast",
         opts,
         Box::new(|_cc| Box::new(App { control })),
     )

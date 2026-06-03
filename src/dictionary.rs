@@ -6,7 +6,7 @@ use crate::types::Language;
 
 fn debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("TYPELAN_DEBUG").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("RECAST_DEBUG").is_some())
 }
 
 /// Parse a plain-text word list (one word per line) into a `HashSet`.
@@ -82,32 +82,47 @@ fn matches_hebrew(word: &str, dict: &HashSet<String>) -> bool {
 
 /// Pure decision: given the same physical key sequence interpreted as English
 /// (`word_en`) and Hebrew (`word_he`), return the layout to switch to — or
-/// `None` if the word is in both dicts (ambiguous) or in neither.
+/// `None` if the word is meaningful in both languages (ambiguous) or in
+/// neither.
 ///
-/// The Hebrew side uses a strict direct dict lookup here, NOT the looser
-/// `matches_hebrew` (prefix-strip) helper. Reason: when the user types an
-/// English word that is not in `en_dict` (a name, slang, plural, typo,
-/// short abbreviation, etc.), the same key sequence interpreted as Hebrew
-/// often pattern-matches "valid Hebrew word with one of the one-letter
-/// inflectional prefixes ו ה ל ב כ מ ש". The prefix-strip rescue then fires
-/// and we wrongly flip to Hebrew. Requiring a direct `he_dict` hit kills
-/// that false positive at the cost of missing some real prefixed-Hebrew
-/// corrections (the dict already carries many prefixed forms outright).
+/// Asymmetric validity by role. To flip a word we require two things, and each
+/// uses a different strictness:
 ///
-/// `matches_hebrew` is still used by `is_known_word` below — there the
-/// looser match is gated by the suffix also having to decide for a layout,
-/// so the false-positive rate is naturally lower.
+///   * **Means something in the target (other) language** — STRICT direct dict
+///     lookup. When the user types an English word missing from `en_dict` (a
+///     name, slang, plural, typo, abbreviation), the same keys read as Hebrew
+///     often pattern-match "valid Hebrew word + one-letter inflectional prefix
+///     ו ה ל ב כ מ ש". Accepting that loose match as the flip *target* fires
+///     a wrong switch to Hebrew, so the target side stays strict.
+///
+///   * **Means nothing in the current (source) language** — LOOSE
+///     `matches_hebrew` (prefix-strip) lookup for the Hebrew source. A real
+///     Hebrew word the user typed often carries an inflectional prefix and so
+///     is absent from `he_dict` directly (only the bare form is stored). With a
+///     strict source check those words look meaningless and we'd flip a nested
+///     chunk of them to English, mangling the word. Treating them as meaningful
+///     Hebrew via `matches_hebrew` blocks the flip — exactly the intent: "to
+///     change a word the letters must mean something in the other language AND
+///     mean nothing in the current one."
+///
+/// English has no one-letter inflectional prefixes, so its source check is the
+/// same strict `en_dict` lookup either way.
 fn decide_target_lang(
     word_en: &str,
     word_he: &str,
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
 ) -> Option<Language> {
-    let is_in_en = !word_en.is_empty() && en_dict.contains(word_en);
-    let is_in_he = !word_he.is_empty() && he_dict.contains(word_he);
-    if is_in_en && !is_in_he {
+    // Strict membership — used as the "means something in the target language"
+    // test (the language we would switch *to*).
+    let in_en_strict = !word_en.is_empty() && en_dict.contains(word_en);
+    let in_he_strict = !word_he.is_empty() && he_dict.contains(word_he);
+    // Loose Hebrew membership (prefix-strip) — used as the "means something in
+    // the current language" test for the Hebrew source side.
+    let he_meaningful = !word_he.is_empty() && matches_hebrew(word_he, he_dict);
+    if in_en_strict && !he_meaningful {
         Some(Language::English)
-    } else if is_in_he && !is_in_en {
+    } else if in_he_strict && !in_en_strict {
         Some(Language::Hebrew)
     } else {
         None
@@ -206,8 +221,11 @@ pub fn check_and_switch_with_split<K: Copy>(
     // source of "I typed a real word and it got replaced anyway" — the
     // split scanner happily finds some sub-interpretation in the other
     // language and triggers a swap. Bail out and trust what the user typed.
+    // Loose Hebrew match here so a real Hebrew word carrying an inflectional
+    // prefix (absent from `he_dict` directly) still counts as valid and blocks
+    // the split scanner from flipping a nested chunk of it.
     let full_en_valid = !full_en.is_empty() && en_dict.contains(&full_en);
-    let full_he_valid = !full_he.is_empty() && he_dict.contains(&full_he);
+    let full_he_valid = !full_he.is_empty() && matches_hebrew(&full_he, he_dict);
     if full_en_valid || full_he_valid {
         debug_log(&full_en, &full_he, None, false);
         return None;

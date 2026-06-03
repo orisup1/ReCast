@@ -1,8 +1,8 @@
-# typeLan - Windows installer (PowerShell)
+# recast - Windows installer (PowerShell)
 #
 # Mirrors the Makefile for Windows hosts. Default target is `deploy`
 # (clean + build + install). Use `-Target service` to also register a
-# Scheduled Task that starts typeLan at logon.
+# Scheduled Task that starts recast at logon.
 #
 # The binary is self-contained: dictionaries are embedded at compile time
 # (`include_str!` in src/main.rs), so the executable runs identically from
@@ -20,7 +20,7 @@
 #   .\deploy.ps1 -Target help
 #
 # Optional:
-#   .\deploy.ps1 -Prefix "C:\Tools\typeLan"   # custom install dir for the bin
+#   .\deploy.ps1 -Prefix "C:\Tools\recast"   # custom install dir for the bin
 
 [CmdletBinding()]
 param(
@@ -37,11 +37,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$BinName  = 'typeLan.exe'
+$BinName  = 'recast.exe'
 $BinSrc   = Join-Path 'target\release' $BinName
 $BinDir   = $Prefix
 $BinDst   = Join-Path $BinDir $BinName
-$TaskName = 'typeLan'
+$TaskName = 'recast'
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
@@ -74,7 +74,7 @@ function Invoke-Install {
     Write-Host "Installed:"
     Write-Host "  $BinDst"
     Write-Host ""
-    Write-Host "Make sure $BinDir is on your PATH, then run: typeLan"
+    Write-Host "Make sure $BinDir is on your PATH, then run: recast"
     Write-Host "(rdev needs no special permissions on Windows.)"
 }
 
@@ -148,7 +148,7 @@ function Invoke-Run {
 
 function Invoke-Help {
     Write-Host @"
-typeLan deploy.ps1 (Windows)
+recast deploy.ps1 (Windows)
 
 Targets:
   build              cargo build --release

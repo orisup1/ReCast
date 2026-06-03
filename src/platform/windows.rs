@@ -26,7 +26,7 @@ pub struct AppState {
 }
 
 pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppControl>) {
-    println!("Starting typeLan keyboard watcher (Windows)...");
+    println!("Starting recast keyboard watcher (Windows)...");
 
     let en_dict_cb = en_dict.clone();
     let he_dict_cb = he_dict.clone();

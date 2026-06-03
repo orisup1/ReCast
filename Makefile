@@ -1,4 +1,4 @@
-# typeLan — build / install / deploy
+# recast — build / install / deploy
 #
 # The binary is self-contained: dictionaries are embedded at compile time
 # (`include_str!` in src/main.rs) so it can be invoked from any directory
@@ -42,17 +42,17 @@ BINDIR := $(PREFIX)/bin
 
 # Linux service path
 SYSTEMD_DIR  := $(HOME)/.config/systemd/user
-SYSTEMD_UNIT := $(SYSTEMD_DIR)/typeLan.service
+SYSTEMD_UNIT := $(SYSTEMD_DIR)/recast.service
 
 # macOS service path
 LAUNCHD_DIR   := $(HOME)/Library/LaunchAgents
-LAUNCHD_LABEL := org.typeLan
+LAUNCHD_LABEL := org.recast
 LAUNCHD_PLIST := $(LAUNCHD_DIR)/$(LAUNCHD_LABEL).plist
 
 CARGO   ?= cargo
 INSTALL ?= install
 
-BIN_NAME := typeLan
+BIN_NAME := recast
 BIN_SRC  := target/release/$(BIN_NAME)
 BIN_DST  := $(BINDIR)/$(BIN_NAME)
 
@@ -114,7 +114,7 @@ service-linux: install
 	@mkdir -p $(SYSTEMD_DIR)
 	@printf '%s\n' \
 	  '[Unit]' \
-	  'Description=typeLan keyboard layout corrector' \
+	  'Description=recast keyboard layout corrector' \
 	  'After=graphical-session.target' \
 	  'PartOf=graphical-session.target' \
 	  '' \
@@ -128,14 +128,14 @@ service-linux: install
 	  'WantedBy=graphical-session.target' \
 	  > $(SYSTEMD_UNIT)
 	systemctl --user daemon-reload
-	systemctl --user enable --now typeLan.service
+	systemctl --user enable --now recast.service
 	@echo
 	@echo "systemd --user service installed and started."
-	@echo "  status: systemctl --user status typeLan"
-	@echo "  logs:   journalctl --user -u typeLan -f"
+	@echo "  status: systemctl --user status recast"
+	@echo "  logs:   journalctl --user -u recast -f"
 
 service-uninstall-linux:
-	-systemctl --user disable --now typeLan.service
+	-systemctl --user disable --now recast.service
 	@rm -f $(SYSTEMD_UNIT)
 	systemctl --user daemon-reload
 	@echo "systemd --user service stopped and removed"
@@ -155,8 +155,8 @@ service-macos: install
 	  '    </array>' \
 	  '    <key>RunAtLoad</key><true/>' \
 	  '    <key>KeepAlive</key><true/>' \
-	  '    <key>StandardOutPath</key><string>/tmp/typeLan.out.log</string>' \
-	  '    <key>StandardErrorPath</key><string>/tmp/typeLan.err.log</string>' \
+	  '    <key>StandardOutPath</key><string>/tmp/recast.out.log</string>' \
+	  '    <key>StandardErrorPath</key><string>/tmp/recast.err.log</string>' \
 	  '</dict>' \
 	  '</plist>' \
 	  > $(LAUNCHD_PLIST)
@@ -166,7 +166,7 @@ service-macos: install
 	@echo "launchd LaunchAgent installed and started."
 	@echo "  plist:  $(LAUNCHD_PLIST)"
 	@echo "  status: launchctl list | grep $(LAUNCHD_LABEL)"
-	@echo "  logs:   tail -f /tmp/typeLan.err.log"
+	@echo "  logs:   tail -f /tmp/recast.err.log"
 
 service-uninstall-macos:
 	-launchctl unload "$(LAUNCHD_PLIST)" 2>/dev/null
@@ -179,7 +179,7 @@ service-unsupported:
 	@exit 1
 
 help:
-	@echo "typeLan Makefile (host OS detected as: $(OS_NAME))"
+	@echo "recast Makefile (host OS detected as: $(OS_NAME))"
 	@echo
 	@echo "Targets:"
 	@echo "  build              cargo build --release (default)"

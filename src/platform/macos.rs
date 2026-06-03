@@ -328,7 +328,7 @@ pub fn setup_event_tap(
     he_dict: HashSet<String>,
     control: Arc<AppControl>,
 ) -> Option<EventTapHandle> {
-    println!("Starting typeLan keyboard watcher (macOS)...");
+    println!("Starting recast keyboard watcher (macOS)...");
 
     let ctx = TapContext {
         state: Arc::new(Mutex::new(AppState {

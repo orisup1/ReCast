@@ -53,11 +53,11 @@ pub fn run(control: Arc<AppControl>) {
                 #[allow(unused_mut)]
                 let mut tray_builder = TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
-                    .with_tooltip("TypeLan")
+                    .with_tooltip("ReCast")
                     .with_icon(icon);
                 #[cfg(target_os = "macos")]
                 {
-                    tray_builder = tray_builder.with_title("TypeLan");
+                    tray_builder = tray_builder.with_title("ReCast");
                 }
                 _tray = Some(tray_builder.build().expect("tray build"));
             }

@@ -1,2 +1,18 @@
-target/debug
+# Rust build artifacts
+/target
+
+# Local notes / scratch
 /info.md
+
+# Editor / IDE
+/.idea
+/.vscode
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
