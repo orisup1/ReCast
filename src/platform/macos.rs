@@ -15,6 +15,14 @@ use crate::types::AppControl;
 /// release the keys we are about to retype before injecting anyway.
 const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// Gap between a synthetic key-down and its key-up. macOS coalesces or drops
+/// `CGEvent`s posted too close together; the previous 50µs spacing let a
+/// backspace go missing (the original first letter survived) or a retyped key
+/// be lost. A couple of milliseconds makes injection reliable.
+const KEY_PRESS_GAP: Duration = Duration::from_millis(2);
+/// Gap between consecutive injected keys, for the same reason.
+const INTER_KEY_GAP: Duration = Duration::from_millis(4);
+
 pub struct AppState {
     pub keys: Vec<Key>,
     pub is_replacing: bool,
@@ -415,8 +423,8 @@ fn replace_word(
         thread::sleep(Duration::from_micros(100));
     }
 
-    // 2. Layout-settle window after switch_layout_to (TIS) before retype.
-    thread::sleep(Duration::from_millis(2));
+    // 2. switch_layout_to already polled until the new layout took effect, so
+    //    no settle delay is needed here — the retype lands in the right layout.
 
     // 3. Gate the listener now that we are about to inject our own events.
     injecting.store(true, Ordering::Relaxed);
@@ -426,23 +434,24 @@ fn replace_word(
         st.buffered_keys.clone()
     };
 
+    // Press + release a single key with pacing that macOS won't drop.
+    let tap_key = |k: Key| {
+        let _ = simulate(&EventType::KeyPress(k));
+        thread::sleep(KEY_PRESS_GAP);
+        let _ = simulate(&EventType::KeyRelease(k));
+        thread::sleep(INTER_KEY_GAP);
+    };
+
     let delete_count = keys.len() + 1 + buf.len();
     for _ in 0..delete_count {
-        let _ = simulate(&EventType::KeyPress(Key::Backspace));
-        let _ = simulate(&EventType::KeyRelease(Key::Backspace));
-        thread::sleep(Duration::from_micros(50));
+        tap_key(Key::Backspace);
     }
     for k in &keys {
-        let _ = simulate(&EventType::KeyPress(*k));
-        let _ = simulate(&EventType::KeyRelease(*k));
-        thread::sleep(Duration::from_micros(50));
+        tap_key(*k);
     }
-    let _ = simulate(&EventType::KeyPress(terminator));
-    let _ = simulate(&EventType::KeyRelease(terminator));
+    tap_key(terminator);
     for k in buf.iter() {
-        let _ = simulate(&EventType::KeyPress(*k));
-        let _ = simulate(&EventType::KeyRelease(*k));
-        thread::sleep(Duration::from_micros(50));
+        tap_key(*k);
     }
 
     let mut st = state_mutex.lock().unwrap();
