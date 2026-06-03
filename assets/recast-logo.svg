@@ -1,0 +1,29 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReCast logo">
+  <defs>
+    <linearGradient id="cap" x1="64" y1="40" x2="192" y2="216" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2A8FDE"/>
+      <stop offset="1" stop-color="#1167B4"/>
+    </linearGradient>
+    <linearGradient id="face" x1="72" y1="60" x2="184" y2="196" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3DA0EC"/>
+      <stop offset="1" stop-color="#1C7AC8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- keycap body (gives the cap its depth) -->
+  <rect x="40" y="48" width="176" height="168" rx="34" fill="#0E5599"/>
+  <!-- keycap top face -->
+  <rect x="52" y="44" width="152" height="148" rx="28" fill="url(#cap)"/>
+  <rect x="66" y="58" width="124" height="120" rx="20" fill="url(#face)"/>
+
+  <!-- two arrows pointing in opposite directions (swap) -->
+  <g stroke="#FFFFFF" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- top arrow: points LEFT -->
+    <line x1="104" y1="100" x2="166" y2="100"/>
+    <polyline points="120,86 102,100 120,114"/>
+
+    <!-- bottom arrow: points RIGHT -->
+    <line x1="90" y1="138" x2="152" y2="138"/>
+    <polyline points="136,124 154,138 136,152"/>
+  </g>
+</svg>

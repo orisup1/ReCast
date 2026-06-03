@@ -1,4 +1,8 @@
-# ReCast
+<p align="center">
+  <img src="assets/icons/icon-256.png" width="128" height="128" alt="ReCast logo">
+</p>
+
+<h1 align="center">ReCast</h1>
 
 ReCast is a small background helper that watches what you type, checks each finished word
 against language dictionaries, and automatically switches the keyboard layout between

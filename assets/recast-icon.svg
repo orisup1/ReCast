@@ -1,0 +1,23 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReCast icon">
+  <defs>
+    <linearGradient id="cap" x1="40" y1="24" x2="216" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2A8FDE"/>
+      <stop offset="1" stop-color="#1167B4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- keycap: thin depth edge + big top face so the mark reads at 16px -->
+  <rect x="28" y="32" width="200" height="192" rx="40" fill="#0E5599"/>
+  <rect x="32" y="24" width="192" height="184" rx="38" fill="url(#cap)"/>
+
+  <!-- two bold arrows pointing in opposite directions (swap) -->
+  <g stroke="#FFFFFF" stroke-width="22" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- top arrow: points LEFT -->
+    <line x1="96" y1="96" x2="172" y2="96"/>
+    <polyline points="118,74 92,96 118,118"/>
+
+    <!-- bottom arrow: points RIGHT -->
+    <line x1="84" y1="140" x2="160" y2="140"/>
+    <polyline points="138,118 164,140 138,162"/>
+  </g>
+</svg>

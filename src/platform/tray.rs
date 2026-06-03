@@ -69,7 +69,7 @@ pub fn run(control: Arc<AppControl>) {
 
         if let Event::NewEvents(StartCause::Init) = event {
             if let Some(menu) = pending_menu.take() {
-                let icon = placeholder_icon();
+                let icon = app_icon();
                 #[allow(unused_mut)]
                 let mut tray_builder = TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
@@ -103,11 +103,12 @@ fn status_label(fixed: u64) -> String {
     format!("Fixed: {}", fixed)
 }
 
-fn placeholder_icon() -> Icon {
-    let size: u32 = 16;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    for _ in 0..(size * size) {
-        rgba.extend_from_slice(&[20, 120, 200, 255]);
-    }
-    Icon::from_rgba(rgba, size, size).expect("icon build")
+/// The ReCast keycap/swap-arrows icon, baked in as raw 32×32 RGBA at compile
+/// time (generated from `assets/recast-icon.svg` → `assets/tray-icon.rgba`).
+/// Self-contained, so the binary needs no icon file at runtime.
+const ICON_RGBA: &[u8] = include_bytes!("../../assets/tray-icon.rgba");
+const ICON_SIZE: u32 = 32;
+
+fn app_icon() -> Icon {
+    Icon::from_rgba(ICON_RGBA.to_vec(), ICON_SIZE, ICON_SIZE).expect("icon build")
 }
