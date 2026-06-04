@@ -22,7 +22,7 @@ ifeq ($(UNAME_S),Linux)
     SERVICE_TARGET := service-linux
     SERVICE_UNINSTALL_TARGET := service-uninstall-linux
     PERM_HINT_1 := Linux evdev access requires the 'input' group:
-    PERM_HINT_2 := "  sudo usermod -aG input \$$USER   # log out + back in"
+    PERM_HINT_2 := sudo usermod -aG input $$USER   # log out + back in
 else ifeq ($(UNAME_S),Darwin)
     OS_NAME := macOS
     SERVICE_TARGET := service-macos
@@ -60,8 +60,14 @@ BIN_DST  := $(BINDIR)/$(BIN_NAME)
 # the file-target dependency does the right thing — `cargo build` itself is
 # fast on a no-op rebuild, but the explicit list lets `make install` skip
 # the cargo invocation when nothing has changed.
-SRC := Cargo.toml Cargo.lock en_dict.txt he_dict.txt \
-       $(shell find src -type f -name '*.rs' 2>/dev/null)
+SRC := Cargo.toml Cargo.lock en_dict.txt he_dict.txt assets/tray-icon.rgba \
+        $(shell find src -type f -name '*.rs' 2>/dev/null)
+
+assets/tray-icon.rgba: assets/recast-icon.svg
+	@echo "Generating tray-icon.rgba from $<"
+	@convert "$<" -resize 32x32 -depth 8 RGBA:"$@" 2>/dev/null || \
+	(magick "$<" -resize 32x32 -depth 8 RGBA:"$@" 2>/dev/null) || \
+	(echo "Error: ImageMagick not installed. Install imagemagick to generate tray icon." && false)
 
 .PHONY: all build clean rebuild install uninstall deploy run help \
         service service-uninstall \
