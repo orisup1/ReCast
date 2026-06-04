@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icons/icon-256.png" width="128" height="128" alt="ReCast logo">
+  <img src="assets/recast-icon.svg" width="128" height="128" alt="ReCast logo">
 </p>
 
 <h1 align="center">ReCast</h1>
