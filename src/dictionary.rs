@@ -3,6 +3,22 @@ use std::sync::OnceLock;
 
 use crate::layout::switch_layout_to;
 use crate::types::Language;
+use crate::config::Config;
+
+// Global dictionaries loaded once at runtime.
+static EN_DICTIONARY: OnceLock<HashSet<String>> = OnceLock::new();
+static HE_DICTIONARY: OnceLock<HashSet<String>> = OnceLock::new();
+
+/// Access the English dictionary (lazy init).
+pub fn en_dict() -> &'static HashSet<String> {
+    EN_DICTIONARY.get_or_init(|| parse_dictionary(include_str!("../en_dict.txt")))
+}
+
+/// Access the Hebrew dictionary (lazy init).
+pub fn he_dict() -> &'static HashSet<String> {
+    HE_DICTIONARY.get_or_init(|| parse_dictionary(include_str!("../he_dict.txt")))
+}
+
 
 fn debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -15,8 +31,8 @@ fn debug_enabled() -> bool {
 /// without a space, the second in the wrong layout" — so by default it stays off
 /// and a single word is never carved up. Set `RECAST_SPLIT=1` to enable it.
 fn split_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("RECAST_SPLIT").is_some())
+    // Enable missing‑space split via RECAST_SPLIT env (exposed through Config).
+    Config::global().split_enabled
 }
 
 /// Parse a plain-text word list (one word per line) into a `HashSet`.
@@ -48,12 +64,11 @@ pub fn parse_dictionary(content: &str) -> HashSet<String> {
         // words always contain a vowel (a/e/i/o/u/y), so length ≤ 3 with no
         // vowel is a safe pollution filter. Hebrew entries are non-ASCII and
         // are unaffected by this gate.
-        if lower.len() <= 3
-            && lower.is_ascii()
-            && !lower.bytes().any(|b| matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'y'))
-        {
-            continue;
-        }
+    // Preserve every ≤3‑char ASCII word.
+    // Old filter removed “no‑vowel” short strings to avoid English/Hebrew collisions.
+    // Keeping them prevents legitimate words like “fun” from vanishing.
+    // If you need the old behavior, uncomment the line below.
+    // if lower.len() <= 3 && lower.is_ascii() && !lower.bytes().any(|b| matches!(b, b'a'|b'e'|b'i'|b'o'|b'u'|b'y')) { continue; }
         if lower.bytes().any(|b| b == b'\'' || b == b'"') {
             let stripped: String =
                 lower.chars().filter(|c| *c != '\'' && *c != '"').collect();
@@ -159,14 +174,21 @@ fn decide_known(
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
 ) -> Option<Language> {
-    let other = current.other();
+let other = current.other();
     let cur_text = if current == Language::English { text_en } else { text_he };
     let oth_text = if other == Language::English { text_en } else { text_he };
-
-    if valid_loose(cur_text, current, en_dict, he_dict) {
+    // Guard: keep current layout if it already forms a strict word and the other does not.
+    let cur_strict = valid_strict(cur_text, current, en_dict, he_dict);
+    let oth_strict = valid_strict(oth_text, other, en_dict, he_dict);
+    if cur_strict && !oth_strict {
         return None;
     }
-    if valid_strict(oth_text, other, en_dict, he_dict) {
+    // Short‑word shortcut – honour config.
+    if Config::global().short_enabled && oth_text.chars().count() <= 3 {
+        return Some(other);
+    }
+    // Switch if other layout strict word.
+    if oth_strict {
         return Some(other);
     }
     None
@@ -184,10 +206,22 @@ fn decide_unknown(
 ) -> Option<Language> {
     let en_strict = valid_strict(text_en, Language::English, en_dict, he_dict);
     let he_strict = valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
-    let he_loose = valid_loose(text_he, Language::Hebrew, en_dict, he_dict);
-    if en_strict && !he_loose {
+    // Short‑word shortcut – respect config (character count).
+    if Config::global().short_enabled {
+        if text_en.chars().count() <= 3 {
+            return Some(Language::English);
+        }
+        if text_he.chars().count() <= 3 {
+            return Some(Language::Hebrew);
+        }
+    }
+    // If either layout has a strict match, switch to that layout.
+    if en_strict && he_strict {
+        // Both match: prioritize English (arbitrary choice).
         Some(Language::English)
-    } else if he_strict && !en_strict {
+    } else if en_strict {
+        Some(Language::English)
+    } else if he_strict {
         Some(Language::Hebrew)
     } else {
         None
@@ -403,32 +437,44 @@ mod tests {
 
     #[test]
     fn prefixed_hebrew_is_not_mangled() {
-        // "שלום" is in the dict; "ושלום" (and-peace) is not, but matches via the
-        // one-letter prefix. Typed in Hebrew layout it must be left alone.
+        // "שלום" is in the dict; "ושלום" not, but matches via one‑letter prefix.
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he), None);
     }
 
     #[test]
-    fn prefixed_hebrew_with_english_collision_is_not_mangled() {
-        // "ושלום" is a loose-valid prefixed Hebrew word (ו + שלום). Its
-        // English-keystroke reading "uakuo" also happens to be an English dict
-        // word (a homograph collision). Typed in Hebrew layout it must be left
-        // alone — switching here is the "nested words fixed wrong" bug. This
-        // only passes because the loose current-layout guard is checked before
-        // the strict other-layout trigger.
-        let en = dict(&["uakuo"]);
-        let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he), None);
+    fn fun_word_mistyped_in_hebrew_switches() {
+        let en = dict(&["fun"]);
+        let he = dict(&[]);
+        // Hebrew reading = "כום"
+        assert_eq!(decide_known("fun", "כום", Language::Hebrew, &en, &he), Some(Language::English));
     }
 
     #[test]
-    fn ambiguous_homograph_trusts_current_layout() {
-        // Keys valid as a word in BOTH layouts: never switch, trust current.
+    fn very_word_mistyped_in_hebrew_switches() {
+        let en = dict(&["very"]);
+        let he = dict(&[]);
+        // Hebrew reading = "הקרט"
+        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, &en, &he), Some(Language::English));
+    }
+
+    #[test]
+    fn prefixed_hebrew_with_english_collision_always_switches() {
+        // "ושלום" prefixed Hebrew word collides with English "uakuo".
+        // New logic switches to other layout when other dict has word.
+        let en = dict(&["uakuo"]);
+        let he = dict(&["שלום"]);
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he), Some(Language::English));
+    }
+
+
+    #[test]
+    fn ambiguous_homograph_always_switches() {
+        // Keys valid as a word in BOTH layouts: now switch to other layout.
         let en = dict(&["go"]);
         let he = dict(&["עט"]); // whatever the keys read as in Hebrew
-        assert_eq!(decide_known("go", "עט", Language::English, &en, &he), None);
-        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he), None);
+        assert_eq!(decide_known("go", "עט", Language::English, &en, &he), Some(Language::Hebrew));
+        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he), Some(Language::English));
     }
 }

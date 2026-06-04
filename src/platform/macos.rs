@@ -19,9 +19,9 @@ const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
 /// `CGEvent`s posted too close together; the previous 50µs spacing let a
 /// backspace go missing (the original first letter survived) or a retyped key
 /// be lost. A couple of milliseconds makes injection reliable.
-const KEY_PRESS_GAP: Duration = Duration::from_millis(2);
+const KEY_PRESS_GAP: Duration = Duration::from_millis(1);
 /// Gap between consecutive injected keys, for the same reason.
-const INTER_KEY_GAP: Duration = Duration::from_millis(4);
+const INTER_KEY_GAP: Duration = Duration::from_millis(1);
 
 pub struct AppState {
     pub keys: Vec<Key>,
@@ -189,8 +189,8 @@ fn key_from_code(code: u16) -> Key {
 struct TapContext {
     state: Arc<Mutex<AppState>>,
     control: Arc<AppControl>,
-    en_dict: HashSet<String>,
-    he_dict: HashSet<String>,
+    en_dict: &'static HashSet<String>,
+    he_dict: &'static HashSet<String>,
     injecting: Arc<AtomicBool>,
 }
 
@@ -345,8 +345,8 @@ impl Drop for EventTapHandle {
 /// needed for keyboard capture (and the OS doesn't kill us for running a tap
 /// on the "wrong" run loop).
 pub fn setup_event_tap(
-    en_dict: HashSet<String>,
-    he_dict: HashSet<String>,
+    en_dict: &'static HashSet<String>,
+    he_dict: &'static HashSet<String>,
     control: Arc<AppControl>,
 ) -> Option<EventTapHandle> {
     println!("Starting recast keyboard watcher (macOS)...");

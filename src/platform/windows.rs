@@ -33,11 +33,10 @@ pub struct AppState {
     pub held_keys: HashSet<Key>,
 }
 
-pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppControl>) {
+pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>, control: Arc<AppControl>) {
     println!("Starting recast keyboard watcher (Windows)...");
 
-    let en_dict_cb = en_dict.clone();
-    let he_dict_cb = he_dict.clone();
+
     let control_cb = Arc::clone(&control);
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         keys: Vec::new(),
@@ -76,8 +75,8 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
                                 &st.keys,
                                 key_to_english_char,
                                 key_to_hebrew_char,
-                                &en_dict_cb,
-                                &he_dict_cb,
+                                en_dict,
+                                he_dict,
                             );
 
                             if let Some(start) = result {

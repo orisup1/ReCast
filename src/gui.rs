@@ -37,11 +37,19 @@ impl eframe::App for App {
 }
 
 pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
+    // Load the same icon as used for the tray (32x32 RGBA)
+    const ICON_RGBA: &[u8] = include_bytes!("../assets/tray-icon.rgba");
+    let icon_data = egui::IconData {
+        rgba: ICON_RGBA.to_vec(),
+        width: 32,
+        height: 32,
+    };
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_fullscreen(true)
-            .with_inner_size([260.0, 140.0])
-            .with_resizable(false),
+            .with_inner_size([300.0, 200.0])
+            .with_resizable(false)
+            .with_icon(icon_data),
         ..Default::default()
     };
     eframe::run_native(

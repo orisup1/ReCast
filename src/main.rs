@@ -14,64 +14,49 @@ mod keymap;
 mod layout;
 mod platform;
 mod types;
+mod config;
 
 use std::sync::Arc;
+use crate::dictionary::{en_dict, he_dict};
+use crate::types::AppControl;
 
-use dictionary::parse_dictionary;
-use types::AppControl;
-
-// Dictionaries are baked into the binary at compile time so the executable is
-// self-contained — it loads identically no matter what the current working
-// directory is when launched.
-const EN_DICT_TXT: &str = include_str!("../en_dict.txt");
-const HE_DICT_TXT: &str = include_str!("../he_dict.txt");
 
 fn main() {
     let with_gui = std::env::args().skip(1).any(|a| a == "-g" || a == "--gui");
-
-    let en_dict = parse_dictionary(EN_DICT_TXT);
-    let he_dict = parse_dictionary(HE_DICT_TXT);
-
-    let control = Arc::new(AppControl::new());
+    let cfg = config::Config::from_env();
+    let en = en_dict();
+    let he = he_dict();
+    let control = Arc::new(AppControl::new_with_config(cfg.clone()));
 
     #[cfg(target_os = "linux")]
     {
         if with_gui {
-            // Keyboard listener runs in a background thread; the GUI must own
-            // the main thread because eframe drives the windowing event loop.
             let listener_control = Arc::clone(&control);
             std::thread::spawn(move || {
-                platform::linux::run(en_dict, he_dict, listener_control);
+                platform::linux::run(en.clone(), he.clone(), listener_control);
             });
             if let Err(e) = gui::run(control) {
                 eprintln!("GUI error: {}", e);
             }
             return;
         }
-        platform::linux::run(en_dict, he_dict, control);
+        platform::linux::run(en.clone(), he.clone(), control);
     }
 
     #[cfg(target_os = "macos")]
     {
-        let _ = with_gui; // GUI flag is currently Linux-only.
-        // Attach the CGEventTap to the main run loop *before* tao takes it
-        // over. The tap callback fires from inside NSApp's event loop, so no
-        // background thread is involved — running it on a side thread (the
-        // earlier design) made macOS terminate the process after ~2s.
-        // `_tap` must outlive `tray::run`; dropping it releases the tap.
-        let _tap = platform::macos::setup_event_tap(en_dict, he_dict, Arc::clone(&control));
-        // Menubar event loop must own the main thread (NSApp requirement).
+        let _ = with_gui; // GUI flag ignored on macOS.
+        let _tap = platform::macos::setup_event_tap(en, he, Arc::clone(&control));
         platform::tray::run(control);
     }
 
     #[cfg(target_os = "windows")]
     {
-        let _ = with_gui;
         let listener_control = Arc::clone(&control);
         std::thread::spawn(move || {
-            platform::windows::run(en_dict, he_dict, listener_control);
+            platform::windows::run(en, he, listener_control);
         });
-        // Tray event loop must own the main thread (Win32 message pump).
         platform::tray::run(control);
     }
 }
+
