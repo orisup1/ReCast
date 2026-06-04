@@ -9,6 +9,16 @@ fn debug_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("RECAST_DEBUG").is_some())
 }
 
+/// Missing-space split correction is opt-in. It can only ever fire when the
+/// whole buffer is gibberish in both layouts, but even then it cannot reliably
+/// tell "one word we simply don't have in the dictionary" from "two words typed
+/// without a space, the second in the wrong layout" — so by default it stays off
+/// and a single word is never carved up. Set `RECAST_SPLIT=1` to enable it.
+fn split_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("RECAST_SPLIT").is_some())
+}
+
 /// Parse a plain-text word list (one word per line) into a `HashSet`.
 ///
 /// For each entry, also inserts a punctuation-stripped variant (apostrophe and
@@ -80,65 +90,108 @@ fn matches_hebrew(word: &str, dict: &HashSet<String>) -> bool {
     false
 }
 
-/// Pure decision: given the same physical key sequence interpreted as English
-/// (`word_en`) and Hebrew (`word_he`), return the layout to switch to — or
-/// `None` if the word is meaningful in both languages (ambiguous) or in
-/// neither.
+/// Strict dictionary membership for `lang`. This is the *trigger* test — "these
+/// keystrokes are unambiguously a word in the other language, switch to it." It
+/// is strict on both sides so a name/typo is never flipped just because its
+/// prefix-stripped reading happens to be a Hebrew word.
+fn valid_strict(
+    text: &str,
+    lang: Language,
+    en_dict: &HashSet<String>,
+    he_dict: &HashSet<String>,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    match lang {
+        Language::English => en_dict.contains(text),
+        Language::Hebrew => he_dict.contains(text),
+    }
+}
+
+/// Looser membership for `lang`. This is the *guard* test — "the user already
+/// typed a real word in this layout, leave it alone." Hebrew adds the one-letter
+/// inflectional-prefix fallback so prefixed real words (absent from the dict
+/// directly) still count and are never carved up. English has no such prefixes,
+/// so it is identical to the strict check.
+fn valid_loose(
+    text: &str,
+    lang: Language,
+    en_dict: &HashSet<String>,
+    he_dict: &HashSet<String>,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    match lang {
+        Language::English => en_dict.contains(text),
+        Language::Hebrew => matches_hebrew(text, he_dict),
+    }
+}
+
+/// Whole-word decision when the current layout is known. This is the core of the
+/// "works like magic" behaviour: the decision is anchored on what the user is
+/// *actually* typing in, instead of guessing symmetrically from the keystrokes.
 ///
-/// Asymmetric validity by role. To flip a word we require two things, and each
-/// uses a different strictness:
+/// `text_en` / `text_he` are the same key sequence read under each layout;
+/// `current` is the live keyboard layout.
 ///
-///   * **Means something in the target (other) language** — STRICT direct dict
-///     lookup. When the user types an English word missing from `en_dict` (a
-///     name, slang, plural, typo, abbreviation), the same keys read as Hebrew
-///     often pattern-match "valid Hebrew word + one-letter inflectional prefix
-///     ו ה ל ב כ מ ש". Accepting that loose match as the flip *target* fires
-///     a wrong switch to Hebrew, so the target side stays strict.
+///   1. The keystrokes already form a real word in the **current** layout —
+///      strict *or* loose (a prefixed Hebrew form counts) → trust the user, do
+///      nothing. This is the user's own rule from day one: "to change a word it
+///      must not mean anything in the current language." It kills both "my real
+///      word got replaced" and "a nested/prefixed word got flipped" — including
+///      the case where the other-layout reading is *also* a dictionary word
+///      (a homograph), which we must leave to the layout the user is actually in.
+///   2. Else they form a confident (strict) word in the **other** layout
+///      → the user typed in the wrong layout, switch. (Fixes the actual
+///      mistypes.)
+///   3. Otherwise it's an unknown word (name/typo/slang) → leave it alone.
 ///
-///   * **Means nothing in the current (source) language** — LOOSE
-///     `matches_hebrew` (prefix-strip) lookup for the Hebrew source. A real
-///     Hebrew word the user typed often carries an inflectional prefix and so
-///     is absent from `he_dict` directly (only the bare form is stored). With a
-///     strict source check those words look meaningless and we'd flip a nested
-///     chunk of them to English, mangling the word. Treating them as meaningful
-///     Hebrew via `matches_hebrew` blocks the flip — exactly the intent: "to
-///     change a word the letters must mean something in the other language AND
-///     mean nothing in the current one."
-///
-/// English has no one-letter inflectional prefixes, so its source check is the
-/// same strict `en_dict` lookup either way.
-fn decide_target_lang(
-    word_en: &str,
-    word_he: &str,
+/// Note the ordering: the loose current-layout guard (1) is checked *before* the
+/// other-layout trigger (2). Checking the trigger first would mangle a valid
+/// prefixed Hebrew word whenever its English-keystroke reading happened to be an
+/// English word — the exact "nested words fixed wrong" bug.
+fn decide_known(
+    text_en: &str,
+    text_he: &str,
+    current: Language,
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
 ) -> Option<Language> {
-    // Strict membership — used as the "means something in the target language"
-    // test (the language we would switch *to*).
-    let in_en_strict = !word_en.is_empty() && en_dict.contains(word_en);
-    let in_he_strict = !word_he.is_empty() && he_dict.contains(word_he);
-    // Loose Hebrew membership (prefix-strip) — used as the "means something in
-    // the current language" test for the Hebrew source side.
-    let he_meaningful = !word_he.is_empty() && matches_hebrew(word_he, he_dict);
-    if in_en_strict && !he_meaningful {
+    let other = current.other();
+    let cur_text = if current == Language::English { text_en } else { text_he };
+    let oth_text = if other == Language::English { text_en } else { text_he };
+
+    if valid_loose(cur_text, current, en_dict, he_dict) {
+        return None;
+    }
+    if valid_strict(oth_text, other, en_dict, he_dict) {
+        return Some(other);
+    }
+    None
+}
+
+/// Whole-word decision when the current layout can't be determined. Falls back
+/// to a symmetric rule: switch only when exactly one language is a strict word
+/// and the other isn't even a loose match — conservative, so it neither mangles
+/// nor fires on ambiguous input.
+fn decide_unknown(
+    text_en: &str,
+    text_he: &str,
+    en_dict: &HashSet<String>,
+    he_dict: &HashSet<String>,
+) -> Option<Language> {
+    let en_strict = valid_strict(text_en, Language::English, en_dict, he_dict);
+    let he_strict = valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
+    let he_loose = valid_loose(text_he, Language::Hebrew, en_dict, he_dict);
+    if en_strict && !he_loose {
         Some(Language::English)
-    } else if in_he_strict && !in_en_strict {
+    } else if he_strict && !en_strict {
         Some(Language::Hebrew)
     } else {
         None
     }
-}
-
-/// True if the key sequence is recognised as a word in either dictionary
-/// (used as the prefix-validity check when looking for a missing-space split).
-fn is_known_word(
-    word_en: &str,
-    word_he: &str,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
-) -> bool {
-    (!word_en.is_empty() && en_dict.contains(word_en))
-        || (!word_he.is_empty() && matches_hebrew(word_he, he_dict))
 }
 
 fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: bool) {
@@ -158,17 +211,97 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
     println!("Switch: {}", if switched { "True" } else { "False" });
 }
 
+/// Pure planning step: decide whether (and where) to switch, given the folded
+/// buffers, the per-key offset tables, and the live `current` layout. Returns
+/// `Some((target_language, start))` where `start` is the key index the acted-on
+/// word begins at (`0` = whole buffer). Kept free of any I/O so it is unit
+/// testable; the actual layout switch happens in the caller.
+fn plan(
+    full_en: &str,
+    full_he: &str,
+    offsets_en: &[usize],
+    offsets_he: &[usize],
+    keys_len: usize,
+    current: Option<Language>,
+    en_dict: &HashSet<String>,
+    he_dict: &HashSet<String>,
+) -> Option<(Language, usize)> {
+    // Whole-buffer decision first — this is what fires for virtually every real
+    // correction.
+    let whole = match current {
+        Some(cur) => decide_known(full_en, full_he, cur, en_dict, he_dict),
+        None => decide_unknown(full_en, full_he, en_dict, he_dict),
+    };
+    if let Some(lang) = whole {
+        return Some((lang, 0));
+    }
+
+    // Missing-space split: opt-in, and only meaningful when we know the layout.
+    if !split_enabled() {
+        return None;
+    }
+    let current = current?;
+    let other = current.other();
+
+    // The full buffer must be gibberish in *both* layouts before we even
+    // consider carving it up; if it reads as a real word either way, it is one
+    // word and must be left intact.
+    let (full_cur, full_oth) = match current {
+        Language::English => (full_en, full_he),
+        Language::Hebrew => (full_he, full_en),
+    };
+    if valid_loose(full_cur, current, en_dict, he_dict)
+        || valid_loose(full_oth, other, en_dict, he_dict)
+    {
+        return None;
+    }
+
+    // Scan split points from the longest prefix down — the first match leaves
+    // the most user-typed text intact. Require: a real word (current layout) on
+    // the left, and a confident word (other layout, ≥2 chars) on the right that
+    // is NOT itself a real word in the current layout.
+    for split in (1..keys_len).rev() {
+        let (cur_prefix, cur_suffix) = match current {
+            Language::English => (
+                &full_en[..offsets_en[split]],
+                &full_en[offsets_en[split]..],
+            ),
+            Language::Hebrew => (
+                &full_he[..offsets_he[split]],
+                &full_he[offsets_he[split]..],
+            ),
+        };
+        if !valid_strict(cur_prefix, current, en_dict, he_dict) {
+            continue;
+        }
+        let oth_suffix = match other {
+            Language::English => &full_en[offsets_en[split]..],
+            Language::Hebrew => &full_he[offsets_he[split]..],
+        };
+        if oth_suffix.chars().count() < 2 {
+            continue;
+        }
+        if valid_strict(oth_suffix, other, en_dict, he_dict)
+            && !valid_loose(cur_suffix, current, en_dict, he_dict)
+        {
+            return Some((other, split));
+        }
+    }
+
+    None
+}
+
 /// Run the layout-switch decision over a key sequence.
 ///
-/// First tries the full buffer (parity with the historical behaviour). If that
-/// yields no decision, scans split points from longest prefix down: when the
-/// prefix is itself a known word in some dictionary and the suffix decides for
-/// a specific layout, treat the suffix as the current word — this catches the
-/// case where the user forgot the space between two words (e.g. "hellohello").
+/// Anchors on the live keyboard layout: a sequence that already reads as a real
+/// word in the current layout is never touched, and we only switch when the
+/// *other* layout yields a confident dictionary word. A missing-space split
+/// fallback exists but is opt-in (`RECAST_SPLIT=1`) because it cannot be made
+/// reliably safe.
 ///
-/// Returns `Some(start)` when a switch was performed; the suffix that was
-/// acted on begins at `keys[start]` (so `start = 0` means the whole buffer
-/// was used). Callers should delete and retype only `keys[start..]`.
+/// Returns `Some(start)` when a switch was performed; the word that was acted on
+/// begins at `keys[start]` (so `start = 0` means the whole buffer). Callers
+/// should delete and retype only `keys[start..]`.
 pub fn check_and_switch_with_split<K: Copy>(
     keys: &[K],
     to_en: impl Fn(K) -> Option<char>,
@@ -181,9 +314,8 @@ pub fn check_and_switch_with_split<K: Copy>(
     }
 
     // Build the full English/Hebrew folds once and record where each key's
-    // char lands in the resulting `String`s. Splits then slice into the
-    // precomputed buffers instead of re-walking the key vector twice per
-    // split point — drops the fallback scan from O(N²) to O(N).
+    // char lands in the resulting `String`s, so the split scan can slice into
+    // the precomputed buffers instead of re-walking the key vector.
     //
     // `offsets_*[k]` is the byte offset *after* the first k keys have been
     // folded, so `&full_en[..offsets_en[k]]` is the prefix for `keys[..k]`
@@ -206,59 +338,97 @@ pub fn check_and_switch_with_split<K: Copy>(
         offsets_he.push(full_he.len());
     }
 
-    // 1. Full-buffer attempt — preserves the original behaviour exactly.
-    if let Some(lang) = decide_target_lang(&full_en, &full_he, en_dict, he_dict) {
-        let switched = switch_layout_to(lang);
-        debug_log(&full_en, &full_he, Some(lang), switched);
-        return if switched { Some(0) } else { None };
-    }
-
-    // If the full buffer is itself a valid word in *either* dictionary, do
-    // not attempt the split fallback. We only get here when
-    // `decide_target_lang` returned `None`, which (since the buffer is
-    // non-empty) means the same keystrokes parse as a real word in BOTH
-    // languages. Splitting an already-valid ambiguous word is the main
-    // source of "I typed a real word and it got replaced anyway" — the
-    // split scanner happily finds some sub-interpretation in the other
-    // language and triggers a swap. Bail out and trust what the user typed.
-    // Loose Hebrew match here so a real Hebrew word carrying an inflectional
-    // prefix (absent from `he_dict` directly) still counts as valid and blocks
-    // the split scanner from flipping a nested chunk of it.
-    let full_en_valid = !full_en.is_empty() && en_dict.contains(&full_en);
-    let full_he_valid = !full_he.is_empty() && matches_hebrew(&full_he, he_dict);
-    if full_en_valid || full_he_valid {
+    let current = crate::layout::current_layout();
+    let Some((lang, start)) = plan(
+        &full_en,
+        &full_he,
+        &offsets_en,
+        &offsets_he,
+        keys.len(),
+        current,
+        en_dict,
+        he_dict,
+    ) else {
         debug_log(&full_en, &full_he, None, false);
         return None;
+    };
+
+    let switched = switch_layout_to(lang);
+    if debug_enabled() && start > 0 {
+        println!("split @ {}", start);
+    }
+    debug_log(&full_en, &full_he, Some(lang), switched);
+    if switched {
+        Some(start)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(words: &[&str]) -> HashSet<String> {
+        words.iter().map(|w| w.to_string()).collect()
     }
 
-    // 2. Split fallback. Scan split points from longest prefix to shortest;
-    //    the first match leaves the most user-typed text intact.
-    for split in (1..keys.len()).rev() {
-        let prefix_en = &full_en[..offsets_en[split]];
-        let prefix_he = &full_he[..offsets_he[split]];
-        if !is_known_word(prefix_en, prefix_he, en_dict, he_dict) {
-            continue;
-        }
-        let suffix_en = &full_en[offsets_en[split]..];
-        let suffix_he = &full_he[offsets_he[split]..];
-        let Some(lang) = decide_target_lang(suffix_en, suffix_he, en_dict, he_dict) else {
-            continue;
-        };
-        let switched = switch_layout_to(lang);
-        if debug_enabled() {
-            println!(
-                "split @ {}: prefix=[{} / {}] suffix=[{} / {}]",
-                split, prefix_en, prefix_he, suffix_en, suffix_he,
-            );
-        }
-        debug_log(suffix_en, suffix_he, Some(lang), switched);
-        if switched {
-            return Some(split);
-        }
-        // Layout was already correct for this suffix; keep scanning shorter
-        // prefixes in case a different split decides differently.
+    // English word "gv" -> these are illustrative ASCII stand-ins; the real
+    // tests below use actual Hebrew text so the prefix logic is exercised.
+    #[test]
+    fn real_word_in_current_layout_is_left_alone() {
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        // Typing "hello" while in English layout: do nothing.
+        assert_eq!(decide_known("hello", "ימךךם", Language::English, &en, &he), None);
+        // Typing "שלום" while in Hebrew layout: do nothing.
+        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, &en, &he), None);
     }
 
-    debug_log(&full_en, &full_he, None, false);
-    None
+    #[test]
+    fn wrong_layout_switches_to_other() {
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        // In Hebrew layout but the keys spell "hello" in English -> switch EN.
+        assert_eq!(
+            decide_known("hello", "ימךךם", Language::Hebrew, &en, &he),
+            Some(Language::English)
+        );
+        // In English layout but the keys spell "שלום" in Hebrew -> switch HE.
+        assert_eq!(
+            decide_known("akuo", "שלום", Language::English, &en, &he),
+            Some(Language::Hebrew)
+        );
+    }
+
+    #[test]
+    fn prefixed_hebrew_is_not_mangled() {
+        // "שלום" is in the dict; "ושלום" (and-peace) is not, but matches via the
+        // one-letter prefix. Typed in Hebrew layout it must be left alone.
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he), None);
+    }
+
+    #[test]
+    fn prefixed_hebrew_with_english_collision_is_not_mangled() {
+        // "ושלום" is a loose-valid prefixed Hebrew word (ו + שלום). Its
+        // English-keystroke reading "uakuo" also happens to be an English dict
+        // word (a homograph collision). Typed in Hebrew layout it must be left
+        // alone — switching here is the "nested words fixed wrong" bug. This
+        // only passes because the loose current-layout guard is checked before
+        // the strict other-layout trigger.
+        let en = dict(&["uakuo"]);
+        let he = dict(&["שלום"]);
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he), None);
+    }
+
+    #[test]
+    fn ambiguous_homograph_trusts_current_layout() {
+        // Keys valid as a word in BOTH layouts: never switch, trust current.
+        let en = dict(&["go"]);
+        let he = dict(&["עט"]); // whatever the keys read as in Hebrew
+        assert_eq!(decide_known("go", "עט", Language::English, &en, &he), None);
+        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he), None);
+    }
 }

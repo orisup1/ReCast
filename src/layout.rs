@@ -1,52 +1,97 @@
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use crate::types::Language;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Current-layout query (shared) — the signal that lets the dictionary anchor its
+// decision on what the user is *actually* typing in, instead of guessing from
+// the keystrokes alone.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Brief cache so the per-word lookup doesn't hammer the OS — notably Linux,
+// where each query spawns a `hyprctl` subprocess. 300 ms is short enough that a
+// manual layout change is picked up almost immediately, long enough to absorb a
+// burst of words. Our own `switch_layout_to` updates the cache directly, so
+// self-initiated switches are reflected with no staleness.
+static LAYOUT_CACHE: Mutex<Option<(Instant, Language)>> = Mutex::new(None);
+const LAYOUT_TTL: Duration = Duration::from_millis(300);
+
+/// Best-effort current keyboard layout. `None` when it can't be determined;
+/// callers then fall back to a layout-agnostic decision.
+pub fn current_layout() -> Option<Language> {
+    if let Ok(guard) = LAYOUT_CACHE.lock() {
+        if let Some((t, l)) = *guard {
+            if t.elapsed() < LAYOUT_TTL {
+                return Some(l);
+            }
+        }
+    }
+    let fresh = query_layout();
+    if let Some(l) = fresh {
+        set_layout_cache(l);
+    }
+    fresh
+}
+
+fn set_layout_cache(lang: Language) {
+    if let Ok(mut guard) = LAYOUT_CACHE.lock() {
+        *guard = Some((Instant::now(), lang));
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn query_layout() -> Option<Language> {
+    None
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Linux: switch layout via hyprctl
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
-pub fn switch_layout_to(lang: Language) -> bool {
+fn query_layout() -> Option<Language> {
     use std::process::Command;
 
-    // First check what layout we are currently on to avoid infinite loops and
-    // unnecessary delays.
-    if let Ok(output) = Command::new("hyprctl").args(&["devices", "-j"]).output() {
-        if let Ok(stdout) = String::from_utf8(output.stdout) {
-            let mut is_currently_hebrew = false;
-            let mut is_currently_english = false;
-
-            for block in stdout.split('{') {
-                if block.contains("\"main\": true") || block.contains("\"main\":true") {
-                    if let Some(idx) = block.find("\"active_keymap\":") {
-                        let remainder = &block[idx + 16..];
-                        if let Some(start) = remainder.find('"') {
-                            let val_remainder = &remainder[start + 1..];
-                            if let Some(end) = val_remainder.find('"') {
-                                let keymap = val_remainder[..end].to_lowercase();
-                                if keymap.contains("hebrew") || keymap.contains("il") {
-                                    is_currently_hebrew = true;
-                                } else if keymap.contains("english") || keymap.contains("us") {
-                                    is_currently_english = true;
-                                }
-                            }
+    let output = Command::new("hyprctl")
+        .args(&["devices", "-j"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    for block in stdout.split('{') {
+        if block.contains("\"main\": true") || block.contains("\"main\":true") {
+            if let Some(idx) = block.find("\"active_keymap\":") {
+                let remainder = &block[idx + 16..];
+                if let Some(start) = remainder.find('"') {
+                    let val_remainder = &remainder[start + 1..];
+                    if let Some(end) = val_remainder.find('"') {
+                        let keymap = val_remainder[..end].to_lowercase();
+                        if keymap.contains("hebrew") || keymap.contains("il") {
+                            return Some(Language::Hebrew);
+                        } else if keymap.contains("english") || keymap.contains("us") {
+                            return Some(Language::English);
                         }
                     }
                 }
             }
-
-            if lang == Language::English && is_currently_english {
-                return false; // Already in English
-            }
-            if lang == Language::Hebrew && is_currently_hebrew {
-                return false; // Already in Hebrew
-            }
         }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn switch_layout_to(lang: Language) -> bool {
+    use std::process::Command;
+
+    // Already on the requested layout — nothing to do.
+    if current_layout() == Some(lang) {
+        return false;
     }
 
     let index = match lang {
         Language::English => "0",
         Language::Hebrew => "1",
     };
-    match Command::new("hyprctl")
+    let ok = match Command::new("hyprctl")
         .args(&["switchxkblayout", "all", index])
         .status()
     {
@@ -55,12 +100,49 @@ pub fn switch_layout_to(lang: Language) -> bool {
             eprintln!("Failed to switch layout using hyprctl: {}", e);
             false
         }
+    };
+    if ok {
+        set_layout_cache(lang);
     }
+    ok
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Windows: switch layout via HKL activation (LoadKeyboardLayoutW)
 // ─────────────────────────────────────────────────────────────────────────────
+#[cfg(target_os = "windows")]
+fn query_layout() -> Option<Language> {
+    use std::ffi::c_void;
+    type DWORD = u32;
+    type HKL = isize;
+    type HWND = *mut c_void;
+    extern "system" {
+        fn GetForegroundWindow() -> HWND;
+        fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
+        fn GetCurrentThreadId() -> DWORD;
+        fn GetKeyboardLayout(idThread: DWORD) -> HKL;
+    }
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let tid = if !hwnd.is_null() {
+            let mut pid: DWORD = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid)
+        } else {
+            GetCurrentThreadId()
+        };
+        let langid = (GetKeyboardLayout(tid) as usize & 0xFFFF) as u16;
+        // The low 10 bits are the *primary* language; the high 6 are the
+        // sublanguage (regional variant). Match on the primary id so every
+        // English variant (en-US 0x0409, en-GB 0x0809, …) and every Hebrew
+        // variant counts, instead of only the two canonical US/IL layouts.
+        match langid & 0x03ff {
+            0x0d => Some(Language::Hebrew),
+            0x09 => Some(Language::English),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn switch_layout_to(lang: Language) -> bool {
     use std::ffi::c_void;
@@ -112,20 +194,25 @@ pub fn switch_layout_to(lang: Language) -> bool {
         // requested layout, skip the switch entirely. Mirrors the Linux
         // hyprctl-based early-exit so check_and_switch_candidates returns
         // false (no replacement) when typing in the correct layout already.
+        // Compare on the *primary* language (low 10 bits) so every regional
+        // variant counts — an en-GB user is already "English" and must not be
+        // flipped to en-US, and a he-IL variant must satisfy a Hebrew request.
+        let desired_primary = desired_langid & 0x03ff;
         let current_hkl = GetKeyboardLayout(tid);
         let current_langid = (current_hkl as usize & 0xFFFF) as u16;
-        if current_langid == desired_langid {
+        if current_langid & 0x03ff == desired_primary {
             return false;
         }
 
-        // Find an installed keyboard layout whose LANGID matches.
+        // Find an installed keyboard layout whose primary language matches —
+        // prefer the user's own installed variant over loading a new one.
         let mut installed: Vec<HKL> = vec![0 as HKL; 64];
         let count = GetKeyboardLayoutList(installed.len() as i32, installed.as_mut_ptr());
         let installed_hkl = if count > 0 {
             installed[..(count as usize)]
                 .iter()
                 .copied()
-                .find(|h| (*h as usize & 0xFFFF) as u16 == desired_langid)
+                .find(|h| ((*h as usize & 0xFFFF) as u16) & 0x03ff == desired_primary)
         } else {
             None
         };
@@ -179,7 +266,8 @@ pub fn switch_layout_to(lang: Language) -> bool {
         loop {
             let updated_hkl = GetKeyboardLayout(tid);
             let updated_langid = (updated_hkl as usize & 0xFFFF) as u16;
-            if updated_langid == desired_langid {
+            if updated_langid & 0x03ff == desired_primary {
+                set_layout_cache(lang);
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -204,7 +292,9 @@ use core_foundation_sys::string::CFStringRef;
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
-struct __TISInputSource;
+struct __TISInputSource {
+    _private: [u8; 0],
+}
 #[cfg(target_os = "macos")]
 type TISInputSourceRef = *mut __TISInputSource;
 
@@ -214,12 +304,27 @@ extern "C" {
     fn TISCopyInputSourceForLanguage(language: CFStringRef) -> TISInputSourceRef;
     fn TISSelectInputSource(source: TISInputSourceRef) -> i32;
     fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
+    // Read a property of an input source. The returned value follows the Get
+    // rule (not owned — must NOT be released).
+    fn TISGetInputSourceProperty(
+        source: TISInputSourceRef,
+        key: CFStringRef,
+    ) -> *const std::ffi::c_void;
+    // The list of language codes ("en", "he", "iw", …) an input source enters.
+    static kTISPropertyInputSourceLanguages: CFStringRef;
     fn CFRelease(cf: CFTypeRef);
 }
 
 #[cfg(target_os = "macos")]
 pub fn switch_layout_to(lang: Language) -> bool {
     use std::time::{Duration, Instant};
+
+    // Already on the target layout — nothing to switch, and (matching the
+    // Linux/Windows early-exit) report "no switch performed". Uses the
+    // language-based detection so any English/Hebrew *variant* counts.
+    if current_layout() == Some(lang) {
+        return false;
+    }
 
     let code = match lang {
         Language::English => "en",
@@ -230,19 +335,6 @@ pub fn switch_layout_to(lang: Language) -> bool {
         let src = TISCopyInputSourceForLanguage(cf_lang.as_concrete_TypeRef());
         if src.is_null() {
             eprintln!("No input source found for language code '{}'", code);
-            return false;
-        }
-
-        // Already on the target layout — nothing to switch, and (matching the
-        // Linux/Windows early-exit) report "no switch performed".
-        let current_src = TISCopyCurrentKeyboardInputSource();
-        let already_target = !current_src.is_null()
-            && core_foundation_sys::base::CFEqual(src as CFTypeRef, current_src as CFTypeRef) != 0;
-        if !current_src.is_null() {
-            CFRelease(current_src as CFTypeRef);
-        }
-        if already_target {
-            CFRelease(src as CFTypeRef);
             return false;
         }
 
@@ -264,7 +356,7 @@ pub fn switch_layout_to(lang: Language) -> bool {
         // deadline elapses), so callers can retype immediately afterwards —
         // parity with the Linux/Windows pollers.
         let deadline = Instant::now() + Duration::from_millis(300);
-        let mut landed = false;
+        let mut landed;
         loop {
             let cur = TISCopyCurrentKeyboardInputSource();
             landed = !cur.is_null()
@@ -279,9 +371,54 @@ pub fn switch_layout_to(lang: Language) -> bool {
         }
 
         CFRelease(src as CFTypeRef);
+        if landed {
+            set_layout_cache(lang);
+        }
         // Only report success once the switch is confirmed. On timeout, return
         // false so the caller skips the retype rather than typing the word out
         // under the old layout (garbage) — parity with the Windows poller.
         landed
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn query_layout() -> Option<Language> {
+    use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
+
+    unsafe {
+        let cur = TISCopyCurrentKeyboardInputSource();
+        if cur.is_null() {
+            return None;
+        }
+        // Inspect the *current* source's own language list rather than testing
+        // it for equality against the default "en"/"he" source. A user on any
+        // English variant (ABC, British, Colemak, Dvorak…) has a current source
+        // that is not equal to the canonical "en" source, so the old equality
+        // test returned None for them and silently disabled layout anchoring.
+        // The languages array lists the primary language first.
+        let langs =
+            TISGetInputSourceProperty(cur, kTISPropertyInputSourceLanguages) as CFArrayRef;
+        let mut result = None;
+        if !langs.is_null() {
+            let count = CFArrayGetCount(langs);
+            for i in 0..count {
+                let value = CFArrayGetValueAtIndex(langs, i) as CFStringRef;
+                if value.is_null() {
+                    continue;
+                }
+                let code = CFString::wrap_under_get_rule(value).to_string();
+                // Hebrew is "he" (modern) or "iw" (legacy ISO code).
+                if code.starts_with("he") || code.starts_with("iw") {
+                    result = Some(Language::Hebrew);
+                    break;
+                }
+                if code.starts_with("en") {
+                    result = Some(Language::English);
+                    break;
+                }
+            }
+        }
+        CFRelease(cur as CFTypeRef);
+        result
     }
 }

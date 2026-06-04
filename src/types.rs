@@ -7,6 +7,16 @@ pub enum Language {
     Hebrew,
 }
 
+impl Language {
+    /// The opposite layout — handy for "switch to the other language" logic.
+    pub fn other(self) -> Self {
+        match self {
+            Language::English => Language::Hebrew,
+            Language::Hebrew => Language::English,
+        }
+    }
+}
+
 /// Shared runtime state between the keyboard listener and the optional GUI.
 pub struct AppControl {
     enabled: AtomicBool,

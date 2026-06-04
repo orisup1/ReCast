@@ -17,8 +17,17 @@ mistyped word in the correct layout.
   (macOS / Windows).
 - When you press Space or Enter, it interprets the typed key sequence as both an English
   and a Hebrew word and looks each up in the matching dictionary.
-- If exactly one dictionary contains the word, it switches the OS keyboard layout to that
-  language, erases the mistyped word, and retypes it (followed by the original Space/Enter).
+- It **anchors on your live keyboard layout** (queried from the OS, with any English or
+  Hebrew regional variant recognised). A sequence that already reads as a real word in your
+  current layout is left untouched — including prefixed Hebrew forms (ו/ה/ל/ב/כ/מ/ש) and
+  words whose other-layout reading happens to also be a dictionary word. It only switches
+  when the *other* layout yields a confident word and the current one yields nothing real.
+  This is what stops valid (and nested/prefixed) words from being mangled.
+- On a switch it erases the mistyped word and retypes it (followed by the original
+  Space/Enter), waiting until the layout change has actually propagated first.
+- Missing-space splitting (carving `helloעולם` into two words) is **opt-in** via
+  `RECAST_SPLIT=1`; it is off by default because it cannot reliably tell a word we simply
+  don't have in the dictionary from two run-together words.
 
 ## Supported platforms
 
@@ -114,4 +123,10 @@ Set `RECAST_DEBUG=1` to print every word check and switch decision:
 
 ```bash
 RECAST_DEBUG=1 recast
+```
+
+Set `RECAST_SPLIT=1` to enable opt-in missing-space splitting (off by default):
+
+```bash
+RECAST_SPLIT=1 recast
 ```
