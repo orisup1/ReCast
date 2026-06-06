@@ -31,15 +31,20 @@ pub fn run(control: Arc<AppControl>) {
     }
 
     let menu = Menu::new();
-    // Disabled informational row mirroring the Linux GUI's fixed-word counter.
+    // Informational row showing fixed-word count.
     let status_item = MenuItem::new(status_label(control.fixed_count()), false, None);
     let toggle_item = MenuItem::new(toggle_label(control.is_enabled()), true, None);
+    let sep = MenuItem::new("", false, None);
+    let about_item = MenuItem::new("About ReCast", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&status_item).expect("append status");
     menu.append(&toggle_item).expect("append toggle");
+    menu.append(&sep).expect("append separator");
+    menu.append(&about_item).expect("append about");
     menu.append(&quit_item).expect("append quit");
 
     let toggle_id = toggle_item.id().clone();
+    let about_id = about_item.id().clone();
     let quit_id = quit_item.id().clone();
     let menu_channel = MenuEvent::receiver();
 
@@ -73,7 +78,11 @@ pub fn run(control: Arc<AppControl>) {
                 #[allow(unused_mut)]
                 let mut tray_builder = TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
-                    .with_tooltip("ReCast")
+                    .with_tooltip({
+                        let enabled = control.is_enabled();
+                        let count = control.fixed_count();
+                        format!("ReCast - {} - {} fixed", if enabled { "Enabled" } else { "Disabled" }, count)
+                    })
                     .with_icon(icon);
                 #[cfg(target_os = "macos")]
                 {
@@ -88,6 +97,38 @@ pub fn run(control: Arc<AppControl>) {
                 let new_enabled = !control.is_enabled();
                 control.set_enabled(new_enabled);
                 toggle_item.set_text(toggle_label(new_enabled));
+                // Update tooltip immediately
+                let _ = _tray.as_ref().map(|t| t.set_tooltip({
+                    let count = control.fixed_count();
+                    format!("ReCast - {} - {} fixed", if new_enabled { "Enabled" } else { "Disabled" }, count)
+                }));
+            } else if event.id == about_id {
+                // Show about dialog - platform specific
+                #[cfg(target_os = "macos")]
+                {
+                    use cocoa::appkit::{NSApp, NSAlert};
+                    use cocoa::base::nil;
+                    unsafe {
+                        let alert = NSAlert::alloc(nil);
+                        alert.setMessageText("ReCast");
+                        alert.setInformativeText("Layout mistake fixer for bilingual typing.\n\n© 2026");
+                        alert.addButtonWithTitle("OK");
+                        alert.runModal();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    use winapi::um::winuser::{MessageBoxW, MB_OK};
+                    use winapi::shared::windef::HWND;
+                    use std::ffi::OsString;
+                    use std::os::windows::ffi::OsStringExt;
+                    let text = OsString::from("ReCast\nLayout mistake fixer for bilingual typing.\n\n© 2026");
+                    let wide: Vec<u16> = text.encode_wide().chain(std::iter::once(0)).collect();
+                    let caption = OsString::from("ReCast").encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+                    unsafe {
+                        MessageBoxW(std::ptr::null_mut(), wide.as_ptr(), caption.as_ptr(), MB_OK);
+                    }
+                }
             } else if event.id == quit_id {
                 process::exit(0);
             }
