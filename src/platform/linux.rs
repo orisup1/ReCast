@@ -28,7 +28,7 @@ pub struct AppState {
 }
 
 pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppControl>) {
-    println!("Starting recast keyboard watcher (Linux/Wayland)...");
+    // println!("Starting recast keyboard watcher (Linux/Wayland)...");
 
     // Persistent virtual device strictly for injecting backspaces and
     // corrected words.  Created once so Wayland has time to recognise it.
@@ -82,12 +82,13 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
         })
         .collect();
 
-    if device_paths.is_empty() {
-        eprintln!("No input devices found. Make sure you are in the 'input' group.");
-        return;
-    }
+     if device_paths.is_empty() {
+         eprintln!("No input devices found. Make sure you are in the 'input' group.");
+         eprintln!("Hint: Run 'sudo usermod -aG input $USER' and log out/in.");
+         return;
+     }
 
-    println!("Found {} input device(s).", device_paths.len());
+    // println!("Found {} input device(s).", device_paths.len());
 
     let state = Arc::new(Mutex::new(AppState {
         keys: Vec::new(),
@@ -114,13 +115,14 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
         let handle = thread::spawn(move || {
             let mut dev = match Device::open(&path_clone) {
                 Ok(d) => d,
-                Err(e) => {
-                    eprintln!("Could not open {:?}: {}", path_clone, e);
-                    return;
-                }
+                 Err(e) => {
+                     eprintln!("Could not open {:?}: {}", path_clone, e);
+                     eprintln!("Hint: Are you in the 'input' group? Run 'sudo usermod -aG input $USER' and log out/in.");
+                     return;
+                 }
             };
 
-            println!("Passively listening on {:?}", path_clone);
+            // println!("Passively listening on {:?}", path_clone);
 
             loop {
                 let events = match dev.fetch_events() {
@@ -153,7 +155,7 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
         handles.push(handle);
     }
 
-    println!("Listening for keyboard events. Press Space or Enter to check a word.");
+    // println!("Listening for keyboard events. Press Space or Enter to check a word.");
     for h in handles {
         let _ = h.join();
     }
