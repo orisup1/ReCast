@@ -54,21 +54,13 @@ pub fn parse_dictionary(content: &str) -> HashSet<String> {
         }
         // ASCII-only lowercase: faster than Unicode `to_lowercase`. Hebrew has
         // no case, English entries are ASCII, so byte-level folding suffices.
+        //
+        // Every entry is kept, including short all-consonant abbreviations
+        // ("nv", "kg", "mm") that collide with Hebrew readings of the same
+        // keys. An earlier vowel-based filter dropped them, but the collision
+        // risk is handled at decision time instead (the ≤3-char gate behind
+        // `RECAST_SHORT`), so legitimate short words are never lost.
         let lower = word.to_ascii_lowercase();
-        // Drop short all-consonant ASCII entries (e.g. "nv", "bf", "kg", "mm",
-        // "mfg", "brr"). The English word list is polluted with abbreviations
-        // and unit symbols that collide with Hebrew words when the same key
-        // sequence is read as Hebrew — typing "מה" produces "nv" under the
-        // English layout, and "nv" being a dict hit made `decide_target_lang`
-        // see both languages as valid and refuse to switch. Real English
-        // words always contain a vowel (a/e/i/o/u/y), so length ≤ 3 with no
-        // vowel is a safe pollution filter. Hebrew entries are non-ASCII and
-        // are unaffected by this gate.
-    // Preserve every ≤3‑char ASCII word.
-    // Old filter removed “no‑vowel” short strings to avoid English/Hebrew collisions.
-    // Keeping them prevents legitimate words like “fun” from vanishing.
-    // If you need the old behavior, uncomment the line below.
-    // if lower.len() <= 3 && lower.is_ascii() && !lower.bytes().any(|b| matches!(b, b'a'|b'e'|b'i'|b'o'|b'u'|b'y')) { continue; }
         if lower.bytes().any(|b| b == b'\'' || b == b'"') {
             let stripped: String =
                 lower.chars().filter(|c| *c != '\'' && *c != '"').collect();
@@ -151,22 +143,21 @@ fn valid_loose(
 /// `text_en` / `text_he` are the same key sequence read under each layout;
 /// `current` is the live keyboard layout.
 ///
-///   1. The keystrokes already form a real word in the **current** layout —
-///      strict *or* loose (a prefixed Hebrew form counts) → trust the user, do
-///      nothing. This is the user's own rule from day one: "to change a word it
-///      must not mean anything in the current language." It kills both "my real
-///      word got replaced" and "a nested/prefixed word got flipped" — including
-///      the case where the other-layout reading is *also* a dictionary word
-///      (a homograph), which we must leave to the layout the user is actually in.
-///   2. Else they form a confident (strict) word in the **other** layout
-///      → the user typed in the wrong layout, switch. (Fixes the actual
-///      mistypes.)
+///   1. The keystrokes already form a strict word in the **current** layout →
+///      trust the user, do nothing. This is the user's own rule from day one:
+///      "to change a word it must not mean anything in the current language."
+///      It also covers homographs (valid in both layouts), which are left to
+///      the layout the user is actually in.
+///   2. Else they form a confident (strict) word in the **other** layout →
+///      the user typed in the wrong layout, switch. (Fixes the actual
+///      mistypes.) Short words (≤3 chars) are collision-prone, so this trigger
+///      can be turned off for them via `RECAST_SHORT=0`.
 ///   3. Otherwise it's an unknown word (name/typo/slang) → leave it alone.
 ///
-/// Note the ordering: the loose current-layout guard (1) is checked *before* the
-/// other-layout trigger (2). Checking the trigger first would mangle a valid
-/// prefixed Hebrew word whenever its English-keystroke reading happened to be an
-/// English word — the exact "nested words fixed wrong" bug.
+/// Note: the guard is deliberately *strict*, not loose. A prefixed Hebrew form
+/// whose keys also spell a real English word switches to English — when both
+/// readings are plausible the strict dictionary hit wins over the inferred
+/// prefix match (see `prefixed_hebrew_with_english_collision_always_switches`).
 fn decide_known(
     text_en: &str,
     text_he: &str,
@@ -174,21 +165,21 @@ fn decide_known(
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
 ) -> Option<Language> {
-let other = current.other();
+    let other = current.other();
     let cur_text = if current == Language::English { text_en } else { text_he };
     let oth_text = if other == Language::English { text_en } else { text_he };
-    // Guard: keep current layout if it already forms a strict word and the other does not.
-    let cur_strict = valid_strict(cur_text, current, en_dict, he_dict);
-    let oth_strict = valid_strict(oth_text, other, en_dict, he_dict);
-    if cur_strict && !oth_strict {
+    // Guard: the current layout already forms a strict word (including the
+    // homograph case where both layouts do) → preserve user intent.
+    if valid_strict(cur_text, current, en_dict, he_dict) {
         return None;
     }
-    // Short‑word shortcut – honour config.
-    if Config::global().short_enabled && oth_text.chars().count() <= 3 {
-        return Some(other);
+    // Short-word gate: ≤3-char words are dictionary-collision-prone; switching
+    // on them can be disabled via config (RECAST_SHORT=0).
+    if !Config::global().short_enabled && oth_text.chars().count() <= 3 {
+        return None;
     }
-    // Switch if other layout strict word.
-    if oth_strict {
+    // Trigger: the other layout yields a confident word → switch.
+    if valid_strict(oth_text, other, en_dict, he_dict) {
         return Some(other);
     }
     None
@@ -204,24 +195,20 @@ fn decide_unknown(
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
 ) -> Option<Language> {
-    let en_strict = valid_strict(text_en, Language::English, en_dict, he_dict);
-    let he_strict = valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
-    // Short‑word shortcut – respect config (character count).
-    if Config::global().short_enabled {
-        if text_en.chars().count() <= 3 {
-            return Some(Language::English);
-        }
-        if text_he.chars().count() <= 3 {
-            return Some(Language::Hebrew);
-        }
-    }
-    // If either layout has a strict match, switch to that layout.
-    if en_strict && he_strict {
-        // Both match: prioritize English (arbitrary choice).
+    // Short-word gate: when disabled, a ≤3-char reading never counts as a
+    // trigger — the same collision guard as in `decide_known`.
+    let short_ok = |text: &str| {
+        Config::global().short_enabled || text.chars().count() > 3
+    };
+    let en_strict =
+        short_ok(text_en) && valid_strict(text_en, Language::English, en_dict, he_dict);
+    let he_strict =
+        short_ok(text_he) && valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
+    // If exactly one layout has a strict match, switch to that layout.
+    // If both match or none match, do not switch.
+    if en_strict && !he_strict {
         Some(Language::English)
-    } else if en_strict {
-        Some(Language::English)
-    } else if he_strict {
+    } else if he_strict && !en_strict {
         Some(Language::Hebrew)
     } else {
         None
@@ -250,6 +237,7 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
 /// `Some((target_language, start))` where `start` is the key index the acted-on
 /// word begins at (`0` = whole buffer). Kept free of any I/O so it is unit
 /// testable; the actual layout switch happens in the caller.
+#[allow(clippy::too_many_arguments)]
 fn plan(
     full_en: &str,
     full_he: &str,
@@ -470,11 +458,37 @@ mod tests {
 
 
     #[test]
-    fn ambiguous_homograph_always_switches() {
-        // Keys valid as a word in BOTH layouts: now switch to other layout.
+    fn short_gibberish_never_switches() {
+        // Short sequence that is a word in NEITHER dict must not trigger a
+        // switch, regardless of the short-word config.
+        let en = dict(&[]);
+        let he = dict(&[]);
+        assert_eq!(decide_known("xkc", "סלב", Language::English, &en, &he), None);
+        assert_eq!(decide_unknown("xkc", "סלב", &en, &he), None);
+    }
+
+    #[test]
+    fn unknown_layout_switches_only_on_one_sided_match() {
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        assert_eq!(
+            decide_unknown("hello", "ימךךם", &en, &he),
+            Some(Language::English)
+        );
+        assert_eq!(
+            decide_unknown("akuo", "שלום", &en, &he),
+            Some(Language::Hebrew)
+        );
+        // In neither dict → no switch.
+        assert_eq!(decide_unknown("qqqq", "ננננ", &en, &he), None);
+    }
+
+    #[test]
+    fn ambiguous_homograph_never_switches() {
+        // Keys valid as a word in BOTH layouts: do not switch, preserve user intent.
         let en = dict(&["go"]);
         let he = dict(&["עט"]); // whatever the keys read as in Hebrew
-        assert_eq!(decide_known("go", "עט", Language::English, &en, &he), Some(Language::Hebrew));
-        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he), Some(Language::English));
+        assert_eq!(decide_known("go", "עט", Language::English, &en, &he), None);
+        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he), None);
     }
 }

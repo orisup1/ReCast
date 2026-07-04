@@ -73,7 +73,7 @@ assets/tray-icon.rgba: assets/recast-icon.svg
         service service-uninstall \
         service-linux service-uninstall-linux \
         service-macos service-uninstall-macos \
-        service-unsupported
+        service-unsupported setup-input-group
 .DEFAULT_GOAL := build
 
 all: build
@@ -116,7 +116,7 @@ service: $(SERVICE_TARGET)
 service-uninstall: $(SERVICE_UNINSTALL_TARGET)
 
 # ─── Linux: systemd --user ────────────────────────────────────────────────
-service-linux: install
+service-linux: install setup-input-group
 	@mkdir -p $(SYSTEMD_DIR)
 	@printf '%s\n' \
 	  '[Unit]' \
@@ -139,6 +139,17 @@ service-linux: install
 	@echo "systemd --user service installed and started."
 	@echo "  status: systemctl --user status recast"
 	@echo "  logs:   journalctl --user -u recast -f"
+
+setup-input-group:
+	@echo "Checking for 'input' group membership..."
+	@if id -nG $$USER | grep -qw input; then \
+		echo "User $$USER is already in the 'input' group."; \
+	else \
+		echo "User $$USER is NOT in the 'input' group."; \
+		echo "Attempting to add $$USER to the 'input' group (requires sudo)..."; \
+		sudo usermod -aG input $$USER && \
+		echo "Added $$USER to 'input' group. Please log out and back in for changes to take effect."; \
+	fi
 
 service-uninstall-linux:
 	-systemctl --user disable --now recast.service

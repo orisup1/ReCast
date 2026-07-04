@@ -24,11 +24,12 @@ impl Language {
 static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
 impl Config {
-    /// Access the global config, falling back to defaults if not yet set.
+    /// Access the global config, falling back to defaults if not yet set
+    /// (matches the `from_env` defaults: short-word switching on, split off).
     pub fn global() -> &'static Config {
         GLOBAL_CONFIG.get_or_init(|| Config {
             short_enabled: true,
-            split_enabled: true,
+            split_enabled: false,
         })
     }
 }
@@ -43,14 +44,6 @@ impl AppControl {
     /// Create a new control and register the provided config globally.
     pub fn new_with_config(cfg: Config) -> Self {
         let _ = GLOBAL_CONFIG.set(cfg);
-        Self {
-            enabled: AtomicBool::new(true),
-            fixed_count: AtomicU64::new(0),
-        }
-    }
-
-    /// Legacy constructor – uses default (empty) config.
-    pub fn new() -> Self {
         Self {
             enabled: AtomicBool::new(true),
             fixed_count: AtomicU64::new(0),

@@ -1,8 +1,6 @@
 use std::process;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use dirs;
-use crate::types::AppControl;
 
 #[cfg(target_os = "linux")]
 use nix::{
@@ -37,7 +35,7 @@ pub fn daemonize() {
 
     // Second fork: ensure we are not a session leader.
     match unsafe { fork() } {
-        Ok(ForkResult::Parent { child }) => {
+        Ok(ForkResult::Parent { .. }) => {
             // Parent: exit immediately.
             process::exit(0);
         }
@@ -56,10 +54,15 @@ pub fn daemonize() {
         process::exit(1);
     }
 
-    // Close standard file descriptors (stdin, stdout, stderr).
-    // We keep them open for simplicity; they can be redirected by the service manager.
-    // Alternatively, we could reopen them to /dev/null.
-    // For now, we leave them as is.
+    // Detach stdio from the launching terminal: redirect stdin/stdout/stderr
+    // to /dev/null so the daemon doesn't write to (or block on) a closed tty.
+    if let Ok(devnull) = OpenOptions::new().read(true).write(true).open("/dev/null") {
+        use std::os::fd::AsRawFd;
+        let fd = devnull.as_raw_fd();
+        for target in 0..=2 {
+            let _ = nix::unistd::dup2(fd, target);
+        }
+    }
 }
 
 /// Write the current process ID to a pidfile in the user's cache directory.
@@ -93,16 +96,19 @@ pub fn stop_daemon() -> std::io::Result<()> {
         std::io::ErrorKind::InvalidData,
         "Invalid PID in pidfile",
     ))?;
-    // Send SIGTERM (or use nix?). We'll use kill via std::process::Command on Unix.
+    // Send SIGTERM via the `kill` utility (avoids pulling nix's signal feature
+    // in for one call and works on macOS too).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::process::Command;
-        let _ = Command::new("kill").arg(&pid.to_string()).status();
+        let _ = Command::new("kill").arg(pid.to_string()).status();
     }
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        let _ = Command::new("taskkill").arg(&format!("/PID {pid}")).arg("/F").status();
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status();
     }
     // Remove pidfile
     let _ = fs::remove_file(pidfile);

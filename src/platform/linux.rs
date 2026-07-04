@@ -27,7 +27,11 @@ pub struct AppState {
     pub held_keys: HashSet<KeyCode>,
 }
 
-pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppControl>) {
+pub fn run(
+    en_dict: &'static HashSet<String>,
+    he_dict: &'static HashSet<String>,
+    control: Arc<AppControl>,
+) {
     // println!("Starting recast keyboard watcher (Linux/Wayland)...");
 
     // Persistent virtual device strictly for injecting backspaces and
@@ -72,8 +76,8 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
                 return None;
             }
             let keys = dev.supported_keys();
-            let is_keyboard = keys.map_or(false, |k| k.contains(KeyCode::KEY_A));
-            let is_mouse = keys.map_or(false, |k| k.contains(KeyCode::BTN_LEFT));
+            let is_keyboard = keys.is_some_and(|k| k.contains(KeyCode::KEY_A));
+            let is_mouse = keys.is_some_and(|k| k.contains(KeyCode::BTN_LEFT));
             if is_keyboard || is_mouse {
                 Some(path)
             } else {
@@ -99,15 +103,10 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
         held_keys: HashSet::new(),
     }));
 
-    let en_dict = Arc::new(en_dict);
-    let he_dict = Arc::new(he_dict);
-
     let mut handles = vec![];
 
     for path in device_paths {
         let state = Arc::clone(&state);
-        let en_dict = Arc::clone(&en_dict);
-        let he_dict = Arc::clone(&he_dict);
         let injector = Arc::clone(&injector);
         let control = Arc::clone(&control);
         let path_clone = path.clone();
@@ -138,7 +137,7 @@ pub fn run(en_dict: HashSet<String>, he_dict: HashSet<String>, control: Arc<AppC
                     if let EventSummary::Key(_, keycode, value) = event.destructure() {
                         match value {
                             1 => handle_key(
-                                keycode, &state, &en_dict, &he_dict, &injector, &control,
+                                keycode, &state, en_dict, he_dict, &injector, &control,
                             ),
                             0 => {
                                 // Track release so replace_word can wait until the

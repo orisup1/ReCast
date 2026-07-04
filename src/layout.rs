@@ -53,7 +53,7 @@ fn query_layout() -> Option<Language> {
     use std::process::Command;
 
     let output = Command::new("hyprctl")
-        .args(&["devices", "-j"])
+        .args(["devices", "-j"])
         .output()
         .ok()?;
     let stdout = String::from_utf8(output.stdout).ok()?;
@@ -92,7 +92,7 @@ pub fn switch_layout_to(lang: Language) -> bool {
         Language::Hebrew => "1",
     };
     let ok = match Command::new("hyprctl")
-        .args(&["switchxkblayout", "all", index])
+        .args(["switchxkblayout", "all", index])
         .status()
     {
         Ok(status) => status.success(),

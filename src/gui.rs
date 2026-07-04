@@ -35,6 +35,9 @@ impl eframe::App for App {
                         .color(egui::Color32::LIGHT_GRAY),
                 );
                 let response = ui.add(checkbox);
+                if response.changed() {
+                    self.control.set_enabled(enabled);
+                }
                 response.on_hover_ui(|ui| {
                     ui.label("Turn layout correction on or off");
                 });

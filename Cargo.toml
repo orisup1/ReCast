@@ -3,6 +3,14 @@ name = "recast"
 version = "0.1.0"
 edition = "2021"
 
+# Smaller, faster release binary — the embedded dictionaries dominate size,
+# but LTO + a single codegen unit still shave several MB and help the hot
+# dictionary-lookup path.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
 [dependencies]
 dirs = "4.0"
 nix = { version = "0.27", features = ["process", "fs"] }

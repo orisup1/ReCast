@@ -110,23 +110,32 @@ runs ReCast at logon. `.\deploy.ps1 -Target help` lists every target.
 ## Running directly
 
 If you don't want a service, just run the binary (or `cargo run --release`) from any
-shell and leave it in the background.
-
-Pass `-g` (Linux only) to launch a small control window with an enable/disable
-switch and a counter of words fixed since startup:
-
-```bash
-recast -g
-```
-
-Set `RECAST_DEBUG=1` to print every word check and switch decision:
+shell. On Linux it daemonizes into the background by default (`-f`/`--foreground`
+keeps it attached; under systemd this is detected automatically); on macOS/Windows
+it stays in the tray/menubar.
 
 ```bash
-RECAST_DEBUG=1 recast
+recast          # start (Linux: forks into the background and writes a pidfile)
+recast -s       # stop a running daemon
+recast -g       # foreground with a terminal dashboard (TUI): status, log, toggle
+recast -w       # foreground with a small control window (Linux only)
+recast -h       # full option list
 ```
 
-Set `RECAST_SPLIT=1` to enable opt-in missing-space splitting (off by default):
+The TUI (`-g`, Linux/Windows) shows the enabled state, fixed-word counter and a
+live log; `e`/`Space` toggles correction on and off, `q` quits. The control
+window (`-w`) offers the same toggle and counter in a tiny GUI window. On macOS
+use the menubar menu instead.
+
+Environment variables:
 
 ```bash
-RECAST_SPLIT=1 recast
+RECAST_DEBUG=1 recast   # print every word check and switch decision
+RECAST_SPLIT=1 recast   # opt-in missing-space splitting (off by default)
+RECAST_SHORT=0 recast   # never auto-switch on short (≤3 char) words
 ```
+
+Short words are the most collision-prone (many 2–3 letter abbreviations are
+valid in one dictionary while spelling a real word in the other layout), so
+`RECAST_SHORT=0` is the knob to reach "never wrongly switch" at the cost of
+not fixing short mistyped words.

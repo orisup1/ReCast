@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::io::{self, Write};
+use std::io;
 use chrono::Local;
 use crate::types::AppControl;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -43,7 +43,7 @@ impl TuiLog {
         }
     }
 
-    fn items(&self) -> Vec<ListItem> {
+    fn items(&self) -> Vec<ListItem<'_>> {
         let guard = self.lines.lock().unwrap();
         guard
             .iter()
@@ -65,20 +65,23 @@ pub fn run_tui(control: Arc<AppControl>) -> std::io::Result<()> {
     let log = Arc::new(TuiLog::new(100));
     let log_clone = Arc::clone(&log);
     let control_clone = control.clone();
+    // Status heartbeat: log a line whenever the enabled state or the fixed
+    // counter changes (plus one initial line), for as long as the TUI runs.
     std::thread::spawn(move || {
-        let mut cnt: u64 = 0;
+        let mut last: Option<(bool, u64)> = None;
         loop {
-            std::thread::sleep(Duration::from_secs(2));
             let enabled = control_clone.is_enabled();
             let fixed = control_clone.fixed_count();
-            log_clone.push(format!(
-                "[{}] recast: enabled={}, fixed={}",
-                Local::now().format("%H:%M:%S"),
-                if enabled { "ON" } else { "OFF" },
-                fixed
-            ));
-            cnt += 1;
-            if cnt > 5 { break; }
+            if last != Some((enabled, fixed)) {
+                last = Some((enabled, fixed));
+                log_clone.push(format!(
+                    "[{}] recast: enabled={}, fixed={}",
+                    Local::now().format("%H:%M:%S"),
+                    if enabled { "ON" } else { "OFF" },
+                    fixed
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
         }
     });
 
@@ -108,7 +111,7 @@ fn run_app<B: Backend>(
 ) -> std::io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &app))?;
-        if crossterm::event::poll(Duration::from_millis(16))? {
+        if crossterm::event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = crossterm::event::read()? {
                 match key.code {
                     KeyCode::Char('q') => break,
@@ -123,6 +126,12 @@ fn run_app<B: Backend>(
                             app.tab += 1;
                         }
                     }
+                    // Toggle layout correction on/off.
+                    KeyCode::Char('e') | KeyCode::Char(' ') => {
+                        let enabled = !app.control.is_enabled();
+                        app.control.set_enabled(enabled);
+                    }
+                    KeyCode::F(1) | KeyCode::Char('?') => app.tab = 2,
                     _ => {}
                 }
             }
@@ -257,7 +266,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Footer
     let footer = Paragraph::new(Span::styled(
-        " ← → / h l : switch tab   q/Esc : quit   F1 : help ",
+        " ← → / h l : switch tab   e/Space : toggle   q/Esc : quit   F1 : help ",
         Style::default().fg(Color::Gray),
     ))
     .block(
@@ -272,6 +281,7 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
 fn render_info(f: &mut Frame, area: ratatui::layout::Rect, enabled: bool, fixed: u64, uptime: u64, normal: &Style, enabled_col: &Style, disabled_col: &Style) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -312,6 +322,7 @@ fn render_log(f: &mut Frame, area: ratatui::layout::Rect, log: &Arc<TuiLog>, nor
     let items: Vec<ListItem> = log.items();
     let list = List::new(items)
         .block(block)
+        .style(*normal)
         .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
         .highlight_symbol(">> ");
     f.render_widget(list, area);
@@ -325,10 +336,11 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         .title_alignment(Alignment::Center);
     let text = vec![
         Line::from("Keyboard-centric navigation:"),
-        Line::from("  ← / h   : previous tab"),
-        Line::from("  → / l   : next tab"),
-        Line::from("  q / Esc : quit"),
-        Line::from("  F1      : show this help"),
+        Line::from("  ← / h     : previous tab"),
+        Line::from("  → / l     : next tab"),
+        Line::from("  e / Space : toggle layout correction on/off"),
+        Line::from("  q / Esc   : quit"),
+        Line::from("  F1 / ?    : show this help"),
         Line::from(""),
         Line::from("Features:"),
         Line::from("  • Responsive layout using Ratatui"),
