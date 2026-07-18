@@ -98,22 +98,28 @@ pub fn run(control: Arc<AppControl>) {
                 control.set_enabled(new_enabled);
                 toggle_item.set_text(toggle_label(new_enabled));
                 // Update tooltip immediately
-                let _ = _tray.as_ref().map(|t| t.set_tooltip({
+                // Fix: set_tooltip requires Option<S>, so wrap in Some(...)
+                let _ = _tray.as_ref().map(|t| {
                     let count = control.fixed_count();
-                    format!("ReCast - {} - {} fixed", if new_enabled { "Enabled" } else { "Disabled" }, count)
-                }));
+                    let tip = format!("ReCast - {} - {} fixed", if new_enabled { "Enabled" } else { "Disabled" }, count);
+                    t.set_tooltip(Some(tip))
+                });
             } else if event.id == about_id {
                 // Show about dialog - platform specific
                 #[cfg(target_os = "macos")]
                 {
-                    use cocoa::appkit::{NSApp, NSAlert};
-                    use cocoa::base::nil;
+                    // Fix: cocoa 0.24 does not expose NSAlert — use raw objc msg_send!
+                    use cocoa::base::id;
+                    use objc::{msg_send, class};
+                    use objc::sel;
+                    use objc::sel_impl;
                     unsafe {
-                        let alert = NSAlert::alloc(nil);
-                        alert.setMessageText("ReCast");
-                        alert.setInformativeText("Layout mistake fixer for bilingual typing.\n\n© 2026");
-                        alert.addButtonWithTitle("OK");
-                        alert.runModal();
+                        let alert: id = msg_send![class!(NSAlert), alloc];
+                        let _: id = msg_send![alert, initWithTitle:"ReCast"
+                            message:"Layout mistake fixer for bilingual typing.\n\n© 2026"
+                            preferredStyle:1u64]; // NSWarningAlertStyle = 0, NSInformationalAlertStyle = 1
+                        let _: id = msg_send![alert, addButtonWithTitle:"OK"];
+                        let _: i64 = msg_send![alert, runModal];
                     }
                 }
                 #[cfg(target_os = "windows")]

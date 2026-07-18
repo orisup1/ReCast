@@ -25,6 +25,7 @@ core-foundation-sys = "0.8"
 tray-icon = "0.24"
 tao = "0.35"
 cocoa = "0.24"
+objc = "0.2"  # needed for raw msg_send! to NSAlert (cocoa 0.24 does not expose NSAlert); see src/platform/tray.rs
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rdev = "0.5.3"
