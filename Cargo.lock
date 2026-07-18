@@ -2907,6 +2907,7 @@ dependencies = [
  "eframe",
  "evdev",
  "nix 0.27.1",
+ "objc",
  "ratatui",
  "rdev",
  "tao",

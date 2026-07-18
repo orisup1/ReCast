@@ -6,9 +6,8 @@
     </linearGradient>
   </defs>
 
-  <!-- keycap: thin depth edge + big top face so the mark reads at 16px -->
-  <rect x="28" y="32" width="200" height="192" rx="40" fill="#0E5599"/>
-  <rect x="32" y="24" width="192" height="184" rx="38" fill="url(#cap)"/>
+<!-- keycap top face with gradient (no solid background) -->
+<rect x="32" y="24" width="192" height="184" rx="38" fill="url(#cap)"/>
 
   <!-- two bold arrows pointing in opposite directions (swap) -->
 <g stroke="#FFFFFF" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" fill="none">

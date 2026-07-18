@@ -63,17 +63,17 @@ BIN_DST  := $(BINDIR)/$(BIN_NAME)
 SRC := Cargo.toml Cargo.lock en_dict.txt he_dict.txt assets/tray-icon.rgba \
         $(shell find src -type f -name '*.rs' 2>/dev/null)
 
-assets/tray-icon.rgba: assets/recast-icon.svg
-	@echo "Generating tray-icon.rgba from $<"
-	@convert "$<" -resize 32x32 -depth 8 RGBA:"$@" 2>/dev/null || \
-	(magick "$<" -resize 32x32 -depth 8 RGBA:"$@" 2>/dev/null) || \
-	(echo "Error: ImageMagick not installed. Install imagemagick to generate tray icon." && false)
+assets/tray-icon.rgba: assets/recast-icon.svg  assets/recast.icns
+	@echo "Regenerating 32x32 transparent tray-icon.rgba..."
+	@magick "$<" -background none -flatten none -alpha remove -resize 32x32 RGBA:"$@" \
+	  || (echo "ERROR: ImageMagick (magick) required. Install via: brew install imagemagick" && exit 1)
 
 .PHONY: all build clean rebuild install uninstall deploy run help \
-        service service-uninstall \
-        service-linux service-uninstall-linux \
-        service-macos service-uninstall-macos \
-        service-unsupported setup-input-group
+	tray-icon \
+	service service-uninstall \
+	service-linux service-uninstall-linux \
+	service-macos service-uninstall-macos \
+	service-unsupported setup-input-group
 .DEFAULT_GOAL := build
 
 all: build
@@ -219,7 +219,7 @@ help:
 	@echo "  BINDIR  = $(BINDIR)"
 	@echo "  BIN_DST = $(BIN_DST)"
 	@echo
-	@echo "The binary is self-contained — dictionaries are embedded at"
-	@echo "compile time, so it runs identically from any working directory."
-	@echo
-	@echo "For Windows: use deploy.ps1 (PowerShell)."
+@echo "The binary is self-contained — dictionaries are embedded at"
+@echo "compile time, so it runs identically from any working directory."
+@echo "Targets: tray-icon to regenerate macOS tray icon; run make help."
+@echo "For Windows: use deploy.ps1 (PowerShell)."
