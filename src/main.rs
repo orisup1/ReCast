@@ -7,6 +7,7 @@
     windows_subsystem = "windows"
 )]
 
+mod banner;
 mod dictionary;
 #[cfg(target_os = "linux")]
 mod gui;
@@ -73,6 +74,13 @@ fn main() {
         }
         println!("Stopped recast daemon.");
         return;
+    }
+
+    // Greet interactive users with the logo when launched directly from a
+    // terminal — not when started by the macOS LaunchAgent / Windows Scheduled
+    // Task, whose stdout is not a TTY.
+    if banner::ran_from_terminal() {
+        banner::print_logo();
     }
 
     let cfg = config::Config::from_env();
