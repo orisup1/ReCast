@@ -127,7 +127,7 @@ pub fn run(control: Arc<AppControl>) {
                     use winapi::um::winuser::{MessageBoxW, MB_OK};
                     use winapi::shared::windef::HWND;
                     use std::ffi::OsString;
-                    use std::os::windows::ffi::OsStringExt;
+                    use std::os::windows::ffi::OsStrExt;
                     let text = OsString::from("ReCast\nLayout mistake fixer for bilingual typing.\n\n© 2026");
                     let wide: Vec<u16> = text.encode_wide().chain(std::iter::once(0)).collect();
                     let caption = OsString::from("ReCast").encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();

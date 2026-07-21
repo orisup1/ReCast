@@ -66,6 +66,13 @@ const KCG_EVENT_KEY_DOWN: u32 = 10;
 const KCG_EVENT_KEY_UP: u32 = 11;
 const KCG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
 
+// Sent by the OS (not the user) when it forcibly disables our tap: either a
+// callback ran too long (`ByTimeout`) or a security / user-input event tripped
+// it (`ByUserInput`). A disabled tap delivers no further keystrokes, so the
+// callback must re-enable the tap when it sees these types.
+const KCG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+const KCG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+
 const EVENT_MASK: u64 = (1u64 << KCG_EVENT_LEFT_MOUSE_DOWN)
     | (1u64 << KCG_EVENT_RIGHT_MOUSE_DOWN)
     | (1u64 << KCG_EVENT_KEY_DOWN)
@@ -196,12 +203,32 @@ struct TapContext {
 
 static CTX: OnceLock<TapContext> = OnceLock::new();
 
+/// Raw handle to our tap, stored so the callback can re-enable it if the OS
+/// disables it. `CFMachPortRef` is a thread-safe Core Foundation type.
+struct TapPort(CFMachPortRef);
+unsafe impl Send for TapPort {}
+unsafe impl Sync for TapPort {}
+static TAP_PORT: OnceLock<TapPort> = OnceLock::new();
+
 unsafe extern "C" fn tap_callback(
     _proxy: CGEventTapProxy,
     event_type: u32,
     cg_event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
+    // The OS disables the tap on a callback timeout or certain input events.
+    // Once disabled it delivers nothing further, so re-enable it immediately —
+    // otherwise the app silently stops seeing the keyboard while the tray keeps
+    // running. Handled before anything else, independent of CTX / injecting.
+    if event_type == KCG_EVENT_TAP_DISABLED_BY_TIMEOUT
+        || event_type == KCG_EVENT_TAP_DISABLED_BY_USER_INPUT
+    {
+        if let Some(port) = TAP_PORT.get() {
+            CGEventTapEnable(port.0, true);
+        }
+        return cg_event;
+    }
+
     let ctx = match CTX.get() {
         Some(c) => c,
         None => return cg_event,
@@ -339,6 +366,27 @@ impl Drop for EventTapHandle {
     }
 }
 
+/// Full macOS startup. Owns everything that used to live in `main`'s macOS
+/// `cfg` block: install the keyboard event tap on the main run loop, then hand
+/// the main thread to the menubar tray. Keeping it here means changes to the
+/// macOS launch path can't touch the Linux or Windows paths.
+pub fn start(
+    en: &'static HashSet<String>,
+    he: &'static HashSet<String>,
+    control: Arc<AppControl>,
+    with_gui: bool,
+) {
+    // The event tap must live on the main run loop (see `setup_event_tap`), so
+    // a main-thread TUI can't coexist with it — the tray is the UI here.
+    if with_gui {
+        eprintln!("--gui is not supported on macOS; running with the menubar tray instead.");
+    }
+    // Bind the tap to a named local so it stays alive for the whole session;
+    // dropping it would disable and release the tap.
+    let _tap = setup_event_tap(en, he, Arc::clone(&control));
+    crate::platform::tray::run(control);
+}
+
 /// Register a system-wide keyboard tap with the main run loop. Must be called
 /// from the main thread before tao's `EventLoop::run` takes it over. The tap
 /// callback fires from inside NSApp's event loop, so no separate thread is
@@ -390,6 +438,9 @@ pub fn setup_event_tap(
             CFRelease(tap as _);
             return None;
         }
+        // Remember the tap so the callback can re-enable it if macOS disables
+        // it later. Set before the tap can fire (it's enabled just below).
+        let _ = TAP_PORT.set(TapPort(tap));
         CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
         Some(EventTapHandle { tap, source })

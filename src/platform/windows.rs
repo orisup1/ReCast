@@ -33,6 +33,34 @@ pub struct AppState {
     pub held_keys: HashSet<Key>,
 }
 
+/// Full Windows startup. Owns everything that used to live in `main`'s Windows
+/// `cfg` block: run the keyboard listener on a background thread and hand the
+/// main thread to the tray (or the TUI with `--gui`). Keeping it here means
+/// changes to the Windows launch path can't touch the Linux or macOS paths.
+pub fn start(
+    en: &'static HashSet<String>,
+    he: &'static HashSet<String>,
+    control: Arc<AppControl>,
+    with_gui: bool,
+) {
+    if with_gui {
+        let listener_control = Arc::clone(&control);
+        thread::spawn(move || {
+            run(en, he, listener_control);
+        });
+        if let Err(e) = crate::tui::run_tui(control) {
+            eprintln!("TUI error: {e}");
+        }
+        return;
+    }
+    // No daemonization on Windows: listener thread plus tray on the main thread.
+    let listener_control = Arc::clone(&control);
+    thread::spawn(move || {
+        run(en, he, listener_control);
+    });
+    crate::platform::tray::run(control);
+}
+
 pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>, control: Arc<AppControl>) {
     println!("Starting recast keyboard watcher (Windows)...");
 
