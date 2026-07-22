@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,7 +50,7 @@ pub fn start(
             run(en, he, listener_control);
         });
         if let Err(e) = crate::tui::run_tui(control) {
-            eprintln!("TUI error: {e}");
+            let _ = writeln!(std::io::stderr(), "TUI error: {e}");
         }
         return;
     }
@@ -62,7 +63,12 @@ pub fn start(
 }
 
 pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>, control: Arc<AppControl>) {
-    println!("Starting recast keyboard watcher (Windows)...");
+    // Non-panicking logging: a release build sets `windows_subsystem = "windows"`,
+    // so there is no console and a plain println!/eprintln! returns Err and
+    // PANICS. Because this function runs on the listener thread, that panic would
+    // silently kill keyboard capture while the tray kept running — the app would
+    // look alive but correct nothing. Ignore write errors instead.
+    let _ = writeln!(std::io::stdout(), "Starting recast keyboard watcher (Windows).");
 
 
     let control_cb = Arc::clone(&control);
@@ -183,9 +189,9 @@ pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>,
         }
     };
 
-    println!("Listening for keyboard events. Press Space or Enter to check a word.");
+    let _ = writeln!(std::io::stdout(), "Listening for keyboard events.");
     if let Err(err) = listen(callback) {
-        eprintln!("Error while listening for keyboard events: {:?}", err);
+        let _ = writeln!(std::io::stderr(), "Error while listening for keyboard events: {err:?}");
     }
 }
 

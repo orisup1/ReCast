@@ -11,6 +11,11 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+[build-dependencies]
+# Embeds the app icon + version metadata into the Windows .exe (see build.rs).
+# Build-only and host-compiled; a no-op for non-Windows targets.
+winresource = "0.1"
+
 [dependencies]
 dirs = "4.0"
 nix = { version = "0.27", features = ["process", "fs"] }

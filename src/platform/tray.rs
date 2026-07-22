@@ -130,18 +130,36 @@ pub fn run(control: Arc<AppControl>) {
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    use winapi::um::winuser::{MessageBoxW, MB_OK};
-                    use winapi::shared::windef::HWND;
+                    use winapi::um::winuser::{
+                        MessageBoxW, MB_OK, MB_ICONINFORMATION, MB_SETFOREGROUND,
+                    };
                     use std::ffi::OsString;
                     use std::os::windows::ffi::OsStrExt;
-                    let text = OsString::from("ReCast\nLayout mistake fixer for bilingual typing.\n\n© 2026");
-                    let wide: Vec<u16> = text.encode_wide().chain(std::iter::once(0)).collect();
-                    let caption = OsString::from("ReCast").encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+                    let body = format!(
+                        "Layout mistake fixer for bilingual typing.\n\nVersion {}\n© 2026",
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    let wide: Vec<u16> =
+                        OsString::from(body).encode_wide().chain(std::iter::once(0)).collect();
+                    let caption: Vec<u16> = OsString::from("About ReCast")
+                        .encode_wide().chain(std::iter::once(0)).collect();
+                    // A tray app has no foreground window, so MB_SETFOREGROUND is
+                    // needed for the dialog to reliably surface above other windows.
                     unsafe {
-                        MessageBoxW(std::ptr::null_mut(), wide.as_ptr(), caption.as_ptr(), MB_OK);
+                        MessageBoxW(
+                            std::ptr::null_mut(),
+                            wide.as_ptr(),
+                            caption.as_ptr(),
+                            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+                        );
                     }
                 }
             } else if event.id == quit_id {
+                // Drop the tray icon first so Windows removes it from the
+                // notification area immediately. process::exit skips destructors,
+                // which would otherwise leave a ghost icon behind until the user
+                // moves the mouse over it.
+                let _ = _tray.take();
                 process::exit(0);
             }
         }
