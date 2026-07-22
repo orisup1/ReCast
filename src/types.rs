@@ -30,6 +30,7 @@ impl Config {
         GLOBAL_CONFIG.get_or_init(|| Config {
             short_enabled: true,
             split_enabled: false,
+            freq_enabled: true,
         })
     }
 }

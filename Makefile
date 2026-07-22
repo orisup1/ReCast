@@ -219,7 +219,7 @@ help:
 	@echo "  BINDIR  = $(BINDIR)"
 	@echo "  BIN_DST = $(BIN_DST)"
 	@echo
-@echo "The binary is self-contained — dictionaries are embedded at"
-@echo "compile time, so it runs identically from any working directory."
-@echo "Targets: tray-icon to regenerate macOS tray icon; run make help."
-@echo "For Windows: use deploy.ps1 (PowerShell)."
+	@echo "The binary is self-contained — dictionaries are embedded at"
+	@echo "compile time, so it runs identically from any working directory."
+	@echo "Targets: tray-icon to regenerate macOS tray icon; run make help."
+	@echo "For Windows: use deploy.ps1 (PowerShell)."

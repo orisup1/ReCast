@@ -138,7 +138,18 @@ Environment variables:
 RECAST_DEBUG=1 recast   # print every word check and switch decision
 RECAST_SPLIT=1 recast   # opt-in missing-space splitting (off by default)
 RECAST_SHORT=0 recast   # never auto-switch on short (≤3 char) words
+RECAST_FREQ=0  recast   # disable the homograph frequency tie-break (on by default)
 ```
+
+When a key sequence spells a real word in **both** layouts (a homograph
+collision), ReCast normally keeps whatever layout you are in. The frequency
+tie-break overrides that in the lopsided case: if the *other* layout's reading
+is a genuinely common word (top ~2000 by usage) while your current reading is
+rare or unlisted, it switches to the common one — so an accidental obscure
+homograph still gets corrected. Set `RECAST_FREQ=0` to always keep the current
+layout on homographs. Frequency ranks come from compact OpenSubtitles wordlists
+embedded in the binary, consulted only for this tie-break (never as a switch
+trigger on their own).
 
 Short words are the most collision-prone (many 2–3 letter abbreviations are
 valid in one dictionary while spelling a real word in the other layout), so

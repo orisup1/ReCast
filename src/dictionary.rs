@@ -1,13 +1,21 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::layout::switch_layout_to;
 use crate::types::Language;
 use crate::config::Config;
 
+/// Word → frequency rank (0-based; lower = more common). Used only to break
+/// homograph ties, never as a membership trigger.
+pub type FreqMap = HashMap<String, u32>;
+
 // Global dictionaries loaded once at runtime.
 static EN_DICTIONARY: OnceLock<HashSet<String>> = OnceLock::new();
 static HE_DICTIONARY: OnceLock<HashSet<String>> = OnceLock::new();
+
+// Global frequency-rank maps loaded once at runtime.
+static EN_FREQ: OnceLock<FreqMap> = OnceLock::new();
+static HE_FREQ: OnceLock<FreqMap> = OnceLock::new();
 
 /// Access the English dictionary (lazy init).
 pub fn en_dict() -> &'static HashSet<String> {
@@ -17,6 +25,16 @@ pub fn en_dict() -> &'static HashSet<String> {
 /// Access the Hebrew dictionary (lazy init).
 pub fn he_dict() -> &'static HashSet<String> {
     HE_DICTIONARY.get_or_init(|| parse_dictionary(include_str!("../he_dict.txt")))
+}
+
+/// Access the English frequency-rank map (lazy init).
+pub fn en_freq() -> &'static FreqMap {
+    EN_FREQ.get_or_init(|| parse_frequency(include_str!("../en_freq.txt"), true))
+}
+
+/// Access the Hebrew frequency-rank map (lazy init).
+pub fn he_freq() -> &'static FreqMap {
+    HE_FREQ.get_or_init(|| parse_frequency(include_str!("../he_freq.txt"), false))
 }
 
 
@@ -71,6 +89,87 @@ pub fn parse_dictionary(content: &str) -> HashSet<String> {
         dict.insert(lower);
     }
     dict
+}
+
+/// Parse a frequency-ordered word list (most common first, one word per line)
+/// into a rank map: `word -> line index`, so a lower value means more common.
+/// The first occurrence of a word wins (its best rank) if it repeats.
+///
+/// When `ascii_fold` is set the entry is ASCII-lowercased and an
+/// apostrophe/quote-stripped variant is added at the same rank, mirroring
+/// `parse_dictionary` so that folded lookups (e.g. `dont`) resolve.
+fn parse_frequency(content: &str, ascii_fold: bool) -> FreqMap {
+    let mut map = FreqMap::with_capacity(content.len() / 8);
+    let mut rank: u32 = 0;
+    for line in content.lines() {
+        let word = line.trim();
+        if word.is_empty() {
+            continue;
+        }
+        if ascii_fold {
+            let lower = word.to_ascii_lowercase();
+            if lower.bytes().any(|b| b == b'\'' || b == b'"') {
+                let stripped: String =
+                    lower.chars().filter(|c| *c != '\'' && *c != '"').collect();
+                if !stripped.is_empty() {
+                    map.entry(stripped).or_insert(rank);
+                }
+            }
+            map.entry(lower).or_insert(rank);
+        } else {
+            map.entry(word.to_string()).or_insert(rank);
+        }
+        rank += 1;
+    }
+    map
+}
+
+/// Frequency rank of `text` in its language's frequency map, if the word is
+/// present (i.e. common enough to appear in the top-N list).
+fn freq_rank(text: &str, lang: Language, en_freq: &FreqMap, he_freq: &FreqMap) -> Option<u32> {
+    match lang {
+        Language::English => en_freq.get(text).copied(),
+        Language::Hebrew => he_freq.get(text).copied(),
+    }
+}
+
+// Homograph tie-break tuning. When a key sequence is a real word in *both*
+// layouts we normally keep the current layout; we only override that when the
+// OTHER reading is decisively the one the user more likely meant.
+const FREQ_COMMON_MAX: u32 = 2000; // the "other" reading must rank at least this common
+const FREQ_RARER_FACTOR: u32 = 10; // and be >= this many times more common than current
+
+/// Homograph tie-break: both `cur_text` (current layout) and `oth_text` (other
+/// layout) are real words. Returns `true` when the other reading is decisively
+/// more common and should win. Conservative — it fires only when the other
+/// reading is a top-`FREQ_COMMON_MAX` word AND the current reading is either
+/// absent from the frequency list or at least `FREQ_RARER_FACTOR`× rarer. With
+/// empty frequency maps (as in unit tests) it always returns `false`, so the
+/// prior "keep current layout" behaviour is unchanged.
+fn other_decisively_more_common(
+    cur_text: &str,
+    current: Language,
+    oth_text: &str,
+    other: Language,
+    en_freq: &FreqMap,
+    he_freq: &FreqMap,
+) -> bool {
+    if !Config::global().freq_enabled {
+        return false;
+    }
+    let Some(oth_rank) = freq_rank(oth_text, other, en_freq, he_freq) else {
+        return false; // the other reading isn't even a common word — don't override.
+    };
+    if oth_rank > FREQ_COMMON_MAX {
+        return false;
+    }
+    match freq_rank(cur_text, current, en_freq, he_freq) {
+        // Current reading is also ranked: switch only if the other is many times more common.
+        Some(cur_rank) => cur_rank >= oth_rank.saturating_mul(FREQ_RARER_FACTOR),
+        // Current reading is absent from the top-N list while the other is very
+        // common: the common reading almost certainly wins.
+        None => true,
+    }
 }
 
 /// One-letter inflectional prefixes that Hebrew attaches to nouns/verbs:
@@ -164,22 +263,36 @@ fn decide_known(
     current: Language,
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
+    en_freq: &FreqMap,
+    he_freq: &FreqMap,
 ) -> Option<Language> {
     let other = current.other();
     let cur_text = if current == Language::English { text_en } else { text_he };
     let oth_text = if other == Language::English { text_en } else { text_he };
+
+    let oth_strict = valid_strict(oth_text, other, en_dict, he_dict);
+    // Short-word gate: ≤3-char words are dictionary-collision-prone; when
+    // disabled (RECAST_SHORT=0) an other-layout reading of that length never
+    // triggers a switch — neither the plain trigger nor the frequency tie-break.
+    let short_block = !Config::global().short_enabled && oth_text.chars().count() <= 3;
+
     // Guard: the current layout already forms a strict word (including the
-    // homograph case where both layouts do) → preserve user intent.
+    // homograph case where both layouts do) → preserve user intent, unless the
+    // other reading is decisively more common (frequency tie-break).
     if valid_strict(cur_text, current, en_dict, he_dict) {
+        if oth_strict
+            && !short_block
+            && other_decisively_more_common(cur_text, current, oth_text, other, en_freq, he_freq)
+        {
+            return Some(other);
+        }
         return None;
     }
-    // Short-word gate: ≤3-char words are dictionary-collision-prone; switching
-    // on them can be disabled via config (RECAST_SHORT=0).
-    if !Config::global().short_enabled && oth_text.chars().count() <= 3 {
+    if short_block {
         return None;
     }
     // Trigger: the other layout yields a confident word → switch.
-    if valid_strict(oth_text, other, en_dict, he_dict) {
+    if oth_strict {
         return Some(other);
     }
     None
@@ -194,6 +307,8 @@ fn decide_unknown(
     text_he: &str,
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
+    en_freq: &FreqMap,
+    he_freq: &FreqMap,
 ) -> Option<Language> {
     // Short-word gate: when disabled, a ≤3-char reading never counts as a
     // trigger — the same collision guard as in `decide_known`.
@@ -205,11 +320,20 @@ fn decide_unknown(
     let he_strict =
         short_ok(text_he) && valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
     // If exactly one layout has a strict match, switch to that layout.
-    // If both match or none match, do not switch.
     if en_strict && !he_strict {
         Some(Language::English)
     } else if he_strict && !en_strict {
         Some(Language::Hebrew)
+    } else if en_strict && he_strict {
+        // Both layouts read as words: break the tie by frequency, else leave it
+        // alone. (Winner must be decisively more common than the loser.)
+        if other_decisively_more_common(text_he, Language::Hebrew, text_en, Language::English, en_freq, he_freq) {
+            Some(Language::English)
+        } else if other_decisively_more_common(text_en, Language::English, text_he, Language::Hebrew, en_freq, he_freq) {
+            Some(Language::Hebrew)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -247,12 +371,14 @@ fn plan(
     current: Option<Language>,
     en_dict: &HashSet<String>,
     he_dict: &HashSet<String>,
+    en_freq: &FreqMap,
+    he_freq: &FreqMap,
 ) -> Option<(Language, usize)> {
     // Whole-buffer decision first — this is what fires for virtually every real
     // correction.
     let whole = match current {
-        Some(cur) => decide_known(full_en, full_he, cur, en_dict, he_dict),
-        None => decide_unknown(full_en, full_he, en_dict, he_dict),
+        Some(cur) => decide_known(full_en, full_he, cur, en_dict, he_dict, en_freq, he_freq),
+        None => decide_unknown(full_en, full_he, en_dict, he_dict, en_freq, he_freq),
     };
     if let Some(lang) = whole {
         return Some((lang, 0));
@@ -370,6 +496,8 @@ pub fn check_and_switch_with_split<K: Copy>(
         current,
         en_dict,
         he_dict,
+        en_freq(),
+        he_freq(),
     ) else {
         debug_log(&full_en, &full_he, None, false);
         return None;
@@ -395,6 +523,17 @@ mod tests {
         words.iter().map(|w| w.to_string()).collect()
     }
 
+    /// Empty frequency map — with these, the tie-break is inert and every test
+    /// below exercises the pure dictionary logic unchanged.
+    fn nofreq() -> FreqMap {
+        FreqMap::new()
+    }
+
+    /// Frequency map from `(word, rank)` pairs (rank 0 = most common).
+    fn freq(entries: &[(&str, u32)]) -> FreqMap {
+        entries.iter().map(|(w, r)| (w.to_string(), *r)).collect()
+    }
+
     // English word "gv" -> these are illustrative ASCII stand-ins; the real
     // tests below use actual Hebrew text so the prefix logic is exercised.
     #[test]
@@ -402,9 +541,9 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         // Typing "hello" while in English layout: do nothing.
-        assert_eq!(decide_known("hello", "ימךךם", Language::English, &en, &he), None);
+        assert_eq!(decide_known("hello", "ימךךם", Language::English, &en, &he, &nofreq(), &nofreq()), None);
         // Typing "שלום" while in Hebrew layout: do nothing.
-        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, &en, &he), None);
+        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), None);
     }
 
     #[test]
@@ -413,12 +552,12 @@ mod tests {
         let he = dict(&["שלום"]);
         // In Hebrew layout but the keys spell "hello" in English -> switch EN.
         assert_eq!(
-            decide_known("hello", "ימךךם", Language::Hebrew, &en, &he),
+            decide_known("hello", "ימךךם", Language::Hebrew, &en, &he, &nofreq(), &nofreq()),
             Some(Language::English)
         );
         // In English layout but the keys spell "שלום" in Hebrew -> switch HE.
         assert_eq!(
-            decide_known("akuo", "שלום", Language::English, &en, &he),
+            decide_known("akuo", "שלום", Language::English, &en, &he, &nofreq(), &nofreq()),
             Some(Language::Hebrew)
         );
     }
@@ -428,7 +567,7 @@ mod tests {
         // "שלום" is in the dict; "ושלום" not, but matches via one‑letter prefix.
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he), None);
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), None);
     }
 
     #[test]
@@ -436,7 +575,7 @@ mod tests {
         let en = dict(&["fun"]);
         let he = dict(&[]);
         // Hebrew reading = "כום"
-        assert_eq!(decide_known("fun", "כום", Language::Hebrew, &en, &he), Some(Language::English));
+        assert_eq!(decide_known("fun", "כום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), Some(Language::English));
     }
 
     #[test]
@@ -444,7 +583,7 @@ mod tests {
         let en = dict(&["very"]);
         let he = dict(&[]);
         // Hebrew reading = "הקרט"
-        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, &en, &he), Some(Language::English));
+        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), Some(Language::English));
     }
 
     #[test]
@@ -453,7 +592,7 @@ mod tests {
         // New logic switches to other layout when other dict has word.
         let en = dict(&["uakuo"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he), Some(Language::English));
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), Some(Language::English));
     }
 
 
@@ -463,8 +602,8 @@ mod tests {
         // switch, regardless of the short-word config.
         let en = dict(&[]);
         let he = dict(&[]);
-        assert_eq!(decide_known("xkc", "סלב", Language::English, &en, &he), None);
-        assert_eq!(decide_unknown("xkc", "סלב", &en, &he), None);
+        assert_eq!(decide_known("xkc", "סלב", Language::English, &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_unknown("xkc", "סלב", &en, &he, &nofreq(), &nofreq()), None);
     }
 
     #[test]
@@ -472,15 +611,15 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         assert_eq!(
-            decide_unknown("hello", "ימךךם", &en, &he),
+            decide_unknown("hello", "ימךךם", &en, &he, &nofreq(), &nofreq()),
             Some(Language::English)
         );
         assert_eq!(
-            decide_unknown("akuo", "שלום", &en, &he),
+            decide_unknown("akuo", "שלום", &en, &he, &nofreq(), &nofreq()),
             Some(Language::Hebrew)
         );
         // In neither dict → no switch.
-        assert_eq!(decide_unknown("qqqq", "ננננ", &en, &he), None);
+        assert_eq!(decide_unknown("qqqq", "ננננ", &en, &he, &nofreq(), &nofreq()), None);
     }
 
     #[test]
@@ -488,7 +627,49 @@ mod tests {
         // Keys valid as a word in BOTH layouts: do not switch, preserve user intent.
         let en = dict(&["go"]);
         let he = dict(&["עט"]); // whatever the keys read as in Hebrew
-        assert_eq!(decide_known("go", "עט", Language::English, &en, &he), None);
-        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he), None);
+        assert_eq!(decide_known("go", "עט", Language::English, &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), None);
+    }
+
+    #[test]
+    fn homograph_switches_to_far_more_common_reading() {
+        // Both readings are real words. In Hebrew layout, but the current
+        // reading ("עט") is rare/unranked while the English reading ("go") is a
+        // top-2000 word → the frequency tie-break switches to English.
+        let en = dict(&["go"]);
+        let he = dict(&["עט"]);
+        let en_f = freq(&[("go", 30)]); // very common
+        let he_f = nofreq(); // "עט" absent from the top-N list
+        assert_eq!(
+            decide_known("go", "עט", Language::Hebrew, &en, &he, &en_f, &he_f),
+            Some(Language::English)
+        );
+    }
+
+    #[test]
+    fn homograph_keeps_current_when_both_common() {
+        // Both readings are common words → no decisive winner, keep current.
+        let en = dict(&["go"]);
+        let he = dict(&["עט"]);
+        let en_f = freq(&[("go", 30)]);
+        let he_f = freq(&[("עט", 40)]); // comparably common, within the factor
+        assert_eq!(
+            decide_known("go", "עט", Language::Hebrew, &en, &he, &en_f, &he_f),
+            None
+        );
+    }
+
+    #[test]
+    fn homograph_no_switch_when_other_reading_uncommon() {
+        // The other reading is a real word but not common enough (rank beyond
+        // FREQ_COMMON_MAX) → don't override the current layout.
+        let en = dict(&["go"]);
+        let he = dict(&["עט"]);
+        let en_f = freq(&[("go", 9000)]); // real word, but rare
+        let he_f = nofreq();
+        assert_eq!(
+            decide_known("go", "עט", Language::Hebrew, &en, &he, &en_f, &he_f),
+            None
+        );
     }
 }
