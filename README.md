@@ -96,6 +96,11 @@ Writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.recast.plist` and st
 You will need to grant the binary **Input Monitoring** and **Accessibility** permissions
 in System Settings → Privacy & Security the first time it runs.
 
+reset app permision with 
+```bash
+tccutil reset All com.recast.app
+```
+
 ## Windows
 
 PowerShell:

@@ -27,6 +27,55 @@ pub struct AppState {
     pub held_keys: HashSet<KeyCode>,
 }
 
+/// Full Linux startup. Owns everything that used to live in `main`'s Linux
+/// `cfg` block: pick a foreground UI (control window or TUI) with the listener
+/// on a background thread, or daemonize and run the listener headless. Keeping
+/// it here means changes to the Linux launch path can't touch macOS or Windows.
+pub fn start(
+    en: &'static HashSet<String>,
+    he: &'static HashSet<String>,
+    control: Arc<AppControl>,
+    with_gui: bool,
+    with_window: bool,
+    with_foreground: bool,
+) {
+    if with_window {
+        // Control window: eframe owns the main thread, listener runs in the
+        // background.
+        let listener_control = Arc::clone(&control);
+        thread::spawn(move || {
+            run(en, he, listener_control);
+        });
+        if let Err(e) = crate::gui::run(control) {
+            eprintln!("GUI error: {e}");
+        }
+        return;
+    }
+    if with_gui {
+        let listener_control = Arc::clone(&control);
+        thread::spawn(move || {
+            run(en, he, listener_control);
+        });
+        if let Err(e) = crate::tui::run_tui(control) {
+            eprintln!("TUI error: {e}");
+        }
+        return;
+    }
+    // Daemonize (fork, setsid, detach stdio) unless asked to stay in the
+    // foreground. Under systemd (Type=simple) the service manager tracks our
+    // PID, so forking would make the unit see the service as dead —
+    // INVOCATION_ID is set by systemd and disables the fork automatically.
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    if !with_foreground && !under_systemd {
+        crate::daemon::daemonize();
+    }
+    if let Err(e) = crate::daemon::write_pidfile() {
+        eprintln!("Failed to write pidfile: {e}");
+        std::process::exit(1);
+    }
+    run(en, he, control);
+}
+
 pub fn run(
     en_dict: &'static HashSet<String>,
     he_dict: &'static HashSet<String>,

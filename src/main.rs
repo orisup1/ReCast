@@ -7,6 +7,9 @@
     windows_subsystem = "windows"
 )]
 
+// Startup ASCII-art banner: shown when launched from a terminal (tty), not
+// when started by a background service / LaunchAgent whose stdout has no TTY.
+mod banner;
 mod dictionary;
 #[cfg(target_os = "linux")]
 mod gui;
@@ -20,8 +23,6 @@ mod tui;
 
 use std::sync::Arc;
 use std::process;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use std::thread;
 use crate::dictionary::{en_dict, he_dict};
 
 const HELP: &str = "\
@@ -75,6 +76,10 @@ fn main() {
         return;
     }
 
+if banner::ran_from_terminal() {
+  banner::print_logo();
+}
+
     let cfg = config::Config::from_env();
     let en = en_dict();
     let he = he_dict();
@@ -87,73 +92,16 @@ fn main() {
     #[cfg(not(target_os = "linux"))]
     let _ = with_foreground;
 
+    // Each platform owns its entire startup sequence in its own module, so a
+    // change to one OS's launch path can't reach into another's. `main` only
+    // parses arguments and dispatches; the per-OS `start` functions live in
+    // `platform/{linux,macos,windows}.rs`.
     #[cfg(target_os = "linux")]
-    {
-        if with_window {
-            // Control window: eframe owns the main thread, listener runs in
-            // the background.
-            let listener_control = Arc::clone(&control);
-            thread::spawn(move || {
-                platform::linux::run(en, he, listener_control);
-            });
-            if let Err(e) = gui::run(control) {
-                eprintln!("GUI error: {e}");
-            }
-            return;
-        }
-        if with_gui {
-            let listener_control = Arc::clone(&control);
-            thread::spawn(move || {
-                platform::linux::run(en, he, listener_control);
-            });
-            if let Err(e) = tui::run_tui(control) {
-                eprintln!("TUI error: {e}");
-            }
-            return;
-        }
-        // Daemonize (fork, setsid, detach stdio) unless asked to stay in the
-        // foreground. Under systemd (Type=simple) the service manager tracks
-        // our PID, so forking would make the unit see the service as dead —
-        // INVOCATION_ID is set by systemd and disables the fork automatically.
-        let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
-        if !with_foreground && !under_systemd {
-            daemon::daemonize();
-        }
-        if let Err(e) = daemon::write_pidfile() {
-            eprintln!("Failed to write pidfile: {e}");
-            process::exit(1);
-        }
-        platform::linux::run(en, he, control);
-    }
+    platform::linux::start(en, he, control, with_gui, with_window, with_foreground);
 
     #[cfg(target_os = "macos")]
-    {
-        // The event tap must live on the main run loop (see macos.rs), so a
-        // main-thread TUI can't coexist with it — the tray is the UI here.
-        if with_gui {
-            eprintln!("--gui is not supported on macOS; running with the menubar tray instead.");
-        }
-        let _tap = platform::macos::setup_event_tap(en, he, Arc::clone(&control));
-        platform::tray::run(control);
-    }
+    platform::macos::start(en, he, control, with_gui);
 
     #[cfg(target_os = "windows")]
-    {
-        if with_gui {
-            let listener_control = Arc::clone(&control);
-            thread::spawn(move || {
-                platform::windows::run(en, he, listener_control);
-            });
-            if let Err(e) = tui::run_tui(control) {
-                eprintln!("TUI error: {e}");
-            }
-            return;
-        }
-        // Windows: run listener thread and tray; no daemonization.
-        let listener_control = Arc::clone(&control);
-        thread::spawn(move || {
-            platform::windows::run(en, he, listener_control);
-        });
-        platform::tray::run(control);
-    }
+    platform::windows::start(en, he, control, with_gui);
 }

@@ -1,22 +1,38 @@
 <svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReCast icon">
   <defs>
-    <linearGradient id="cap" x1="40" y1="24" x2="216" y2="232" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#2A8FDE"/>
-      <stop offset="1" stop-color="#1167B4"/>
+    <linearGradient id="skirt" x1="48" y1="60" x2="208" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1C7AC8"/>
+      <stop offset="1" stop-color="#0C4C8C"/>
+    </linearGradient>
+    <linearGradient id="face" x1="72" y1="40" x2="184" y2="168" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#46A7F0"/>
+      <stop offset="1" stop-color="#1E80CE"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="70" y1="44" x2="150" y2="140" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
   </defs>
 
-<!-- keycap top face with gradient (no solid background) -->
-<rect x="32" y="24" width="192" height="184" rx="38" fill="url(#cap)"/>
+  <!-- keycap, tilted slightly for a dynamic twist; scaled to fill the icon frame -->
+  <g transform="translate(128 128) scale(1.12) translate(-128 -128)">
+    <g transform="rotate(-7 128 128)">
+      <!-- keycap body (skirt weighted to the bottom = the key's height) -->
+      <rect x="48" y="50" width="160" height="180" rx="32" fill="url(#skirt)"/>
+      <!-- sculpted top face, raised with a wide bottom lip -->
+      <rect x="60" y="44" width="136" height="144" rx="25" fill="url(#face)"/>
+      <!-- glossy highlight across the upper-left of the face -->
+      <path d="M60 69 a25 25 0 0 1 25 -25 h86 a25 25 0 0 1 25 25 v14 c-45 26 -91 26 -136 0 Z" fill="url(#gloss)"/>
 
-  <!-- two bold arrows pointing in opposite directions (swap) -->
-<g stroke="#FFFFFF" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <!-- top arrow: points LEFT -->
-    <line x1="90" y1="96" x2="166" y2="96"/>
-    <polyline points="112,78 86,96 112,114"/>
- 
-    <!-- bottom arrow: points RIGHT -->
-    <line x1="90" y1="140" x2="166" y2="140"/>
-    <polyline points="144,114 170,140 144,166"/>
+      <!-- two curved arrows forming a recast / cycle loop -->
+      <g stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none">
+        <!-- top arc: over the top, head tangent (points down) -->
+        <path d="M99 99 A34 34 0 0 1 157 99"/>
+        <polyline points="141,100 161,106 167,85"/>
+        <!-- bottom arc: under the bottom, head tangent (points up) -->
+        <path d="M157 133 A34 34 0 0 1 99 133"/>
+        <polyline points="115,132 95,126 89,147"/>
+      </g>
+    </g>
   </g>
 </svg>
