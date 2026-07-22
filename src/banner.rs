@@ -62,7 +62,7 @@ fn info_lines(cyan: &str, dim: &str, bold: &str, reset: &str) -> Vec<String> {
 /// 256-color SGR, not 24-bit; emitting truecolor there renders wrong, so we
 /// detect support and quantize down when it's absent.
 #[derive(Clone, Copy)]
-enum ColorDepth {
+pub enum ColorDepth {
     True,
     Ansi256,
 }
@@ -219,11 +219,51 @@ fn plain_banner() -> String {
     )
 }
 
+/// Same half-block renderer but downsamples the 32×32 source to 16 rows so
+/// the output is a single compact line (good for a menubar/tray title).
+pub fn logo_rows_compact(depth: ColorDepth) -> String {
+  let px = |x: usize, y: usize| -> (u8, u8, u8, u8) {
+    let i = (y * LOGO_W + x) * 4;
+    (LOGO_RGBA[i], LOGO_RGBA[i + 1], LOGO_RGBA[i + 2], LOGO_RGBA[i + 3])
+  };
+  let mut s = String::new();
+  let step = LOGO_H / 8;
+  for row in 0..8 {
+    let y0 = row * step;
+    for x in 0..LOGO_W {
+      let (tr, tg, tb, ta) = px(x, y0);
+      let (br, bgc, bb, ba) = px(x, y0 + 1);
+      let top = ta >= ALPHA_CUTOFF;
+      let bot = ba >= ALPHA_CUTOFF;
+      match (top, bot) {
+        (true, true) => {
+          s.push_str(&fg(depth, tr, tg, tb));
+          s.push_str(&bg(depth, br, bgc, bb));
+          s.push('▀');
+        }
+        (true, false) => {
+          s.push_str("\x1b[0m");
+          s.push_str(&fg(depth, tr, tg, tb));
+          s.push('▀');
+        }
+        (false, true) => {
+          s.push_str("\x1b[0m");
+          s.push_str(&fg(depth, br, bgc, bb));
+          s.push('▄');
+        }
+        (false, false) => s.push_str("\x1b[0m "),
+      }
+    }
+  }
+  s.push_str("\x1b[0m");
+  s
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
+  #[test]
     fn logo_rows_are_uniform_and_half_height() {
         assert_eq!(logo_rows(ColorDepth::True).len(), LOGO_H / 2);
         assert_eq!(logo_rows(ColorDepth::Ansi256).len(), LOGO_H / 2);

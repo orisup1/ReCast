@@ -7,9 +7,8 @@
     windows_subsystem = "windows"
 )]
 
-// Startup ASCII-art banner: Linux/Windows only. Disabled on macOS while its
-// interaction with the menubar app is being investigated.
-#[cfg(not(target_os = "macos"))]
+// Startup ASCII-art banner: shown when launched from a terminal (tty), not
+// when started by a background service / LaunchAgent whose stdout has no TTY.
 mod banner;
 mod dictionary;
 #[cfg(target_os = "linux")]
@@ -77,15 +76,9 @@ fn main() {
         return;
     }
 
-    // Greet interactive users with the logo when launched directly from a
-    // terminal — not when started by the macOS LaunchAgent / Windows Scheduled
-    // Task, whose stdout is not a TTY. macOS is excluded entirely for now.
-    #[cfg(not(target_os = "macos"))]
-    {
-        if banner::ran_from_terminal() {
-            banner::print_logo();
-        }
-    }
+if banner::ran_from_terminal() {
+  banner::print_logo();
+}
 
     let cfg = config::Config::from_env();
     let en = en_dict();

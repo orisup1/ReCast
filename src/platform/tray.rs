@@ -7,6 +7,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use crate::banner;
 use crate::types::AppControl;
 
 /// How often the menu's "Fixed: N" counter is refreshed while idle.
@@ -84,10 +85,15 @@ pub fn run(control: Arc<AppControl>) {
                         format!("ReCast - {} - {} fixed", if enabled { "Enabled" } else { "Disabled" }, count)
                     })
                     .with_icon(icon);
-                #[cfg(target_os = "macos")]
-                {
-                    tray_builder = tray_builder.with_title("ReCast");
-                }
+#[cfg(target_os = "macos")]
+{
+  let title = if banner::ran_from_terminal() {
+    menubar_banner()
+  } else {
+    "ReCast".to_string()
+  };
+  tray_builder = tray_builder.with_title(&title);
+}
                 _tray = Some(tray_builder.build().expect("tray build"));
             }
         }
@@ -150,9 +156,23 @@ fn status_label(fixed: u64) -> String {
     format!("Fixed: {}", fixed)
 }
 
-/// The ReCast keycap/swap-arrows icon, baked in as raw 32×32 RGBA at compile
-/// time (generated from `assets/recast-icon.svg` → `assets/tray-icon.rgba`).
-/// Self-contained, so the binary needs no icon file at runtime.
+// Compose a single-line menubar banner: a compact half-block icon strip
+// followed by a short label. macOS menubar titles are single-line only and
+// ignore ANSI escape sequences, so we rely on half-block characters plus
+// color for truecolor terminals; plain fallback strips to "ReCast vX".
+fn menubar_banner() -> String {
+  if std::env::var_os("NO_COLOR").is_some() {
+    format!("ReCast v{}", env!("CARGO_PKG_VERSION"))
+  } else {
+    let depth = banner::ColorDepth::True;
+    let mut row = banner::logo_rows_compact(depth);
+    if !row.is_empty() { row.push(' '); }
+    row.push_str("\x1b[38;5;39mReCast\x1b[0m ");
+    row.push_str(&format!("\x1b[2mv{}\x1b[0m", env!("CARGO_PKG_VERSION")));
+    row
+  }
+}
+
 const ICON_RGBA: &[u8] = include_bytes!("../../assets/tray-icon.rgba");
 const ICON_SIZE: u32 = 32;
 
