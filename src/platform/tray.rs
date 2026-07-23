@@ -7,6 +7,8 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+// Only the macOS menubar title uses the banner (Windows shows a tooltip).
+#[cfg(target_os = "macos")]
 use crate::banner;
 use crate::types::AppControl;
 
@@ -114,18 +116,44 @@ pub fn run(control: Arc<AppControl>) {
                 // Show about dialog - platform specific
                 #[cfg(target_os = "macos")]
                 {
-                    // Fix: cocoa 0.24 does not expose NSAlert — use raw objc msg_send!
-                    use cocoa::base::id;
-                    use objc::{msg_send, class};
+                    // NSAlert is configured via setMessageText:/setInformativeText:
+                    // and shown with runModal. The previous code sent a
+                    // UIAlertController-style `initWithTitle:message:preferredStyle:`
+                    // selector (which NSAlert does not implement) and passed Rust
+                    // &str where NSString* was expected — an unrecognized-selector
+                    // Objective-C exception that aborted the whole process whenever
+                    // About was clicked. Build real NSStrings and use NSAlert's API.
+                    use cocoa::appkit::NSApp;
+                    use cocoa::base::{id, nil, YES};
+                    use cocoa::foundation::NSString;
+                    use objc::{class, msg_send};
                     use objc::sel;
                     use objc::sel_impl;
+
+                    let info = format!(
+                        "Layout mistake fixer for bilingual typing.\n\n\
+                         Version {}\n\n\
+                         Created by Ori Supino\n\
+                         © 2026 Ori Supino",
+                        env!("CARGO_PKG_VERSION")
+                    );
+
                     unsafe {
-                        let alert: id = msg_send![class!(NSAlert), alloc];
-                        let _: id = msg_send![alert, initWithTitle:"ReCast"
-                            message:"Layout mistake fixer for bilingual typing.\n\n© 2026"
-                            preferredStyle:1u64]; // NSWarningAlertStyle = 0, NSInformationalAlertStyle = 1
-                        let _: id = msg_send![alert, addButtonWithTitle:"OK"];
+                        // Accessory apps have no key window, so pull ReCast to the
+                        // front or the alert can appear buried behind other apps.
+                        let _: () = msg_send![NSApp(), activateIgnoringOtherApps: YES];
+
+                        let alert: id = msg_send![class!(NSAlert), new];
+                        let title = NSString::alloc(nil).init_str("ReCast");
+                        let body = NSString::alloc(nil).init_str(&info);
+                        let ok = NSString::alloc(nil).init_str("OK");
+                        let _: () = msg_send![alert, setMessageText: title];
+                        let _: () = msg_send![alert, setInformativeText: body];
+                        let _: id = msg_send![alert, addButtonWithTitle: ok];
                         let _: i64 = msg_send![alert, runModal];
+                        // The three NSStrings are alloc/init-owned; leaking them
+                        // per (rare) About click is negligible and keeps this off
+                        // the manual-release path.
                     }
                 }
                 #[cfg(target_os = "windows")]
@@ -136,7 +164,7 @@ pub fn run(control: Arc<AppControl>) {
                     use std::ffi::OsString;
                     use std::os::windows::ffi::OsStrExt;
                     let body = format!(
-                        "Layout mistake fixer for bilingual typing.\n\nVersion {}\n© 2026",
+                        "Layout mistake fixer for bilingual typing.\n\nVersion {}\n\nCreated by Ori Supino\n© 2026 Ori Supino",
                         env!("CARGO_PKG_VERSION")
                     );
                     let wide: Vec<u16> =
@@ -178,6 +206,10 @@ fn status_label(fixed: u64) -> String {
 // followed by a short label. macOS menubar titles are single-line only and
 // ignore ANSI escape sequences, so we rely on half-block characters plus
 // color for truecolor terminals; plain fallback strips to "ReCast vX".
+//
+// macOS-only: it is the only platform whose tray item carries an inline title
+// (Windows uses a hover tooltip), so gating it avoids a dead-code warning there.
+#[cfg(target_os = "macos")]
 fn menubar_banner() -> String {
   if std::env::var_os("NO_COLOR").is_some() {
     format!("ReCast v{}", env!("CARGO_PKG_VERSION"))

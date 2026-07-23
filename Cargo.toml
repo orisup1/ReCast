@@ -1,7 +1,15 @@
 [package]
 name = "recast"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
+authors = ["Ori Supino <ori@supino.org>"]
+description = "Automatic English/Hebrew keyboard-layout correction that lives in your tray/menubar and retypes words you typed in the wrong layout."
+readme = "README.md"
+repository = "https://github.com/orisup1/recast"
+homepage = "https://github.com/orisup1/recast"
+license = "Apache-2.0"
+keywords = ["keyboard", "layout", "hebrew", "typing", "productivity"]
+categories = ["command-line-utilities", "text-processing"]
 
 # Smaller, faster release binary — the embedded dictionaries dominate size,
 # but LTO + a single codegen unit still shave several MB and help the hot
