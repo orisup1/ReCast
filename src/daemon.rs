@@ -1,6 +1,13 @@
-use std::process;
-use std::fs::{self, OpenOptions};
+use std::fs;
+// Only the Linux daemon path (daemonize + write_pidfile) uses these; on
+// macOS/Windows they would be unused imports. `stop_daemon` still uses `fs`
+// on every target, so that import stays ungated.
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::process;
 
 #[cfg(target_os = "linux")]
 use nix::{
@@ -66,6 +73,11 @@ pub fn daemonize() {
 }
 
 /// Write the current process ID to a pidfile in the user's cache directory.
+///
+/// Only the Linux daemon writes a pidfile (macOS/Windows run in the foreground
+/// under a launch agent / scheduled task), so this is Linux-only; gating it
+/// avoids a dead-code warning on the other targets.
+#[cfg(target_os = "linux")]
 pub fn write_pidfile() -> std::io::Result<()> {
     let mut dir = dirs::cache_dir().ok_or_else(|| std::io::Error::new(
         std::io::ErrorKind::NotFound,
