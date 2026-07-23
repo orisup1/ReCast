@@ -34,6 +34,90 @@ pub struct AppState {
     pub held_keys: HashSet<Key>,
 }
 
+/// Reattach the process to the console of whatever launched it so the startup
+/// ASCII-art banner can print.
+///
+/// Release builds set `windows_subsystem = "windows"` (see the crate attribute
+/// in `main.rs`) so launching from Explorer never flashes a console window.
+/// The side effect is that the process starts with *no* console and null
+/// standard handles even when the user ran `recast` from an existing terminal —
+/// so `IsTerminal(stdout)` is false and `banner::print_logo` prints nothing.
+///
+/// `AttachConsole(ATTACH_PARENT_PROCESS)` borrows the launching shell's console;
+/// we then repoint the standard handles at its `CONOUT$`/`CONIN$` buffers (a
+/// GUI-subsystem process's handles aren't wired up automatically) and enable
+/// virtual-terminal processing so the banner's ANSI color escapes render.
+///
+/// When there is no parent console — Explorer double-click, the logon Scheduled
+/// Task — `AttachConsole` fails and this is a silent no-op, exactly matching the
+/// old behaviour of no banner. In debug builds the process already owns a
+/// console, so `AttachConsole` also fails harmlessly and stdout is untouched.
+///
+/// Must run before the first stdout access (i.e. before `banner::print_logo`).
+pub fn attach_parent_console() {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
+    use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::processenv::SetStdHandle;
+    use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    use winapi::um::wincon::{
+        AttachConsole, ATTACH_PARENT_PROCESS, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    };
+    use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
+
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().chain(once(0)).collect()
+    };
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            // No parent console to attach to (Explorer / Scheduled Task launch),
+            // or one is already attached (debug build): leave stdio as-is.
+            return;
+        }
+
+        // Open the attached console's screen buffer and repoint stdout/stderr at
+        // it; Rust's stdio reads the std handle on each write, so setting it here
+        // (before any output) is enough for `println!` and `is_terminal()`.
+        let conout = CreateFileW(
+            wide("CONOUT$").as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        );
+        if conout != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_OUTPUT_HANDLE, conout);
+            SetStdHandle(STD_ERROR_HANDLE, conout);
+            // Turn on ANSI escape interpretation so the banner's colors show as
+            // colors rather than raw `\x1b[` gibberish.
+            let mut mode = 0u32;
+            if GetConsoleMode(conout, &mut mode) != 0 {
+                SetConsoleMode(conout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+
+        let conin = CreateFileW(
+            wide("CONIN$").as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        );
+        if conin != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_INPUT_HANDLE, conin);
+        }
+    }
+}
+
 /// Full Windows startup. Owns everything that used to live in `main`'s Windows
 /// `cfg` block: run the keyboard listener on a background thread and hand the
 /// main thread to the tray (or the TUI with `--gui`). Keeping it here means

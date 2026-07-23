@@ -36,7 +36,14 @@ objc = "0.2"  # needed for raw msg_send! to NSAlert (cocoa 0.24 does not expose 
 rdev = "0.5.3"
 tray-icon = "0.24"
 tao = "0.35"
-winapi = { version = "0.3", features = ["winuser", "windef"] }
+winapi = { version = "0.3", features = [
+    "winuser", "windef",
+    # Reattaching the parent console at startup so the banner can print even
+    # though release builds run under `windows_subsystem = "windows"` (see
+    # platform::windows::attach_parent_console).
+    "wincon", "consoleapi", "processenv", "winbase",
+    "fileapi", "handleapi", "winnt",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"

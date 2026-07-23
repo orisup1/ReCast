@@ -76,6 +76,12 @@ fn main() {
         return;
     }
 
+// Windows release builds run as a GUI-subsystem app with no console, so
+// reattach the launching terminal's console first — otherwise stdout is not a
+// TTY and the banner never prints. No-op when launched without a parent console.
+#[cfg(target_os = "windows")]
+platform::windows::attach_parent_console();
+
 if banner::ran_from_terminal() {
   banner::print_logo();
 }
