@@ -9,8 +9,8 @@ use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode};
 /// the keys we are about to retype before injecting anyway.
 const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
 
-use crate::dictionary::check_and_switch_with_split;
-use crate::keymap::{evkey_to_english_char, evkey_to_hebrew_char};
+use crate::dictionary::{check_and_correct, Fix};
+use crate::keymap::{english_char_to_evkey, evkey_to_english_char, evkey_to_hebrew_char};
 use crate::types::AppControl;
 
 /// Per-keyboard state tracked across events.
@@ -245,7 +245,7 @@ fn handle_key(
                     st.keys.clear();
                     return;
                 }
-                let result = check_and_switch_with_split(
+                let result = check_and_correct(
                     &st.keys,
                     evkey_to_english_char,
                     evkey_to_hebrew_char,
@@ -253,19 +253,14 @@ fn handle_key(
                     he_dict,
                 );
 
-                if let Some(start) = result {
+                if let Some((typed, retype)) = replacement(&st.keys, result) {
                     control.record_fix();
                     st.is_replacing = true;
-                    // Only the suffix from `start` onward is the word that
-                    // needs to be erased and retyped — anything before it is
-                    // a previously-typed word that the user concatenated by
-                    // forgetting a space, and we want to leave it intact.
-                    let keys_clone: Vec<KeyCode> = st.keys[start..].to_vec();
                     let terminator = key;
                     let injector_clone = Arc::clone(injector);
                     let state_clone = Arc::clone(state_mutex);
                     thread::spawn(move || {
-                        replace_word(keys_clone, terminator, &injector_clone, &state_clone);
+                        replace_word(typed, retype, terminator, &injector_clone, &state_clone);
                     });
                 }
                 st.keys.clear();
@@ -313,9 +308,33 @@ fn handle_key(
     }
 }
 
-/// After a layout switch, erase the mistyped word and retype it in the new layout.
+/// Turn a [`Fix`] into the pair the replace thread needs: the keys the user
+/// actually typed (which is what has to be erased) and the keys to inject in
+/// their place.
+fn replacement(keys: &[KeyCode], fix: Option<Fix>) -> Option<(Vec<KeyCode>, Vec<KeyCode>)> {
+    match fix? {
+        // Same keys, new layout — they now produce the other language. Anything
+        // before `start` is a previously-typed word that the user concatenated
+        // by forgetting a space, and we want to leave it intact.
+        Fix::Layout { start } => {
+            let word = keys[start..].to_vec();
+            Some((word.clone(), word))
+        }
+        // Same layout, different letters: erase the whole word and type the
+        // corrected spelling instead. If any character turns out not to be
+        // typeable, drop the fix rather than inject half a word.
+        Fix::Spelling { text } => {
+            let retype: Option<Vec<KeyCode>> = text.chars().map(english_char_to_evkey).collect();
+            Some((keys.to_vec(), retype?))
+        }
+    }
+}
+
+/// Erase the word the user typed and inject the corrected one: the same keys
+/// after a layout switch, or different keys for a spelling fix.
 fn replace_word(
-    keys: Vec<KeyCode>,
+    typed: Vec<KeyCode>,
+    retype: Vec<KeyCode>,
     terminator: KeyCode,
     injector: &Arc<Mutex<VirtualDevice>>,
     state_mutex: &Arc<Mutex<AppState>>,
@@ -335,7 +354,8 @@ fn replace_word(
     //     is still held by the physical keyboard, the compositor sees it as
     //     a duplicate of the held key and drops it — which is why the
     //     trailing space (and occasionally the last word letter) went missing.
-    let mut keys_of_interest: HashSet<KeyCode> = keys.iter().copied().collect();
+    let mut keys_of_interest: HashSet<KeyCode> =
+        typed.iter().chain(retype.iter()).copied().collect();
     keys_of_interest.insert(terminator);
     let wait_start = Instant::now();
     loop {
@@ -372,8 +392,8 @@ fn replace_word(
     // compositor still sees distinct keystroke frames, but there are no
     // inter-key sleeps and the injector lock is taken once instead of twice
     // per event — the dominant cost of retyping.
-    let delete_count = keys.len() + 1 + buffered.len(); // +1 = physical terminator
-    let total_keys = delete_count + keys.len() + 1 + buffered.len();
+    let delete_count = typed.len() + 1 + buffered.len(); // +1 = physical terminator
+    let total_keys = delete_count + retype.len() + 1 + buffered.len();
     let mut evs: Vec<InputEvent> = Vec::with_capacity(total_keys * 4);
     let mut push_key = |kc: KC| {
         evs.push(InputEvent::new(EventType::KEY.0, kc.0, 1));
@@ -386,8 +406,8 @@ fn replace_word(
     for _ in 0..delete_count {
         push_key(KC::KEY_BACKSPACE);
     }
-    // 3. Retype the physical keys.
-    for key in &keys {
+    // 3. Type the corrected word.
+    for key in &retype {
         push_key(*key);
     }
     // 4. Retype the terminator (space/enter).

@@ -22,6 +22,29 @@ pub fn evkey_to_english_char(key: evdev::KeyCode) -> Option<char> {
     }
 }
 
+/// Inverse of [`evkey_to_english_char`]: the key that types `c` under an
+/// English layout. Used to inject a spelling correction, whose text is a
+/// *different* string from what the user typed and so cannot be replayed from
+/// the original keycodes. Returns `None` for anything the English layout can't
+/// produce with a bare (unshifted) key press.
+#[cfg(target_os = "linux")]
+pub fn english_char_to_evkey(c: char) -> Option<evdev::KeyCode> {
+    use evdev::KeyCode as K;
+    Some(match c {
+        'a' => K::KEY_A, 'b' => K::KEY_B, 'c' => K::KEY_C, 'd' => K::KEY_D,
+        'e' => K::KEY_E, 'f' => K::KEY_F, 'g' => K::KEY_G, 'h' => K::KEY_H,
+        'i' => K::KEY_I, 'j' => K::KEY_J, 'k' => K::KEY_K, 'l' => K::KEY_L,
+        'm' => K::KEY_M, 'n' => K::KEY_N, 'o' => K::KEY_O, 'p' => K::KEY_P,
+        'q' => K::KEY_Q, 'r' => K::KEY_R, 's' => K::KEY_S, 't' => K::KEY_T,
+        'u' => K::KEY_U, 'v' => K::KEY_V, 'w' => K::KEY_W, 'x' => K::KEY_X,
+        'y' => K::KEY_Y, 'z' => K::KEY_Z,
+        '1' => K::KEY_1, '2' => K::KEY_2, '3' => K::KEY_3, '4' => K::KEY_4,
+        '5' => K::KEY_5, '6' => K::KEY_6, '7' => K::KEY_7, '8' => K::KEY_8,
+        '9' => K::KEY_9, '0' => K::KEY_0,
+        _ => return None,
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn evkey_to_hebrew_char(key: evdev::KeyCode) -> Option<char> {
     use evdev::KeyCode as K;
@@ -72,6 +95,29 @@ pub fn key_to_english_char(key: rdev::Key) -> Option<char> {
     }
 }
 
+/// Inverse of [`key_to_english_char`]: the key that types `c` under an English
+/// layout. Used to inject a spelling correction, whose text is a *different*
+/// string from what the user typed and so cannot be replayed from the original
+/// keys. Returns `None` for anything the English layout can't produce with a
+/// bare (unshifted) key press.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn english_char_to_key(c: char) -> Option<rdev::Key> {
+    use rdev::Key as K;
+    Some(match c {
+        'a' => K::KeyA, 'b' => K::KeyB, 'c' => K::KeyC, 'd' => K::KeyD,
+        'e' => K::KeyE, 'f' => K::KeyF, 'g' => K::KeyG, 'h' => K::KeyH,
+        'i' => K::KeyI, 'j' => K::KeyJ, 'k' => K::KeyK, 'l' => K::KeyL,
+        'm' => K::KeyM, 'n' => K::KeyN, 'o' => K::KeyO, 'p' => K::KeyP,
+        'q' => K::KeyQ, 'r' => K::KeyR, 's' => K::KeyS, 't' => K::KeyT,
+        'u' => K::KeyU, 'v' => K::KeyV, 'w' => K::KeyW, 'x' => K::KeyX,
+        'y' => K::KeyY, 'z' => K::KeyZ,
+        '1' => K::Num1, '2' => K::Num2, '3' => K::Num3, '4' => K::Num4,
+        '5' => K::Num5, '6' => K::Num6, '7' => K::Num7, '8' => K::Num8,
+        '9' => K::Num9, '0' => K::Num0,
+        _ => return None,
+    })
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn key_to_hebrew_char(key: rdev::Key) -> Option<char> {
     use rdev::Key as K;
@@ -95,5 +141,46 @@ pub fn key_to_hebrew_char(key: rdev::Key) -> Option<char> {
         K::Num7 => Some('7'), K::Num8 => Some('8'), K::Num9 => Some('9'),
         K::Num0 => Some('0'),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The spelling autocorrect types its result through the inverse map, so a
+    /// single wrong entry there would silently inject the wrong letter. Pin it
+    /// to the forward map it inverts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn english_key_map_round_trips() {
+        use super::{english_char_to_evkey, evkey_to_english_char};
+
+        for code in 0u16..=255 {
+            let key = evdev::KeyCode::new(code);
+            if let Some(c) = evkey_to_english_char(key) {
+                assert_eq!(english_char_to_evkey(c), Some(key), "{c}");
+            }
+        }
+        // Every letter a correction can be built from must be typeable.
+        for c in 'a'..='z' {
+            assert!(english_char_to_evkey(c).is_some(), "{c}");
+        }
+        // Anything the English layout can't type unshifted has no key.
+        for c in ['A', ' ', '\'', 'ש', '-'] {
+            assert_eq!(english_char_to_evkey(c), None, "{c}");
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn english_key_map_round_trips() {
+        use super::{english_char_to_key, key_to_english_char};
+
+        for c in 'a'..='z' {
+            let key = english_char_to_key(c).unwrap_or_else(|| panic!("{c}"));
+            assert_eq!(key_to_english_char(key), Some(c), "{c}");
+        }
+        for c in ['A', ' ', '\'', 'ש', '-'] {
+            assert_eq!(english_char_to_key(c), None, "{c}");
+        }
     }
 }

@@ -10,7 +10,28 @@ pub struct Config {
     /// real word in *both* layouts, switch to the reading that is decisively more
     /// common instead of always keeping the current layout.
     pub freq_enabled: bool,
+    /// Enable the English in-language spelling autocorrect: when a word is not
+    /// a wrong-layout mistype but *is* a near-miss of a common English word,
+    /// retype it as that word.
+    pub spell_enabled: bool,
+    /// Shortest word the spelling autocorrect will touch. Below this, unknown
+    /// tokens are overwhelmingly initialisms and names ("btw", "ori"), and a
+    /// single edit is enough to turn one into an unrelated word.
+    pub spell_min_len: usize,
+    /// Worst frequency rank a spelling suggestion may have. The dictionary
+    /// contains ~370k words including archaic ones; this is what keeps the
+    /// suggestion to a word people actually type.
+    pub spell_max_rank: u32,
+    /// Maximum edit distance for a spelling suggestion (0 disables, 1 = only
+    /// single-typo fixes, 2 = also two-edit fixes on longer words).
+    pub spell_max_dist: u8,
 }
+
+/// Shipped defaults for the spelling autocorrect. Deliberately conservative:
+/// a missed correction is invisible, a wrong one rewrites the user's text.
+pub const DEFAULT_SPELL_MIN_LEN: usize = 4;
+pub const DEFAULT_SPELL_MAX_RANK: u32 = 20_000;
+pub const DEFAULT_SPELL_MAX_DIST: u8 = 1;
 
 impl Config {
     /// Load configuration from environment variables.
@@ -20,6 +41,12 @@ impl Config {
     ///                split fallback (default: disabled).
     /// RECAST_FREQ  – set to `0` to disable the homograph frequency tie-break
     ///                (default: enabled).
+    /// RECAST_SPELL – set to `0` to disable the English spelling autocorrect
+    ///                (default: enabled).
+    /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
+    /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
+    ///                     (default: 20000).
+    /// RECAST_SPELL_DIST – maximum edit distance, 1 or 2 (default: 1).
     pub fn from_env() -> Self {
         Self {
             short_enabled: std::env::var("RECAST_SHORT")
@@ -31,6 +58,20 @@ impl Config {
             freq_enabled: std::env::var("RECAST_FREQ")
                 .map(|v| v != "0")
                 .unwrap_or(true),
+            spell_enabled: std::env::var("RECAST_SPELL")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            spell_min_len: env_num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),
+            spell_max_rank: env_num("RECAST_SPELL_RANK", DEFAULT_SPELL_MAX_RANK),
+            spell_max_dist: env_num("RECAST_SPELL_DIST", DEFAULT_SPELL_MAX_DIST),
         }
     }
+}
+
+/// Numeric env override, falling back to `default` when unset or unparsable.
+fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }

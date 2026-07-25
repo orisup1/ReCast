@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use rdev::{listen, simulate, Event, EventType, Key};
 
-use crate::dictionary::check_and_switch_with_split;
-use crate::keymap::{key_to_english_char, key_to_hebrew_char};
+use crate::dictionary::{check_and_correct, Fix};
+use crate::keymap::{english_char_to_key, key_to_english_char, key_to_hebrew_char};
 use crate::types::AppControl;
 
 /// Maximum time the replace thread will wait for the user to physically
@@ -189,7 +189,7 @@ pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>,
                                 st.keys.clear();
                                 return;
                             }
-                            let result = check_and_switch_with_split(
+                            let result = check_and_correct(
                                 &st.keys,
                                 key_to_english_char,
                                 key_to_hebrew_char,
@@ -197,20 +197,17 @@ pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>,
                                 he_dict,
                             );
 
-                            if let Some(start) = result {
+                            if let Some((typed, retype)) = replacement(&st.keys, result) {
                                 control_cb.record_fix();
                                 st.is_replacing = true;
-                                // See linux.rs: anything before `start` is a
-                                // previously-typed word the user concatenated
-                                // by forgetting a space; leave it untouched.
-                                let keys_clone: Vec<Key> = st.keys[start..].to_vec();
                                 let terminator = key;
                                 let state_clone = Arc::clone(&state_cb);
                                 let injecting_flag = Arc::clone(&injecting);
 
                                 thread::spawn(move || {
                                     replace_word(
-                                        keys_clone,
+                                        typed,
+                                        retype,
                                         terminator,
                                         &state_clone,
                                         &injecting_flag,
@@ -279,9 +276,28 @@ pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>,
     }
 }
 
-/// After a layout switch, erase the mistyped word and retype it in the new layout.
+/// Turn a [`Fix`] into the pair the replace thread needs: the keys the user
+/// actually typed (which is what has to be erased) and the keys to inject in
+/// their place. See `linux.rs` for the reasoning; kept per-platform because the
+/// key type is the platform's own.
+fn replacement(keys: &[Key], fix: Option<Fix>) -> Option<(Vec<Key>, Vec<Key>)> {
+    match fix? {
+        Fix::Layout { start } => {
+            let word = keys[start..].to_vec();
+            Some((word.clone(), word))
+        }
+        Fix::Spelling { text } => {
+            let retype: Option<Vec<Key>> = text.chars().map(english_char_to_key).collect();
+            Some((keys.to_vec(), retype?))
+        }
+    }
+}
+
+/// Erase the word the user typed and inject the corrected one: the same keys
+/// after a layout switch, or different keys for a spelling fix.
 fn replace_word(
-    keys: Vec<Key>,
+    typed: Vec<Key>,
+    retype: Vec<Key>,
     terminator: Key,
     state_mutex: &Arc<Mutex<AppState>>,
     injecting: &Arc<AtomicBool>,
@@ -289,7 +305,7 @@ fn replace_word(
     // 1. Wait for the user to physically release the terminator and any of
     //    the word's keys before injecting. injecting=false here so release
     //    events from the listener still update held_keys.
-    let mut keys_of_interest: HashSet<Key> = keys.iter().copied().collect();
+    let mut keys_of_interest: HashSet<Key> = typed.iter().chain(retype.iter()).copied().collect();
     keys_of_interest.insert(terminator);
     let wait_start = Instant::now();
     loop {
@@ -326,11 +342,11 @@ fn replace_word(
     };
 
     // +1 for the terminator the user physically typed.
-    let delete_count = keys.len() + 1 + buf.len();
+    let delete_count = typed.len() + 1 + buf.len();
     for _ in 0..delete_count {
         tap_key(Key::Backspace);
     }
-    for k in &keys {
+    for k in &retype {
         tap_key(*k);
     }
     tap_key(terminator);

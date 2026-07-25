@@ -25,12 +25,17 @@ static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
 impl Config {
     /// Access the global config, falling back to defaults if not yet set
-    /// (matches the `from_env` defaults: short-word switching on, split off).
+    /// (matches the `from_env` defaults: short-word switching on, split off,
+    /// spelling autocorrect on).
     pub fn global() -> &'static Config {
         GLOBAL_CONFIG.get_or_init(|| Config {
             short_enabled: true,
             split_enabled: false,
             freq_enabled: true,
+            spell_enabled: true,
+            spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
+            spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
+            spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
         })
     }
 }

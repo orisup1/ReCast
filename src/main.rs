@@ -16,6 +16,7 @@ mod gui;
 mod keymap;
 mod layout;
 mod platform;
+mod spell;
 mod types;
 mod config;
 mod daemon;
@@ -26,7 +27,7 @@ use std::process;
 use crate::dictionary::{en_dict, he_dict};
 
 const HELP: &str = "\
-recast — automatic English/Hebrew keyboard-layout correction
+recast — automatic English/Hebrew layout correction + English autocorrect
 
 Usage: recast [OPTIONS]
 
@@ -39,9 +40,14 @@ Options:
   -h, --help        Show this help
 
 Environment:
-  RECAST_DEBUG=1    Print every word check and switch decision
-  RECAST_SPLIT=1    Enable the opt-in missing-space split fallback
-  RECAST_SHORT=0    Never auto-switch on short (≤3 char) words";
+  RECAST_DEBUG=1      Print every word check and switch decision
+  RECAST_SPLIT=1      Enable the opt-in missing-space split fallback
+  RECAST_SHORT=0      Never auto-switch on short (≤3 char) words
+  RECAST_FREQ=0       Disable the homograph frequency tie-break
+  RECAST_SPELL=0      Disable the English spelling autocorrect
+  RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
+  RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 20000)
+  RECAST_SPELL_DIST=n Maximum edit distance, 1 or 2 (default 1)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
