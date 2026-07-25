@@ -27,6 +27,10 @@ pub fn evkey_to_english_char(key: evdev::KeyCode) -> Option<char> {
 /// *different* string from what the user typed and so cannot be replayed from
 /// the original keycodes. Returns `None` for anything the English layout can't
 /// produce with a bare (unshifted) key press.
+///
+/// Linux only: `uinput` speaks keycodes, so a correction has to be spelled back
+/// out as key presses. macOS and Windows insert the corrected text directly
+/// (see their `replace_word`) and need no inverse map.
 #[cfg(target_os = "linux")]
 pub fn english_char_to_evkey(c: char) -> Option<evdev::KeyCode> {
     use evdev::KeyCode as K;
@@ -95,29 +99,6 @@ pub fn key_to_english_char(key: rdev::Key) -> Option<char> {
     }
 }
 
-/// Inverse of [`key_to_english_char`]: the key that types `c` under an English
-/// layout. Used to inject a spelling correction, whose text is a *different*
-/// string from what the user typed and so cannot be replayed from the original
-/// keys. Returns `None` for anything the English layout can't produce with a
-/// bare (unshifted) key press.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn english_char_to_key(c: char) -> Option<rdev::Key> {
-    use rdev::Key as K;
-    Some(match c {
-        'a' => K::KeyA, 'b' => K::KeyB, 'c' => K::KeyC, 'd' => K::KeyD,
-        'e' => K::KeyE, 'f' => K::KeyF, 'g' => K::KeyG, 'h' => K::KeyH,
-        'i' => K::KeyI, 'j' => K::KeyJ, 'k' => K::KeyK, 'l' => K::KeyL,
-        'm' => K::KeyM, 'n' => K::KeyN, 'o' => K::KeyO, 'p' => K::KeyP,
-        'q' => K::KeyQ, 'r' => K::KeyR, 's' => K::KeyS, 't' => K::KeyT,
-        'u' => K::KeyU, 'v' => K::KeyV, 'w' => K::KeyW, 'x' => K::KeyX,
-        'y' => K::KeyY, 'z' => K::KeyZ,
-        '1' => K::Num1, '2' => K::Num2, '3' => K::Num3, '4' => K::Num4,
-        '5' => K::Num5, '6' => K::Num6, '7' => K::Num7, '8' => K::Num8,
-        '9' => K::Num9, '0' => K::Num0,
-        _ => return None,
-    })
-}
-
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn key_to_hebrew_char(key: rdev::Key) -> Option<char> {
     use rdev::Key as K;
@@ -167,20 +148,6 @@ mod tests {
         // Anything the English layout can't type unshifted has no key.
         for c in ['A', ' ', '\'', 'ש', '-'] {
             assert_eq!(english_char_to_evkey(c), None, "{c}");
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    #[test]
-    fn english_key_map_round_trips() {
-        use super::{english_char_to_key, key_to_english_char};
-
-        for c in 'a'..='z' {
-            let key = english_char_to_key(c).unwrap_or_else(|| panic!("{c}"));
-            assert_eq!(key_to_english_char(key), Some(c), "{c}");
-        }
-        for c in ['A', ' ', '\'', 'ש', '-'] {
-            assert_eq!(english_char_to_key(c), None, "{c}");
         }
     }
 }

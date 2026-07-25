@@ -5,23 +5,25 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rdev::{listen, simulate, Event, EventType, Key};
+use rdev::{listen, Event, EventType, Key};
+use winapi::ctypes::c_int;
+use winapi::um::winuser::{
+    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VK_BACK,
+    VK_RETURN, VK_SPACE,
+};
 
-use crate::dictionary::{check_and_correct, Fix};
-use crate::keymap::{english_char_to_key, key_to_english_char, key_to_hebrew_char};
+use crate::dictionary::{check_and_correct, Dict, Fix};
+use crate::keymap::{key_to_english_char, key_to_hebrew_char};
 use crate::types::AppControl;
 
 /// Maximum time the replace thread will wait for the user to physically
 /// release the keys we are about to retype before injecting anyway.
 const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// Gap between a synthetic key-down and its key-up, and between consecutive
-/// keys. `SendInput` (used by rdev) is synchronous and reliable, so this can
-/// be tighter than the macOS pacing, but the previous 50µs spacing was tight
-/// enough that a backspace could be dropped in slow apps (leaving the original
-/// first letter behind). 1ms gives a safe margin while staying fast.
-const KEY_PRESS_GAP: Duration = Duration::from_millis(1);
-const INTER_KEY_GAP: Duration = Duration::from_millis(1);
+/// Grace period between the last injected event and un-gating the listener.
+/// `SendInput` returns as soon as the events are queued, so clearing the gate
+/// immediately can let our own tail end up back in the word buffer.
+const INJECT_SETTLE: Duration = Duration::from_millis(2);
 
 pub struct AppState {
     pub keys: Vec<Key>,
@@ -123,8 +125,8 @@ pub fn attach_parent_console() {
 /// main thread to the tray (or the TUI with `--gui`). Keeping it here means
 /// changes to the Windows launch path can't touch the Linux or macOS paths.
 pub fn start(
-    en: &'static HashSet<String>,
-    he: &'static HashSet<String>,
+    en: Dict,
+    he: Dict,
     control: Arc<AppControl>,
     with_gui: bool,
 ) {
@@ -146,7 +148,7 @@ pub fn start(
     crate::platform::tray::run(control);
 }
 
-pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>, control: Arc<AppControl>) {
+pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
     // Non-panicking logging: a release build sets `windows_subsystem = "windows"`,
     // so there is no console and a plain println!/eprintln! returns Err and
     // PANICS. Because this function runs on the listener thread, that panic would
@@ -197,7 +199,7 @@ pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>,
                                 he_dict,
                             );
 
-                            if let Some((typed, retype)) = replacement(&st.keys, result) {
+                            if let Some((erase, text)) = replacement(&st.keys, result) {
                                 control_cb.record_fix();
                                 st.is_replacing = true;
                                 let terminator = key;
@@ -206,8 +208,8 @@ pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>,
 
                                 thread::spawn(move || {
                                     replace_word(
-                                        typed,
-                                        retype,
+                                        erase,
+                                        text,
                                         terminator,
                                         &state_clone,
                                         &injecting_flag,
@@ -276,54 +278,119 @@ pub fn run(en_dict: &'static HashSet<String>, he_dict: &'static HashSet<String>,
     }
 }
 
-/// Turn a [`Fix`] into the pair the replace thread needs: the keys the user
-/// actually typed (which is what has to be erased) and the keys to inject in
-/// their place. See `linux.rs` for the reasoning; kept per-platform because the
-/// key type is the platform's own.
-fn replacement(keys: &[Key], fix: Option<Fix>) -> Option<(Vec<Key>, Vec<Key>)> {
+/// Turn a [`Fix`] into what the replace thread needs: how many of the typed
+/// keys have to be erased, and the finished text to put in their place.
+///
+/// Unlike Linux (which can only replay keycodes through `uinput`), Windows can
+/// insert the characters themselves, so both kinds of fix reduce to the same
+/// thing — erase N, insert a string — and neither depends on the keys being
+/// typeable under the active layout.
+fn replacement(keys: &[Key], fix: Option<Fix>) -> Option<(usize, String)> {
     match fix? {
-        Fix::Layout { start } => {
-            let word = keys[start..].to_vec();
-            Some((word.clone(), word))
-        }
-        Fix::Spelling { text } => {
-            let retype: Option<Vec<Key>> = text.chars().map(english_char_to_key).collect();
-            Some((keys.to_vec(), retype?))
-        }
+        // Anything before `start` is a previously-typed word the user
+        // concatenated by forgetting a space; leave it intact.
+        Fix::Layout { start, text } => Some((keys.len() - start, text)),
+        Fix::Spelling { text } => Some((keys.len(), text)),
     }
 }
 
-/// Erase the word the user typed and inject the corrected one: the same keys
-/// after a layout switch, or different keys for a spelling fix.
+// ─────────────────────────────────────────────────────────────────────────────
+// Text injection via SendInput.
+//
+// `rdev::simulate` sends one key at a time and needs pacing between events, so
+// a correction typed itself out over tens of milliseconds. `SendInput` takes
+// the *whole* sequence — the backspaces, the corrected word as Unicode, and the
+// terminator — in a single call, and the OS delivers it as one uninterrupted
+// burst: the word is replaced the way a paste lands, not the way typing does.
+//
+// `KEYEVENTF_UNICODE` events carry the character rather than a key position, so
+// the injected text is exactly what we computed regardless of which layout is
+// active — the layout switch still happens (for what the user types next), but
+// the correction no longer depends on it having propagated.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One keyboard `INPUT`: a virtual-key press/release when `unicode` is `None`,
+/// otherwise a UTF-16 code unit typed as text.
+fn key_input(vk: u16, unicode: Option<u16>, up: bool) -> INPUT {
+    let mut input: INPUT = unsafe { std::mem::zeroed() };
+    input.type_ = INPUT_KEYBOARD;
+    let mut flags = if up { KEYEVENTF_KEYUP } else { 0 };
+    let (vk, scan) = match unicode {
+        Some(unit) => {
+            flags |= KEYEVENTF_UNICODE;
+            (0, unit)
+        }
+        None => (vk, 0),
+    };
+    unsafe {
+        *input.u.ki_mut() = KEYBDINPUT {
+            wVk: vk,
+            wScan: scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+    }
+    input
+}
+
+fn press(vk: u16, out: &mut Vec<INPUT>) {
+    out.push(key_input(vk, None, false));
+    out.push(key_input(vk, None, true));
+}
+
+fn type_text(text: &str, out: &mut Vec<INPUT>) {
+    for unit in text.encode_utf16() {
+        out.push(key_input(0, Some(unit), false));
+        out.push(key_input(0, Some(unit), true));
+    }
+}
+
+/// Hand the whole batch to the OS in one call.
+fn send(inputs: &mut [INPUT]) {
+    if inputs.is_empty() {
+        return;
+    }
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_mut_ptr(),
+            std::mem::size_of::<INPUT>() as c_int,
+        );
+    }
+}
+
+/// Erase the word the user typed and put the corrected one in its place, in a
+/// single `SendInput` burst.
 fn replace_word(
-    typed: Vec<Key>,
-    retype: Vec<Key>,
+    erase: usize,
+    text: String,
     terminator: Key,
     state_mutex: &Arc<Mutex<AppState>>,
     injecting: &Arc<AtomicBool>,
 ) {
-    // 1. Wait for the user to physically release the terminator and any of
-    //    the word's keys before injecting. injecting=false here so release
-    //    events from the listener still update held_keys.
-    let mut keys_of_interest: HashSet<Key> = typed.iter().chain(retype.iter()).copied().collect();
-    keys_of_interest.insert(terminator);
-    let wait_start = Instant::now();
-    loop {
-        let still_held = {
-            let st = state_mutex.lock().unwrap();
-            keys_of_interest.iter().any(|k| st.held_keys.contains(k))
-        };
-        if !still_held {
-            break;
+    // 1. The corrected word goes in as text, so the only real key we press is
+    //    Return (a space rides along inside the text instead). Wait for the
+    //    user to lift it first: a synthetic press of a still-held key is
+    //    swallowed as a duplicate. injecting=false here so release events from
+    //    the listener still update held_keys.
+    let needs_return = terminator == Key::Return;
+    if needs_return {
+        let wait_start = Instant::now();
+        loop {
+            let still_held = {
+                let st = state_mutex.lock().unwrap();
+                st.held_keys.contains(&Key::Return)
+            };
+            if !still_held || wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
+                break;
+            }
+            thread::sleep(Duration::from_micros(100));
         }
-        if wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
-            break;
-        }
-        thread::sleep(Duration::from_micros(100));
     }
 
     // 2. switch_layout_to already polled until the layout change took effect,
-    //    so no settle delay is needed here.
+    //    and the text below is layout-independent anyway.
 
     // 3. Gate the listener now that we are about to inject our own events.
     injecting.store(true, Ordering::Relaxed);
@@ -333,30 +400,48 @@ fn replace_word(
         st.buffered_keys.clone()
     };
 
-    // Press + release a single key with pacing the OS won't drop.
-    let tap_key = |k: Key| {
-        let _ = simulate(&EventType::KeyPress(k));
-        thread::sleep(KEY_PRESS_GAP);
-        let _ = simulate(&EventType::KeyRelease(k));
-        thread::sleep(INTER_KEY_GAP);
-    };
-
     // +1 for the terminator the user physically typed.
-    let delete_count = typed.len() + 1 + buf.len();
+    let delete_count = erase + 1 + buf.len();
+    let mut inputs: Vec<INPUT> = Vec::with_capacity((delete_count + text.len() + 1) * 2);
     for _ in 0..delete_count {
-        tap_key(Key::Backspace);
+        press(VK_BACK as u16, &mut inputs);
     }
-    for k in &retype {
-        tap_key(*k);
+    type_text(&text, &mut inputs);
+    if needs_return {
+        press(VK_RETURN as u16, &mut inputs);
+    } else {
+        type_text(" ", &mut inputs);
     }
-    tap_key(terminator);
-    for k in buf.iter() {
-        tap_key(*k);
+    send(&mut inputs);
+
+    // Keys the user managed to type while we were replacing: replayed as keys
+    // (they are physical key positions, not text) once the word is back.
+    if !buf.is_empty() {
+        let mut replay: Vec<INPUT> = Vec::with_capacity(buf.len() * 2);
+        for k in &buf {
+            if let Some(vk) = vk_of(*k) {
+                press(vk, &mut replay);
+            }
+        }
+        send(&mut replay);
     }
 
+    thread::sleep(INJECT_SETTLE);
     let mut st = state_mutex.lock().unwrap();
     st.keys = buf;
     st.buffered_keys.clear();
     st.is_replacing = false;
     injecting.store(false, Ordering::Relaxed);
+}
+
+/// Virtual-key code for a key we may have to replay. A VK is a key *position*,
+/// so replaying one reproduces the physical key the user pressed whatever the
+/// active layout is; letters and digits share their uppercase ASCII value.
+/// `None` for anything the word buffer never holds.
+fn vk_of(key: Key) -> Option<u16> {
+    match key {
+        Key::Space => Some(VK_SPACE as u16),
+        Key::Return => Some(VK_RETURN as u16),
+        other => key_to_english_char(other).map(|c| c.to_ascii_uppercase() as u16),
+    }
 }

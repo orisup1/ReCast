@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode};
 
 /// Maximum time `replace_word` will wait for the user to physically release
-/// the keys we are about to retype before injecting anyway.
-const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
+/// the keys we are about to retype before injecting anyway. Kept short: the
+/// correction should feel instant, and a key still held when it expires gets a
+/// synthetic release instead of more waiting (see `replace_word`).
+const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(40);
 
-use crate::dictionary::{check_and_correct, Fix};
+use crate::dictionary::{check_and_correct, Dict, Fix};
 use crate::keymap::{english_char_to_evkey, evkey_to_english_char, evkey_to_hebrew_char};
 use crate::types::AppControl;
 
@@ -32,8 +34,8 @@ pub struct AppState {
 /// on a background thread, or daemonize and run the listener headless. Keeping
 /// it here means changes to the Linux launch path can't touch macOS or Windows.
 pub fn start(
-    en: &'static HashSet<String>,
-    he: &'static HashSet<String>,
+    en: Dict,
+    he: Dict,
     control: Arc<AppControl>,
     with_gui: bool,
     with_window: bool,
@@ -77,8 +79,8 @@ pub fn start(
 }
 
 pub fn run(
-    en_dict: &'static HashSet<String>,
-    he_dict: &'static HashSet<String>,
+    en_dict: Dict,
+    he_dict: Dict,
     control: Arc<AppControl>,
 ) {
     // println!("Starting recast keyboard watcher (Linux/Wayland)...");
@@ -213,8 +215,8 @@ pub fn run(
 fn handle_key(
     key: KeyCode,
     state_mutex: &Arc<Mutex<AppState>>,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
+    en_dict: Dict,
+    he_dict: Dict,
     injector: &Arc<Mutex<VirtualDevice>>,
     control: &Arc<AppControl>,
 ) {
@@ -316,7 +318,13 @@ fn replacement(keys: &[KeyCode], fix: Option<Fix>) -> Option<(Vec<KeyCode>, Vec<
         // Same keys, new layout — they now produce the other language. Anything
         // before `start` is a previously-typed word that the user concatenated
         // by forgetting a space, and we want to leave it intact.
-        Fix::Layout { start } => {
+        // `text` is unused here: a `uinput` device speaks keycodes, not
+        // characters, so there is no way to insert the finished word directly
+        // the way macOS/Windows do. Replaying the keys is equivalent — the
+        // layout has already changed, so they now produce that same text — and
+        // the whole sequence goes out as one batch below, so it still lands in
+        // a single frame rather than as visible retyping.
+        Fix::Layout { start, .. } => {
             let word = keys[start..].to_vec();
             Some((word.clone(), word))
         }
@@ -349,28 +357,34 @@ fn replace_word(
         )
     };
 
-    // 1a. Wait for the user to physically release the terminator and any of
-    //     the word's keys. If we inject a synthetic press while the same key
-    //     is still held by the physical keyboard, the compositor sees it as
-    //     a duplicate of the held key and drops it — which is why the
+    // 1a. Only the keys we are about to *press* matter here: a synthetic press
+    //     of a key the physical keyboard is still holding looks like a
+    //     duplicate to the compositor and gets dropped — which is how the
     //     trailing space (and occasionally the last word letter) went missing.
-    let mut keys_of_interest: HashSet<KeyCode> =
-        typed.iter().chain(retype.iter()).copied().collect();
+    //     The erased keys are not in that set; they only cost backspaces.
+    //
+    //     The user is usually still holding the space that triggered this, so
+    //     waiting it out is the single biggest source of delay before the
+    //     correction appears. Wait only briefly, then inject a synthetic
+    //     *release* for whatever is still down so the press that follows is no
+    //     longer a duplicate, and go ahead anyway.
+    let mut keys_of_interest: HashSet<KeyCode> = retype.iter().copied().collect();
     keys_of_interest.insert(terminator);
     let wait_start = Instant::now();
-    loop {
-        let still_held = {
+    let still_held: Vec<KeyCode> = loop {
+        let held: Vec<KeyCode> = {
             let st = state_mutex.lock().unwrap();
-            keys_of_interest.iter().any(|k| st.held_keys.contains(k))
+            keys_of_interest
+                .iter()
+                .copied()
+                .filter(|k| st.held_keys.contains(k))
+                .collect()
         };
-        if !still_held {
-            break;
-        }
-        if wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
-            break;
+        if held.is_empty() || wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
+            break held;
         }
         thread::sleep(Duration::from_micros(100));
-    }
+    };
 
     // 1b. Wait for the hyprctl layout switch to take effect in the compositor.
     //     hyprctl returns synchronously, so this is only the compositor's
@@ -395,6 +409,14 @@ fn replace_word(
     let delete_count = typed.len() + 1 + buffered.len(); // +1 = physical terminator
     let total_keys = delete_count + retype.len() + 1 + buffered.len();
     let mut evs: Vec<InputEvent> = Vec::with_capacity(total_keys * 4);
+    // 1c. Release anything the user is still holding (see 1a). A release for a
+    //     key this device never pressed is harmless — the compositor just sees
+    //     the key go up early, and the user's own release later is a no-op.
+    for kc in &still_held {
+        evs.push(InputEvent::new(EventType::KEY.0, kc.0, 0));
+        evs.push(syn());
+    }
+
     let mut push_key = |kc: KC| {
         evs.push(InputEvent::new(EventType::KEY.0, kc.0, 1));
         evs.push(syn());

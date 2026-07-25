@@ -1,8 +1,8 @@
 # recast — build / install / deploy
 #
 # The binary is self-contained: dictionaries are embedded at compile time
-# (`include_str!` in src/main.rs) so it can be invoked from any directory
-# without a wrapper or environment variable.
+# (prepared by build.rs, embedded in src/dictionary.rs) so it can be invoked
+# from any directory without a wrapper or environment variable.
 #
 # Common targets:
 #   make              build (release)

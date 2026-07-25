@@ -1,42 +1,132 @@
-use std::collections::{HashMap, HashSet};
+//! Word lists and the decision core.
+//!
+//! The four lists (English/Hebrew dictionaries and frequency lists) are
+//! embedded in the binary in the *prepared* form `build.rs` writes: folded,
+//! deduplicated and **sorted**, one entry per line. Sorted is the whole point —
+//! it means a lookup is a binary search straight over the embedded bytes
+//! ([`Dict`] / [`Freq`]), so the program never allocates a hash table, never
+//! parses anything at startup, and the ~11 MB of word data stays as read-only
+//! pages of the executable that the OS can drop under memory pressure rather
+//! than ~100 MB of resident heap.
+
 use std::sync::OnceLock;
 
 use crate::layout::switch_layout_to;
 use crate::types::Language;
 use crate::config::Config;
 
-/// Word → frequency rank (0-based; lower = more common). Used only to break
-/// homograph ties, never as a membership trigger.
-pub type FreqMap = HashMap<String, u32>;
-
-// Global dictionaries loaded once at runtime.
-static EN_DICTIONARY: OnceLock<HashSet<String>> = OnceLock::new();
-static HE_DICTIONARY: OnceLock<HashSet<String>> = OnceLock::new();
-
-// Global frequency-rank maps loaded once at runtime.
-static EN_FREQ: OnceLock<FreqMap> = OnceLock::new();
-static HE_FREQ: OnceLock<FreqMap> = OnceLock::new();
-
-/// Access the English dictionary (lazy init).
-pub fn en_dict() -> &'static HashSet<String> {
-    EN_DICTIONARY.get_or_init(|| parse_dictionary(include_str!("../en_dict.txt")))
+/// A sorted, `\n`-separated word list living in the binary's read-only data.
+///
+/// `Copy` and pointer-sized: it is passed around by value, and cloning it costs
+/// nothing because there is nothing to clone — the words are never copied out
+/// of the executable image.
+#[derive(Clone, Copy)]
+pub struct Dict {
+    blob: &'static str,
 }
 
-/// Access the Hebrew dictionary (lazy init).
-pub fn he_dict() -> &'static HashSet<String> {
-    HE_DICTIONARY.get_or_init(|| parse_dictionary(include_str!("../he_dict.txt")))
+/// A sorted `word\trank` list (rank 0-based; lower = more common). Used only to
+/// break homograph ties and to gate spelling suggestions, never as a membership
+/// trigger.
+#[derive(Clone, Copy)]
+pub struct Freq {
+    blob: &'static str,
 }
 
-/// Access the English frequency-rank map (lazy init).
-pub fn en_freq() -> &'static FreqMap {
-    EN_FREQ.get_or_init(|| parse_frequency(include_str!("../en_freq.txt"), true))
+impl Dict {
+    pub const fn new(blob: &'static str) -> Self {
+        Self { blob }
+    }
+
+    /// Exact membership test: a binary search over the sorted lines.
+    pub fn contains(self, word: &str) -> bool {
+        lookup(self.blob.as_bytes(), word.as_bytes()).is_some()
+    }
 }
 
-/// Access the Hebrew frequency-rank map (lazy init).
-pub fn he_freq() -> &'static FreqMap {
-    HE_FREQ.get_or_init(|| parse_frequency(include_str!("../he_freq.txt"), false))
+impl Freq {
+    pub const fn new(blob: &'static str) -> Self {
+        Self { blob }
+    }
+
+    /// Rank of `word`, if it is common enough to appear in the list.
+    pub fn rank(self, word: &str) -> Option<u32> {
+        let line = lookup(self.blob.as_bytes(), word.as_bytes())?;
+        let tab = line.iter().position(|&b| b == b'\t')?;
+        parse_rank(&line[tab + 1..])
+    }
 }
 
+/// The key of a blob line: everything before the first tab (a `Freq` line), or
+/// the whole line when there is none (a `Dict` line).
+fn key_of(line: &[u8]) -> &[u8] {
+    match line.iter().position(|&b| b == b'\t') {
+        Some(i) => &line[..i],
+        None => line,
+    }
+}
+
+fn parse_rank(bytes: &[u8]) -> Option<u32> {
+    let mut rank: u32 = 0;
+    for &b in bytes {
+        rank = rank.checked_mul(10)?.checked_add(b.checked_sub(b'0')? as u32)?;
+    }
+    Some(rank)
+}
+
+/// Binary search for the line whose key equals `needle`, over a blob whose
+/// lines are sorted by byte order.
+///
+/// The blob carries no index — a probe lands on an arbitrary byte and walks
+/// back to the start of the line it fell inside, which is what keeps the whole
+/// structure to "just the sorted text" with nothing else resident. `lo` is
+/// always the start of a line and `hi` is always a line start or the end of the
+/// blob, so each step either moves `lo` past the probed line or pulls `hi` down
+/// to it, and the window always shrinks.
+fn lookup<'a>(blob: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    let (mut lo, mut hi) = (0usize, blob.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        // Start of the line containing `mid` (never before `lo`, which is
+        // itself a line start).
+        let start = match blob[lo..mid].iter().rposition(|&b| b == b'\n') {
+            Some(i) => lo + i + 1,
+            None => lo,
+        };
+        let end = start
+            + blob[start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(blob.len() - start);
+        let line = &blob[start..end];
+        match key_of(line).cmp(needle) {
+            std::cmp::Ordering::Less => lo = end + 1,
+            std::cmp::Ordering::Greater => hi = start,
+            std::cmp::Ordering::Equal => return Some(line),
+        }
+    }
+    None
+}
+
+/// The English dictionary (sorted blob, prepared by `build.rs`).
+pub const fn en_dict() -> Dict {
+    Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_dict.blob")))
+}
+
+/// The Hebrew dictionary (sorted blob, prepared by `build.rs`).
+pub const fn he_dict() -> Dict {
+    Dict::new(include_str!(concat!(env!("OUT_DIR"), "/he_dict.blob")))
+}
+
+/// The English frequency list (sorted blob, prepared by `build.rs`).
+pub const fn en_freq() -> Freq {
+    Freq::new(include_str!(concat!(env!("OUT_DIR"), "/en_freq.blob")))
+}
+
+/// The Hebrew frequency list (sorted blob, prepared by `build.rs`).
+pub const fn he_freq() -> Freq {
+    Freq::new(include_str!(concat!(env!("OUT_DIR"), "/he_freq.blob")))
+}
 
 fn debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -53,83 +143,12 @@ fn split_enabled() -> bool {
     Config::global().split_enabled
 }
 
-/// Parse a plain-text word list (one word per line) into a `HashSet`.
-///
-/// For each entry, also inserts a punctuation-stripped variant (apostrophe and
-/// double-quote removed) so that words like `don't` match a typed `dont` —
-/// the English keymap can't produce `'`, so the original entries would
-/// otherwise be unreachable.
-///
-/// Operates on an already-loaded string (the dictionaries are embedded via
-/// `include_str!` in `main.rs`, so the binary is self-contained and can be
-/// run from any working directory).
-pub fn parse_dictionary(content: &str) -> HashSet<String> {
-    let mut dict = HashSet::with_capacity(content.len() / 8);
-    for line in content.lines() {
-        let word = line.trim();
-        if word.is_empty() {
-            continue;
-        }
-        // ASCII-only lowercase: faster than Unicode `to_lowercase`. Hebrew has
-        // no case, English entries are ASCII, so byte-level folding suffices.
-        //
-        // Every entry is kept, including short all-consonant abbreviations
-        // ("nv", "kg", "mm") that collide with Hebrew readings of the same
-        // keys. An earlier vowel-based filter dropped them, but the collision
-        // risk is handled at decision time instead (the ≤3-char gate behind
-        // `RECAST_SHORT`), so legitimate short words are never lost.
-        let lower = word.to_ascii_lowercase();
-        if lower.bytes().any(|b| b == b'\'' || b == b'"') {
-            let stripped: String =
-                lower.chars().filter(|c| *c != '\'' && *c != '"').collect();
-            if !stripped.is_empty() {
-                dict.insert(stripped);
-            }
-        }
-        dict.insert(lower);
-    }
-    dict
-}
-
-/// Parse a frequency-ordered word list (most common first, one word per line)
-/// into a rank map: `word -> line index`, so a lower value means more common.
-/// The first occurrence of a word wins (its best rank) if it repeats.
-///
-/// When `ascii_fold` is set the entry is ASCII-lowercased and an
-/// apostrophe/quote-stripped variant is added at the same rank, mirroring
-/// `parse_dictionary` so that folded lookups (e.g. `dont`) resolve.
-fn parse_frequency(content: &str, ascii_fold: bool) -> FreqMap {
-    let mut map = FreqMap::with_capacity(content.len() / 8);
-    let mut rank: u32 = 0;
-    for line in content.lines() {
-        let word = line.trim();
-        if word.is_empty() {
-            continue;
-        }
-        if ascii_fold {
-            let lower = word.to_ascii_lowercase();
-            if lower.bytes().any(|b| b == b'\'' || b == b'"') {
-                let stripped: String =
-                    lower.chars().filter(|c| *c != '\'' && *c != '"').collect();
-                if !stripped.is_empty() {
-                    map.entry(stripped).or_insert(rank);
-                }
-            }
-            map.entry(lower).or_insert(rank);
-        } else {
-            map.entry(word.to_string()).or_insert(rank);
-        }
-        rank += 1;
-    }
-    map
-}
-
-/// Frequency rank of `text` in its language's frequency map, if the word is
+/// Frequency rank of `text` in its language's frequency list, if the word is
 /// present (i.e. common enough to appear in the top-N list).
-fn freq_rank(text: &str, lang: Language, en_freq: &FreqMap, he_freq: &FreqMap) -> Option<u32> {
+fn freq_rank(text: &str, lang: Language, en_freq: Freq, he_freq: Freq) -> Option<u32> {
     match lang {
-        Language::English => en_freq.get(text).copied(),
-        Language::Hebrew => he_freq.get(text).copied(),
+        Language::English => en_freq.rank(text),
+        Language::Hebrew => he_freq.rank(text),
     }
 }
 
@@ -144,15 +163,15 @@ const FREQ_RARER_FACTOR: u32 = 10; // and be >= this many times more common than
 /// more common and should win. Conservative — it fires only when the other
 /// reading is a top-`FREQ_COMMON_MAX` word AND the current reading is either
 /// absent from the frequency list or at least `FREQ_RARER_FACTOR`× rarer. With
-/// empty frequency maps (as in unit tests) it always returns `false`, so the
+/// empty frequency lists (as in unit tests) it always returns `false`, so the
 /// prior "keep current layout" behaviour is unchanged.
 fn other_decisively_more_common(
     cur_text: &str,
     current: Language,
     oth_text: &str,
     other: Language,
-    en_freq: &FreqMap,
-    he_freq: &FreqMap,
+    en_freq: Freq,
+    he_freq: Freq,
 ) -> bool {
     if !Config::global().freq_enabled {
         return false;
@@ -180,7 +199,7 @@ const HE_PREFIXES: &[char] = &['ו', 'ה', 'ל', 'ב', 'כ', 'מ', 'ש'];
 /// directly, try stripping a leading prefix letter and looking up the rest.
 /// Only one prefix is stripped to avoid over-matching; the dictionary already
 /// holds many common prefixed forms as full entries.
-fn matches_hebrew(word: &str, dict: &HashSet<String>) -> bool {
+fn matches_hebrew(word: &str, dict: Dict) -> bool {
     if dict.contains(word) {
         return true;
     }
@@ -200,12 +219,7 @@ fn matches_hebrew(word: &str, dict: &HashSet<String>) -> bool {
 /// keystrokes are unambiguously a word in the other language, switch to it." It
 /// is strict on both sides so a name/typo is never flipped just because its
 /// prefix-stripped reading happens to be a Hebrew word.
-fn valid_strict(
-    text: &str,
-    lang: Language,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
-) -> bool {
+fn valid_strict(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool {
     if text.is_empty() {
         return false;
     }
@@ -220,12 +234,7 @@ fn valid_strict(
 /// inflectional-prefix fallback so prefixed real words (absent from the dict
 /// directly) still count and are never carved up. English has no such prefixes,
 /// so it is identical to the strict check.
-fn valid_loose(
-    text: &str,
-    lang: Language,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
-) -> bool {
+fn valid_loose(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool {
     if text.is_empty() {
         return false;
     }
@@ -261,10 +270,10 @@ fn decide_known(
     text_en: &str,
     text_he: &str,
     current: Language,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
-    en_freq: &FreqMap,
-    he_freq: &FreqMap,
+    en_dict: Dict,
+    he_dict: Dict,
+    en_freq: Freq,
+    he_freq: Freq,
 ) -> Option<Language> {
     let other = current.other();
     let cur_text = if current == Language::English { text_en } else { text_he };
@@ -305,10 +314,10 @@ fn decide_known(
 fn decide_unknown(
     text_en: &str,
     text_he: &str,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
-    en_freq: &FreqMap,
-    he_freq: &FreqMap,
+    en_dict: Dict,
+    he_dict: Dict,
+    en_freq: Freq,
+    he_freq: Freq,
 ) -> Option<Language> {
     // Short-word gate: when disabled, a ≤3-char reading never counts as a
     // trigger — the same collision guard as in `decide_known`.
@@ -339,6 +348,39 @@ fn decide_unknown(
     }
 }
 
+/// What the two correction pipelines decided to do with a finished word.
+///
+/// Exactly one of these ever comes back for a given word: the pipelines are
+/// mutually exclusive by construction (see [`plan`]), so a word that gets
+/// spell-corrected is never also layout-switched, and vice versa.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fix {
+    /// Wrong-layout mistype: the layout has already been switched, so the
+    /// caller should erase `keys[start..]` and put the corrected word in its
+    /// place. `start = 0` is the whole buffer; a non-zero `start` comes from
+    /// the missing-space split.
+    ///
+    /// Two ways to put it back, and platforms pick whichever their injection
+    /// API supports: `text` is the finished word (what `keys[start..]` spells
+    /// in the *new* layout) for platforms that insert text directly, and
+    /// replaying `keys[start..]` produces exactly the same characters now that
+    /// the layout has changed, for platforms that can only send keycodes.
+    Layout { start: usize, text: String },
+    /// Misspelling in the current (English) layout: the layout is untouched and
+    /// the caller should erase the whole word and type `text` instead. `text`
+    /// is always plain lowercase ASCII, so it is typeable through the English
+    /// keymap.
+    Spelling { text: String },
+}
+
+/// Internal counterpart of [`Fix`] that still carries the target language, so
+/// the pure planner can be tested without performing the switch.
+#[derive(Clone, Debug, PartialEq)]
+enum Plan {
+    Switch { lang: Language, start: usize },
+    Spell { text: String },
+}
+
 fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: bool) {
     if !debug_enabled() {
         return;
@@ -356,11 +398,22 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
     println!("Switch: {}", if switched { "True" } else { "False" });
 }
 
-/// Pure planning step: decide whether (and where) to switch, given the folded
-/// buffers, the per-key offset tables, and the live `current` layout. Returns
-/// `Some((target_language, start))` where `start` is the key index the acted-on
-/// word begins at (`0` = whole buffer). Kept free of any I/O so it is unit
-/// testable; the actual layout switch happens in the caller.
+/// Pure planning step: decide what to do with the word, given the folded
+/// buffers, the per-key offset tables, and the live `current` layout. Kept free
+/// of any I/O so it is unit testable; the actual layout switch happens in the
+/// caller.
+///
+/// The two pipelines run in a fixed order and the first one to produce a plan
+/// wins — a word is only ever corrected once:
+///
+///   1. **Layout** (whole buffer, then the opt-in missing-space split). It goes
+///      first because it is the *exact* signal: the keystrokes literally spell
+///      a real word in the other language, no guessing involved.
+///   2. **Spelling** (English only). Reached only when the layout pipeline
+///      declined, i.e. the keystrokes are not a word in either language. The
+///      resulting word is typed as-is and never re-examined by the layout
+///      pipeline, so a spell-corrected word whose keys happen to also read as a
+///      Hebrew word is *not* subsequently flipped.
 #[allow(clippy::too_many_arguments)]
 fn plan(
     full_en: &str,
@@ -369,11 +422,11 @@ fn plan(
     offsets_he: &[usize],
     keys_len: usize,
     current: Option<Language>,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
-    en_freq: &FreqMap,
-    he_freq: &FreqMap,
-) -> Option<(Language, usize)> {
+    en_dict: Dict,
+    he_dict: Dict,
+    en_freq: Freq,
+    he_freq: Freq,
+) -> Option<Plan> {
     // Whole-buffer decision first — this is what fires for virtually every real
     // correction.
     let whole = match current {
@@ -381,10 +434,64 @@ fn plan(
         None => decide_unknown(full_en, full_he, en_dict, he_dict, en_freq, he_freq),
     };
     if let Some(lang) = whole {
-        return Some((lang, 0));
+        return Some(Plan::Switch { lang, start: 0 });
     }
 
-    // Missing-space split: opt-in, and only meaningful when we know the layout.
+    if let Some(split) = plan_split(
+        full_en, full_he, offsets_en, offsets_he, keys_len, current, en_dict, he_dict,
+    ) {
+        return Some(split);
+    }
+
+    plan_spelling(full_en, full_he, current, en_dict, he_dict, en_freq)
+}
+
+/// Second pipeline: the word is not a mistype of the other layout, but it may
+/// be a mistype of an English word.
+///
+/// Only runs when we *know* the layout is English, for two reasons. It is a
+/// correctness requirement — the correction is injected as keystrokes, which
+/// only produce the intended letters under an English layout — and a safety one:
+/// under an unknown or Hebrew layout the English reading of the keys is not what
+/// the user is looking at, so "fixing" it would be nonsense.
+///
+/// The Hebrew reading is also required to be nothing at all, loose match
+/// included. A key sequence that reads as a prefixed Hebrew word is the layout
+/// pipeline's business (it just wasn't confident enough to switch); rewriting it
+/// as an English word would be the two pipelines fighting over one word.
+fn plan_spelling(
+    full_en: &str,
+    full_he: &str,
+    current: Option<Language>,
+    en_dict: Dict,
+    he_dict: Dict,
+    en_freq: Freq,
+) -> Option<Plan> {
+    if current != Some(Language::English) {
+        return None;
+    }
+    if valid_loose(full_he, Language::Hebrew, en_dict, he_dict) {
+        return None;
+    }
+    let text = crate::spell::correct(full_en, en_dict, en_freq)?;
+    Some(Plan::Spell { text })
+}
+
+/// Missing-space split: opt-in, and only meaningful when we know the layout.
+/// Carves `helloעולם` into two words by finding a split where the left side is
+/// a real word in the current layout and the right side is a confident word in
+/// the other one.
+#[allow(clippy::too_many_arguments)]
+fn plan_split(
+    full_en: &str,
+    full_he: &str,
+    offsets_en: &[usize],
+    offsets_he: &[usize],
+    keys_len: usize,
+    current: Option<Language>,
+    en_dict: Dict,
+    he_dict: Dict,
+) -> Option<Plan> {
     if !split_enabled() {
         return None;
     }
@@ -432,31 +539,36 @@ fn plan(
         if valid_strict(oth_suffix, other, en_dict, he_dict)
             && !valid_loose(cur_suffix, current, en_dict, he_dict)
         {
-            return Some((other, split));
+            return Some(Plan::Switch {
+                lang: other,
+                start: split,
+            });
         }
     }
 
     None
 }
 
-/// Run the layout-switch decision over a key sequence.
+/// Run both correction pipelines over a finished key sequence.
 ///
-/// Anchors on the live keyboard layout: a sequence that already reads as a real
-/// word in the current layout is never touched, and we only switch when the
-/// *other* layout yields a confident dictionary word. A missing-space split
-/// fallback exists but is opt-in (`RECAST_SPLIT=1`) because it cannot be made
-/// reliably safe.
+/// The layout pipeline anchors on the live keyboard layout: a sequence that
+/// already reads as a real word in the current layout is never touched, and we
+/// only switch when the *other* layout yields a confident dictionary word. A
+/// missing-space split fallback exists but is opt-in (`RECAST_SPLIT=1`) because
+/// it cannot be made reliably safe. Only if none of that fires does the English
+/// spelling autocorrect get a look at the word.
 ///
-/// Returns `Some(start)` when a switch was performed; the word that was acted on
-/// begins at `keys[start]` (so `start = 0` means the whole buffer). Callers
-/// should delete and retype only `keys[start..]`.
-pub fn check_and_switch_with_split<K: Copy>(
+/// Returns the single [`Fix`] to apply, or `None` to leave the word alone. For
+/// `Fix::Layout` the layout switch has already happened by the time this
+/// returns (and `None` is returned instead if the OS refused it); for
+/// `Fix::Spelling` no layout call is made at all.
+pub fn check_and_correct<K: Copy>(
     keys: &[K],
     to_en: impl Fn(K) -> Option<char>,
     to_he: impl Fn(K) -> Option<char>,
-    en_dict: &HashSet<String>,
-    he_dict: &HashSet<String>,
-) -> Option<usize> {
+    en_dict: Dict,
+    he_dict: Dict,
+) -> Option<Fix> {
     if keys.is_empty() {
         return None;
     }
@@ -469,12 +581,19 @@ pub fn check_and_switch_with_split<K: Copy>(
     // folded, so `&full_en[..offsets_en[k]]` is the prefix for `keys[..k]`
     // and `&full_en[offsets_en[k]..]` is the suffix for `keys[k..]`. Same
     // for Hebrew. Length is `keys.len() + 1`.
+    //
+    // The offset tables exist only for the missing-space split, which is off by
+    // default — when it is, they are not built at all and a finished word costs
+    // two short string allocations instead of four.
+    let want_offsets = split_enabled();
     let mut full_en = String::with_capacity(keys.len());
     let mut full_he = String::with_capacity(keys.len() * 2);
-    let mut offsets_en = Vec::with_capacity(keys.len() + 1);
-    let mut offsets_he = Vec::with_capacity(keys.len() + 1);
-    offsets_en.push(0);
-    offsets_he.push(0);
+    let mut offsets_en = Vec::with_capacity(if want_offsets { keys.len() + 1 } else { 0 });
+    let mut offsets_he = Vec::with_capacity(if want_offsets { keys.len() + 1 } else { 0 });
+    if want_offsets {
+        offsets_en.push(0);
+        offsets_he.push(0);
+    }
     for &k in keys {
         if let Some(c) = to_en(k) {
             full_en.push(c);
@@ -482,12 +601,14 @@ pub fn check_and_switch_with_split<K: Copy>(
         if let Some(c) = to_he(k) {
             full_he.push(c);
         }
-        offsets_en.push(full_en.len());
-        offsets_he.push(full_he.len());
+        if want_offsets {
+            offsets_en.push(full_en.len());
+            offsets_he.push(full_he.len());
+        }
     }
 
     let current = crate::layout::current_layout();
-    let Some((lang, start)) = plan(
+    let Some(plan) = plan(
         &full_en,
         &full_he,
         &offsets_en,
@@ -503,15 +624,65 @@ pub fn check_and_switch_with_split<K: Copy>(
         return None;
     };
 
-    let switched = switch_layout_to(lang);
-    if debug_enabled() && start > 0 {
-        println!("split @ {}", start);
+    match plan {
+        Plan::Switch { lang, start } => {
+            let switched = switch_layout_to(lang);
+            if debug_enabled() && start > 0 {
+                println!("split @ {}", start);
+            }
+            debug_log(&full_en, &full_he, Some(lang), switched);
+            // The corrected word, already spelled in the target language, for
+            // platforms that insert text instead of replaying keys. A non-zero
+            // `start` only ever comes from the split, which only runs when the
+            // offset tables were built.
+            let (full, offsets) = match lang {
+                Language::English => (&full_en, &offsets_en),
+                Language::Hebrew => (&full_he, &offsets_he),
+            };
+            let text = if start == 0 {
+                full.clone()
+            } else {
+                full[offsets[start]..].to_string()
+            };
+            // The OS refused (or was already on) the target layout: retyping now
+            // would re-enter the same characters, so do nothing.
+            switched.then_some(Fix::Layout { start, text })
+        }
+        Plan::Spell { text } => {
+            // No layout call at all — the word stays in English, only its
+            // letters change.
+            debug_log(&full_en, &full_he, None, false);
+            if debug_enabled() {
+                println!("spell: {} -> {}", full_en, text);
+            }
+            Some(Fix::Spelling { text })
+        }
     }
-    debug_log(&full_en, &full_he, Some(lang), switched);
-    if switched {
-        Some(start)
-    } else {
-        None
+}
+
+/// Test-only builders: assemble the same sorted-blob layout `build.rs` writes,
+/// from a handful of words, and leak it so it has the `'static` lifetime the
+/// real (binary-embedded) lists have.
+#[cfg(test)]
+impl Dict {
+    pub(crate) fn of(words: &[&str]) -> Dict {
+        let mut words: Vec<&str> = words.to_vec();
+        words.sort_unstable();
+        words.dedup();
+        Dict::new(Box::leak(words.join("\n").into_boxed_str()))
+    }
+}
+
+#[cfg(test)]
+impl Freq {
+    /// No word is ranked: the frequency tie-break is inert.
+    pub(crate) const EMPTY: Freq = Freq::new("");
+
+    pub(crate) fn of(entries: &[(&str, u32)]) -> Freq {
+        let mut entries: Vec<(&str, u32)> = entries.to_vec();
+        entries.sort_unstable();
+        let blob: Vec<String> = entries.iter().map(|(w, r)| format!("{w}\t{r}")).collect();
+        Freq::new(Box::leak(blob.join("\n").into_boxed_str()))
     }
 }
 
@@ -519,19 +690,64 @@ pub fn check_and_switch_with_split<K: Copy>(
 mod tests {
     use super::*;
 
-    fn dict(words: &[&str]) -> HashSet<String> {
-        words.iter().map(|w| w.to_string()).collect()
+    fn dict(words: &[&str]) -> Dict {
+        Dict::of(words)
     }
 
-    /// Empty frequency map — with these, the tie-break is inert and every test
+    /// Empty frequency list — with these, the tie-break is inert and every test
     /// below exercises the pure dictionary logic unchanged.
-    fn nofreq() -> FreqMap {
-        FreqMap::new()
+    fn nofreq() -> Freq {
+        Freq::EMPTY
     }
 
-    /// Frequency map from `(word, rank)` pairs (rank 0 = most common).
-    fn freq(entries: &[(&str, u32)]) -> FreqMap {
-        entries.iter().map(|(w, r)| (w.to_string(), *r)).collect()
+    /// Frequency list from `(word, rank)` pairs (rank 0 = most common).
+    fn freq(entries: &[(&str, u32)]) -> Freq {
+        Freq::of(entries)
+    }
+
+    #[test]
+    fn binary_search_finds_every_entry_and_nothing_else() {
+        // The lookup walks back from an arbitrary probe byte to a line start,
+        // so exercise it against a list long enough to need several probes.
+        let words = ["a", "aa", "ab", "abc", "b", "hello", "helot", "zebra", "שלום"];
+        let d = dict(&words);
+        for w in words {
+            assert!(d.contains(w), "{w}");
+        }
+        for w in ["", "aaa", "abcd", "he", "hellp", "zebras", "שלו", "~"] {
+            assert!(!d.contains(w), "{w}");
+        }
+        // Ranks come back with their entry, including the last line (no
+        // trailing newline in the blob).
+        let f = freq(&[("hello", 500), ("a", 0), ("zebra", 12_345)]);
+        assert_eq!(f.rank("a"), Some(0));
+        assert_eq!(f.rank("hello"), Some(500));
+        assert_eq!(f.rank("zebra"), Some(12_345));
+        assert_eq!(f.rank("hell"), None);
+        assert_eq!(Freq::EMPTY.rank("hello"), None);
+    }
+
+    #[test]
+    fn embedded_lists_are_sorted_and_searchable() {
+        // Guards the build-script contract: a blob that came out unsorted would
+        // make every lookup silently unreliable.
+        for blob in [en_dict().blob, he_dict().blob] {
+            assert!(blob.lines().is_sorted(), "dictionary blob not sorted");
+        }
+        for blob in [en_freq().blob, he_freq().blob] {
+            assert!(
+                blob.lines()
+                    .map(|l| l.split('\t').next().unwrap())
+                    .is_sorted(),
+                "frequency blob not sorted"
+            );
+        }
+        assert!(en_dict().contains("hello"));
+        assert!(en_dict().contains("dont")); // the folded variant of "don't"
+        assert!(!en_dict().contains("zzzqqq"));
+        assert!(he_dict().contains("שלום"));
+        assert!(en_freq().rank("the").is_some());
+        assert!(he_freq().rank("את").is_some());
     }
 
     // English word "gv" -> these are illustrative ASCII stand-ins; the real
@@ -541,9 +757,9 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         // Typing "hello" while in English layout: do nothing.
-        assert_eq!(decide_known("hello", "ימךךם", Language::English, &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_known("hello", "ימךךם", Language::English, en, he, nofreq(), nofreq()), None);
         // Typing "שלום" while in Hebrew layout: do nothing.
-        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -552,12 +768,12 @@ mod tests {
         let he = dict(&["שלום"]);
         // In Hebrew layout but the keys spell "hello" in English -> switch EN.
         assert_eq!(
-            decide_known("hello", "ימךךם", Language::Hebrew, &en, &he, &nofreq(), &nofreq()),
+            decide_known("hello", "ימךךם", Language::Hebrew, en, he, nofreq(), nofreq()),
             Some(Language::English)
         );
         // In English layout but the keys spell "שלום" in Hebrew -> switch HE.
         assert_eq!(
-            decide_known("akuo", "שלום", Language::English, &en, &he, &nofreq(), &nofreq()),
+            decide_known("akuo", "שלום", Language::English, en, he, nofreq(), nofreq()),
             Some(Language::Hebrew)
         );
     }
@@ -567,7 +783,7 @@ mod tests {
         // "שלום" is in the dict; "ושלום" not, but matches via one‑letter prefix.
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -575,7 +791,7 @@ mod tests {
         let en = dict(&["fun"]);
         let he = dict(&[]);
         // Hebrew reading = "כום"
-        assert_eq!(decide_known("fun", "כום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), Some(Language::English));
+        assert_eq!(decide_known("fun", "כום", Language::Hebrew, en, he, nofreq(), nofreq()), Some(Language::English));
     }
 
     #[test]
@@ -583,7 +799,7 @@ mod tests {
         let en = dict(&["very"]);
         let he = dict(&[]);
         // Hebrew reading = "הקרט"
-        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), Some(Language::English));
+        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, en, he, nofreq(), nofreq()), Some(Language::English));
     }
 
     #[test]
@@ -592,7 +808,7 @@ mod tests {
         // New logic switches to other layout when other dict has word.
         let en = dict(&["uakuo"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), Some(Language::English));
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, en, he, nofreq(), nofreq()), Some(Language::English));
     }
 
 
@@ -602,8 +818,8 @@ mod tests {
         // switch, regardless of the short-word config.
         let en = dict(&[]);
         let he = dict(&[]);
-        assert_eq!(decide_known("xkc", "סלב", Language::English, &en, &he, &nofreq(), &nofreq()), None);
-        assert_eq!(decide_unknown("xkc", "סלב", &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_known("xkc", "סלב", Language::English, en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_unknown("xkc", "סלב", en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -611,15 +827,15 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         assert_eq!(
-            decide_unknown("hello", "ימךךם", &en, &he, &nofreq(), &nofreq()),
+            decide_unknown("hello", "ימךךם", en, he, nofreq(), nofreq()),
             Some(Language::English)
         );
         assert_eq!(
-            decide_unknown("akuo", "שלום", &en, &he, &nofreq(), &nofreq()),
+            decide_unknown("akuo", "שלום", en, he, nofreq(), nofreq()),
             Some(Language::Hebrew)
         );
         // In neither dict → no switch.
-        assert_eq!(decide_unknown("qqqq", "ננננ", &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_unknown("qqqq", "ננננ", en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -627,8 +843,8 @@ mod tests {
         // Keys valid as a word in BOTH layouts: do not switch, preserve user intent.
         let en = dict(&["go"]);
         let he = dict(&["עט"]); // whatever the keys read as in Hebrew
-        assert_eq!(decide_known("go", "עט", Language::English, &en, &he, &nofreq(), &nofreq()), None);
-        assert_eq!(decide_known("go", "עט", Language::Hebrew, &en, &he, &nofreq(), &nofreq()), None);
+        assert_eq!(decide_known("go", "עט", Language::English, en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_known("go", "עט", Language::Hebrew, en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -641,7 +857,7 @@ mod tests {
         let en_f = freq(&[("go", 30)]); // very common
         let he_f = nofreq(); // "עט" absent from the top-N list
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, &en, &he, &en_f, &he_f),
+            decide_known("go", "עט", Language::Hebrew, en, he, en_f, he_f),
             Some(Language::English)
         );
     }
@@ -654,9 +870,100 @@ mod tests {
         let en_f = freq(&[("go", 30)]);
         let he_f = freq(&[("עט", 40)]); // comparably common, within the factor
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, &en, &he, &en_f, &he_f),
+            decide_known("go", "עט", Language::Hebrew, en, he, en_f, he_f),
             None
         );
+    }
+
+    /// Run the planner on an already-folded pair of readings. The offset tables
+    /// and key count only matter to the missing-space split, which is off by
+    /// default, so tests that don't exercise it can pass empty ones.
+    fn plan_for(
+        en_text: &str,
+        he_text: &str,
+        current: Option<Language>,
+        en: Dict,
+        he: Dict,
+        en_f: Freq,
+    ) -> Option<Plan> {
+        plan(en_text, he_text, &[], &[], 0, current, en, he, en_f, nofreq())
+    }
+
+    #[test]
+    fn spelling_fixes_a_typo_the_layout_pipeline_passed_on() {
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        let en_f = freq(&[("hello", 500)]);
+        // "helo" is not a word in English and its Hebrew reading is gibberish,
+        // so the layout pipeline declines — and the speller takes over.
+        assert_eq!(
+            plan_for("helo", "יקךם", Some(Language::English), en, he, en_f),
+            Some(Plan::Spell { text: "hello".to_string() })
+        );
+    }
+
+    #[test]
+    fn layout_switch_wins_over_spelling() {
+        // The keys are one edit from "hello" AND spell a real Hebrew word. The
+        // layout reading is exact rather than a guess, so it wins — and because
+        // a single plan comes back, the speller never also runs.
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        let en_f = freq(&[("hello", 500)]);
+        assert_eq!(
+            plan_for("helo", "שלום", Some(Language::English), en, he, en_f),
+            Some(Plan::Switch { lang: Language::Hebrew, start: 0 })
+        );
+    }
+
+    #[test]
+    fn spell_corrected_word_is_not_also_layout_switched() {
+        // The user's case: a slight misspelling gets corrected, and the fact
+        // that the *corrected* word's keys also read as a real Hebrew word must
+        // not flip it. The plan is a Spell, which performs no layout switch,
+        // and the injected keys are never fed back through the checker.
+        let en = dict(&["hello"]);
+        // "ימךךם" is what the keys of "hello" read as in Hebrew — a dictionary
+        // word here, so a re-check would have switched.
+        let he = dict(&["ימךךם", "שלום"]);
+        let en_f = freq(&[("hello", 500)]);
+        let plan = plan_for("helo", "יקךם", Some(Language::English), en, he, en_f);
+        assert_eq!(plan, Some(Plan::Spell { text: "hello".to_string() }));
+        assert!(!matches!(plan, Some(Plan::Switch { .. })));
+    }
+
+    #[test]
+    fn spelling_yields_to_a_hebrew_reading() {
+        // The Hebrew reading is a prefixed real word: not confident enough for
+        // the layout pipeline to switch, but definitely not ours to rewrite.
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        let en_f = freq(&[("hello", 500)]);
+        assert_eq!(
+            plan_for("helo", "ושלום", Some(Language::English), en, he, en_f),
+            None
+        );
+    }
+
+    #[test]
+    fn spelling_only_runs_in_a_known_english_layout() {
+        // Corrections are injected as keystrokes, so they only produce the
+        // intended letters under an English layout — anywhere else, hands off.
+        let en = dict(&["hello"]);
+        let he = dict(&[]);
+        let en_f = freq(&[("hello", 500)]);
+        assert_eq!(plan_for("helo", "יקךם", Some(Language::Hebrew), en, he, en_f), None);
+        assert_eq!(plan_for("helo", "יקךם", None, en, he, en_f), None);
+    }
+
+    #[test]
+    fn known_word_is_never_spell_corrected() {
+        // A real English word is left alone even when a far more common word is
+        // one edit away.
+        let en = dict(&["form", "from"]);
+        let he = dict(&[]);
+        let en_f = freq(&[("from", 10), ("form", 900)]);
+        assert_eq!(plan_for("form", "בםרצ", Some(Language::English), en, he, en_f), None);
     }
 
     #[test]
@@ -668,7 +975,7 @@ mod tests {
         let en_f = freq(&[("go", 9000)]); // real word, but rare
         let he_f = nofreq();
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, &en, &he, &en_f, &he_f),
+            decide_known("go", "עט", Language::Hebrew, en, he, en_f, he_f),
             None
         );
     }

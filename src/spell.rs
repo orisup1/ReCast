@@ -26,10 +26,8 @@
 //! Everything here is pure and dictionary-driven, so it is unit testable and
 //! never touches the OS.
 
-use std::collections::HashSet;
-
 use crate::config::Config;
-use crate::dictionary::FreqMap;
+use crate::dictionary::{Dict, Freq};
 
 /// Letters a candidate may be built from. The English keymap can only produce
 /// `a-z` (and digits, which are excluded from correction entirely), so
@@ -71,7 +69,7 @@ enum Tier {
 /// Thresholds come from the global config (`RECAST_SPELL*`); the actual work is
 /// in [`correct_with`], which takes them explicitly so tests don't depend on
 /// the environment.
-pub fn correct(word: &str, en_dict: &HashSet<String>, en_freq: &FreqMap) -> Option<String> {
+pub fn correct(word: &str, en_dict: Dict, en_freq: Freq) -> Option<String> {
     let cfg = Config::global();
     if !cfg.spell_enabled {
         return None;
@@ -89,8 +87,8 @@ pub fn correct(word: &str, en_dict: &HashSet<String>, en_freq: &FreqMap) -> Opti
 /// Core of [`correct`] with the tuning knobs passed in.
 pub fn correct_with(
     word: &str,
-    en_dict: &HashSet<String>,
-    en_freq: &FreqMap,
+    en_dict: Dict,
+    en_freq: Freq,
     min_len: usize,
     max_rank: u32,
     max_dist: u8,
@@ -109,7 +107,7 @@ pub fn correct_with(
     // token we would have been willing to *suggest* is not one to overwrite.
     // (The bound matters: the tail of the corpus is itself full of misspellings
     // — "adress", "goverment" — which are exactly what we are here to fix.)
-    if en_freq.get(word).is_some_and(|&rank| rank <= max_rank) {
+    if en_freq.rank(word).is_some_and(|rank| rank <= max_rank) {
         return None;
     }
 
@@ -174,14 +172,14 @@ fn consider(
     typed: &str,
     tier: Tier,
     max_rank: u32,
-    en_dict: &HashSet<String>,
-    en_freq: &FreqMap,
+    en_dict: Dict,
+    en_freq: Freq,
     best: &mut Option<(Tier, u32, String)>,
 ) {
     if !first_letter_ok(typed, cand) {
         return;
     }
-    let Some(&rank) = en_freq.get(cand) else {
+    let Some(rank) = en_freq.rank(cand) else {
         return;
     };
     if rank > max_rank || !en_dict.contains(cand) {
@@ -282,17 +280,19 @@ fn for_each_edit1(word: &str, mut f: impl FnMut(&str, Tier)) {
 mod tests {
     use super::*;
 
-    fn dict(words: &[&str]) -> HashSet<String> {
-        words.iter().map(|w| w.to_string()).collect()
+    use std::collections::HashSet;
+
+    fn dict(words: &[&str]) -> Dict {
+        Dict::of(words)
     }
 
-    fn freq(entries: &[(&str, u32)]) -> FreqMap {
-        entries.iter().map(|(w, r)| (w.to_string(), *r)).collect()
+    fn freq(entries: &[(&str, u32)]) -> Freq {
+        Freq::of(entries)
     }
 
     /// Defaults matching `Config::from_env`, so the tests exercise shipped
     /// behaviour rather than a hand-tuned configuration.
-    fn fix(word: &str, d: &HashSet<String>, f: &FreqMap) -> Option<String> {
+    fn fix(word: &str, d: Dict, f: Freq) -> Option<String> {
         correct_with(word, d, f, 4, 20_000, 1)
     }
 
@@ -302,7 +302,7 @@ mod tests {
         let f = freq(&[("hello", 500), ("hell", 4000)]);
         // "helo" is one insertion away from "hello" and one substitution away
         // from "hell"; the more common word wins.
-        assert_eq!(fix("helo", &d, &f).as_deref(), Some("hello"));
+        assert_eq!(fix("helo", d, f).as_deref(), Some("hello"));
     }
 
     #[test]
@@ -311,9 +311,9 @@ mod tests {
         // "help" is the more common word, but restoring the dropped half of the
         // "ll" is by far the likelier thing to have happened.
         let f = freq(&[("help", 140), ("hello", 203)]);
-        assert_eq!(fix("helo", &d, &f).as_deref(), Some("hello"));
+        assert_eq!(fix("helo", d, f).as_deref(), Some("hello"));
         // Same the other way round: an extra letter in a double.
-        assert_eq!(fix("hellp", &d, &f).as_deref(), Some("help"));
+        assert_eq!(fix("hellp", d, f).as_deref(), Some("help"));
     }
 
     #[test]
@@ -323,10 +323,10 @@ mod tests {
         // becoming "same".
         let d = dict(&["same"]);
         let f = freq(&[("same", 240), ("sami", 18_299)]);
-        assert_eq!(fix("sami", &d, &f), None);
+        assert_eq!(fix("sami", d, f), None);
         // The same word, unseen by the corpus, is treated as a typo.
         let f_unseen = freq(&[("same", 240)]);
-        assert_eq!(fix("sami", &d, &f_unseen).as_deref(), Some("same"));
+        assert_eq!(fix("sami", d, f_unseen).as_deref(), Some("same"));
     }
 
     #[test]
@@ -336,14 +336,14 @@ mod tests {
         // when it is seen *often*.
         let d = dict(&["address"]);
         let f = freq(&[("address", 1_141), ("adress", 42_567)]);
-        assert_eq!(fix("adress", &d, &f).as_deref(), Some("address"));
+        assert_eq!(fix("adress", d, f).as_deref(), Some("address"));
     }
 
     #[test]
     fn corrects_a_transposition() {
         let d = dict(&["their", "there"]);
         let f = freq(&[("their", 100)]);
-        assert_eq!(fix("theri", &d, &f).as_deref(), Some("their"));
+        assert_eq!(fix("theri", d, f).as_deref(), Some("their"));
     }
 
     #[test]
@@ -352,14 +352,14 @@ mod tests {
         let f = freq(&[("from", 10), ("form", 900)]);
         // "form" is a word, even though "from" is far more common: never
         // second-guess something the dictionary already knows.
-        assert_eq!(fix("form", &d, &f), None);
+        assert_eq!(fix("form", d, f), None);
     }
 
     #[test]
     fn leaves_an_unknown_word_with_no_near_match_alone() {
         let d = dict(&["hello"]);
         let f = freq(&[("hello", 500)]);
-        assert_eq!(fix("zqxjk", &d, &f), None);
+        assert_eq!(fix("zqxjk", d, f), None);
     }
 
     #[test]
@@ -369,7 +369,7 @@ mod tests {
         // common.
         let d = dict(&["work", "sort"]);
         let f = freq(&[("work", 100), ("sort", 900)]);
-        assert_eq!(fix("sork", &d, &f).as_deref(), Some("sort"));
+        assert_eq!(fix("sork", d, f).as_deref(), Some("sort"));
     }
 
     #[test]
@@ -378,7 +378,7 @@ mod tests {
         let f = freq(&[("the", 0)]);
         // Below the default minimum length, so it needs an explicit min_len.
         assert_eq!(
-            correct_with("hte", &d, &f, 3, 20_000, 1).as_deref(),
+            correct_with("hte", d, f, 3, 20_000, 1).as_deref(),
             Some("the")
         );
     }
@@ -389,7 +389,7 @@ mod tests {
         // default minimum length is what protects them.
         let d = dict(&["or", "orb"]);
         let f = freq(&[("or", 50), ("orb", 900)]);
-        assert_eq!(fix("ori", &d, &f), None);
+        assert_eq!(fix("ori", d, f), None);
     }
 
     #[test]
@@ -397,7 +397,7 @@ mod tests {
         // "helo" is one edit from "helot", but nobody meant to type "helot".
         let d = dict(&["helot"]);
         let f = freq(&[("helot", 45_000)]);
-        assert_eq!(fix("helo", &d, &f), None);
+        assert_eq!(fix("helo", d, f), None);
     }
 
     #[test]
@@ -406,14 +406,14 @@ mod tests {
         // junk) but not a dictionary word → not a suggestion.
         let d = dict(&["hello"]);
         let f = freq(&[("helo", 300), ("hella", 800)]);
-        assert_eq!(fix("hellu", &d, &f), None);
+        assert_eq!(fix("hellu", d, f), None);
     }
 
     #[test]
     fn words_with_digits_are_never_corrected() {
         let d = dict(&["test"]);
         let f = freq(&[("test", 100)]);
-        assert_eq!(fix("test1", &d, &f), None);
+        assert_eq!(fix("test1", d, f), None);
     }
 
     #[test]
@@ -421,15 +421,15 @@ mod tests {
         let d = dict(&["keyboard"]);
         let f = freq(&[("keyboard", 3_000)]);
         // Two edits (missing "y", swapped "ao") — ignored at max_dist 1.
-        assert_eq!(fix("keboadr", &d, &f), None);
+        assert_eq!(fix("keboadr", d, f), None);
         // At max_dist 2 the rank budget is max_rank / DIST2_RANK_FACTOR, so
         // 3000 passes under 20000/5 = 4000 …
         assert_eq!(
-            correct_with("keboadr", &d, &f, 4, 20_000, 2).as_deref(),
+            correct_with("keboadr", d, f, 4, 20_000, 2).as_deref(),
             Some("keyboard")
         );
         // … but the same word would not clear a tighter budget.
-        assert_eq!(correct_with("keboadr", &d, &f, 4, 10_000, 2), None);
+        assert_eq!(correct_with("keboadr", d, f, 4, 10_000, 2), None);
     }
 
     #[test]
@@ -439,7 +439,7 @@ mod tests {
         // rarer-but-closer word wins.
         let f = freq(&[("batter", 100), ("better", 5_000)]);
         assert_eq!(
-            correct_with("bettes", &d, &f, 4, 20_000, 2).as_deref(),
+            correct_with("bettes", d, f, 4, 20_000, 2).as_deref(),
             Some("better")
         );
     }

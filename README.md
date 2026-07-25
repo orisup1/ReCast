@@ -24,8 +24,11 @@ merely misspelled gets fixed in place instead.
   words whose other-layout reading happens to also be a dictionary word. It only switches
   when the *other* layout yields a confident word and the current one yields nothing real.
   This is what stops valid (and nested/prefixed) words from being mangled.
-- On a switch it erases the mistyped word and retypes it (followed by the original
-  Space/Enter), waiting until the layout change has actually propagated first.
+- On a switch it erases the mistyped word and puts the corrected one back **in one shot**,
+  the way a paste lands rather than the way typing does — followed by the original
+  Space/Enter. On macOS and Windows the word is inserted as text in a single event, so it
+  appears at once and does not depend on the layout change having propagated; on Linux the
+  whole erase + retype sequence goes to the virtual keyboard as one batch.
 - If no layout switch applies and you are typing in English, a second pipeline compares the
   word *within* English and fixes near-miss typos in place (see
   [English autocorrect](#english-autocorrect)). Only one of the two ever acts on a word.
@@ -52,7 +55,9 @@ and creates a `uinput` virtual device named `recast-injector` to replay correcte
 
 The English and Hebrew dictionaries are baked into the binary at compile time, so the
 executable is self-contained and runs identically from any working directory — no data
-files or wrapper scripts to install.
+files or wrapper scripts to install. They are baked in *sorted*, so a lookup is a binary
+search over the embedded bytes: nothing is parsed at startup and the daemon idles at a
+few MB of memory instead of ~100 MB.
 
 ## Linux: full install + autostart
 

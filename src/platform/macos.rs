@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use rdev::{simulate, EventType, Key};
 
-use crate::dictionary::{check_and_correct, Fix};
-use crate::keymap::{english_char_to_key, key_to_english_char, key_to_hebrew_char};
+use crate::dictionary::{check_and_correct, Dict, Fix};
+use crate::keymap::{key_to_english_char, key_to_hebrew_char};
 use crate::types::AppControl;
 
 /// Maximum time the replace thread will wait for the user to physically
@@ -22,6 +22,11 @@ const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
 const KEY_PRESS_GAP: Duration = Duration::from_millis(1);
 /// Gap between consecutive injected keys, for the same reason.
 const INTER_KEY_GAP: Duration = Duration::from_millis(1);
+/// Grace period between the last injected event and un-gating the listener.
+/// `CGEventPost` hands the event to the system, which delivers it to our tap on
+/// the main thread a moment later; clearing the gate immediately can let our
+/// own injected text come back in as user input.
+const INJECT_SETTLE: Duration = Duration::from_millis(2);
 
 pub struct AppState {
     pub keys: Vec<Key>,
@@ -54,6 +59,7 @@ type CFRunLoopRef = *mut c_void;
 type CFRunLoopMode = *const c_void;
 type CGEventTapProxy = *mut c_void;
 type CGEventRef = *mut c_void;
+type CGEventSourceRef = *mut c_void;
 type CFIndex = isize;
 
 const KCG_HID_EVENT_TAP: u32 = 0;
@@ -93,6 +99,21 @@ extern "C" {
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+
+    // Text injection (see `paste_text`). A keyboard event carrying a Unicode
+    // string inserts the whole string at once, independent of the active
+    // layout — the OS treats it as typed text rather than key positions.
+    fn CGEventCreateKeyboardEvent(
+        source: CGEventSourceRef,
+        virtual_key: u16,
+        key_down: bool,
+    ) -> CGEventRef;
+    fn CGEventKeyboardSetUnicodeString(
+        event: CGEventRef,
+        string_length: usize,
+        unicode_string: *const u16,
+    );
+    fn CGEventPost(tap: u32, event: CGEventRef);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -196,8 +217,8 @@ fn key_from_code(code: u16) -> Key {
 struct TapContext {
     state: Arc<Mutex<AppState>>,
     control: Arc<AppControl>,
-    en_dict: &'static HashSet<String>,
-    he_dict: &'static HashSet<String>,
+    en_dict: Dict,
+    he_dict: Dict,
     injecting: Arc<AtomicBool>,
 }
 
@@ -283,10 +304,10 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                     &st.keys,
                     key_to_english_char,
                     key_to_hebrew_char,
-                    &ctx.en_dict,
-                    &ctx.he_dict,
+                    ctx.en_dict,
+                    ctx.he_dict,
                 );
-                if let Some((typed, retype)) = replacement(&st.keys, result) {
+                if let Some((erase, text)) = replacement(&st.keys, result) {
                     ctx.control.record_fix();
                     st.is_replacing = true;
                     let state_clone = Arc::clone(&ctx.state);
@@ -294,7 +315,7 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                     let injecting_flag = Arc::clone(&ctx.injecting);
 
                     thread::spawn(move || {
-                        replace_word(typed, retype, terminator, &state_clone, &injecting_flag);
+                        replace_word(erase, text, terminator, &state_clone, &injecting_flag);
                     });
                 }
                 st.keys.clear();
@@ -367,8 +388,8 @@ impl Drop for EventTapHandle {
 /// the main thread to the menubar tray. Keeping it here means changes to the
 /// macOS launch path can't touch the Linux or Windows paths.
 pub fn start(
-    en: &'static HashSet<String>,
-    he: &'static HashSet<String>,
+    en: Dict,
+    he: Dict,
     control: Arc<AppControl>,
     with_gui: bool,
 ) {
@@ -389,8 +410,8 @@ pub fn start(
 /// needed for keyboard capture (and the OS doesn't kill us for running a tap
 /// on the "wrong" run loop).
 pub fn setup_event_tap(
-    en_dict: &'static HashSet<String>,
-    he_dict: &'static HashSet<String>,
+    en_dict: Dict,
+    he_dict: Dict,
     control: Arc<AppControl>,
 ) -> Option<EventTapHandle> {
     println!("Starting recast keyboard watcher (macOS)...");
@@ -443,54 +464,80 @@ pub fn setup_event_tap(
     }
 }
 
-/// Turn a [`Fix`] into the pair the replace thread needs: the keys the user
-/// actually typed (which is what has to be erased) and the keys to inject in
-/// their place. See `linux.rs` for the reasoning; kept per-platform because the
-/// key type is the platform's own.
-fn replacement(keys: &[Key], fix: Option<Fix>) -> Option<(Vec<Key>, Vec<Key>)> {
+/// Turn a [`Fix`] into what the replace thread needs: how many of the typed
+/// keys have to be erased, and the finished text to put in their place.
+///
+/// Unlike Linux (which can only replay keycodes through `uinput`), macOS can
+/// insert the characters themselves, so both kinds of fix reduce to the same
+/// thing — erase N, insert a string — and neither depends on the keys being
+/// typeable under the active layout.
+fn replacement(keys: &[Key], fix: Option<Fix>) -> Option<(usize, String)> {
     match fix? {
-        Fix::Layout { start } => {
-            let word = keys[start..].to_vec();
-            Some((word.clone(), word))
-        }
-        Fix::Spelling { text } => {
-            let retype: Option<Vec<Key>> = text.chars().map(english_char_to_key).collect();
-            Some((keys.to_vec(), retype?))
+        // Anything before `start` is a previously-typed word the user
+        // concatenated by forgetting a space; leave it intact.
+        Fix::Layout { start, text } => Some((keys.len() - start, text)),
+        Fix::Spelling { text } => Some((keys.len(), text)),
+    }
+}
+
+/// Insert `text` as one event, the way a paste lands rather than the way typing
+/// does.
+///
+/// Posting the word character by character meant one `CGEvent` per letter, each
+/// needing pacing the OS wouldn't drop — tens of milliseconds of visible
+/// retyping. A single keyboard event carrying the whole Unicode string arrives
+/// atomically, and because it carries characters rather than key positions the
+/// result is exactly the corrected word whatever layout is active.
+fn paste_text(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    unsafe {
+        // A press/release pair: some applications only act on one of the two,
+        // and the string is attached to both so either order works.
+        for down in [true, false] {
+            let event = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, down);
+            if event.is_null() {
+                return;
+            }
+            CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
+            CGEventPost(KCG_HID_EVENT_TAP, event);
+            CFRelease(event as *const c_void);
         }
     }
 }
 
-/// Erase the word the user typed and inject the corrected one: the same keys
-/// after a layout switch, or different keys for a spelling fix.
+/// Erase the word the user typed and put the corrected one in its place.
 fn replace_word(
-    typed: Vec<Key>,
-    retype: Vec<Key>,
+    erase: usize,
+    text: String,
     terminator: Key,
     state_mutex: &Arc<Mutex<AppState>>,
     injecting: &Arc<AtomicBool>,
 ) {
-    // 1. Wait for the user to physically release the terminator and any of
-    //    the word's keys before injecting. injecting=false here so release
-    //    events from the listener still update held_keys.
-    let mut keys_of_interest: HashSet<Key> = typed.iter().chain(retype.iter()).copied().collect();
-    keys_of_interest.insert(terminator);
-    let wait_start = Instant::now();
-    loop {
-        let still_held = {
-            let st = state_mutex.lock().unwrap();
-            keys_of_interest.iter().any(|k| st.held_keys.contains(k))
-        };
-        if !still_held {
-            break;
+    // 1. The corrected word goes in as text, so the only real key we press is
+    //    Return (a space rides along inside the text instead). Wait for the
+    //    user to lift it first: a synthetic press of a still-held key is
+    //    swallowed as a duplicate. injecting=false here so release events from
+    //    the listener still update held_keys.
+    let needs_return = terminator == Key::Return;
+    if needs_return {
+        let wait_start = Instant::now();
+        loop {
+            let still_held = {
+                let st = state_mutex.lock().unwrap();
+                st.held_keys.contains(&Key::Return)
+            };
+            if !still_held || wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
+                break;
+            }
+            thread::sleep(Duration::from_micros(100));
         }
-        if wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
-            break;
-        }
-        thread::sleep(Duration::from_micros(100));
     }
 
-    // 2. switch_layout_to already polled until the new layout took effect, so
-    //    no settle delay is needed here — the retype lands in the right layout.
+    // 2. switch_layout_to already polled until the new layout took effect, and
+    //    the pasted text is layout-independent anyway.
 
     // 3. Gate the listener now that we are about to inject our own events.
     injecting.store(true, Ordering::Relaxed);
@@ -500,7 +547,9 @@ fn replace_word(
         st.buffered_keys.clone()
     };
 
-    // Press + release a single key with pacing that macOS won't drop.
+    // Press + release a single key with pacing that macOS won't drop. Only the
+    // backspaces and the odd replayed key go through this now; the word itself
+    // is one event.
     let tap_key = |k: Key| {
         let _ = simulate(&EventType::KeyPress(k));
         thread::sleep(KEY_PRESS_GAP);
@@ -508,18 +557,26 @@ fn replace_word(
         thread::sleep(INTER_KEY_GAP);
     };
 
-    let delete_count = typed.len() + 1 + buf.len();
+    // +1 for the terminator the user physically typed.
+    let delete_count = erase + 1 + buf.len();
     for _ in 0..delete_count {
         tap_key(Key::Backspace);
     }
-    for k in &retype {
-        tap_key(*k);
+    if needs_return {
+        paste_text(&text);
+        tap_key(Key::Return);
+    } else {
+        // The trailing space is part of the same paste, so nothing has to be
+        // pressed at all.
+        paste_text(&format!("{text} "));
     }
-    tap_key(terminator);
+    // Keys the user managed to type while we were replacing: replayed as keys
+    // (they are physical key positions, not text) once the word is back.
     for k in buf.iter() {
         tap_key(*k);
     }
 
+    thread::sleep(INJECT_SETTLE);
     let mut st = state_mutex.lock().unwrap();
     st.keys = buf;
     st.buffered_keys.clear();
