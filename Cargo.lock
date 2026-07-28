@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "recast"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "cocoa 0.24.1",
