@@ -8,14 +8,15 @@ ReCast is a small background helper that watches what you type, checks each fini
 against language dictionaries, and automatically switches the keyboard layout between
 English and Hebrew when it looks like you are typing in the wrong layout — then retypes the
 mistyped word in the correct layout. It also autocorrects English typos, so a word that is
-merely misspelled gets fixed in place instead.
+merely misspelled gets fixed in place instead — and completes words you are still typing.
 
 ## How it works
 
 - Captures global key events on every supported platform.
-- Builds up the current word from key presses; resets the buffer on cursor / focus-shifting
-  keys (Tab, Escape, arrows, Home/End, PgUp/PgDn, Insert, Delete) and on mouse clicks
-  (macOS / Windows).
+- Builds up the current word from key presses, remembering the Shift / Caps Lock state of
+  each one so a correction comes back capitalized the way you typed it; resets the buffer on
+  cursor / focus-shifting keys (Tab, Escape, arrows, Home/End, PgUp/PgDn, Insert, Delete)
+  and on mouse clicks (macOS / Windows).
 - When you press Space or Enter, it interprets the typed key sequence as both an English
   and a Hebrew word and looks each up in the matching dictionary.
 - It **anchors on your live keyboard layout** (queried from the OS, with any English or
@@ -32,6 +33,11 @@ merely misspelled gets fixed in place instead.
 - If no layout switch applies and you are typing in English, a second pipeline compares the
   word *within* English and fixes near-miss typos in place (see
   [English autocorrect](#english-autocorrect)). Only one of the two ever acts on a word.
+- Tapping **Right Shift** mid-word completes it — tap again to cycle through the other
+  guesses — and abbreviations you define expand when the word is finished (see
+  [Auto-complete](#auto-complete)).
+- Tapping **Ctrl twice** right after a correction puts back what you typed and stops that
+  word being corrected again (see [Undo](#undo)).
 - Missing-space splitting (carving `helloעולם` into two words) is **opt-in** via
   `RECAST_SPLIT=1`; it is off by default because it cannot reliably tell a word we simply
   don't have in the dictionary from two run-together words.
@@ -52,6 +58,24 @@ and creates a `uinput` virtual device named `recast-injector` to replay correcte
 1. Install Rust (`rustup`, `cargo`).
 2. Make sure both English and Hebrew layouts are installed in your OS keyboard settings.
    On Linux/Hyprland the xkb config must list English as layout 0 and Hebrew as layout 1.
+
+### Prebuilt binaries
+
+`exec/` holds ready-to-run builds if you would rather not install a toolchain. They are
+self-contained — the dictionaries are inside the executable — so there is nothing to
+unpack alongside them:
+
+| File               | Target                                                     |
+| ------------------ | ---------------------------------------------------------- |
+| `exec/recastLinux` | Linux x86-64                                               |
+| `exec/ReCast.exe`  | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
+| `exec/recastMac`   | macOS x86-64                                               |
+| `exec/ReCast.app`  | macOS bundle                                               |
+
+They are committed artifacts rather than build output, so they are only as current as the
+last time someone refreshed them — the Linux and Windows builds track this README, the
+macOS ones lag behind and are best rebuilt from source (`make service`). Building yourself
+is still the recommended path; these exist so you can try it in one step.
 
 The English and Hebrew dictionaries are baked into the binary at compile time, so the
 executable is self-contained and runs identically from any working directory — no data
@@ -152,8 +176,16 @@ RECAST_SPELL=0 recast   # disable the English spelling autocorrect (on by defaul
 
 RECAST_SPELL_MIN=5    recast  # shortest word the autocorrect may fix (default 4)
 RECAST_SPELL_RANK=10000 recast  # how common a suggestion must be (default 20000)
-RECAST_SPELL_DIST=2   recast  # also fix two-edit typos on longer words (default 1)
+RECAST_SPELL_DIST=1   recast  # cap the autocorrect at single-edit typos (default 3)
+
+RECAST_COMPLETE=0 recast        # disable auto-complete entirely (on by default)
+RECAST_COMPLETE_MIN=4 recast    # shortest prefix Right Shift will complete (default 3)
+RECAST_COMPLETE_RANK=10000 recast  # how common a completion must be (default 30000)
 ```
+
+`RECAST_DEBUG=1` prints **every word you type** — under a service that means into your
+system log, password fields included, since ReCast cannot tell one text field from
+another. Use it while diagnosing something, not as a standing setting.
 
 When a key sequence spells a real word in **both** layouts (a homograph
 collision), ReCast normally keeps whatever layout you are in. The frequency
@@ -186,19 +218,167 @@ word is only corrected when all of this holds:
   `github` are left alone),
 - it is at least `RECAST_SPELL_MIN` characters (default 4), all letters — no
   digits, so identifiers survive,
-- the correction is one edit away (`RECAST_SPELL_DIST=2` also allows two on
-  words of 6+ characters, with a 5× stricter frequency bar),
+- it is not typed in ALL CAPS — acronyms are not misspellings,
+- it is not listed in your own `ignore.txt` (see below),
+- the correction is inside the edit budget for a word that length: one edit up to
+  6 characters, two from 7, three from 10, capped by `RECAST_SPELL_DIST`
+  (default 3 — set it to 1 for single-typo fixes only),
 - the correction is a common word, within `RECAST_SPELL_RANK` (default 20000),
-- the correction keeps your first letter — except for a swap of the first two.
+  halved past one edit and divided by five past two.
 
-Among the survivors, finger slips (a swapped pair, a doubled letter typed once
-or twice) beat plain misspellings, and the more common word breaks the tie.
-Unavoidably, jargon absent from an everyday corpus can still be "fixed"
-(`impl` → `imply`); `RECAST_SPELL=0` turns the whole pipeline off.
+### How it picks
 
-The two pipelines are mutually exclusive: each finished word gets **one**
-correction or none. The layout switch is tried first, because it is exact — the
-keystrokes literally spell a real word in the other language — and only if it
-declines does the speller get a look. A word that the speller fixes is typed as
+It is a noisy-channel corrector, the standard formulation from Kernighan, Church
+and Gale: the user knew the word they wanted and their hands (or their memory of
+the spelling) turned it into what we saw, so the answer maximises
+`P(word) × P(typo | word)` — how likely anyone was to want that word at all,
+times how likely that word was to come out looking like this. **Both** matter.
+Ranking by edit distance and using frequency only to break ties, the way most
+simple correctors do, quietly makes the second factor infinitely more important
+than the first; here the two are added in log space, so a candidate can win
+either by being the likelier slip or by being the far likelier word.
+
+Distance is *weighted*, not counted: the mistakes people actually make cost less
+than a full edit. Dropping or doubling one half of a double letter is the
+cheapest, then a transposition, then hitting the key physically next to the right
+one, then a vowel-for-vowel swap; anything else is a plain edit. So `helo` →
+`hello` beats `helo` → `help` even though `help` is the more common word — but
+make `help` a hundred times more common and it wins after all.
+
+On top of single letters there is a table of **whole-string confusions** —
+`ant`↔`ent`, `ance`↔`ence`, `ie`↔`ei`, `able`↔`ible`, `f`↔`ph`, `n`↔`kn`,
+`r`↔`wr`, `c`↔`k`, `i`↔`y` and a few dozen more. This is Brill and Moore's error
+model: a writer who types `apparant` made *one* decision about how the word is
+spelled, not three unrelated slips, and pricing it as one is what brings it into
+range. It is also what lets a phonetic respelling be found at all — `fisical` and
+`physical` share barely half their letters, but only one rule apart.
+
+Edits are priced by *where* in the word they land, too. Getting the opening of a
+word wrong is rare and rewriting it is the most damaging thing this can do, so a
+first-letter edit carries a heavy surcharge and a plain wrong first letter is out
+of reach entirely — with two exceptions, both of which keep the letters you
+typed: a transposed opening (`hte` → `the`) and a word-initial spelling rule
+(`fone` → `phone`).
+
+Together that is what makes badly mangled words reachable — `recieveing` →
+`receiving`, `beutifull` → `beautiful`, `maintainance` → `maintenance`,
+`restaraunt` → `restaurant` — where a strict one-edit speller had to give up.
+
+The wider budget has a cost: an 8-letter piece of jargon two slips from a common
+word is exactly the shape this is built to fix, so `hostname` → `hostage` and
+`postgres` → `posters` are the sort of thing that can happen (as `impl` → `imply`
+already could at one edit). Ways out: double-tap Ctrl on the spot (see
+[Undo](#undo)); list the words you type in `<config dir>/recast/ignore.txt`, one
+per line; set `RECAST_SPELL_DIST=1` for the old single-edit behaviour; or
+`RECAST_SPELL=0` to turn the pipeline off. The double-tap is also how a word
+comes *back off* either list, so nothing you retire is retired for good.
+
+What it deliberately does not do is look at the surrounding words. Every
+published evaluation of this kind of corrector puts the ceiling for single-word
+correction well below what context-aware models reach, and correcting a word that
+is *already* a real word (`from` for `form`) needs that context. ReCast never
+touches a word the dictionary knows, so it stays on the safe side of that line.
+
+## Auto-complete
+
+Two ways to type less, both off the same word buffer and both English-only (the
+result is injected as English text or keystrokes, so it only comes out right
+under an English layout).
+
+**Tap Right Shift** mid-word and ReCast finishes it (`recei` → `received`,
+`tomo` → `tomorrow`). Right Shift is the trigger because it is the only key on
+every keyboard that types nothing and means nothing to the app you are in: a tap
+of it can't move focus, indent a line or open your editor's own completion popup
+the way Tab would, so nothing has to be undone when ReCast declines. Holding it
+to type a capital is unaffected — only a tap with nothing pressed in between
+counts.
+
+**Tap it again to cycle.** The first guess is not always the word you meant, so
+the next tap swaps in the next candidate, and tapping past the end of the short
+list hands back exactly what you typed, capitalization included. That is what
+makes guessing affordable: a wrong completion costs one more tap, not a word's
+worth of deletion — and it is why the completer is allowed to guess at all.
+
+Candidates are ranked by **what the tap saves you**, not by raw frequency: the
+value of an offer is the letters it fills in weighted by how likely that word is
+(`P ∝ 1/rank`), so completing a five-letter prefix by one letter loses to a word
+that finishes it outright. Frequency still dominates a lopsided pair — `tomo`
+completes to `tomorrow`, not to a longer, rarer relative — it only decides
+between candidates that were already close.
+
+**Abbreviations** you define expand when you finish the word — and the first tap
+of Right Shift offers one too, since a rule you wrote by hand beats anything
+guessed from a corpus. Put them in `<config dir>/recast/abbrev.txt`, one per
+line:
+
+```
+# comments start with #
+btw = by the way
+addr = 1 Main Street, Tel Aviv
+ty	thank you
+```
+
+Nothing is built in: the file starts absent and the feature stays inert until you
+put something in it. The expansion takes priority over every other pipeline —
+you wrote the rule, so nothing overrules it — and it follows the capitalization
+you typed (`Btw` → `By the way`, `BTW` → `BY THE WAY`).
+
+`RECAST_COMPLETE=0` turns both off.
+
+## Undo
+
+**Tap Ctrl twice, quickly**, right after a correction and ReCast puts back what
+you actually typed — and switches the layout back too, if that is what the
+correction changed. Ctrl is the second gesture key for the same reason Right
+Shift is the first: on its own it types nothing and means nothing to the app you
+are in, so the gesture can't leak a keystroke into your document. Holding Ctrl
+for a shortcut is unaffected; only two bare press-and-release pairs inside half a
+second count.
+
+Undo erases backwards from the cursor, so it is only offered for the correction
+the cursor is **still sitting on**. Type anything else — even a space — and that
+correction is final and the next double-tap does nothing. This is the same
+bargain macOS and iOS make, and it is what stops a mistimed double-tap from
+eating text further back.
+
+Putting the letters back is only half of it. A correction is a *function* of what
+you typed, so retyping the same word reaches the same conclusion — an undo that
+only rewrote the screen would put you on a treadmill. So undoing a word also
+**retires** it: nothing corrects that word again until ReCast restarts. That is
+the fast path for the `hostname` → `hostage` case, and `ignore.txt` is still how
+you make it permanent.
+
+A completion can be taken back the same way, though tapping Right Shift around
+the cycle gets you there without the gesture.
+
+### …and the same gesture puts a word back in play
+
+The double-tap is a **toggle**, so it also works in the other direction. Type a
+word you have retired — one you undid earlier, or one sitting in `ignore.txt` —
+and nothing happens to it, as you asked. Double-tap Ctrl right there and ReCast
+takes it off the list and corrects it after all:
+
+```
+hostname ⇥                 you undid this earlier, so nothing happens
+Ctrl Ctrl                  → hostage      (and hostname is off the list again)
+```
+
+Coming off the list means coming off it properly: the entry is removed from
+`ignore.txt` on disk as well as from memory, so it does not come back at the next
+restart. Only lines that *are* that word are removed — your comments, spacing and
+every other entry are copied through byte for byte, and the file is replaced by
+rename so an interrupted write can't leave you with half a list.
+
+Which direction the gesture takes is decided by what happened to the word, never
+by how you tap: a word that was just corrected gets the correction taken back, a
+word that was just passed over because it is listed gets un-listed. A word that
+is simply spelled correctly arms nothing, and the gesture does nothing at all.
+
+## One fix per word
+
+The pipelines are mutually exclusive: each finished word gets **one** correction
+or none. An abbreviation expansion goes first (you defined it by hand), then the
+layout switch, because it is exact — the keystrokes literally spell a real word
+in the other language — and only if that declines does the speller get a look. A word that the speller fixes is typed as
 its corrected self and never re-examined, so it is not then flipped to the other
 layout even if its keys happen to spell a Hebrew word too.

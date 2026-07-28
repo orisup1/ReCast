@@ -49,6 +49,24 @@ pub fn english_char_to_evkey(c: char) -> Option<evdev::KeyCode> {
     })
 }
 
+/// Like [`english_char_to_evkey`], but also covers the characters a *replacement*
+/// can contain that the word buffer itself never holds: capitals (from case
+/// tracking) and spaces (from a multi-word abbreviation expansion). Returns the
+/// key plus whether shift has to be held while pressing it.
+///
+/// Linux only, and for the same reason as its unshifted sibling: `uinput` speaks
+/// keycodes, so anything we put back has to be spelled out as key presses.
+#[cfg(target_os = "linux")]
+pub fn english_char_to_evkey_shifted(c: char) -> Option<(evdev::KeyCode, bool)> {
+    if c == ' ' {
+        return Some((evdev::KeyCode::KEY_SPACE, false));
+    }
+    if c.is_ascii_uppercase() {
+        return english_char_to_evkey(c.to_ascii_lowercase()).map(|k| (k, true));
+    }
+    english_char_to_evkey(c).map(|k| (k, false))
+}
+
 #[cfg(target_os = "linux")]
 pub fn evkey_to_hebrew_char(key: evdev::KeyCode) -> Option<char> {
     use evdev::KeyCode as K;
@@ -97,6 +115,37 @@ pub fn key_to_english_char(key: rdev::Key) -> Option<char> {
         K::Num0 => Some('0'),
         _ => None,
     }
+}
+
+/// Inverse of [`key_to_english_char`]: the key that types `c` under an English
+/// layout, plus whether shift has to be held for it.
+///
+/// macOS and Windows inject a correction as *text*, so unlike Linux they never
+/// need this to type anything. It exists to put words back into the *word
+/// buffer*: after a completion the buffer has to hold the finished word rather
+/// than the prefix the user typed, or the next Space would check a string that
+/// is not what is on screen.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn english_char_to_key(c: char) -> Option<(rdev::Key, bool)> {
+    use rdev::Key as K;
+    if c == ' ' {
+        return Some((K::Space, false));
+    }
+    let shift = c.is_ascii_uppercase();
+    let key = match c.to_ascii_lowercase() {
+        'a' => K::KeyA, 'b' => K::KeyB, 'c' => K::KeyC, 'd' => K::KeyD,
+        'e' => K::KeyE, 'f' => K::KeyF, 'g' => K::KeyG, 'h' => K::KeyH,
+        'i' => K::KeyI, 'j' => K::KeyJ, 'k' => K::KeyK, 'l' => K::KeyL,
+        'm' => K::KeyM, 'n' => K::KeyN, 'o' => K::KeyO, 'p' => K::KeyP,
+        'q' => K::KeyQ, 'r' => K::KeyR, 's' => K::KeyS, 't' => K::KeyT,
+        'u' => K::KeyU, 'v' => K::KeyV, 'w' => K::KeyW, 'x' => K::KeyX,
+        'y' => K::KeyY, 'z' => K::KeyZ,
+        '1' => K::Num1, '2' => K::Num2, '3' => K::Num3, '4' => K::Num4,
+        '5' => K::Num5, '6' => K::Num6, '7' => K::Num7, '8' => K::Num8,
+        '9' => K::Num9, '0' => K::Num0,
+        _ => return None,
+    };
+    Some((key, shift))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -149,5 +198,26 @@ mod tests {
         for c in ['A', ' ', '\'', 'ש', '-'] {
             assert_eq!(english_char_to_evkey(c), None, "{c}");
         }
+    }
+
+    /// The macOS/Windows inverse map refills the word buffer after a
+    /// completion, so a wrong entry there desynchronises the buffer from the
+    /// screen. Pin it to the forward map the same way.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn english_key_map_round_trips_for_rdev() {
+        use super::{english_char_to_key, key_to_english_char};
+
+        for c in 'a'..='z' {
+            let (key, shift) = english_char_to_key(c).expect("letter must be typeable");
+            assert!(!shift, "{c}");
+            assert_eq!(key_to_english_char(key), Some(c), "{c}");
+            // A capital is the same key with shift held.
+            let upper = c.to_ascii_uppercase();
+            assert_eq!(english_char_to_key(upper), Some((key, true)), "{upper}");
+        }
+        // An expansion may contain spaces; nothing else outside the map does.
+        assert_eq!(english_char_to_key(' ').map(|(_, s)| s), Some(false));
+        assert_eq!(english_char_to_key('ש'), None);
     }
 }

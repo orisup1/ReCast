@@ -36,6 +36,9 @@ impl Config {
             spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
             spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
             spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
+            complete_enabled: true,
+            complete_min_len: crate::config::DEFAULT_COMPLETE_MIN_LEN,
+            complete_max_rank: crate::config::DEFAULT_COMPLETE_MAX_RANK,
         })
     }
 }
@@ -70,5 +73,16 @@ impl AppControl {
 
     pub fn record_fix(&self) {
         self.fixed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A fix was taken back by the undo gesture, so it should stop counting as
+    /// one. Saturates at zero rather than wrapping — the counter is a tally the
+    /// user reads, not an audit trail.
+    pub fn record_undo(&self) {
+        let _ = self
+            .fixed_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 }

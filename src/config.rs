@@ -23,15 +23,32 @@ pub struct Config {
     /// suggestion to a word people actually type.
     pub spell_max_rank: u32,
     /// Maximum edit distance for a spelling suggestion (0 disables, 1 = only
-    /// single-typo fixes, 2 = also two-edit fixes on longer words).
+    /// single-typo fixes, 2–3 = also badly mangled words). The word's own
+    /// length caps this further: two edits need 7 characters and three need 10,
+    /// so raising it only ever affects words long enough to survive it.
     pub spell_max_dist: u8,
+    /// Enable auto-complete: the completion key finishes the word being typed,
+    /// and abbreviations from `<config>/recast/abbrev.txt` expand when a word
+    /// is finished.
+    pub complete_enabled: bool,
+    /// Shortest partial word the completer will finish. One or two letters
+    /// match too many words for the most common one to be a good guess.
+    pub complete_min_len: usize,
+    /// Worst frequency rank a completion may have — the same idea as
+    /// `spell_max_rank`, but looser, because a completion is asked for.
+    pub complete_max_rank: u32,
 }
 
 /// Shipped defaults for the spelling autocorrect. Deliberately conservative:
 /// a missed correction is invisible, a wrong one rewrites the user's text.
 pub const DEFAULT_SPELL_MIN_LEN: usize = 4;
 pub const DEFAULT_SPELL_MAX_RANK: u32 = 20_000;
-pub const DEFAULT_SPELL_MAX_DIST: u8 = 1;
+pub const DEFAULT_SPELL_MAX_DIST: u8 = 3;
+
+/// Shipped defaults for auto-complete. Looser than the speller's, because a
+/// completion only ever happens when the user presses the key for it.
+pub const DEFAULT_COMPLETE_MIN_LEN: usize = 3;
+pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
 
 impl Config {
     /// Load configuration from environment variables.
@@ -46,7 +63,12 @@ impl Config {
     /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
     /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
     ///                     (default: 20000).
-    /// RECAST_SPELL_DIST – maximum edit distance, 1 or 2 (default: 1).
+    /// RECAST_SPELL_DIST – maximum edit distance, 1 to 3 (default: 3).
+    /// RECAST_COMPLETE   – set to `0` to disable auto-complete (default:
+    ///                     enabled).
+    /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 3).
+    /// RECAST_COMPLETE_RANK – worst frequency rank a completion may have
+    ///                        (default: 30000).
     pub fn from_env() -> Self {
         Self {
             short_enabled: std::env::var("RECAST_SHORT")
@@ -64,6 +86,11 @@ impl Config {
             spell_min_len: env_num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),
             spell_max_rank: env_num("RECAST_SPELL_RANK", DEFAULT_SPELL_MAX_RANK),
             spell_max_dist: env_num("RECAST_SPELL_DIST", DEFAULT_SPELL_MAX_DIST),
+            complete_enabled: std::env::var("RECAST_COMPLETE")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            complete_min_len: env_num("RECAST_COMPLETE_MIN", DEFAULT_COMPLETE_MIN_LEN),
+            complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
         }
     }
 }

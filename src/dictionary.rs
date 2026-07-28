@@ -55,6 +55,37 @@ impl Freq {
         let tab = line.iter().position(|&b| b == b'\t')?;
         parse_rank(&line[tab + 1..])
     }
+
+    /// Call `f(word, rank)` for every entry starting with `prefix`, in list
+    /// order.
+    ///
+    /// Because the blob is sorted, those entries are one contiguous run: a
+    /// binary search finds where it starts and the walk stops at the first line
+    /// that no longer matches. This is what lets the speller and the completer
+    /// consider "every common word beginning with h" without paying for the
+    /// other 96% of the list.
+    pub fn for_each_with_prefix(self, prefix: &str, mut f: impl FnMut(&str, u32)) {
+        let blob = self.blob.as_bytes();
+        let mut pos = lower_bound(blob, prefix.as_bytes());
+        while pos < blob.len() {
+            let end = pos + blob[pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(blob.len() - pos);
+            let line = &blob[pos..end];
+            let key = key_of(line);
+            if !key.starts_with(prefix.as_bytes()) {
+                return;
+            }
+            if let (Ok(word), Some(rank)) = (
+                std::str::from_utf8(key),
+                line.get(key.len() + 1..).and_then(parse_rank),
+            ) {
+                f(word, rank);
+            }
+            pos = end + 1;
+        }
+    }
 }
 
 /// The key of a blob line: everything before the first tab (a `Freq` line), or
@@ -106,6 +137,32 @@ fn lookup<'a>(blob: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
         }
     }
     None
+}
+
+/// Byte offset of the first line whose key is `>= needle`, or the end of the
+/// blob when there is none. The mirror of [`lookup`] for range queries: the
+/// same walk-back-to-a-line-start probe, keeping the answer on a line boundary
+/// so the caller can read forward from it.
+fn lower_bound(blob: &[u8], needle: &[u8]) -> usize {
+    let (mut lo, mut hi) = (0usize, blob.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let start = match blob[lo..mid].iter().rposition(|&b| b == b'\n') {
+            Some(i) => lo + i + 1,
+            None => lo,
+        };
+        let end = start
+            + blob[start..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(blob.len() - start);
+        if key_of(&blob[start..end]) < needle {
+            lo = end + 1;
+        } else {
+            hi = start;
+        }
+    }
+    lo.min(blob.len())
 }
 
 /// The English dictionary (sorted blob, prepared by `build.rs`).
@@ -348,7 +405,58 @@ fn decide_unknown(
     }
 }
 
-/// What the two correction pipelines decided to do with a finished word.
+/// The capitalization the user typed, recovered from the shift/caps-lock state
+/// of each key. The word buffers hold key *positions*, which say nothing about
+/// case on their own, so this is tracked alongside them and re-applied to
+/// whatever the pipelines decide to type back — otherwise correcting `Helo`
+/// would quietly hand back a lowercase `hello`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Case {
+    /// No shift anywhere, or a mix too irregular to reproduce.
+    Lower,
+    /// First letter shifted, the rest not: a sentence opener or a name.
+    Title,
+    /// Every letter shifted: an acronym, or someone shouting.
+    Upper,
+}
+
+impl Case {
+    /// The case pattern of a word whose letters were typed with these shift
+    /// states.
+    fn of(shifted: &[bool]) -> Case {
+        match shifted.split_first() {
+            None => Case::Lower,
+            Some((false, _)) => Case::Lower,
+            // A single shifted letter reads as a capital, not as an acronym.
+            Some((true, [])) => Case::Title,
+            Some((true, rest)) if rest.iter().all(|&s| s) => Case::Upper,
+            Some((true, rest)) if rest.iter().all(|&s| !s) => Case::Title,
+            // Anything else (sHiFtY) is not a pattern worth reproducing.
+            Some((true, _)) => Case::Lower,
+        }
+    }
+
+    /// Re-apply the pattern to a replacement word. Only ASCII letters are
+    /// touched, so a Hebrew reading (which has no case) passes through
+    /// unchanged, as does an expansion's punctuation.
+    fn apply(self, text: &str) -> String {
+        match self {
+            Case::Lower => text.to_string(),
+            Case::Upper => text.to_uppercase(),
+            Case::Title => {
+                let mut out = String::with_capacity(text.len());
+                let mut chars = text.chars();
+                if let Some(first) = chars.next() {
+                    out.extend(first.to_uppercase());
+                    out.push_str(chars.as_str());
+                }
+                out
+            }
+        }
+    }
+}
+
+/// What the correction pipelines decided to do with a finished word.
 ///
 /// Exactly one of these ever comes back for a given word: the pipelines are
 /// mutually exclusive by construction (see [`plan`]), so a word that gets
@@ -362,14 +470,23 @@ pub enum Fix {
     ///
     /// Two ways to put it back, and platforms pick whichever their injection
     /// API supports: `text` is the finished word (what `keys[start..]` spells
-    /// in the *new* layout) for platforms that insert text directly, and
-    /// replaying `keys[start..]` produces exactly the same characters now that
-    /// the layout has changed, for platforms that can only send keycodes.
-    Layout { start: usize, text: String },
-    /// Misspelling in the current (English) layout: the layout is untouched and
-    /// the caller should erase the whole word and type `text` instead. `text`
-    /// is always plain lowercase ASCII, so it is typeable through the English
-    /// keymap.
+    /// in the *new* layout, capitalization included) for platforms that insert
+    /// text directly, and replaying `keys[start..]` produces exactly the same
+    /// characters now that the layout has changed, for platforms that can only
+    /// send keycodes. `lang` is the layout that was switched to — a keycode
+    /// replay needs it to know whether re-pressing shift reproduces the user's
+    /// capitals (English) or mangles the word (Hebrew has no case, and shift
+    /// there types punctuation).
+    Layout {
+        start: usize,
+        text: String,
+        lang: Language,
+    },
+    /// Rewrite in the current (English) layout, from the speller or from an
+    /// abbreviation expansion: the layout is untouched and the caller should
+    /// erase the whole word and type `text` instead. `text` is ASCII and
+    /// typeable through the English keymap, but — unlike before case tracking —
+    /// it may contain capitals, and an expansion may contain spaces.
     Spelling { text: String },
 }
 
@@ -379,6 +496,8 @@ pub enum Fix {
 enum Plan {
     Switch { lang: Language, start: usize },
     Spell { text: String },
+    /// A user-configured abbreviation was typed out in full.
+    Expand { text: String },
 }
 
 fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: bool) {
@@ -403,12 +522,14 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
 /// of any I/O so it is unit testable; the actual layout switch happens in the
 /// caller.
 ///
-/// The two pipelines run in a fixed order and the first one to produce a plan
-/// wins — a word is only ever corrected once:
+/// The pipelines run in a fixed order and the first one to produce a plan wins
+/// — a word is only ever corrected once:
 ///
+///   0. **Abbreviation expansion** (English only). The user wrote this rule
+///      down themselves, so nothing gets to overrule it.
 ///   1. **Layout** (whole buffer, then the opt-in missing-space split). It goes
-///      first because it is the *exact* signal: the keystrokes literally spell
-///      a real word in the other language, no guessing involved.
+///      ahead of the speller because it is the *exact* signal: the keystrokes
+///      literally spell a real word in the other language, no guessing involved.
 ///   2. **Spelling** (English only). Reached only when the layout pipeline
 ///      declined, i.e. the keystrokes are not a word in either language. The
 ///      resulting word is typed as-is and never re-examined by the layout
@@ -422,11 +543,32 @@ fn plan(
     offsets_he: &[usize],
     keys_len: usize,
     current: Option<Language>,
+    case: Case,
     en_dict: Dict,
     he_dict: Dict,
     en_freq: Freq,
     he_freq: Freq,
 ) -> Option<Plan> {
+    // A word the user has already taken back with the undo gesture is not
+    // offered a second opinion. This is checked before everything else,
+    // expansions included: the reading being suppressed is the one the user
+    // saw, chose to keep, and would otherwise have to fight for again on every
+    // repetition (see `complete::suppressed`).
+    let typed = match current {
+        Some(Language::Hebrew) => full_he,
+        _ => full_en,
+    };
+    if crate::complete::suppressed(typed) {
+        return None;
+    }
+
+    // An expansion the user configured by hand outranks everything we infer.
+    if current == Some(Language::English) {
+        if let Some(text) = crate::complete::expand(full_en) {
+            return Some(Plan::Expand { text });
+        }
+    }
+
     // Whole-buffer decision first — this is what fires for virtually every real
     // correction.
     let whole = match current {
@@ -443,7 +585,7 @@ fn plan(
         return Some(split);
     }
 
-    plan_spelling(full_en, full_he, current, en_dict, he_dict, en_freq)
+    plan_spelling(full_en, full_he, current, case, en_dict, he_dict, en_freq)
 }
 
 /// Second pipeline: the word is not a mistype of the other layout, but it may
@@ -459,15 +601,27 @@ fn plan(
 /// included. A key sequence that reads as a prefixed Hebrew word is the layout
 /// pipeline's business (it just wasn't confident enough to switch); rewriting it
 /// as an English word would be the two pipelines fighting over one word.
+/// An all-caps token is an acronym (`NASA`, `HTTP`, a ticker, an env var), not
+/// a misspelling — the dictionary has no opinion on it and the speller would
+/// happily turn it into the nearest common word. Case tracking is what makes
+/// this distinction visible at all.
 fn plan_spelling(
     full_en: &str,
     full_he: &str,
     current: Option<Language>,
+    case: Case,
     en_dict: Dict,
     he_dict: Dict,
     en_freq: Freq,
 ) -> Option<Plan> {
     if current != Some(Language::English) {
+        return None;
+    }
+    if case == Case::Upper {
+        return None;
+    }
+    // A word the user has declared theirs is never second-guessed.
+    if crate::complete::ignored(full_en) {
         return None;
     }
     if valid_loose(full_he, Language::Hebrew, en_dict, he_dict) {
@@ -566,6 +720,7 @@ pub fn check_and_correct<K: Copy>(
     keys: &[K],
     to_en: impl Fn(K) -> Option<char>,
     to_he: impl Fn(K) -> Option<char>,
+    shift_of: impl Fn(K) -> bool,
     en_dict: Dict,
     he_dict: Dict,
 ) -> Option<Fix> {
@@ -590,6 +745,10 @@ pub fn check_and_correct<K: Copy>(
     let mut full_he = String::with_capacity(keys.len() * 2);
     let mut offsets_en = Vec::with_capacity(if want_offsets { keys.len() + 1 } else { 0 });
     let mut offsets_he = Vec::with_capacity(if want_offsets { keys.len() + 1 } else { 0 });
+    // Shift state of the keys that produced an English character, which is what
+    // the case pattern is read off. Keys that type nothing in English (a Hebrew
+    // punctuation position, say) have no case to contribute.
+    let mut shifted_en = Vec::with_capacity(keys.len());
     if want_offsets {
         offsets_en.push(0);
         offsets_he.push(0);
@@ -597,6 +756,7 @@ pub fn check_and_correct<K: Copy>(
     for &k in keys {
         if let Some(c) = to_en(k) {
             full_en.push(c);
+            shifted_en.push(shift_of(k));
         }
         if let Some(c) = to_he(k) {
             full_he.push(c);
@@ -606,6 +766,7 @@ pub fn check_and_correct<K: Copy>(
             offsets_he.push(full_he.len());
         }
     }
+    let case = Case::of(&shifted_en);
 
     let current = crate::layout::current_layout();
     let Some(plan) = plan(
@@ -615,6 +776,7 @@ pub fn check_and_correct<K: Copy>(
         &offsets_he,
         keys.len(),
         current,
+        case,
         en_dict,
         he_dict,
         en_freq(),
@@ -644,20 +806,114 @@ pub fn check_and_correct<K: Copy>(
             } else {
                 full[offsets[start]..].to_string()
             };
+            // Only an English target has capitals to restore; Hebrew has no
+            // case at all, so the pattern is meaningless there.
+            let text = if lang == Language::English && start == 0 {
+                case.apply(&text)
+            } else {
+                text
+            };
             // The OS refused (or was already on) the target layout: retyping now
             // would re-enter the same characters, so do nothing.
-            switched.then_some(Fix::Layout { start, text })
+            switched.then_some(Fix::Layout { start, text, lang })
         }
-        Plan::Spell { text } => {
+        Plan::Spell { text } | Plan::Expand { text } => {
             // No layout call at all — the word stays in English, only its
             // letters change.
             debug_log(&full_en, &full_he, None, false);
             if debug_enabled() {
                 println!("spell: {} -> {}", full_en, text);
             }
-            Some(Fix::Spelling { text })
+            Some(Fix::Spelling {
+                text: case.apply(&text),
+            })
         }
     }
+}
+
+/// The word `keys` spells, if the pipelines left it alone *only* because the
+/// user has it on one of their lists — `ignore.txt` or the session list a
+/// previous undo put it on.
+///
+/// Called by the platform listeners when [`check_and_correct`] declined, to
+/// decide whether the Ctrl double-tap has anything to offer. The gesture is a
+/// toggle: it takes back a correction that happened, and takes a word off the
+/// list when a correction *didn't* happen for that reason. Nothing else arms
+/// it, so a word that is simply spelled correctly is untouched by it.
+///
+/// The two lists are checked against different readings, and deliberately so.
+/// A session entry came from undoing what the user was looking at, so it
+/// suppresses the reading under the live layout. `ignore.txt` is the speller's
+/// escape hatch and only ever gated the English reading — a word on it that is
+/// typed in the wrong layout should still be layout-corrected, so it is not
+/// consulted outside English.
+pub fn declined_by_list<K: Copy>(
+    keys: &[K],
+    to_en: impl Fn(K) -> Option<char>,
+    to_he: impl Fn(K) -> Option<char>,
+) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    let mut full_en = String::with_capacity(keys.len());
+    let mut full_he = String::with_capacity(keys.len() * 2);
+    for &k in keys {
+        if let Some(c) = to_en(k) {
+            full_en.push(c);
+        }
+        if let Some(c) = to_he(k) {
+            full_he.push(c);
+        }
+    }
+    let current = crate::layout::current_layout();
+    let typed = match current {
+        Some(Language::Hebrew) => &full_he,
+        _ => &full_en,
+    };
+    if crate::complete::suppressed(typed) {
+        return Some(typed.clone());
+    }
+    if current == Some(Language::English) && crate::complete::ignored(&full_en) {
+        return Some(full_en);
+    }
+    None
+}
+
+/// Complete the partial word the user has typed so far, on an explicit request
+/// (the completion key — see the platform listeners).
+///
+/// Unlike the correction pipelines this fires *mid-word*, with no terminator
+/// typed and nothing wrong with the input: the user asked. It still refuses
+/// under a non-English layout for the same reason the speller does — the result
+/// is injected as English text or English keystrokes, and under Hebrew that is
+/// not what the user is looking at.
+///
+/// Returns the candidates in offer order (each already capitalized to match
+/// what was typed), for the caller to swap in one at a time as the completion
+/// key is tapped again. Empty means there is nothing worth offering.
+pub fn complete_candidates<K: Copy>(
+    keys: &[K],
+    to_en: impl Fn(K) -> Option<char>,
+    shift_of: impl Fn(K) -> bool,
+    en_dict: Dict,
+) -> Vec<String> {
+    if keys.is_empty() || crate::layout::current_layout() != Some(Language::English) {
+        return Vec::new();
+    }
+    let mut prefix = String::with_capacity(keys.len());
+    let mut shifted = Vec::with_capacity(keys.len());
+    for &k in keys {
+        if let Some(c) = to_en(k) {
+            prefix.push(c);
+            shifted.push(shift_of(k));
+        }
+    }
+    let words = crate::complete::completions(&prefix, en_dict, en_freq());
+    if debug_enabled() && !words.is_empty() {
+        println!("complete: {} -> {}", prefix, words.join(" | "));
+    }
+    let case = Case::of(&shifted);
+    words.into_iter().map(|w| case.apply(&w)).collect()
 }
 
 /// Test-only builders: assemble the same sorted-blob layout `build.rs` writes,
@@ -725,6 +981,46 @@ mod tests {
         assert_eq!(f.rank("zebra"), Some(12_345));
         assert_eq!(f.rank("hell"), None);
         assert_eq!(Freq::EMPTY.rank("hello"), None);
+    }
+
+    #[test]
+    fn prefix_scan_yields_exactly_the_matching_run() {
+        // The range query the speller and the completer are both built on: it
+        // has to start at the first match (not the first line that merely sorts
+        // after the prefix) and stop at the first non-match.
+        let f = freq(&[
+            ("a", 0),
+            ("hell", 4),
+            ("hello", 1),
+            ("help", 2),
+            ("helot", 3),
+            ("zebra", 5),
+        ]);
+        let collect = |prefix: &str| {
+            let mut out: Vec<(String, u32)> = Vec::new();
+            f.for_each_with_prefix(prefix, |w, r| out.push((w.to_string(), r)));
+            out
+        };
+        assert_eq!(
+            collect("hel"),
+            vec![
+                ("hell".to_string(), 4),
+                ("hello".to_string(), 1),
+                ("helot".to_string(), 3),
+                ("help".to_string(), 2),
+            ]
+        );
+        assert_eq!(collect("zebra"), vec![("zebra".to_string(), 5)]);
+        assert!(collect("q").is_empty(), "no match anywhere in the middle");
+        assert!(collect("zz").is_empty(), "no match past the end");
+        assert_eq!(collect("").len(), 6, "an empty prefix matches everything");
+        // The same query over the real 50k-entry blob.
+        let mut seen = 0usize;
+        en_freq().for_each_with_prefix("keyboa", |w, _| {
+            assert!(w.starts_with("keyboa"), "{w}");
+            seen += 1;
+        });
+        assert!(seen > 0, "the real list has words starting with 'keyboa'");
     }
 
     #[test]
@@ -886,7 +1182,21 @@ mod tests {
         he: Dict,
         en_f: Freq,
     ) -> Option<Plan> {
-        plan(en_text, he_text, &[], &[], 0, current, en, he, en_f, nofreq())
+        plan_cased(en_text, he_text, current, Case::Lower, en, he, en_f)
+    }
+
+    fn plan_cased(
+        en_text: &str,
+        he_text: &str,
+        current: Option<Language>,
+        case: Case,
+        en: Dict,
+        he: Dict,
+        en_f: Freq,
+    ) -> Option<Plan> {
+        plan(
+            en_text, he_text, &[], &[], 0, current, case, en, he, en_f, nofreq(),
+        )
     }
 
     #[test]
@@ -964,6 +1274,56 @@ mod tests {
         let he = dict(&[]);
         let en_f = freq(&[("from", 10), ("form", 900)]);
         assert_eq!(plan_for("form", "בםרצ", Some(Language::English), en, he, en_f), None);
+    }
+
+    #[test]
+    fn case_is_read_off_the_shift_states() {
+        assert_eq!(Case::of(&[false, false, false]), Case::Lower);
+        assert_eq!(Case::of(&[true, false, false]), Case::Title);
+        assert_eq!(Case::of(&[true, true, true]), Case::Upper);
+        assert_eq!(Case::of(&[true]), Case::Title, "one letter is a capital");
+        assert_eq!(Case::of(&[true, false, true]), Case::Lower, "no pattern");
+        assert_eq!(Case::of(&[]), Case::Lower);
+    }
+
+    #[test]
+    fn case_is_reapplied_to_the_replacement() {
+        assert_eq!(Case::Lower.apply("hello"), "hello");
+        assert_eq!(Case::Title.apply("hello"), "Hello");
+        assert_eq!(Case::Upper.apply("hello"), "HELLO");
+        // An expansion keeps its own inner capitals under Title case.
+        assert_eq!(Case::Title.apply("by the way"), "By the way");
+        // Hebrew has no case, so the pattern is a no-op there.
+        assert_eq!(Case::Title.apply("שלום"), "שלום");
+    }
+
+    #[test]
+    fn an_all_caps_token_is_never_spell_corrected() {
+        // Acronyms are not misspellings: "NASA" is not a mistyped "nada".
+        let en = dict(&["nada"]);
+        let he = dict(&[]);
+        let en_f = freq(&[("nada", 500)]);
+        assert_eq!(
+            plan_cased("nasa", "מקק", Some(Language::English), Case::Upper, en, he, en_f),
+            None
+        );
+        // The same letters typed normally are still fair game.
+        assert_eq!(
+            plan_cased("nasa", "מקק", Some(Language::English), Case::Lower, en, he, en_f),
+            Some(Plan::Spell { text: "nada".to_string() })
+        );
+    }
+
+    #[test]
+    fn an_all_caps_word_is_still_layout_switched() {
+        // Case only silences the *speller*: keys that literally spell a Hebrew
+        // word were still typed in the wrong layout, shouting or not.
+        let en = dict(&[]);
+        let he = dict(&["שלום"]);
+        assert_eq!(
+            plan_cased("akuo", "שלום", Some(Language::English), Case::Upper, en, he, nofreq()),
+            Some(Plan::Switch { lang: Language::Hebrew, start: 0 })
+        );
     }
 
     #[test]

@@ -1,0 +1,556 @@
+//! Auto-complete: finishing a word instead of fixing one.
+//!
+//! The other two pipelines are *corrections* — they wait for a finished word,
+//! decide it is wrong, and rewrite it. This one is the opposite: the word is
+//! not finished, nothing is wrong with it, and the user has explicitly asked
+//! for the rest of it. That difference is why it lives outside `spell.rs` and
+//! why it is allowed to be far less conservative: a completion the user did not
+//! want cost them one keypress and is undone by another, while a wrong
+//! autocorrect happens without being asked for.
+//!
+//! Two mechanisms, both keyed off the partial word in the buffer:
+//!
+//! * [`completions`] — press the completion key mid-word and the word is
+//!   filled in. It returns a short *ordered list*, not a single answer, because
+//!   the trigger key can be tapped again: the second tap swaps in the next
+//!   candidate, and the last one hands back exactly what the user typed. That
+//!   is what makes a wrong first guess cost a keypress instead of a deletion,
+//!   and it is why the completer is allowed to guess at all. The frequency list
+//!   is sorted, so "every common word starting with `hel`" is one contiguous
+//!   run of it (see `Freq::for_each_with_prefix`) and ranking them is a short
+//!   walk, no index and no allocation per rejected candidate.
+//! * [`expand`] — abbreviations the user wrote down themselves in
+//!   `<config>/recast/abbrev.txt`, expanded when the word is finished — or
+//!   offered as the first completion, since a rule the user wrote by hand
+//!   beats anything inferred from a corpus.
+//!
+//! It also owns the session [`suppress`] list: the words a Ctrl-double-tap undo
+//! has taken back, which nothing may correct again until restart.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+use crate::config::Config;
+use crate::dictionary::{Dict, Freq};
+
+/// Longest partial word we will try to complete. Past this the user is typing
+/// an identifier or a URL, not reaching for a word.
+const MAX_PREFIX_LEN: usize = 20;
+
+/// How many guesses a cycle offers before coming back round to what the user
+/// typed. Small on purpose: past three or four taps, deleting the word and
+/// typing it out is faster than hunting, and every extra candidate is a rarer
+/// word than the one before it.
+pub const MAX_CANDIDATES: usize = 4;
+
+/// Fixed-point scale for [`value`], so the ranking can be done in integers.
+const VALUE_SCALE: u64 = 1 << 20;
+
+/// How good a completion is: the keystrokes it would save, weighted by how
+/// likely it is to be the word meant.
+///
+/// Ranking candidates by raw frequency — the obvious thing, and what this did
+/// at first — quietly optimises the wrong quantity. The user pressed a key to
+/// save typing, and a completion that adds one letter to a five-letter prefix
+/// has saved them nothing for that press; one that adds six has saved six. So
+/// the offer is worth `letters saved × P(this is the word)`, and with rank as
+/// a Zipfian stand-in for the probability (`P ∝ 1/rank`) that is this ratio.
+///
+/// It only reorders candidates that are already close in frequency: a word ten
+/// times commoner than its neighbour still wins on frequency alone, which is
+/// why `hel` still completes to `help` rather than to a longer, rarer word.
+fn value(saved: usize, rank: u32) -> u64 {
+    saved as u64 * VALUE_SCALE / (rank as u64 + 1)
+}
+
+/// Completions to offer for the partial word `prefix`, best first.
+///
+/// Empty when there is nothing worth offering. The user's own abbreviation for
+/// the prefix, if they defined one, always comes first.
+pub fn completions(prefix: &str, en_dict: Dict, en_freq: Freq) -> Vec<String> {
+    let cfg = Config::global();
+    if !cfg.complete_enabled {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(MAX_CANDIDATES + 1);
+    // An abbreviation is a rule the user wrote by hand — it outranks every
+    // guess, exactly as it does when the word is finished (see `plan`).
+    if let Some(text) = abbreviations().get(prefix) {
+        out.push(text.clone());
+    }
+    out.extend(completions_with(
+        prefix,
+        en_dict,
+        en_freq,
+        cfg.complete_min_len,
+        cfg.complete_max_rank,
+    ));
+    out
+}
+
+/// Core of [`completions`] with the tuning knobs passed in, so tests don't
+/// depend on the environment. Abbreviations are not consulted here.
+///
+/// A candidate must be a *longer* word than what was typed (completing a word
+/// to itself is a no-op the caller shouldn't have to unwind), a dictionary word
+/// — the frequency list is corpus-derived and full of junk tokens — and common
+/// enough to be a word someone reaching for that prefix might mean.
+pub fn completions_with(
+    prefix: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+) -> Vec<String> {
+    if prefix.len() < min_len
+        || prefix.len() > MAX_PREFIX_LEN
+        || !prefix.bytes().all(|b| b.is_ascii_lowercase())
+    {
+        return Vec::new();
+    }
+
+    // Kept sorted by descending `value`, truncated to length as it goes, so the
+    // scan never holds more than a handful of candidates however long the
+    // prefix run is.
+    let mut best: Vec<(u64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
+    en_freq.for_each_with_prefix(prefix, |word, rank| {
+        if rank > max_rank || word.len() <= prefix.len() {
+            return;
+        }
+        let value = value(word.len() - prefix.len(), rank);
+        // Cheap rejection before the dictionary lookup: if the list is already
+        // full of better candidates this one can't get in.
+        if best.len() == MAX_CANDIDATES && best[MAX_CANDIDATES - 1].0 >= value {
+            return;
+        }
+        // Checked last: it is the only expensive test, and by here only a
+        // handful of candidates per prefix still survive.
+        if !en_dict.contains(word) {
+            return;
+        }
+        // Ties (same value, different words) go to the commoner word.
+        let at = best.partition_point(|(v, r, _)| (*v, std::cmp::Reverse(*r)) > (value, std::cmp::Reverse(rank)));
+        best.insert(at, (value, rank, word.to_string()));
+        best.truncate(MAX_CANDIDATES);
+    });
+    best.into_iter().map(|(_, _, word)| word).collect()
+}
+
+/// The expansion configured for `word`, if the user defined one.
+///
+/// Matching is case-insensitive on the key; the expansion is reproduced exactly
+/// as written, and the caller re-applies the capitalization the user typed.
+pub fn expand(word: &str) -> Option<String> {
+    if !Config::global().complete_enabled || word.is_empty() {
+        return None;
+    }
+    abbreviations().get(word).cloned()
+}
+
+/// Whether the user has declared `word` off limits in
+/// `<config>/recast/ignore.txt` — one token per line, `#` for comments.
+///
+/// The wider the speller's edit budget gets, the more jargon it can reach: an
+/// eight-letter token two slips from a top-few-thousand word is exactly what it
+/// is built to fix, and `hostname` is exactly that shape. Rather than tune the
+/// thresholds until nobody's vocabulary is served, this is the escape hatch for
+/// the handful of words each user actually types.
+pub fn ignored(word: &str) -> bool {
+    ignore_list().lock().is_ok_and(|list| list.contains(word))
+}
+
+/// Take `word` off both lists, `ignore.txt` included.
+///
+/// The counterpart of [`suppress`], and the reason the gesture is worth having
+/// in this direction too: a list you can only add to is one you eventually stop
+/// trusting. Editing the file is a real edit to something the user owns, so it
+/// is done conservatively — only lines that *are* this word are dropped,
+/// comments and everything else are copied through untouched, and the write
+/// goes via a temporary file so an interrupted save can't leave a half-written
+/// list behind.
+pub fn unlist(word: &str) {
+    let word = word.to_lowercase();
+    if let Ok(mut set) = suppressed_words().lock() {
+        set.remove(&word);
+    }
+    let was_in_file = ignore_list()
+        .lock()
+        .map(|mut list| list.remove(&word))
+        .unwrap_or(false);
+    if was_in_file {
+        remove_from_ignore_file(&word);
+    }
+}
+
+/// Drop every line of `ignore.txt` that is `word`, keeping the rest verbatim.
+fn remove_from_ignore_file(word: &str) {
+    let Some(path) = user_path("ignore.txt") else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    // Rename over the original rather than truncating it: the user wrote this
+    // file, and a failed write should cost them nothing.
+    let tmp = path.with_extension("txt.tmp");
+    if std::fs::write(&tmp, without_word(&text, word)).is_ok()
+        && std::fs::rename(&tmp, &path).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// `text` without the lines that list `word`. Everything else — comments,
+/// blanks, spacing, the other entries — is copied through exactly as written:
+/// this is the user's file, and the gesture has a mandate for one line of it.
+fn without_word(text: &str, word: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // A comment is never a listing, whatever it says.
+        if !trimmed.starts_with('#') && trimmed.to_lowercase() == word {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
+/// Words the user has taken back with the undo gesture this session.
+///
+/// Undo has to do more than put the letters back. A correction is a *function*
+/// of what was typed: retype the same word and the same pipeline reaches the
+/// same conclusion, so an undo that only rewrites the screen leaves the user on
+/// a treadmill — which is what made the previous escape hatch (edit
+/// `ignore.txt`, restart the daemon) the only real one. Undoing a word
+/// therefore also retires it: nothing corrects it again until restart.
+///
+/// Deliberately not persisted: this is the list you land on by reflex, and
+/// `ignore.txt` is the one you land on by deciding. [`unlist`] clears entries
+/// from both.
+fn suppressed_words() -> &'static Mutex<HashSet<String>> {
+    static WORDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WORDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Stop correcting `word` for the rest of the session (see
+/// [`suppressed_words`]). Called by the undo gesture with the reading the user
+/// actually typed.
+pub fn suppress(word: &str) {
+    if word.is_empty() {
+        return;
+    }
+    if let Ok(mut set) = suppressed_words().lock() {
+        set.insert(word.to_lowercase());
+    }
+}
+
+/// Whether `word` has been undone this session.
+pub fn suppressed(word: &str) -> bool {
+    suppressed_words()
+        .lock()
+        .is_ok_and(|set| set.contains(&word.to_lowercase()))
+}
+
+/// Path of a user list: `<config dir>/recast/<name>`.
+pub fn user_path(name: &str) -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("recast").join(name))
+}
+
+/// The ignore list, read from disk on first use. Behind a `Mutex` rather than
+/// straight in a `OnceLock` because [`unlist`] can take entries out of it: the
+/// file is still read once, but it is no longer immutable for the life of the
+/// process.
+fn ignore_list() -> &'static Mutex<HashSet<String>> {
+    static LIST: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let text = user_path("ignore.txt")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        Mutex::new(parse_ignore_list(&text))
+    })
+}
+
+/// Parse the ignore file: one word per line, `#` starting a comment, folded to
+/// lowercase to match the (lowercase) reading of the key buffer.
+fn parse_ignore_list(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The abbreviation table, read once on first use. A missing or unreadable file
+/// simply means "no abbreviations" — this is an optional convenience, not
+/// something worth failing startup or nagging about.
+fn abbreviations() -> &'static HashMap<String, String> {
+    static TABLE: OnceLock<HashMap<String, String>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let text = user_path("abbrev.txt")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        parse_abbreviations(&text)
+    })
+}
+
+/// Parse the abbreviation file: one `abbreviation = expansion` per line, `=` or
+/// a tab as the separator, `#` starting a comment line. Keys are lowercased
+/// (the buffer only ever holds lowercase readings) and blank or malformed lines
+/// are skipped rather than rejected — a typo in the file should cost the user
+/// that one line, not the whole table.
+fn parse_abbreviations(text: &str) -> HashMap<String, String> {
+    let mut table = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=').or_else(|| line.split_once('\t')) else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        table.insert(key.to_lowercase(), value.to_string());
+    }
+    table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(words: &[&str]) -> Dict {
+        Dict::of(words)
+    }
+
+    fn freq(entries: &[(&str, u32)]) -> Freq {
+        Freq::of(entries)
+    }
+
+    /// Every candidate, in offer order, under the shipped defaults
+    /// (`Config::from_env`).
+    fn offers(prefix: &str, d: Dict, f: Freq) -> Vec<String> {
+        completions_with(
+            prefix,
+            d,
+            f,
+            crate::config::DEFAULT_COMPLETE_MIN_LEN,
+            crate::config::DEFAULT_COMPLETE_MAX_RANK,
+        )
+    }
+
+    /// What the first tap of the completion key puts on screen.
+    fn finish(prefix: &str, d: Dict, f: Freq) -> Option<String> {
+        offers(prefix, d, f).into_iter().next()
+    }
+
+    #[test]
+    fn completes_to_the_most_common_word_with_that_prefix() {
+        let d = dict(&["hello", "help", "helmet"]);
+        let f = freq(&[("hello", 500), ("help", 140), ("helmet", 9_000)]);
+        assert_eq!(finish("hel", d, f).as_deref(), Some("help"));
+    }
+
+    #[test]
+    fn a_completion_must_be_a_dictionary_word() {
+        // The frequency list is corpus-derived and full of junk tokens; a
+        // completion has to be a word, not merely something people have typed.
+        let d = dict(&["helmet"]);
+        let f = freq(&[("helo", 100), ("helmet", 9_000)]);
+        assert_eq!(finish("hel", d, f).as_deref(), Some("helmet"));
+    }
+
+    #[test]
+    fn a_rare_completion_is_not_offered() {
+        let d = dict(&["helot"]);
+        let f = freq(&[("helot", 45_000)]);
+        assert_eq!(finish("hel", d, f), None);
+    }
+
+    #[test]
+    fn never_completes_a_word_to_itself() {
+        let d = dict(&["help"]);
+        let f = freq(&[("help", 140)]);
+        assert_eq!(finish("help", d, f), None);
+    }
+
+    #[test]
+    fn a_prefix_with_no_common_word_is_left_alone() {
+        let d = dict(&["hello"]);
+        let f = freq(&[("hello", 500)]);
+        assert_eq!(finish("zqx", d, f), None);
+    }
+
+    #[test]
+    fn short_and_non_alphabetic_prefixes_are_skipped() {
+        let d = dict(&["hello", "the"]);
+        let f = freq(&[("hello", 500), ("the", 0)]);
+        // One letter matches thousands of words; completing it is a coin flip.
+        assert_eq!(finish("t", d, f), None);
+        // Digits mean an identifier, not a word being reached for.
+        assert_eq!(finish("hel2", d, f), None);
+    }
+
+    #[test]
+    fn candidates_come_back_in_offer_order_for_the_cycle() {
+        let d = dict(&["help", "hello", "helmet", "helicopter", "helpless"]);
+        let f = freq(&[
+            ("help", 140),
+            ("hello", 500),
+            ("helmet", 9_000),
+            ("helicopter", 12_000),
+            ("helpless", 25_000),
+        ]);
+        let offers = offers("hel", d, f);
+        assert_eq!(offers.first().map(String::as_str), Some("help"));
+        assert!(offers.len() <= MAX_CANDIDATES);
+        // A tap must never offer the same word twice, or the cycle stalls.
+        let unique: std::collections::HashSet<&String> = offers.iter().collect();
+        assert_eq!(unique.len(), offers.len());
+    }
+
+    #[test]
+    fn a_longer_completion_beats_an_equally_common_short_one() {
+        // Same frequency, so the tie-break is what the completion is *for*:
+        // `tomorrow` saves four keystrokes for the tap, `tomb` saves none worth
+        // having. Ranking by frequency alone could not tell these apart.
+        let d = dict(&["tomorrow", "tome"]);
+        let f = freq(&[("tomorrow", 900), ("tome", 900)]);
+        assert_eq!(finish("tom", d, f).as_deref(), Some("tomorrow"));
+    }
+
+    #[test]
+    fn frequency_still_dominates_a_lopsided_pair() {
+        // Four extra letters do not buy a word that nobody types: `tomorrow` is
+        // an order of magnitude commoner, so it wins despite saving less.
+        let d = dict(&["tomorrow", "tomographies"]);
+        let f = freq(&[("tomorrow", 900), ("tomographies", 29_000)]);
+        assert_eq!(finish("tomo", d, f).as_deref(), Some("tomorrow"));
+    }
+
+    #[test]
+    fn undone_words_are_left_alone_for_the_session() {
+        assert!(!suppressed("hostname"));
+        suppress("Hostname");
+        // Folded, because the buffer's reading is always lowercase.
+        assert!(suppressed("hostname"));
+        assert!(!suppressed("hostnames"));
+    }
+
+    #[test]
+    fn unlisting_puts_a_word_back_in_play() {
+        // The other half of the toggle: what one double-tap retired, the next
+        // one on the same word un-retires.
+        suppress("postgres");
+        assert!(suppressed("postgres"));
+        unlist("Postgres");
+        assert!(!suppressed("postgres"));
+    }
+
+    #[test]
+    fn rewriting_the_ignore_file_touches_only_the_listed_word() {
+        let before = "# my words\nhostname\n\n  Postgres  \nkubectl\n";
+        let after = without_word(before, "postgres");
+        assert_eq!(after, "# my words\nhostname\n\nkubectl\n");
+
+        // Comments are copied through even when they read like the word …
+        assert_eq!(without_word("# postgres\nfoo\n", "postgres"), "# postgres\nfoo\n");
+        // … and a word that is not there leaves the file byte-identical.
+        assert_eq!(without_word(before, "redis"), before);
+    }
+
+    #[test]
+    fn parses_the_abbreviation_file() {
+        let table = parse_abbreviations(
+            "# my shortcuts\n\
+             btw = by the way\n\
+             \n\
+             TY\tthank you\n\
+             addr=1 Main Street, Tel Aviv\n\
+             broken line with no separator\n\
+             empty =\n",
+        );
+        assert_eq!(table.get("btw").map(String::as_str), Some("by the way"));
+        // Keys are folded to lowercase to match the (lowercase) key buffer …
+        assert_eq!(table.get("ty").map(String::as_str), Some("thank you"));
+        // … while the expansion keeps exactly what was written.
+        assert_eq!(
+            table.get("addr").map(String::as_str),
+            Some("1 Main Street, Tel Aviv")
+        );
+        assert!(!table.contains_key("empty"), "a valueless line is skipped");
+        assert_eq!(table.len(), 3, "comments and junk lines are skipped");
+    }
+
+    #[test]
+    fn parses_the_ignore_list() {
+        let list = parse_ignore_list("# jargon\nhostname\n\n  Postgres  \n");
+        assert!(list.contains("hostname"));
+        assert!(list.contains("postgres"), "trimmed and lowercased");
+        assert_eq!(list.len(), 2);
+    }
+}
+
+
+/// Against the real embedded lists, the way `spell::real_data` is: the unit
+/// tests above pin the *rules*, these pin what the rules actually do to the
+/// data we ship. A threshold change that looks harmless in isolation shows up
+/// here.
+#[cfg(test)]
+mod real_data {
+    use super::*;
+    use crate::dictionary::{en_dict, en_freq};
+
+    fn offers(prefix: &str) -> Vec<String> {
+        completions_with(
+            prefix,
+            en_dict(),
+            en_freq(),
+            crate::config::DEFAULT_COMPLETE_MIN_LEN,
+            crate::config::DEFAULT_COMPLETE_MAX_RANK,
+        )
+    }
+
+    #[test]
+    fn finishes_everyday_words() {
+        assert_eq!(offers("tomo").first().map(String::as_str), Some("tomorrow"));
+        assert_eq!(offers("gove").first().map(String::as_str), Some("government"));
+        assert_eq!(offers("unde").first().map(String::as_str), Some("understand"));
+        assert_eq!(offers("recei").first().map(String::as_str), Some("received"));
+    }
+
+    #[test]
+    fn a_crowded_prefix_offers_a_cycle_worth_of_guesses() {
+        // The point of the cycle: `hel` is genuinely ambiguous, so the first
+        // guess being wrong has to be cheap rather than unlikely.
+        let offers = offers("hel");
+        assert_eq!(offers.len(), MAX_CANDIDATES);
+        for word in ["hello", "help"] {
+            assert!(offers.iter().any(|w| w == word), "{word} missing: {offers:?}");
+        }
+    }
+
+    #[test]
+    fn every_offer_is_longer_than_what_was_typed() {
+        // A candidate that saves nothing is worse than no candidate: it costs
+        // the tap and hands back the same word.
+        for prefix in ["hel", "com", "dev", "imp", "thr", "abo"] {
+            for word in offers(prefix) {
+                assert!(word.len() > prefix.len(), "{prefix} -> {word}");
+                assert!(word.starts_with(prefix), "{prefix} -> {word}");
+            }
+        }
+    }
+
+    #[test]
+    fn gibberish_and_identifiers_are_left_alone() {
+        assert!(offers("zqxj").is_empty());
+        // Wrong-layout Hebrew never reaches here (the completer is English-only
+        // by layout), but a prefix that spells nothing must still decline.
+        assert!(offers("qwrt").is_empty());
+    }
+}

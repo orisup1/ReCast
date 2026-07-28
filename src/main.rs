@@ -10,6 +10,7 @@
 // Startup ASCII-art banner: shown when launched from a terminal (tty), not
 // when started by a background service / LaunchAgent whose stdout has no TTY.
 mod banner;
+mod complete;
 mod dictionary;
 #[cfg(target_os = "linux")]
 mod gui;
@@ -47,7 +48,25 @@ Environment:
   RECAST_SPELL=0      Disable the English spelling autocorrect
   RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
   RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 20000)
-  RECAST_SPELL_DIST=n Maximum edit distance, 1 or 2 (default 1)";
+  RECAST_SPELL_DIST=n Maximum edit distance, 1 to 3 (default 3)
+  RECAST_COMPLETE=0   Disable auto-complete (word completion + abbreviations)
+  RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)
+  RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
+
+Auto-complete:
+  Tap Right Shift mid-word to finish it; tap again to cycle through the
+  next guesses, and once more to get back exactly what you typed.
+  Abbreviations expand when a word is finished, and are offered by the
+  first tap too; define them one per line as `abbr = expansion` in
+  <config dir>/recast/abbrev.txt.
+
+Undo (Ctrl tapped twice, quickly):
+  After a correction, it puts back what you typed — the layout too, if the
+  correction changed it — and leaves that word alone from then on.
+  After a word that was left alone *because* you had listed it, the same
+  gesture takes it off the list (ignore.txt included) and corrects it.
+  Only the word the cursor is still sitting on: type anything else and the
+  gesture has nothing to act on.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
