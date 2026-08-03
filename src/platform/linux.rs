@@ -26,7 +26,7 @@ use crate::keymap::{
     english_char_to_evkey_shifted, evkey_to_english_char, evkey_to_english_char_shifted,
     evkey_to_hebrew_char,
 };
-use crate::types::{AppControl, Language};
+use crate::types::{AppControl, FixKind, Language};
 
 /// One key of the word being typed, with the shift state it was typed under.
 /// The buffer holds key *positions*, which carry no case of their own, so the
@@ -402,8 +402,13 @@ fn handle_key(
                     he_dict,
                 );
 
+                // Describe the fix for the history before `replacement`
+                // consumes it.
+                let note = result.as_ref().map(|fix| note_of(&st.keys, fix));
                 if let Some(rep) = replacement(&st.keys, result) {
-                    control.record_fix();
+                    if let Some((from, to, kind)) = &note {
+                        control.record_fix(from, to, *kind);
+                    }
                     st.is_replacing = true;
                     let undo = undo_of(&st.keys, &rep, Some(key));
                     // +1 for the terminator the user physically typed, which is
@@ -570,7 +575,11 @@ fn handle_release(
     if back_to_typed {
         control.record_undo();
     } else if index == 0 {
-        control.record_fix();
+        control.record_fix(
+            &reading(&typed, Language::English),
+            &candidates[index],
+            FixKind::Complete,
+        );
     }
 
     // The buffer has to end up holding what is on screen, or the next Space
@@ -730,13 +739,16 @@ fn unlist_and_correct(
         en_dict,
         he_dict,
     );
+    let note = result.as_ref().map(|fix| note_of(&skip.keys, fix));
     // Off the list, but the pipelines have nothing to say about it after all —
     // which is a fine outcome, and not one to rewrite the screen over.
     let Some(rep) = replacement(&skip.keys, result) else {
         return;
     };
 
-    control.record_fix();
+    if let Some((from, to, kind)) = &note {
+        control.record_fix(from, to, *kind);
+    }
     st.is_replacing = true;
     st.cycle = None;
     let erase = rep.erase + usize::from(skip.terminator.is_some());
@@ -769,6 +781,28 @@ fn reading(keys: &[Typed], lang: Language) -> String {
 
 fn non_empty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+/// The pair of words the recent-corrections history shows for `fix`, and which
+/// pipeline produced it.
+///
+/// The "before" side is what was on screen, which is not the same reading in
+/// both cases: a layout fix has already switched to `lang`, so what the user
+/// was looking at is the *other* layout's reading, while a spelling fix or an
+/// expansion never left English.
+fn note_of(keys: &[Typed], fix: &Fix) -> (String, String, FixKind) {
+    match fix {
+        Fix::Layout { start, text, lang } => (
+            reading(&keys[*start..], lang.other()),
+            text.clone(),
+            FixKind::Layout,
+        ),
+        Fix::Spelling { text } => (
+            reading(keys, Language::English),
+            text.clone(),
+            FixKind::Spelling,
+        ),
+    }
 }
 
 /// Spell `text` out as key presses, or `None` if any character can't be typed

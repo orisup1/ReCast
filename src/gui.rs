@@ -28,7 +28,11 @@ impl eframe::App for App {
                 );
                 ui.add_space(12.0);
 
-                let mut enabled = self.control.is_enabled();
+                // The switch itself, not `is_enabled()`, which also reads false
+                // during a pause — this window has no pause control, so a
+                // checkbox that unticked itself for half an hour would be
+                // reporting something the user can't act on here.
+                let mut enabled = self.control.is_switched_on();
                 let checkbox = egui::Checkbox::new(
                     &mut enabled,
                     egui::RichText::new("Enable layout correction")
@@ -48,6 +52,25 @@ impl eframe::App for App {
                         .size(18.0)
                         .color(egui::Color32::LIGHT_GRAY),
                 );
+                // Shown next to the fixed count, and only once there is
+                // something to show: the pair is what says whether the speller
+                // is set where this user wants it.
+                let undone = self.control.undo_count();
+                if undone > 0 {
+                    ui.label(
+                        RichText::new(format!("Taken back: {undone}"))
+                            .size(14.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+                if let Some(hint) = self.control.tighten_hint() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(hint)
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 190, 90)),
+                    );
+                }
                 ui.add_space(16.0);
                 ui.label(
                     RichText::new("Running in background. Closes window but keeps service.")

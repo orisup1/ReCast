@@ -16,11 +16,17 @@ mod dictionary;
 mod gui;
 mod keymap;
 mod layout;
+mod notify;
 mod platform;
+mod prefs;
 mod spell;
 mod types;
 mod config;
 mod daemon;
+// The terminal dashboard is Linux/Windows only: on macOS the event tap owns the
+// main run loop, so `--gui` is refused there and the whole module would be dead
+// code — which is what it was, warning about itself on every macOS build.
+#[cfg(not(target_os = "macos"))]
 mod tui;
 
 use std::sync::Arc;
@@ -38,6 +44,8 @@ Options:
                     (Linux only)
   -s, --stop        Stop a running recast daemon (via its pidfile)
   -f, --foreground  Linux: don't daemonize (implied when run under systemd)
+      --status      Print what is running and what is configured, then exit
+  -v, --version     Print the version and exit
   -h, --help        Show this help
 
 Environment:
@@ -66,7 +74,12 @@ Undo (Ctrl tapped twice, quickly):
   After a word that was left alone *because* you had listed it, the same
   gesture takes it off the list (ignore.txt included) and corrects it.
   Only the word the cursor is still sitting on: type anything else and the
-  gesture has nothing to act on.";
+  gesture has nothing to act on.
+
+Your files (<config dir>/recast/):
+  abbrev.txt  `abbr = expansion` per line
+  ignore.txt  one word per line, never corrected
+  Both are re-read within a couple of seconds of being edited — no restart.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -80,6 +93,14 @@ fn main() {
             "-w" | "--window" => with_window = true,
             "-s" | "--stop" => with_kill = true,
             "-f" | "--foreground" => with_foreground = true,
+            "--status" => {
+                print_status();
+                return;
+            }
+            "-v" | "-V" | "--version" => {
+                println!("recast {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "-h" | "--help" => {
                 println!("{HELP}");
                 return;
@@ -114,7 +135,15 @@ if banner::ran_from_terminal() {
     let cfg = config::Config::from_env();
     let en = en_dict();
     let he = he_dict();
-    let control = Arc::new(types::AppControl::new_with_config(cfg));
+    // The switch is remembered across restarts: someone who turned correction
+    // off should not have it turned back on for them by a reboot.
+    let enabled = prefs::load_enabled();
+    if !enabled {
+        println!("Correction is switched off from last time — turn it back on from the tray or TUI.");
+    }
+    let control = Arc::new(types::AppControl::new_with_config_and_state(cfg, enabled));
+    // Pick up edits to abbrev.txt / ignore.txt without a restart.
+    complete::spawn_watcher();
 
     #[cfg(not(target_os = "linux"))]
     if with_window {
@@ -135,4 +164,36 @@ if banner::ran_from_terminal() {
 
     #[cfg(target_os = "windows")]
     platform::windows::start(en, he, control, with_gui);
+}
+
+/// Answer the two questions a user asks when something isn't happening: is it
+/// running, and is it configured the way I think it is.
+///
+/// Deliberately readable without a running daemon — it reports the state on
+/// disk, which is what the next launch will pick up.
+fn print_status() {
+    println!("recast {}", env!("CARGO_PKG_VERSION"));
+
+    #[cfg(target_os = "linux")]
+    match daemon::running_pid() {
+        Some(pid) => println!("  running:        yes (pid {pid})"),
+        None => println!("  running:        no"),
+    }
+
+    println!(
+        "  correction:     {}",
+        if prefs::load_enabled() { "enabled" } else { "disabled" }
+    );
+    match prefs::autostart_enabled() {
+        Some(true) => println!("  start at login: yes"),
+        Some(false) => println!("  start at login: no"),
+        None => {}
+    }
+    match complete::config_dir() {
+        Some(dir) => println!("  config dir:     {}", dir.display()),
+        None => println!("  config dir:     (none — no OS config directory)"),
+    }
+    let (abbrevs, ignored) = complete::list_counts();
+    println!("  abbrev.txt:     {abbrevs} abbreviation(s)");
+    println!("  ignore.txt:     {ignored} word(s)");
 }

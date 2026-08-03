@@ -75,8 +75,8 @@ pub fn completions(prefix: &str, en_dict: Dict, en_freq: Freq) -> Vec<String> {
     let mut out = Vec::with_capacity(MAX_CANDIDATES + 1);
     // An abbreviation is a rule the user wrote by hand — it outranks every
     // guess, exactly as it does when the word is finished (see `plan`).
-    if let Some(text) = abbreviations().get(prefix) {
-        out.push(text.clone());
+    if let Some(text) = abbreviation(prefix) {
+        out.push(text);
     }
     out.extend(completions_with(
         prefix,
@@ -144,7 +144,12 @@ pub fn expand(word: &str) -> Option<String> {
     if !Config::global().complete_enabled || word.is_empty() {
         return None;
     }
-    abbreviations().get(word).cloned()
+    abbreviation(word)
+}
+
+/// The expansion the user defined for `key`, if any.
+fn abbreviation(key: &str) -> Option<String> {
+    abbreviations().lock().ok()?.get(key).cloned()
 }
 
 /// Whether the user has declared `word` off limits in
@@ -255,21 +260,22 @@ pub fn suppressed(word: &str) -> bool {
 
 /// Path of a user list: `<config dir>/recast/<name>`.
 pub fn user_path(name: &str) -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("recast").join(name))
+    Some(config_dir()?.join(name))
+}
+
+/// Where ReCast keeps the user's files — `~/.config/recast` and its
+/// per-OS equivalents.
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("recast"))
 }
 
 /// The ignore list, read from disk on first use. Behind a `Mutex` rather than
-/// straight in a `OnceLock` because [`unlist`] can take entries out of it: the
-/// file is still read once, but it is no longer immutable for the life of the
-/// process.
+/// straight in a `OnceLock` because it is not immutable for the life of the
+/// process: [`unlist`] takes entries out of it, [`ignore_word`] puts them in,
+/// and [`reload_user_files`] replaces it wholesale when the file is edited.
 fn ignore_list() -> &'static Mutex<HashSet<String>> {
     static LIST: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    LIST.get_or_init(|| {
-        let text = user_path("ignore.txt")
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        Mutex::new(parse_ignore_list(&text))
-    })
+    LIST.get_or_init(|| Mutex::new(parse_ignore_list(&read_user_file("ignore.txt"))))
 }
 
 /// Parse the ignore file: one word per line, `#` starting a comment, folded to
@@ -282,17 +288,133 @@ fn parse_ignore_list(text: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// The abbreviation table, read once on first use. A missing or unreadable file
-/// simply means "no abbreviations" — this is an optional convenience, not
-/// something worth failing startup or nagging about.
-fn abbreviations() -> &'static HashMap<String, String> {
-    static TABLE: OnceLock<HashMap<String, String>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let text = user_path("abbrev.txt")
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        parse_abbreviations(&text)
-    })
+/// The abbreviation table, read on first use and again whenever the file
+/// changes. A missing or unreadable file simply means "no abbreviations" — this
+/// is an optional convenience, not something worth failing startup or nagging
+/// about.
+fn abbreviations() -> &'static Mutex<HashMap<String, String>> {
+    static TABLE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(parse_abbreviations(&read_user_file("abbrev.txt"))))
+}
+
+/// The text of one of the user's list files, or empty if it isn't there.
+fn read_user_file(name: &str) -> String {
+    user_path(name)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
+}
+
+/// Re-read `abbrev.txt` and `ignore.txt` from disk.
+///
+/// The session's undo list is deliberately left alone: those are words the user
+/// took back with a gesture minutes ago, and a reload is a statement about the
+/// files, not about that.
+pub fn reload_user_files() {
+    if let Ok(mut table) = abbreviations().lock() {
+        *table = parse_abbreviations(&read_user_file("abbrev.txt"));
+    }
+    if let Ok(mut list) = ignore_list().lock() {
+        *list = parse_ignore_list(&read_user_file("ignore.txt"));
+    }
+}
+
+/// Add `word` to the ignore list and to `ignore.txt`, so nothing corrects it
+/// again — the counterpart of [`unlist`], for the user who has just seen a
+/// correction they never want repeated.
+///
+/// Appends rather than rewrites: the file belongs to the user, and adding a
+/// line is the smallest possible edit to it.
+///
+/// Only the tray's recent-corrections list calls this, so it is gated to the
+/// platforms that have a tray; on Linux the same job is done by the Ctrl
+/// double-tap and by editing the file.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn ignore_word(word: &str) {
+    let word = word.trim().to_lowercase();
+    if word.is_empty() {
+        return;
+    }
+    let already = ignore_list()
+        .lock()
+        .map(|mut list| !list.insert(word.clone()))
+        .unwrap_or(true);
+    if already {
+        return;
+    }
+    let Some(path) = user_path("ignore.txt") else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(appended_line(&existing, &word).as_bytes());
+    }
+}
+
+/// What to append to `existing` to list `word`.
+///
+/// A file whose last line has no newline of its own would otherwise gain a
+/// line reading `previouswordnewword`, listing neither — and the user's last
+/// entry would stop working, which is a strange thing to have happen from
+/// clicking a menu item about a different word.
+///
+/// Only [`ignore_word`] calls it, so it is dead on the platforms without a
+/// tray — but it is pure, so it is still tested there.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+fn appended_line(existing: &str, word: &str) -> String {
+    let lead = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+    format!("{lead}{word}\n")
+}
+
+/// How many abbreviations and ignored words are loaded — what `--status`
+/// reports, so a user who has just edited a file can see it took.
+pub fn list_counts() -> (usize, usize) {
+    (
+        abbreviations().lock().map(|t| t.len()).unwrap_or(0),
+        ignore_list().lock().map(|l| l.len()).unwrap_or(0),
+    )
+}
+
+/// How often the user's list files are checked for edits. Slow enough to be
+/// free (two `stat`s), fast enough that adding an abbreviation and typing it
+/// feels like the same action.
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Watch `abbrev.txt` and `ignore.txt` for edits and reload them in place.
+///
+/// Reading these once at startup made the files a restart away from taking
+/// effect, which for `abbrev.txt` is most of the cost of using it at all: an
+/// abbreviation is written *because* you are about to type it. Polling two
+/// modification times beats a filesystem-watch dependency here — the files are
+/// tiny, the interval is long, and a missing file (the default state) has to be
+/// handled either way.
+pub fn spawn_watcher() {
+    std::thread::spawn(|| {
+        let stamp = || {
+            ["abbrev.txt", "ignore.txt"].map(|name| {
+                user_path(name)
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok())
+            })
+        };
+        let mut last = stamp();
+        loop {
+            std::thread::sleep(WATCH_INTERVAL);
+            let now = stamp();
+            if now != last {
+                last = now;
+                reload_user_files();
+            }
+        }
+    });
 }
 
 /// Parse the abbreviation file: one `abbreviation = expansion` per line, `=` or
@@ -461,6 +583,15 @@ mod tests {
         assert_eq!(without_word("# postgres\nfoo\n", "postgres"), "# postgres\nfoo\n");
         // … and a word that is not there leaves the file byte-identical.
         assert_eq!(without_word(before, "redis"), before);
+    }
+
+    #[test]
+    fn listing_a_word_never_joins_it_to_the_line_before() {
+        assert_eq!(appended_line("", "hostname"), "hostname\n");
+        assert_eq!(appended_line("kubectl\n", "hostname"), "hostname\n");
+        // A last line with no newline of its own gets one first, or both
+        // entries would be lost to `kubectlhostname`.
+        assert_eq!(appended_line("kubectl", "hostname"), "\nhostname\n");
     }
 
     #[test]

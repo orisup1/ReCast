@@ -91,6 +91,22 @@ pub fn write_pidfile() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The PID of a running daemon, if there is one.
+///
+/// Linux-only, because it is the only platform that daemonizes and writes a
+/// pidfile — macOS and Windows run in the foreground under a launch agent or
+/// scheduled task, where the OS is the thing that knows. A stale pidfile left
+/// by a killed process reads as "not running", which is what the user means by
+/// the question.
+#[cfg(target_os = "linux")]
+pub fn running_pid() -> Option<u32> {
+    let pidfile = dirs::cache_dir()?.join("recast").join("pid");
+    let pid: u32 = fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
+    std::path::Path::new(&format!("/proc/{pid}"))
+        .exists()
+        .then_some(pid)
+}
+
 /// Read the pidfile and attempt to kill that process.
 pub fn stop_daemon() -> std::io::Result<()> {
     let mut dir = dirs::cache_dir().ok_or_else(|| std::io::Error::new(

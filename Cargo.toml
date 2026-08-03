@@ -51,6 +51,10 @@ winapi = { version = "0.3", features = [
     # platform::windows::attach_parent_console).
     "wincon", "consoleapi", "processenv", "winbase",
     "fileapi", "handleapi", "winnt",
+    # "Start at login": the per-user Run key (see prefs::windows_autostart).
+    # Listed explicitly rather than relied on through tao/tray-icon's own
+    # feature set, which cargo happens to unify with ours today.
+    "winreg", "winerror", "minwindef",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

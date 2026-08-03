@@ -162,13 +162,30 @@ recast          # start (Linux: forks into the background and writes a pidfile)
 recast -s       # stop a running daemon
 recast -g       # foreground with a terminal dashboard (TUI): status, log, toggle
 recast -w       # foreground with a small control window (Linux only)
+recast --status # what is running, and what is configured
+recast -v       # version
 recast -h       # full option list
 ```
 
-The TUI (`-g`, Linux/Windows) shows the enabled state, fixed-word counter and a
-live log; `e`/`Space` toggles correction on and off, `q` quits. The control
-window (`-w`) offers the same toggle and counter in a tiny GUI window. On macOS
-use the menubar menu instead.
+The TUI (`-g`, Linux/Windows) shows the enabled state, the counters and the
+corrections themselves as they happen; `e`/`Space` toggles correction on and
+off, `p` pauses it for half an hour, `r` re-reads your files, `q` quits. The
+control window (`-w`) offers the toggle and counters in a tiny GUI window. On
+macOS use the menubar menu instead.
+
+The enabled/disabled switch is **remembered across restarts** — turning
+correction off is a decision about the machine, not about one run of the
+process — and `--status` reports it whether or not anything is running:
+
+```
+recast 0.6.0
+  running:        yes (pid 4821)
+  correction:     enabled
+  start at login: yes
+  config dir:     /home/you/.config/recast
+  abbrev.txt:     3 abbreviation(s)
+  ignore.txt:     7 word(s)
+```
 
 Environment variables:
 
@@ -390,6 +407,33 @@ in the other language — and only if that declines does the speller get a look.
 its corrected self and never re-examined, so it is not then flipped to the other
 layout even if its keys happen to spell a Hebrew word too.
 
+## The tray / menubar menu
+
+On macOS and Windows everything below is in the menu behind the icon:
+
+| Item                    | What it does                                                                                                     |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `Fixed: N · M taken back` | The two counters. See [Is it set right for you?](#is-it-set-right-for-you).                                      |
+| `Disable` / `Enable`    | The switch, remembered across restarts.                                                                            |
+| `Pause for 30 minutes`  | Stops correcting, then starts again by itself. Counts down in the menu, and the same row ends it early.            |
+| `Recent`                | The last five corrections, `typed → result (pipeline)`. **Click one and that word goes into `ignore.txt`.**        |
+| `Reload lists`          | Re-reads `abbrev.txt` / `ignore.txt` now (they are picked up within a couple of seconds anyway).                    |
+| `Start at login`        | Registers ReCast with launchd / the per-user `Run` key, without going back to `make service` or `deploy.ps1`.       |
+
+The recent list is there because silent text replacement is the whole premise
+of this program: "what did it just change?" is the question a counter cannot
+answer, and clicking the answer is how you say *not this word, ever*.
+
+## Is it set right for you?
+
+The menu and the TUI show **two** numbers — corrections that stuck, and
+corrections you took back with the undo gesture. The pair is the reading. A
+correction you were happy with is invisible by design, so the count on its own
+cannot tell working well from working badly; the ratio can. Once five have been
+taken back and they are a third or more of the total, both UIs say so and
+suggest `RECAST_SPELL_DIST=1`, which is the knob that turns the badly-mangled
+cases back off.
+
 ## Passwords
 
 On macOS ReCast stops watching the keyboard entirely while a password field has
@@ -406,8 +450,10 @@ service on any platform.
 
 ## Your files
 
-Both are optional, read once at startup, and absent by default — nothing is created
-for you. They live under the OS config directory:
+Both are optional and absent by default — nothing is created for you. They are
+re-read within about two seconds of being edited, so adding an abbreviation and
+typing it are the same action rather than a restart apart. They live under the
+OS config directory:
 
 | OS      | Directory                               |
 | ------- | --------------------------------------- |
@@ -419,22 +465,34 @@ for you. They live under the OS config directory:
 | ------------ | ------------------------------------------------------------------------------------------------------------------------ |
 | `abbrev.txt` | `abbr = expansion` per line, `#` comments. Expands when you finish the word, and is offered by the first Right Shift tap. |
 | `ignore.txt` | One word per line, `#` comments. Words the autocorrect must never touch.                                                  |
+| `state.txt`  | Written by ReCast: the Enable/Disable switch, so it survives a restart.                                                   |
+| `welcomed`   | Written by ReCast: a marker saying the one-time hint below has been shown. Delete it to see it again.                     |
 
-`ignore.txt` is the only file ReCast writes: double-tapping Ctrl on a word that was
-skipped *because* it is listed takes that line back out — comments, spacing and every
-other entry copied through untouched, and the file replaced by rename.
+`ignore.txt` is the only file of *yours* that ReCast writes. Double-tapping Ctrl on a
+word that was skipped *because* it is listed takes that line back out — comments,
+spacing and every other entry copied through untouched, and the file replaced by
+rename — and clicking a correction in the tray's `Recent` list appends one.
+
+The first time a correction ever lands, ReCast says so once with a desktop
+notification, because the gestures below are otherwise invisible: there is no
+window to discover them in, and the README is not where you are when your word
+is rewritten for the first time. Once, ever — the `welcomed` marker is what
+makes sure of it.
 
 ## Development
 
 ```bash
 cargo build --release     # or `make` — release is the meaningful profile (LTO + strip)
-cargo test                # 88 tests, all pure: dictionaries, speller, completer, keymaps
+cargo test                # 99 tests, all pure: dictionaries, speller, completer, keymaps, counters
 RECAST_DEBUG=1 cargo run  # log every word check and switch decision
 ```
 
 The correction pipeline is platform-agnostic and lives in `src/dictionary.rs` (the
 decision core), `src/spell.rs` (the English speller) and `src/complete.rs` (completion,
-abbreviations, the ignore and undo lists). Only capture and injection are per-OS, in
+abbreviations, the ignore and undo lists, and the watcher that reloads them).
+`src/types.rs` holds the shared counters and the corrections history the UIs read,
+`src/prefs.rs` the state kept between runs, and `src/notify.rs` the one-time hint.
+Only capture and injection are per-OS, in
 `src/platform/{linux,macos,windows}.rs`, and each of those owns its entire startup path.
 The word lists are preprocessed by `build.rs` into sorted blobs the binary embeds, so
 there is nothing to install alongside the executable.
