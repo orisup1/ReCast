@@ -253,6 +253,31 @@ extern "C" {
     fn CGEventPost(tap: u32, event: CGEventRef);
 }
 
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    /// Whether some application has turned on secure event input — what a
+    /// password field does while it has focus. Returns a Carbon `Boolean`
+    /// (an unsigned char), so it is taken as `u8` rather than `bool`: any
+    /// non-zero value is true, and only 0 and 1 would be sound as a Rust bool.
+    fn IsSecureEventInputEnabled() -> u8;
+}
+
+/// Whether a password field (or anything else asking for secure input) has
+/// focus right now.
+///
+/// While it does, ReCast stops looking at the keyboard entirely: the buffer is
+/// dropped, nothing is checked, nothing is corrected. The tap is listen-only
+/// and macOS already withholds the characters, but "we couldn't have read it
+/// anyway" is a weaker promise than not being in the loop at all — and the
+/// visible half matters too, since a correction firing inside a password field
+/// would rewrite a password on the strength of a dictionary lookup.
+///
+/// Cheap enough to ask per keystroke: it reads a process-wide flag the window
+/// server keeps, with no round trip.
+fn secure_input_active() -> bool {
+    unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFMachPortCreateRunLoopSource(
@@ -394,6 +419,20 @@ unsafe extern "C" fn tap_callback(
     };
 
     if ctx.injecting.load(Ordering::Relaxed) {
+        return cg_event;
+    }
+
+    // A password field has focus: drop whatever is buffered and look away until
+    // it doesn't. Clearing rather than merely skipping matters — the buffer may
+    // hold the start of a word typed a moment before the field took focus, and
+    // that half-word must not be joined to what is typed into it, nor still be
+    // sitting there to be corrected when focus comes back.
+    if secure_input_active() {
+        if let Ok(mut st) = ctx.state.lock() {
+            st.keys.clear();
+            st.last_action = None;
+            st.cycle = None;
+        }
         return cg_event;
     }
 

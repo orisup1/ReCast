@@ -390,6 +390,20 @@ in the other language — and only if that declines does the speller get a look.
 its corrected self and never re-examined, so it is not then flipped to the other
 layout even if its keys happen to spell a Hebrew word too.
 
+## Passwords
+
+On macOS ReCast stops watching the keyboard entirely while a password field has
+focus, using the same signal the OS gives every application
+(`IsSecureEventInputEnabled`): the word buffer is dropped, nothing is checked
+and nothing is corrected until focus moves on. The event tap is listen-only and
+macOS withholds those characters from it in any case — but not being in the
+loop is a stronger promise than not having been given the data, and it also
+stops a correction from firing *inside* the field.
+
+There is no equivalent signal on Linux or Windows, so the same guarantee cannot
+be made there; `RECAST_DEBUG=1` in particular should not be left on under a
+service on any platform.
+
 ## Your files
 
 Both are optional, read once at startup, and absent by default — nothing is created
