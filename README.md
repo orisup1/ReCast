@@ -19,6 +19,11 @@ merely misspelled gets fixed in place instead — and completes words you are st
   and on mouse clicks (macOS / Windows).
 - When you press Space or Enter, it interprets the typed key sequence as both an English
   and a Hebrew word and looks each up in the matching dictionary.
+- **Punctuation is not part of the word.** A word you finished with `.`, `,`, `?`, `)` or
+  a quote is looked up without it — the end of a clause or a sentence is where words most
+  often end, and a correction that only fired before a bare space missed most of them.
+  Whatever you typed comes back with the correction (`recieve,` → `receive,`), and
+  punctuation *inside* a word stays part of it (`don't`).
 - It **anchors on your live keyboard layout** (queried from the OS, with any English or
   Hebrew regional variant recognised). A sequence that already reads as a real word in your
   current layout is left untouched — including prefixed Hebrew forms (ו/ה/ל/ב/כ/מ/ש) and
@@ -44,11 +49,11 @@ merely misspelled gets fixed in place instead — and completes words you are st
 
 ## Supported platforms
 
-| OS      | Capture       | Layout switch                                    |
-| ------- | ------------- | ------------------------------------------------ |
-| Linux   | `evdev`       | `hyprctl switchxkblayout` (Hyprland only)        |
-| macOS   | `rdev`        | Carbon `TISSelectInputSource`                    |
-| Windows | `rdev`        | `LoadKeyboardLayoutW` + `WM_INPUTLANGCHANGEREQUEST` |
+| OS      | Capture         | Injection                        | Layout switch                                       |
+| ------- | --------------- | -------------------------------- | --------------------------------------------------- |
+| Linux   | `evdev`         | `uinput` keycodes, one batch     | `hyprctl switchxkblayout` (Hyprland only)           |
+| macOS   | `CGEventTap`    | `CGEvent` Unicode string         | Carbon `TISSelectInputSource`                       |
+| Windows | `rdev`          | one `SendInput` Unicode batch    | `LoadKeyboardLayoutW` + `WM_INPUTLANGCHANGEREQUEST` |
 
 Linux additionally requires the user to be in the `input` group (for `evdev` read access)
 and creates a `uinput` virtual device named `recast-injector` to replay corrected words.
@@ -217,7 +222,9 @@ word is only corrected when all of this holds:
   corpus sees often (that is what protects names and handles — `sami`, `ori`,
   `github` are left alone),
 - it is at least `RECAST_SPELL_MIN` characters (default 4), all letters — no
-  digits, so identifiers survive,
+  digits and no internal punctuation, so identifiers, paths and `github.com`
+  survive (the punctuation you *ended* the word with is set aside first, and
+  typed back with the correction),
 - it is not typed in ALL CAPS — acronyms are not misspellings,
 - it is not listed in your own `ignore.txt` (see below),
 - the correction is inside the edit budget for a word that length: one edit up to
@@ -382,3 +389,50 @@ layout switch, because it is exact — the keystrokes literally spell a real wor
 in the other language — and only if that declines does the speller get a look. A word that the speller fixes is typed as
 its corrected self and never re-examined, so it is not then flipped to the other
 layout even if its keys happen to spell a Hebrew word too.
+
+## Your files
+
+Both are optional, read once at startup, and absent by default — nothing is created
+for you. They live under the OS config directory:
+
+| OS      | Directory                               |
+| ------- | --------------------------------------- |
+| Linux   | `~/.config/recast/`                     |
+| macOS   | `~/Library/Application Support/recast/` |
+| Windows | `%APPDATA%\recast\`                     |
+
+| File         | What it holds                                                                                                            |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `abbrev.txt` | `abbr = expansion` per line, `#` comments. Expands when you finish the word, and is offered by the first Right Shift tap. |
+| `ignore.txt` | One word per line, `#` comments. Words the autocorrect must never touch.                                                  |
+
+`ignore.txt` is the only file ReCast writes: double-tapping Ctrl on a word that was
+skipped *because* it is listed takes that line back out — comments, spacing and every
+other entry copied through untouched, and the file replaced by rename.
+
+## Development
+
+```bash
+cargo build --release     # or `make` — release is the meaningful profile (LTO + strip)
+cargo test                # 88 tests, all pure: dictionaries, speller, completer, keymaps
+RECAST_DEBUG=1 cargo run  # log every word check and switch decision
+```
+
+The correction pipeline is platform-agnostic and lives in `src/dictionary.rs` (the
+decision core), `src/spell.rs` (the English speller) and `src/complete.rs` (completion,
+abbreviations, the ignore and undo lists). Only capture and injection are per-OS, in
+`src/platform/{linux,macos,windows}.rs`, and each of those owns its entire startup path.
+The word lists are preprocessed by `build.rs` into sorted blobs the binary embeds, so
+there is nothing to install alongside the executable.
+
+Both cross-targets compile from Linux, and are worth checking before a release since
+neither is exercised by `cargo test`:
+
+```bash
+cargo check --target x86_64-pc-windows-gnu
+cargo check --target x86_64-apple-darwin
+```
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use rdev::{simulate, EventType, Key};
 
 use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix};
-use crate::keymap::{english_char_to_key, key_to_english_char, key_to_hebrew_char};
+use crate::keymap::{
+    english_char_to_key, key_to_english_char, key_to_english_char_shifted, key_to_hebrew_char,
+};
 use crate::types::{AppControl, Language};
 
 /// Maximum time the replace thread will wait for the user to physically
@@ -498,7 +500,7 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                 }
                 let result = check_and_correct(
                     &st.keys,
-                    |t: Typed| key_to_english_char(t.key),
+                    |t: Typed| key_to_english_char_shifted(t.key, t.shift),
                     |t: Typed| key_to_hebrew_char(t.key),
                     |t: Typed| t.shift,
                     ctx.en_dict,
@@ -528,8 +530,9 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                     });
                 } else if let Some(word) = crate::dictionary::declined_by_list(
                     &st.keys,
-                    |t: Typed| key_to_english_char(t.key),
+                    |t: Typed| key_to_english_char_shifted(t.key, t.shift),
                     |t: Typed| key_to_hebrew_char(t.key),
+                    |t: Typed| t.shift,
                 ) {
                     // Nothing happened to this word, and the only reason is
                     // that the user has it listed. Arm the gesture to change
@@ -630,7 +633,7 @@ fn handle_key_release(ctx: &TapContext, key: Key) {
             }
             let candidates = complete_candidates(
                 &st.keys,
-                |t: Typed| key_to_english_char(t.key),
+                |t: Typed| key_to_english_char_shifted(t.key, t.shift),
                 |t: Typed| t.shift,
                 ctx.en_dict,
             );
@@ -778,7 +781,7 @@ fn unlist_and_correct(ctx: &TapContext, mut st: std::sync::MutexGuard<'_, AppSta
     crate::complete::unlist(&skip.word);
     let result = check_and_correct(
         &skip.keys,
-        |t: Typed| key_to_english_char(t.key),
+        |t: Typed| key_to_english_char_shifted(t.key, t.shift),
         |t: Typed| key_to_hebrew_char(t.key),
         |t: Typed| t.shift,
         ctx.en_dict,
@@ -815,7 +818,7 @@ fn unlist_and_correct(ctx: &TapContext, mut st: std::sync::MutexGuard<'_, AppSta
 fn reading(keys: &[Typed], lang: Language) -> String {
     keys.iter()
         .filter_map(|t| match lang {
-            Language::English => key_to_english_char(t.key)
+            Language::English => key_to_english_char_shifted(t.key, t.shift)
                 .map(|c| if t.shift { c.to_ascii_uppercase() } else { c }),
             // Hebrew has no case, so the shift the user held says nothing.
             Language::Hebrew => key_to_hebrew_char(t.key),

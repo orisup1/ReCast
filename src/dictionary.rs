@@ -490,6 +490,63 @@ pub enum Fix {
     Spelling { text: String },
 }
 
+/// One key sequence read under one layout, split at the word's end.
+///
+/// A finished word is rarely just letters: people end clauses with `,` and
+/// sentences with `.`, and those characters are in the buffer like any other.
+/// Asking the dictionary about `hello,` gets a miss, which is why a mistyped
+/// word used to go uncorrected precisely where words most often end — and why a
+/// spelling fix, retyped from the word alone, used to swallow the comma with
+/// it. So the trailing punctuation is set aside once, here: [`word`](Self::word)
+/// is what the dictionaries are asked about, [`tail`](Self::tail) is what has to
+/// be put back after whatever they answer, and `full` is the two together — the
+/// characters actually on screen, one per key.
+///
+/// Only the *trailing* run is separated. Punctuation inside a word is part of it
+/// (`don't`), and a leading `(` is left in place because both readings have to
+/// keep agreeing character-for-character with the keys, which is what lets a
+/// correction be erased and put back by count.
+#[derive(Clone, Copy)]
+struct Reading<'a> {
+    /// Everything the keys spell in this layout.
+    full: &'a str,
+    /// The word: `full` up to the trailing punctuation.
+    word: &'a str,
+    /// The trailing punctuation, `""` when the word ends the buffer.
+    tail: &'a str,
+}
+
+/// Whether a character the keys produced belongs to the word itself, rather
+/// than to the punctuation trailing it.
+///
+/// `trusted_shift` says whether the map that produced `c` knows about shift.
+/// The English map does, so `!` arrives as `!` and can be set aside. The Hebrew
+/// map does not — every key gives its unshifted character — so a character
+/// typed with shift held is *not* known to be what is on screen, and stripping
+/// it would mean putting something else back in its place. There it counts as
+/// part of the word, which at worst leaves the word unrecognised: the same
+/// outcome as before any of this existed.
+fn in_word(c: char, shift: bool, trusted_shift: bool) -> bool {
+    c.is_alphanumeric() || (shift && !trusted_shift)
+}
+
+impl<'a> Reading<'a> {
+    /// `word_end` is the byte offset the caller recorded while folding: the end
+    /// of the last character that counts as part of the word.
+    fn new(full: &'a str, word_end: usize) -> Self {
+        Self {
+            full,
+            word: &full[..word_end],
+            tail: &full[word_end..],
+        }
+    }
+
+    #[cfg(test)]
+    fn of(full: &'a str) -> Self {
+        Self::new(full, full.len())
+    }
+}
+
 /// Internal counterpart of [`Fix`] that still carries the target language, so
 /// the pure planner can be tested without performing the switch.
 #[derive(Clone, Debug, PartialEq)]
@@ -498,6 +555,19 @@ enum Plan {
     Spell { text: String },
     /// A user-configured abbreviation was typed out in full.
     Expand { text: String },
+}
+
+/// What a spelling fix or an expansion puts on screen: the new word in the case
+/// the old one was typed in, followed by the punctuation that ended it.
+///
+/// The caller erases every character the user typed, the punctuation included —
+/// it sits between the cursor and the word, so there is no erasing around it —
+/// which means anything left out here is deleted from the user's text. That is
+/// what used to happen to the comma in `recieve,`.
+fn respelled(fixed: &str, case: Case, tail: &str) -> String {
+    let mut out = case.apply(fixed);
+    out.push_str(tail);
+    out
 }
 
 fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: bool) {
@@ -537,8 +607,8 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
 ///      Hebrew word is *not* subsequently flipped.
 #[allow(clippy::too_many_arguments)]
 fn plan(
-    full_en: &str,
-    full_he: &str,
+    en: Reading,
+    he: Reading,
     offsets_en: &[usize],
     offsets_he: &[usize],
     keys_len: usize,
@@ -549,14 +619,18 @@ fn plan(
     en_freq: Freq,
     he_freq: Freq,
 ) -> Option<Plan> {
+    // Every pipeline below asks about the *word* — the punctuation the user
+    // finished it with is set aside by `Reading` and put back by the caller.
+    // The split scan is the one exception: its offsets index the full readings.
+    let (word_en, word_he) = (en.word, he.word);
     // A word the user has already taken back with the undo gesture is not
     // offered a second opinion. This is checked before everything else,
     // expansions included: the reading being suppressed is the one the user
     // saw, chose to keep, and would otherwise have to fight for again on every
     // repetition (see `complete::suppressed`).
     let typed = match current {
-        Some(Language::Hebrew) => full_he,
-        _ => full_en,
+        Some(Language::Hebrew) => word_he,
+        _ => word_en,
     };
     if crate::complete::suppressed(typed) {
         return None;
@@ -564,7 +638,7 @@ fn plan(
 
     // An expansion the user configured by hand outranks everything we infer.
     if current == Some(Language::English) {
-        if let Some(text) = crate::complete::expand(full_en) {
+        if let Some(text) = crate::complete::expand(word_en) {
             return Some(Plan::Expand { text });
         }
     }
@@ -572,20 +646,20 @@ fn plan(
     // Whole-buffer decision first — this is what fires for virtually every real
     // correction.
     let whole = match current {
-        Some(cur) => decide_known(full_en, full_he, cur, en_dict, he_dict, en_freq, he_freq),
-        None => decide_unknown(full_en, full_he, en_dict, he_dict, en_freq, he_freq),
+        Some(cur) => decide_known(word_en, word_he, cur, en_dict, he_dict, en_freq, he_freq),
+        None => decide_unknown(word_en, word_he, en_dict, he_dict, en_freq, he_freq),
     };
     if let Some(lang) = whole {
         return Some(Plan::Switch { lang, start: 0 });
     }
 
     if let Some(split) = plan_split(
-        full_en, full_he, offsets_en, offsets_he, keys_len, current, en_dict, he_dict,
+        en.full, he.full, offsets_en, offsets_he, keys_len, current, en_dict, he_dict,
     ) {
         return Some(split);
     }
 
-    plan_spelling(full_en, full_he, current, case, en_dict, he_dict, en_freq)
+    plan_spelling(word_en, word_he, current, case, en_dict, he_dict, en_freq)
 }
 
 /// Second pipeline: the word is not a mistype of the other layout, but it may
@@ -745,21 +819,38 @@ pub fn check_and_correct<K: Copy>(
     let mut full_he = String::with_capacity(keys.len() * 2);
     let mut offsets_en = Vec::with_capacity(if want_offsets { keys.len() + 1 } else { 0 });
     let mut offsets_he = Vec::with_capacity(if want_offsets { keys.len() + 1 } else { 0 });
-    // Shift state of the keys that produced an English character, which is what
-    // the case pattern is read off. Keys that type nothing in English (a Hebrew
-    // punctuation position, say) have no case to contribute.
+    // Shift state of the keys that produced an English *letter*, which is what
+    // the case pattern is read off. Digits and punctuation have no case to
+    // contribute, and the shift behind a `!` would otherwise read as a capital
+    // and break the pattern.
     let mut shifted_en = Vec::with_capacity(keys.len());
     if want_offsets {
         offsets_en.push(0);
         offsets_he.push(0);
     }
+    // Where the word ends in each reading: everything after it is the
+    // punctuation the user finished with, which the dictionaries must not see
+    // and the correction must not eat (see `Reading`).
+    let mut word_end_en = 0usize;
+    let mut word_end_he = 0usize;
     for &k in keys {
+        let shift = shift_of(k);
         if let Some(c) = to_en(k) {
             full_en.push(c);
-            shifted_en.push(shift_of(k));
+            if in_word(c, shift, true) {
+                word_end_en = full_en.len();
+            }
+            // Case is read off letters alone: the shift behind a `!` says
+            // nothing about whether the word was capitalized.
+            if c.is_ascii_alphabetic() {
+                shifted_en.push(shift);
+            }
         }
         if let Some(c) = to_he(k) {
             full_he.push(c);
+            if in_word(c, shift, false) {
+                word_end_he = full_he.len();
+            }
         }
         if want_offsets {
             offsets_en.push(full_en.len());
@@ -767,11 +858,13 @@ pub fn check_and_correct<K: Copy>(
         }
     }
     let case = Case::of(&shifted_en);
+    let en = Reading::new(&full_en, word_end_en);
+    let he = Reading::new(&full_he, word_end_he);
 
     let current = crate::layout::current_layout();
     let Some(plan) = plan(
-        &full_en,
-        &full_he,
+        en,
+        he,
         &offsets_en,
         &offsets_he,
         keys.len(),
@@ -822,10 +915,10 @@ pub fn check_and_correct<K: Copy>(
             // letters change.
             debug_log(&full_en, &full_he, None, false);
             if debug_enabled() {
-                println!("spell: {} -> {}", full_en, text);
+                println!("spell: {} -> {}{}", full_en, text, en.tail);
             }
             Some(Fix::Spelling {
-                text: case.apply(&text),
+                text: respelled(&text, case, en.tail),
             })
         }
     }
@@ -851,30 +944,43 @@ pub fn declined_by_list<K: Copy>(
     keys: &[K],
     to_en: impl Fn(K) -> Option<char>,
     to_he: impl Fn(K) -> Option<char>,
+    shift_of: impl Fn(K) -> bool,
 ) -> Option<String> {
     if keys.is_empty() {
         return None;
     }
     let mut full_en = String::with_capacity(keys.len());
     let mut full_he = String::with_capacity(keys.len() * 2);
+    let mut word_end_en = 0usize;
+    let mut word_end_he = 0usize;
     for &k in keys {
+        let shift = shift_of(k);
         if let Some(c) = to_en(k) {
             full_en.push(c);
+            if in_word(c, shift, true) {
+                word_end_en = full_en.len();
+            }
         }
         if let Some(c) = to_he(k) {
             full_he.push(c);
+            if in_word(c, shift, false) {
+                word_end_he = full_he.len();
+            }
         }
     }
+    // The lists hold words, so they are asked about the word — the same reading
+    // `plan` would have checked them against, punctuation set aside.
     let current = crate::layout::current_layout();
     let typed = match current {
-        Some(Language::Hebrew) => &full_he,
-        _ => &full_en,
+        Some(Language::Hebrew) => &full_he[..word_end_he],
+        _ => &full_en[..word_end_en],
     };
     if crate::complete::suppressed(typed) {
-        return Some(typed.clone());
+        return Some(typed.to_string());
     }
-    if current == Some(Language::English) && crate::complete::ignored(&full_en) {
-        return Some(full_en);
+    let word_en = &full_en[..word_end_en];
+    if current == Some(Language::English) && crate::complete::ignored(word_en) {
+        return Some(word_en.to_string());
     }
     None
 }
@@ -1195,7 +1301,17 @@ mod tests {
         en_f: Freq,
     ) -> Option<Plan> {
         plan(
-            en_text, he_text, &[], &[], 0, current, case, en, he, en_f, nofreq(),
+            Reading::of(en_text),
+            Reading::of(he_text),
+            &[],
+            &[],
+            0,
+            current,
+            case,
+            en,
+            he,
+            en_f,
+            nofreq(),
         )
     }
 
@@ -1323,6 +1439,100 @@ mod tests {
         assert_eq!(
             plan_cased("akuo", "שלום", Some(Language::English), Case::Upper, en, he, nofreq()),
             Some(Plan::Switch { lang: Language::Hebrew, start: 0 })
+        );
+    }
+
+    /// Build the reading the fold would produce for `text`, where `shifted`
+    /// lists the characters that were typed with shift held.
+    fn read<'a>(text: &'a str, trusted_shift: bool, shifted: &[char]) -> Reading<'a> {
+        let mut word_end = 0;
+        for (i, c) in text.char_indices() {
+            if in_word(c, shifted.contains(&c), trusted_shift) {
+                word_end = i + c.len_utf8();
+            }
+        }
+        Reading::new(text, word_end)
+    }
+
+    #[test]
+    fn a_word_ends_before_the_punctuation_that_follows_it() {
+        // The end of a clause or a sentence is where words most often end, so
+        // this is the difference between correcting most of what is typed and
+        // correcting only what is followed by a space.
+        let r = read("hello,", true, &[]);
+        assert_eq!(r.word, "hello");
+        assert_eq!(r.tail, ",");
+        assert_eq!(r.full, "hello,");
+        // Several at once — a quoted word ending a sentence.
+        assert_eq!(read("hello.\"", true, &['"']).word, "hello");
+        // Punctuation inside a word is part of it.
+        assert_eq!(read("don't", true, &[]).word, "don't");
+        // A digit is not punctuation: `utf8` is one token, not `utf` plus junk.
+        assert_eq!(read("utf8", true, &[]).word, "utf8");
+        // Nothing to set aside.
+        assert_eq!(read("hello", true, &[]).tail, "");
+        // The whole buffer is punctuation: no word at all, and no panic.
+        assert_eq!(read("...", true, &[]).word, "");
+        // Under a map with no shifted forms (Hebrew), a character typed with
+        // shift is kept: we don't know it is really the character on screen.
+        assert_eq!(read("שלום1", false, &['1']).word, "שלום1");
+        assert_eq!(read("שלום.", false, &[]).word, "שלום");
+    }
+
+    #[test]
+    fn a_word_typed_in_the_wrong_layout_is_still_fixed_at_a_full_stop() {
+        // The keys spell "שלום" plus the Hebrew layout's period. Before the
+        // word/punctuation split this asked the dictionary about "שלום." and
+        // got nothing, so ending a sentence meant losing the correction.
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        let plan = plan(
+            read("akuo/", true, &[]),
+            read("שלום.", false, &[]),
+            &[],
+            &[],
+            0,
+            Some(Language::English),
+            Case::Lower,
+            en,
+            he,
+            nofreq(),
+            nofreq(),
+        );
+        assert_eq!(plan, Some(Plan::Switch { lang: Language::Hebrew, start: 0 }));
+    }
+
+    #[test]
+    fn a_spelling_fix_keeps_the_punctuation_it_was_typed_with() {
+        // The caller erases the comma along with the word, so a replacement
+        // without it deletes it from the user's text.
+        assert_eq!(respelled("receive", Case::Lower, ","), "receive,");
+        assert_eq!(respelled("receive", Case::Title, "."), "Receive.");
+        assert_eq!(respelled("receive", Case::Lower, ""), "receive");
+        // The case pattern belongs to the word, not to what follows it.
+        assert_eq!(respelled("by the way", Case::Title, "!"), "By the way!");
+    }
+
+    #[test]
+    fn the_speller_sees_the_word_without_its_punctuation() {
+        let en = dict(&["hello"]);
+        let he = dict(&[]);
+        let en_f = freq(&[("hello", 500)]);
+        assert_eq!(
+            plan(
+                read("helo,", true, &[]),
+                read("יקךם,", false, &[]),
+                &[],
+                &[],
+                0,
+                Some(Language::English),
+                Case::Lower,
+                en,
+                he,
+                en_f,
+                nofreq(),
+            ),
+            Some(Plan::Spell { text: "hello".to_string() })
         );
     }
 

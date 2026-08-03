@@ -1,6 +1,33 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Linux key → character mappings
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// The non-letter keys of a US layout: the key, what it types on its own, and
+/// what it types with shift held.
+///
+/// These are in the map because a word does not stop at its last letter —
+/// people end clauses with one of these and sentences with another. Reading
+/// them back is what lets the decision core look past a trailing `.` or `,`
+/// (`dictionary::Reading`) instead of asking the dictionary about `hello,`, and
+/// what stops a spelling fix from erasing the punctuation along with the word.
+#[cfg(target_os = "linux")]
+const EN_SYMBOLS: &[(evdev::KeyCode, char, char)] = {
+    use evdev::KeyCode as K;
+    &[
+        (K::KEY_1, '1', '!'), (K::KEY_2, '2', '@'), (K::KEY_3, '3', '#'),
+        (K::KEY_4, '4', '$'), (K::KEY_5, '5', '%'), (K::KEY_6, '6', '^'),
+        (K::KEY_7, '7', '&'), (K::KEY_8, '8', '*'), (K::KEY_9, '9', '('),
+        (K::KEY_0, '0', ')'),
+        (K::KEY_MINUS, '-', '_'), (K::KEY_EQUAL, '=', '+'),
+        (K::KEY_LEFTBRACE, '[', '{'), (K::KEY_RIGHTBRACE, ']', '}'),
+        (K::KEY_BACKSLASH, '\\', '|'),
+        (K::KEY_SEMICOLON, ';', ':'), (K::KEY_APOSTROPHE, '\'', '"'),
+        (K::KEY_GRAVE, '`', '~'),
+        (K::KEY_COMMA, ',', '<'), (K::KEY_DOT, '.', '>'),
+        (K::KEY_SLASH, '/', '?'),
+    ]
+};
+
 #[cfg(target_os = "linux")]
 pub fn evkey_to_english_char(key: evdev::KeyCode) -> Option<char> {
     use evdev::KeyCode as K;
@@ -14,12 +41,27 @@ pub fn evkey_to_english_char(key: evdev::KeyCode) -> Option<char> {
         K::KEY_S => Some('s'), K::KEY_T => Some('t'), K::KEY_U => Some('u'),
         K::KEY_V => Some('v'), K::KEY_W => Some('w'), K::KEY_X => Some('x'),
         K::KEY_Y => Some('y'), K::KEY_Z => Some('z'),
-        K::KEY_1 => Some('1'), K::KEY_2 => Some('2'), K::KEY_3 => Some('3'),
-        K::KEY_4 => Some('4'), K::KEY_5 => Some('5'), K::KEY_6 => Some('6'),
-        K::KEY_7 => Some('7'), K::KEY_8 => Some('8'), K::KEY_9 => Some('9'),
-        K::KEY_0 => Some('0'),
-        _ => None,
+        other => EN_SYMBOLS
+            .iter()
+            .find(|(k, _, _)| *k == other)
+            .map(|(_, plain, _)| *plain),
     }
+}
+
+/// The English character `key` types with `shift` in the state it was typed in.
+///
+/// Letters come back lowercase whatever the shift — the dictionaries are
+/// lowercase and the capitalization is tracked separately (`dictionary::Case`)
+/// — but a symbol key has to give its *shifted* form, or `!` reads as `1` and a
+/// sentence-ending word never gets looked up.
+#[cfg(target_os = "linux")]
+pub fn evkey_to_english_char_shifted(key: evdev::KeyCode, shift: bool) -> Option<char> {
+    if shift {
+        if let Some((_, _, shifted)) = EN_SYMBOLS.iter().find(|(k, _, _)| *k == key) {
+            return Some(*shifted);
+        }
+    }
+    evkey_to_english_char(key)
 }
 
 /// Inverse of [`evkey_to_english_char`]: the key that types `c` under an
@@ -42,10 +84,12 @@ pub fn english_char_to_evkey(c: char) -> Option<evdev::KeyCode> {
         'q' => K::KEY_Q, 'r' => K::KEY_R, 's' => K::KEY_S, 't' => K::KEY_T,
         'u' => K::KEY_U, 'v' => K::KEY_V, 'w' => K::KEY_W, 'x' => K::KEY_X,
         'y' => K::KEY_Y, 'z' => K::KEY_Z,
-        '1' => K::KEY_1, '2' => K::KEY_2, '3' => K::KEY_3, '4' => K::KEY_4,
-        '5' => K::KEY_5, '6' => K::KEY_6, '7' => K::KEY_7, '8' => K::KEY_8,
-        '9' => K::KEY_9, '0' => K::KEY_0,
-        _ => return None,
+        other => {
+            return EN_SYMBOLS
+                .iter()
+                .find(|(_, plain, _)| *plain == other)
+                .map(|(k, _, _)| *k)
+        }
     })
 }
 
@@ -64,7 +108,15 @@ pub fn english_char_to_evkey_shifted(c: char) -> Option<(evdev::KeyCode, bool)> 
     if c.is_ascii_uppercase() {
         return english_char_to_evkey(c.to_ascii_lowercase()).map(|k| (k, true));
     }
-    english_char_to_evkey(c).map(|k| (k, false))
+    if let Some(key) = english_char_to_evkey(c) {
+        return Some((key, false));
+    }
+    // A symbol that needs shift — the `!` a corrected word kept from the
+    // sentence it ended.
+    EN_SYMBOLS
+        .iter()
+        .find(|(_, _, shifted)| *shifted == c)
+        .map(|(k, _, _)| (*k, true))
 }
 
 #[cfg(target_os = "linux")]
@@ -96,6 +148,25 @@ pub fn evkey_to_hebrew_char(key: evdev::KeyCode) -> Option<char> {
 // ─────────────────────────────────────────────────────────────────────────────
 // macOS key → character mappings
 // ─────────────────────────────────────────────────────────────────────────────
+/// The rdev twin of [`EN_SYMBOLS`] — same table, same reason.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const EN_SYMBOLS: &[(rdev::Key, char, char)] = {
+    use rdev::Key as K;
+    &[
+        (K::Num1, '1', '!'), (K::Num2, '2', '@'), (K::Num3, '3', '#'),
+        (K::Num4, '4', '$'), (K::Num5, '5', '%'), (K::Num6, '6', '^'),
+        (K::Num7, '7', '&'), (K::Num8, '8', '*'), (K::Num9, '9', '('),
+        (K::Num0, '0', ')'),
+        (K::Minus, '-', '_'), (K::Equal, '=', '+'),
+        (K::LeftBracket, '[', '{'), (K::RightBracket, ']', '}'),
+        (K::BackSlash, '\\', '|'),
+        (K::SemiColon, ';', ':'), (K::Quote, '\'', '"'),
+        (K::BackQuote, '`', '~'),
+        (K::Comma, ',', '<'), (K::Dot, '.', '>'),
+        (K::Slash, '/', '?'),
+    ]
+};
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn key_to_english_char(key: rdev::Key) -> Option<char> {
     use rdev::Key as K;
@@ -109,12 +180,24 @@ pub fn key_to_english_char(key: rdev::Key) -> Option<char> {
         K::KeyS => Some('s'), K::KeyT => Some('t'), K::KeyU => Some('u'),
         K::KeyV => Some('v'), K::KeyW => Some('w'), K::KeyX => Some('x'),
         K::KeyY => Some('y'), K::KeyZ => Some('z'),
-        K::Num1 => Some('1'), K::Num2 => Some('2'), K::Num3 => Some('3'),
-        K::Num4 => Some('4'), K::Num5 => Some('5'), K::Num6 => Some('6'),
-        K::Num7 => Some('7'), K::Num8 => Some('8'), K::Num9 => Some('9'),
-        K::Num0 => Some('0'),
-        _ => None,
+        other => EN_SYMBOLS
+            .iter()
+            .find(|(k, _, _)| *k == other)
+            .map(|(_, plain, _)| *plain),
     }
+}
+
+/// The English character `key` types with `shift` held — the rdev twin of
+/// [`evkey_to_english_char_shifted`], and the same rule: letters stay
+/// lowercase, symbols give their shifted form.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn key_to_english_char_shifted(key: rdev::Key, shift: bool) -> Option<char> {
+    if shift {
+        if let Some((_, _, shifted)) = EN_SYMBOLS.iter().find(|(k, _, _)| *k == key) {
+            return Some(*shifted);
+        }
+    }
+    key_to_english_char(key)
 }
 
 /// Inverse of [`key_to_english_char`]: the key that types `c` under an English
@@ -140,10 +223,19 @@ pub fn english_char_to_key(c: char) -> Option<(rdev::Key, bool)> {
         'q' => K::KeyQ, 'r' => K::KeyR, 's' => K::KeyS, 't' => K::KeyT,
         'u' => K::KeyU, 'v' => K::KeyV, 'w' => K::KeyW, 'x' => K::KeyX,
         'y' => K::KeyY, 'z' => K::KeyZ,
-        '1' => K::Num1, '2' => K::Num2, '3' => K::Num3, '4' => K::Num4,
-        '5' => K::Num5, '6' => K::Num6, '7' => K::Num7, '8' => K::Num8,
-        '9' => K::Num9, '0' => K::Num0,
-        _ => return None,
+        other => {
+            return EN_SYMBOLS
+                .iter()
+                .find_map(|(k, plain, shifted)| {
+                    if *plain == other {
+                        Some((*k, false))
+                    } else if *shifted == other {
+                        Some((*k, true))
+                    } else {
+                        None
+                    }
+                })
+        }
     };
     Some((key, shift))
 }
@@ -195,9 +287,36 @@ mod tests {
             assert!(english_char_to_evkey(c).is_some(), "{c}");
         }
         // Anything the English layout can't type unshifted has no key.
-        for c in ['A', ' ', '\'', 'ש', '-'] {
+        for c in ['A', ' ', 'ש', '£'] {
             assert_eq!(english_char_to_evkey(c), None, "{c}");
         }
+    }
+
+    /// Punctuation is only useful if it survives the whole round trip: it is
+    /// read off the key that was pressed, kept beside the word, and typed back
+    /// out with the correction. A gap anywhere in that chain deletes a comma
+    /// from the user's text.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn punctuation_round_trips_through_both_shift_states() {
+        use super::{
+            english_char_to_evkey_shifted, evkey_to_english_char,
+            evkey_to_english_char_shifted, EN_SYMBOLS,
+        };
+
+        for &(key, plain, shifted) in EN_SYMBOLS {
+            assert_eq!(evkey_to_english_char(key), Some(plain));
+            assert_eq!(evkey_to_english_char_shifted(key, false), Some(plain));
+            assert_eq!(evkey_to_english_char_shifted(key, true), Some(shifted));
+            assert_eq!(english_char_to_evkey_shifted(plain), Some((key, false)));
+            assert_eq!(english_char_to_evkey_shifted(shifted), Some((key, true)));
+        }
+        // A letter is unaffected by shift here: the case a word was typed in is
+        // tracked separately, and the dictionaries are lowercase.
+        assert_eq!(
+            evkey_to_english_char_shifted(evdev::KeyCode::KEY_A, true),
+            Some('a')
+        );
     }
 
     /// The macOS/Windows inverse map refills the word buffer after a

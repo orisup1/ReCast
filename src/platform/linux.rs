@@ -23,7 +23,8 @@ const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
 
 use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix};
 use crate::keymap::{
-    english_char_to_evkey_shifted, evkey_to_english_char, evkey_to_hebrew_char,
+    english_char_to_evkey_shifted, evkey_to_english_char, evkey_to_english_char_shifted,
+    evkey_to_hebrew_char,
 };
 use crate::types::{AppControl, Language};
 
@@ -394,7 +395,7 @@ fn handle_key(
                 }
                 let result = check_and_correct(
                     &st.keys,
-                    |t| evkey_to_english_char(t.key),
+                    |t| evkey_to_english_char_shifted(t.key, t.shift),
                     |t| evkey_to_hebrew_char(t.key),
                     |t| t.shift,
                     en_dict,
@@ -423,8 +424,9 @@ fn handle_key(
                     });
                 } else if let Some(word) = crate::dictionary::declined_by_list(
                     &st.keys,
-                    |t: Typed| evkey_to_english_char(t.key),
+                    |t: Typed| evkey_to_english_char_shifted(t.key, t.shift),
                     |t: Typed| evkey_to_hebrew_char(t.key),
+                    |t: Typed| t.shift,
                 ) {
                     // Nothing happened to this word, and the only reason is
                     // that the user has it listed. Arm the gesture to change
@@ -536,7 +538,7 @@ fn handle_release(
             }
             let candidates = complete_candidates(
                 &st.keys,
-                |t: Typed| evkey_to_english_char(t.key),
+                |t: Typed| evkey_to_english_char_shifted(t.key, t.shift),
                 |t: Typed| t.shift,
                 en_dict,
             );
@@ -722,7 +724,7 @@ fn unlist_and_correct(
     crate::complete::unlist(&skip.word);
     let result = check_and_correct(
         &skip.keys,
-        |t: Typed| evkey_to_english_char(t.key),
+        |t: Typed| evkey_to_english_char_shifted(t.key, t.shift),
         |t: Typed| evkey_to_hebrew_char(t.key),
         |t: Typed| t.shift,
         en_dict,
@@ -759,7 +761,7 @@ fn unlist_and_correct(
 fn reading(keys: &[Typed], lang: Language) -> String {
     keys.iter()
         .filter_map(|t| match lang {
-            Language::English => evkey_to_english_char(t.key),
+            Language::English => evkey_to_english_char_shifted(t.key, t.shift),
             Language::Hebrew => evkey_to_hebrew_char(t.key),
         })
         .collect()
