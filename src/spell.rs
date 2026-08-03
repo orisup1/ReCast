@@ -91,9 +91,26 @@ const MAX_LEN: usize = 20;
 
 /// One plain edit: the unit the distance budget is denominated in.
 const COST_EDIT: u32 = 100;
-/// Substituting a key for one of its physical neighbours — the classic fat
-/// finger, and by far the most common wrong-letter typo.
-const COST_ADJACENT: u32 = 65;
+/// Substituting a key for the one **beside it in the same row** — the classic
+/// fat finger, and by far the most common wrong-letter typo. The hand is
+/// already on that row and the finger lands one key over.
+///
+/// This is the cheapest substitution there is, and `bag_bound` prunes the whole
+/// frequency scan at the cheapest rate any edit offers — so lowering it makes
+/// every correction slower (measurably: 65 → 60 costs ~10% of the scan) for a
+/// discrimination that the gap to [`COST_ADJACENT_DIAG`] already provides.
+const COST_ADJACENT_ROW: u32 = 65;
+/// The same slip onto the row above or below (`g` for `t`, `g` for `b`). Still
+/// a finger in the wrong place, but reaching across rows is a deliberate
+/// movement that goes wrong less often than sliding along one.
+const COST_ADJACENT_DIAG: u32 = 72;
+/// An **extra** letter next to one of its neighbours on the keyboard: the hand
+/// caught a second key on its way past (`worjk` for `work`, `mnake` for
+/// `make`). Distinct from a stray letter the writer believed in — that is a
+/// misspelling and still costs a full edit — and dearer than a fat-fingered
+/// substitution, since hitting two keys is less common than hitting the wrong
+/// one.
+const COST_STRAY_KEY: u32 = 70;
 /// Two letters typed in the wrong order.
 const COST_TRANSPOSE: u32 = 60;
 /// Half of a double letter dropped (`hello` → `helo`) or a single letter typed
@@ -544,7 +561,12 @@ fn min_cost_per_letter_x100() -> u32 {
     *MIN.get_or_init(|| {
         // A substitution changes two letter counts, an insertion or deletion
         // one, a transposition none (so it can never help close a bag gap).
-        let mut min = (COST_DOUBLE * 100).min(COST_ADJACENT * 100 / 2);
+        // Every cheap edit has to be represented here or the bound stops being
+        // one: a discount the matrix can give but this cannot see would let
+        // `bag_bound` reject a candidate the matrix would have accepted.
+        let cheapest_gap = COST_DOUBLE.min(COST_STRAY_KEY);
+        let cheapest_sub = COST_ADJACENT_ROW.min(COST_ADJACENT_DIAG).min(COST_VOWEL);
+        let mut min = (cheapest_gap * 100).min(cheapest_sub * 100 / 2);
         for rule in RULES {
             // What the rule actually moves, not how long it is: `ance` → `ence`
             // is four letters wide but only exchanges one of them.
@@ -607,22 +629,30 @@ fn qwerty_pos(c: u8) -> Option<(i32, i32)> {
     None
 }
 
-/// Neighbours of each letter as a bitmask over `a..=z`, built once from
-/// [`qwerty_pos`].
+/// Neighbours of each letter as bitmasks over `a..=z`, built once from
+/// [`qwerty_pos`]: `.0` is the key beside it in the same row, `.1` the keys on
+/// the row above or below. Two masks rather than one because the two slips are
+/// not equally likely — see [`COST_ADJACENT_ROW`] and [`COST_ADJACENT_DIAG`].
 ///
 /// The matrix asks about adjacency in every substitution cell, and walking the
 /// keyboard rows to answer costs more than the rest of the cell put together —
 /// this is the single hottest lookup in the scan.
-fn adjacency_table() -> &'static [u32; 26] {
-    static TABLE: OnceLock<[u32; 26]> = OnceLock::new();
+fn adjacency_table() -> &'static [(u32, u32); 26] {
+    static TABLE: OnceLock<[(u32, u32); 26]> = OnceLock::new();
     TABLE.get_or_init(|| {
-        let mut table = [0u32; 26];
+        let mut table = [(0u32, 0u32); 26];
         for a in 0..26u8 {
             for b in 0..26u8 {
                 let (x, y) = (b'a' + a, b'a' + b);
                 if let (Some((r1, c1)), Some((r2, c2))) = (qwerty_pos(x), qwerty_pos(y)) {
-                    if (r1 - r2).abs() <= 1 && (c1 - c2).abs() <= 2 && (r1, c1) != (r2, c2) {
-                        table[a as usize] |= 1 << b;
+                    if (r1 - r2).abs() > 1 || (c1 - c2).abs() > 2 || (r1, c1) == (r2, c2) {
+                        continue;
+                    }
+                    let entry = &mut table[a as usize];
+                    if r1 == r2 {
+                        entry.0 |= 1 << b;
+                    } else {
+                        entry.1 |= 1 << b;
                     }
                 }
             }
@@ -631,36 +661,100 @@ fn adjacency_table() -> &'static [u32; 26] {
     })
 }
 
+/// What typing `b` instead of `a` would cost as a finger slip, or `None` if the
+/// two keys are nowhere near each other and one cannot explain the other.
+fn adjacent_cost(a: u8, b: u8) -> Option<u32> {
+    if !a.is_ascii_lowercase() || !b.is_ascii_lowercase() {
+        return None;
+    }
+    let (row, diag) = adjacency_table()[(a - b'a') as usize];
+    let bit = 1 << (b - b'a');
+    if row & bit != 0 {
+        Some(COST_ADJACENT_ROW)
+    } else if diag & bit != 0 {
+        Some(COST_ADJACENT_DIAG)
+    } else {
+        None
+    }
+}
+
 /// Whether two letters are neighbouring keys — the substitution a hurrying hand
 /// actually makes.
 fn adjacent(a: u8, b: u8) -> bool {
-    if !a.is_ascii_lowercase() || !b.is_ascii_lowercase() {
-        return false;
-    }
-    adjacency_table()[(a - b'a') as usize] & (1 << (b - b'a')) != 0
+    adjacent_cost(a, b).is_some()
+}
+
+/// Every substitution cost, precomputed for all 676 letter pairs.
+///
+/// The substitution cell is the hottest arithmetic in the program — every cell
+/// of every matrix of every candidate in the scan asks for one — and answering
+/// it by testing masks and vowels costs more than the table lookup that
+/// replaces it. Fits in `u8` because [`COST_EDIT`] is the most anything costs.
+fn sub_table() -> &'static [[u8; 26]; 26] {
+    static TABLE: OnceLock<[[u8; 26]; 26]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [[0u8; 26]; 26];
+        for a in 0..26u8 {
+            for b in 0..26u8 {
+                let (x, y) = (b'a' + a, b'a' + b);
+                table[a as usize][b as usize] = if x == y {
+                    0
+                } else if let Some(slip) = adjacent_cost(x, y) {
+                    slip as u8
+                } else if is_vowel(x) && is_vowel(y) {
+                    COST_VOWEL as u8
+                } else {
+                    COST_EDIT as u8
+                };
+            }
+        }
+        table
+    })
 }
 
 /// Cost of typing `y` where `x` was meant.
 fn sub_cost(x: u8, y: u8) -> u32 {
-    if x == y {
-        0
-    } else if adjacent(x, y) {
-        COST_ADJACENT
-    } else if is_vowel(x) && is_vowel(y) {
-        COST_VOWEL
+    if !x.is_ascii_lowercase() || !y.is_ascii_lowercase() {
+        return if x == y { 0 } else { COST_EDIT };
+    }
+    sub_table()[(x - b'a') as usize][(y - b'a') as usize] as u32
+}
+
+/// Cost of the intended word having a letter at `w[i - 1]` that never got
+/// typed. Dropping one half of a double letter is a slip of timing; dropping a
+/// letter that stands alone is a misspelling.
+///
+/// Deliberately says nothing about the keyboard: adjacency explains keys that
+/// were *hit*, and there is no sense in which a letter is missing because of
+/// where its key sits.
+fn missing_cost(w: &[u8], i: usize) -> u32 {
+    let c = w[i - 1];
+    let doubled = (i >= 2 && w[i - 2] == c) || (i < w.len() && w[i] == c);
+    if doubled {
+        COST_DOUBLE
     } else {
         COST_EDIT
     }
 }
 
-/// Cost of the typed word carrying an extra `w[i - 1]`. Dropping one half of a
-/// double letter is a slip; dropping a letter that stands alone is a
-/// misspelling.
-fn gap_cost(w: &[u8], i: usize) -> u32 {
+/// Cost of the typed word carrying an extra `w[i - 1]` the intended word does
+/// not have — and the other half of the asymmetry with [`missing_cost`].
+///
+/// An extra letter has two innocent explanations and one guilty one. It can be
+/// half of a double typed twice; it can be a neighbouring key the hand caught
+/// on the way past, which is what the keyboard geometry is for; or the writer
+/// put a letter there because they thought it belonged, which is a misspelling
+/// and pays the full edit. Telling the three apart is most of the value of
+/// knowing where the keys are: `mnake` and `amke` are both one edit from
+/// `make` by letter count, but only one of them is a hand missing.
+fn extra_cost(w: &[u8], i: usize) -> u32 {
     let c = w[i - 1];
-    let doubled = (i >= 2 && w[i - 2] == c) || (i < w.len() && w[i] == c);
-    if doubled {
+    let before = (i >= 2).then(|| w[i - 2]);
+    let after = w.get(i).copied();
+    if before == Some(c) || after == Some(c) {
         COST_DOUBLE
+    } else if [before, after].into_iter().flatten().any(|n| adjacent(n, c)) {
+        COST_STRAY_KEY
     } else {
         COST_EDIT
     }
@@ -671,6 +765,12 @@ fn gap_cost(w: &[u8], i: usize) -> u32 {
 #[derive(Default)]
 struct Dp {
     cells: Vec<u32>,
+    /// `extra_cost` for each position of the typed word, computed once per
+    /// candidate instead of once per cell. It depends only on the typed word,
+    /// which is the same for every one of the thousands of candidates in a
+    /// scan — and the deletion cell is on the hot path, where two adjacency
+    /// lookups per cell were costing ~10% of the whole correction.
+    extra: Vec<u32>,
 }
 
 impl Dp {
@@ -694,12 +794,16 @@ impl Dp {
         }
         let at = |i: usize, j: usize| i * width + j;
 
+        self.extra.clear();
+        self.extra.push(0); // unused: positions are 1-based here
+        self.extra.extend((1..=n).map(|i| extra_cost(a, i)));
+
         self.cells[0] = 0;
         for j in 1..=m {
             // Turning the empty prefix of `a` into `b[..j]` is all insertions,
             // every one of them at the start of the typed word.
             self.cells[j] = self.cells[j - 1]
-                .saturating_add(gap_cost(b, j))
+                .saturating_add(missing_cost(b, j))
                 .saturating_add(position_penalty(0));
         }
 
@@ -719,14 +823,18 @@ impl Dp {
                     // All deletions: the typed word has a prefix the intended
                     // word doesn't.
                     self.cells[at(i - 1, 0)]
-                        .saturating_add(gap_cost(a, i))
+                        .saturating_add(self.extra[i])
                         .saturating_add(position_penalty(i - 1))
                 } else {
+                    // `a` is what was typed and `b` what was meant, so the two
+                    // directions are not the same event: a letter only in `b`
+                    // was dropped, one only in `a` was added — and only the
+                    // second can be explained by where the keys are.
                     let insertion = self.cells[at(i, j - 1)]
-                        .saturating_add(gap_cost(b, j))
+                        .saturating_add(missing_cost(b, j))
                         .saturating_add(position_penalty(i));
                     let deletion = self.cells[at(i - 1, j)]
-                        .saturating_add(gap_cost(a, i))
+                        .saturating_add(self.extra[i])
                         .saturating_add(position_penalty(i - 1));
                     let substitution = self.cells[at(i - 1, j - 1)]
                         .saturating_add(sub_cost(a[i - 1], b[j - 1]))
@@ -1053,7 +1161,24 @@ mod tests {
         assert_eq!(cost("helo", "hello"), Some(COST_DOUBLE), "restores a double");
         assert_eq!(cost("hellp", "help"), Some(COST_DOUBLE), "un-doubles");
         assert_eq!(cost("hleo", "helo"), Some(COST_TRANSPOSE), "transposition");
-        assert_eq!(cost("wans", "wand"), Some(COST_ADJACENT), "neighbouring key");
+        assert_eq!(
+            cost("wans", "wand"),
+            Some(COST_ADJACENT_ROW),
+            "the key beside it in the same row"
+        );
+        assert_eq!(
+            cost("wang", "want"),
+            Some(COST_ADJACENT_DIAG),
+            "a key one row over"
+        );
+        // An extra letter next to the key beside it: two keys caught at once,
+        // not a letter the writer believed in.
+        assert_eq!(cost("worjk", "work"), Some(COST_STRAY_KEY), "stray key");
+        assert_eq!(
+            cost("worqk", "work"),
+            Some(COST_EDIT),
+            "an extra letter from nowhere near is still a full edit"
+        );
         assert_eq!(cost("mork", "mort"), Some(COST_EDIT), "unrelated letter");
         assert_eq!(cost("hello", "hello"), Some(0), "no edit");
     }
@@ -1068,7 +1193,7 @@ mod tests {
         );
         // … so it can overturn a small channel difference but never a whole
         // extra edit.
-        assert!(score(COST_DOUBLE, 40_000) > score(COST_ADJACENT, 5));
+        assert!(score(COST_DOUBLE, 40_000) > score(COST_ADJACENT_ROW, 5));
         // And a whole extra plain edit is never bought by frequency: the
         // cheapest candidate at the very bottom of the 50k list still beats a
         // one-edit-dearer candidate at the very top.
@@ -1095,6 +1220,10 @@ mod tests {
             ("beutifull", "beautiful"),
             ("keboadr", "keyboard"),
             ("adress", "address"),
+            // The stray-key discount is a cheaper edit than the bound knew
+            // about before it was derived from the table — check it here too.
+            ("worjk", "work"),
+            ("mnake", "make"),
             ("fone", "phone"),
             ("dependant", "dependent"),
             ("hello", "hello"),
@@ -1137,6 +1266,39 @@ mod tests {
         assert!(adjacent(b'g', b'b'), "row below");
         assert!(!adjacent(b'g', b'p'), "across the keyboard");
         assert!(!adjacent(b'a', b'a'), "a key is not its own neighbour");
+    }
+
+    #[test]
+    fn sliding_along_a_row_is_likelier_than_reaching_across_one() {
+        assert_eq!(adjacent_cost(b'g', b'f'), Some(COST_ADJACENT_ROW));
+        assert_eq!(adjacent_cost(b'g', b't'), Some(COST_ADJACENT_DIAG));
+        assert_eq!(adjacent_cost(b'g', b'b'), Some(COST_ADJACENT_DIAG));
+        assert_eq!(adjacent_cost(b'g', b'p'), None);
+        assert!(COST_ADJACENT_ROW < COST_ADJACENT_DIAG);
+    }
+
+    #[test]
+    fn an_extra_letter_is_priced_by_what_it_could_have_come_from() {
+        // Half of a double, typed twice.
+        assert_eq!(extra_cost(b"hellp", 4), COST_DOUBLE);
+        // A neighbour of the key beside it: two keys caught at once. Checked
+        // in both directions, since the hand can catch the extra key on the
+        // way in or on the way out.
+        assert_eq!(extra_cost(b"worjk", 4), COST_STRAY_KEY, "next to the letter after");
+        assert_eq!(extra_cost(b"mnake", 2), COST_STRAY_KEY, "next to the letter before");
+        // A letter from the other side of the keyboard explains nothing about
+        // the hand, so it stays a misspelling.
+        assert_eq!(extra_cost(b"worqk", 4), COST_EDIT);
+    }
+
+    #[test]
+    fn a_dropped_letter_is_not_explained_by_the_keyboard() {
+        // The asymmetry: adjacency is about keys that were *hit*. "make" is
+        // missing nothing because of where "n" sits, so restoring a letter
+        // next to its neighbour is still a plain edit — only the double-letter
+        // discount applies on this side.
+        assert_eq!(missing_cost(b"hello", 4), COST_DOUBLE);
+        assert_eq!(missing_cost(b"make", 2), COST_EDIT);
     }
 
     #[test]
@@ -1198,6 +1360,36 @@ mod real_data {
             ("taht", "that"),
             ("fomr", "form"),
             ("abput", "about"),
+        ] {
+            assert_eq!(fix(typo).as_deref(), Some(want), "{typo}");
+        }
+    }
+
+    #[test]
+    fn fixes_fat_finger_typos() {
+        // Slips of the hand rather than of the memory: a key caught on the way
+        // past, or the one next to the one meant. None of these are spelling
+        // mistakes — the writer knows the word — and what makes them reachable
+        // is knowing which keys sit next to which.
+        for (typo, want) in [
+            ("worjk", "work"),
+            ("mnake", "make"),
+            ("tjhat", "that"),
+            ("witjh", "with"),
+            ("abnout", "about"),
+            ("juest", "just"),
+            ("alsdo", "also"),
+            ("yearsd", "years"),
+            ("thiunk", "think"),
+            ("peopkle", "people"),
+            ("conmputer", "computer"),
+            ("becausse", "because"),
+            // Substituting the neighbouring key rather than adding one.
+            ("wprk", "work"),
+            ("tjis", "this"),
+            ("fimd", "find"),
+            ("srill", "still"),
+            ("differemt", "different"),
         ] {
             assert_eq!(fix(typo).as_deref(), Some(want), "{typo}");
         }
@@ -1273,3 +1465,5 @@ mod real_data {
     }
 
 }
+
+

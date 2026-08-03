@@ -166,6 +166,46 @@ if banner::ran_from_terminal() {
     platform::windows::start(en, he, control, with_gui);
 }
 
+#[cfg(test)]
+mod tests {
+    /// Every version string in the program is `env!("CARGO_PKG_VERSION")` — the
+    /// help text, the tray's About box, the menubar title, the Windows exe
+    /// resources — and the `.app` bundle's `Info.plist` is generated from
+    /// Cargo.toml by `make bundle-plist`. The README is the one place left that
+    /// has to *write* a version down, because its sample `--status` output is
+    /// prose rather than something the program renders.
+    ///
+    /// So it is pinned here instead. A sample that quietly claims an old
+    /// release is the kind of documentation error nobody notices for four
+    /// versions — which is exactly what happened to the bundle plist, and why
+    /// it is generated now.
+    #[test]
+    fn the_readme_states_the_version_the_binary_reports() {
+        let readme = include_str!("../README.md");
+        let quoted: Vec<&str> = readme
+            .match_indices("recast ")
+            .filter_map(|(at, matched)| {
+                let token = readme[at + matched.len()..]
+                    .split_whitespace()
+                    .next()?;
+                token.starts_with(|c: char| c.is_ascii_digit()).then_some(token)
+            })
+            .collect();
+        assert!(
+            !quoted.is_empty(),
+            "the README no longer shows a version — drop this test or put the sample back"
+        );
+        for found in quoted {
+            assert_eq!(
+                found,
+                env!("CARGO_PKG_VERSION"),
+                "README says {found}, Cargo.toml says {}",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+}
+
 /// Answer the two questions a user asks when something isn't happening: is it
 /// running, and is it configured the way I think it is.
 ///

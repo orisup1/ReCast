@@ -178,7 +178,7 @@ correction off is a decision about the machine, not about one run of the
 process — and `--status` reports it whether or not anything is running:
 
 ```
-recast 0.6.0
+recast 0.7.0
   running:        yes (pid 4821)
   correction:     enabled
   start at login: yes
@@ -268,6 +268,31 @@ cheapest, then a transposition, then hitting the key physically next to the righ
 one, then a vowel-for-vowel swap; anything else is a plain edit. So `helo` →
 `hello` beats `helo` → `help` even though `help` is the more common word — but
 make `help` a hundred times more common and it wins after all.
+
+### What the keyboard explains
+
+Where the keys sit is what separates a slip of the *hand* from a slip of the
+*memory*, and it is used in three places:
+
+- **The wrong key.** A letter next to the one meant is a fat finger, not a
+  misspelling. Sliding one key along a row (`wprk` → `work`) is the likeliest
+  slip there is; reaching onto the row above or below (`g` for `t`) is a
+  deliberate movement that goes wrong less often, and costs a little more.
+- **An extra key.** A letter that is a *neighbour of the letter beside it* is
+  the hand catching two keys on the way past — `worjk` → `work`, `mnake` →
+  `make`, `tjhat` → `that`. Those used to cost a full edit, which put them out
+  of reach of anything but the longest words; now the hand is a cheaper
+  explanation than the writer having believed in the letter. A stray letter
+  from the other side of the keyboard (`worqk`) still pays full price, because
+  nothing about the hand explains it.
+- **Nothing about a missing key.** The discount is deliberately one-directional:
+  adjacency explains keys that were *hit*, and there is no sense in which a
+  letter is missing because of where its key sits. Only the double-letter
+  discount applies on that side.
+
+The geometry is QWERTY, including the half-key stagger between rows, and it is
+about the *physical* keyboard: this is the same reasoning for a word typed under
+the Hebrew layout, since the keys have not moved.
 
 On top of single letters there is a table of **whole-string confusions** —
 `ant`↔`ent`, `ance`↔`ence`, `ie`↔`ei`, `able`↔`ible`, `f`↔`ph`, `n`↔`kn`,
@@ -483,7 +508,7 @@ makes sure of it.
 
 ```bash
 cargo build --release     # or `make` — release is the meaningful profile (LTO + strip)
-cargo test                # 99 tests, all pure: dictionaries, speller, completer, keymaps, counters
+cargo test                # 103 tests, all pure: dictionaries, speller, completer, keymaps, counters
 RECAST_DEBUG=1 cargo run  # log every word check and switch decision
 ```
 
