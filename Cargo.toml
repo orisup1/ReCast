@@ -19,6 +19,15 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# `objc` 0.2's `msg_send!` / `class!` macros expand to a
+# `cfg(feature = "cargo-clippy")` test, which rustc now reports as an unexpected
+# cfg — on every one of the dozens of call sites in platform/tray.rs, which is
+# enough to fail a `-D warnings` build on macOS. The value is declared expected
+# here rather than allowing the lint: a codebase this full of `cfg(target_os)`
+# wants to keep being told when it invents a cfg that nothing sets.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [build-dependencies]
 # Embeds the app icon + version metadata into the Windows .exe (see build.rs).
 # Build-only and host-compiled; a no-op for non-Windows targets.

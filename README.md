@@ -74,19 +74,36 @@ unpack alongside them:
 | ------------------ | ---------------------------------------------------------- |
 | `exec/recastLinux` | Linux x86-64                                               |
 | `exec/ReCast.exe`  | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
-| `exec/recastMac`   | macOS x86-64                                               |
+| `exec/recastMac`   | macOS arm64                                                |
 | `exec/ReCast.app`  | macOS bundle                                               |
 
 They are committed artifacts rather than build output, so they are only as current as the
-last time someone refreshed them — the Linux and Windows builds track this README, the
-macOS ones lag behind and are best rebuilt from source (`make service`). Building yourself
-is still the recommended path; these exist so you can try it in one step.
+last time someone refreshed them. That refresh is now a button: the **Binaries** workflow
+(`.github/workflows/binaries.yml`, run from the Actions tab) builds all three on their own
+runners and commits the results back here, so they no longer drift apart one platform at a
+time. The next run also replaces the arm64-only macOS builds above with universal
+(arm64 + x86-64) ones, which an Intel Mac can actually run. Building yourself is still the
+recommended path; these exist so you can try it in one step.
 
 The English and Hebrew dictionaries are baked into the binary at compile time, so the
 executable is self-contained and runs identically from any working directory — no data
 files or wrapper scripts to install. They are baked in *sorted*, so a lookup is a binary
 search over the embedded bytes: nothing is parsed at startup and the daemon idles at a
 few MB of memory instead of ~100 MB.
+
+### Memory
+
+ReCast is meant to start at login and still be running weeks later, which makes memory
+growth a different kind of bug — there is no end of the run to hide it behind. So nothing
+in it grows with use. The word buffer, the list of words you have undone and the
+corrections history are all bounded at their source; the ~11 MB of dictionaries are
+read-only pages of the executable rather than heap, so they are shared, never copied and
+reclaimable by the OS under pressure.
+
+Measured, not asserted: `cargo test` includes a check that ten times the work adds no
+meaningful memory, and that the total stays under a 50 MB ceiling. On this machine it
+settles at **about 9 MB and grows by hundredths of one** across the tenfold increase. `recast --status`
+prints the figure so you can check a daemon that has been up for a month against it.
 
 ## Linux: full install + autostart
 
@@ -159,7 +176,7 @@ it stays in the tray/menubar.
 
 ```bash
 recast          # start (Linux: forks into the background and writes a pidfile)
-recast -s       # stop a running daemon
+recast -s       # stop a running daemon (Linux only)
 recast -g       # foreground with a terminal dashboard (TUI): status, log, toggle
 recast -w       # foreground with a small control window (Linux only)
 recast --status # what is running, and what is configured
@@ -185,6 +202,24 @@ recast 0.7.0
   config dir:     /home/you/.config/recast
   abbrev.txt:     3 abbreviation(s)
   ignore.txt:     7 word(s)
+  memory (this):  8.9 MB
+
+  settings (with any RECAST_* override applied):
+    short words          on
+    missing-space split  off
+    frequency tie-break  on
+    spelling             on  (min length 4, max rank 20000, max distance 3)
+    auto-complete        on  (min prefix 3, max rank 30000)
+```
+
+The settings block reads back what the program actually resolved, which is the
+only way to tell an override that was applied from one that was not. A value it
+could not parse is reported rather than swallowed — `RECAST_SPELL_DIST=l` used
+to fall back silently to the default 3, the *loosest* setting, from someone
+plainly trying to tighten it:
+
+```
+  ! RECAST_SPELL_DIST="l" is not a number — using the default instead.
 ```
 
 Environment variables:
@@ -459,7 +494,57 @@ taken back and they are a third or more of the total, both UIs say so and
 suggest `RECAST_SPELL_DIST=1`, which is the knob that turns the badly-mangled
 cases back off.
 
-## Passwords
+## Privacy
+
+ReCast reads every key you press. It cannot work otherwise — deciding that
+`akuo` was meant to be `שלום` means seeing `akuo` first — so the only questions
+worth answering are what it does with that, and what it doesn't. This section is
+the answer, and everything in it is checkable against the source.
+
+**Nothing leaves the machine.** There is no network code in this program and no
+networking crate in its dependency list: no telemetry, no analytics, no crash
+reporting, no update check, no remote dictionary. The word lists are compiled
+into the executable by `build.rs`, so even the lookups are local — there is
+nothing to fetch and nothing to ask.
+
+**Nothing you type is written to disk, except the words you ask it to keep.**
+The word being typed lives in memory and is dropped at every word boundary, on
+Tab / Escape / an arrow key, and on a mouse click. The recent-corrections list
+the tray and TUI show is the last 20, held in RAM and gone when the process
+exits — it is a glance, not a log, and it is never persisted. The one exception
+is `ignore.txt`, which gains a word only when you put it there yourself, by
+double-tapping Ctrl on a correction or clicking one in `Recent`. That is your
+file, in plain text, and you can read or edit it (see
+[Your files](#your-files)).
+
+**Your clipboard is never touched.** A corrected word is injected as synthetic
+input carrying the characters directly — `CGEventKeyboardSetUnicodeString` on
+macOS, a `KEYEVENTF_UNICODE` `SendInput` batch on Windows, `uinput` keycodes on
+Linux. Nothing is copied, so what you had on the clipboard is still there
+afterwards. (This is why corrections land at once, the way a paste does, without
+being one.)
+
+**The one notification quotes nothing.** The first-correction hint deliberately
+does not name the word it is about: a notification is a copy of text that
+outlives the moment it belonged to, sitting in a notification centre after the
+window it came from is closed.
+
+**Logging is off, and turning it on is the one thing to be careful with.**
+Normal operation writes no record of what you type. `RECAST_DEBUG=1` prints
+every word it checks to stdout — useful at a terminal, and a transcript of your
+typing anywhere else. Where that goes depends on how ReCast was started: the
+Linux daemon sends stdout to `/dev/null`, the systemd user unit sends it to the
+journal, and the macOS LaunchAgent writes `/tmp/recast.out.log` and
+`/tmp/recast.err.log`, which are readable by other users on the machine. Don't
+leave debug on under a service on any platform.
+
+**What it needs from the OS**, for the same reason, is the permission to see all
+of this: membership of the `input` group on Linux (plus a `uinput` device to
+type corrections back), Input Monitoring and Accessibility on macOS, and a
+low-level keyboard hook on Windows. Those are the real trust you are extending;
+the rest of this section is about what is done with it.
+
+### Passwords
 
 On macOS ReCast stops watching the keyboard entirely while a password field has
 focus, using the same signal the OS gives every application
@@ -470,8 +555,7 @@ loop is a stronger promise than not having been given the data, and it also
 stops a correction from firing *inside* the field.
 
 There is no equivalent signal on Linux or Windows, so the same guarantee cannot
-be made there; `RECAST_DEBUG=1` in particular should not be left on under a
-service on any platform.
+be made there.
 
 ## Your files
 
@@ -508,7 +592,7 @@ makes sure of it.
 
 ```bash
 cargo build --release     # or `make` — release is the meaningful profile (LTO + strip)
-cargo test                # 103 tests, all pure: dictionaries, speller, completer, keymaps, counters
+cargo test                # 109 tests, all pure: dictionaries, speller, completer, keymaps, counters
 RECAST_DEBUG=1 cargo run  # log every word check and switch decision
 ```
 
@@ -529,6 +613,12 @@ neither is exercised by `cargo test`:
 cargo check --target x86_64-pc-windows-gnu
 cargo check --target x86_64-apple-darwin
 ```
+
+CI (`.github/workflows/ci.yml`) runs `cargo test`, `cargo clippy -- -D warnings` and a
+release build on Linux, macOS and Windows runners for every push. The three platform
+modules are near-identical copies that nothing keeps in step, so a change made in one and
+forgotten in the other two is the most likely regression here — building each on its own
+OS is what catches it.
 
 ## License
 

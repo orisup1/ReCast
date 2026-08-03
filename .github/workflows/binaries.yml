@@ -1,0 +1,164 @@
+# Refresh the committed binaries in `exec/`.
+#
+# `exec/` holds release builds tracked in git, so someone can download a working
+# ReCast without a Rust toolchain. Keeping them current by hand means building
+# on three machines; this does it on three runners instead and commits the
+# result back to the branch it was started from.
+#
+# Deliberately `workflow_dispatch` only. Each refresh adds ~45 MB to the
+# repository permanently — git history cannot be made smaller after the fact —
+# so this is a button pressed at release time, not something that fires on
+# every push.
+
+name: Binaries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Build each artifact on its own OS. No cache: what ships should come from a
+  # clean build, not from whatever a previous run happened to leave behind.
+  # ───────────────────────────────────────────────────────────────────────────
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev
+
+      - name: Build
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recastLinux
+          path: target/release/recast
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      # The committed binary was arm64-only, which is silently useless on an
+      # Intel Mac. Both slices cost one extra compile and one `lipo`.
+      - name: Build both architectures
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Merge into a universal binary
+        run: |
+          lipo -create -output recastMac \
+            target/aarch64-apple-darwin/release/recast \
+            target/x86_64-apple-darwin/release/recast
+          lipo -info recastMac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recastMac
+          path: recastMac
+          if-no-files-found: error
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # build.rs embeds the icon and version resources through `winresource`,
+      # which finds the resource compiler in the runner's Windows SDK.
+      #
+      # `+crt-static` is what keeps the README's promise that this download
+      # needs no runtime DLLs: the MSVC toolchain otherwise links
+      # `vcruntime140.dll` dynamically, which is not on a clean Windows install
+      # and would turn a one-step try-it into a redistributable hunt.
+      - name: Build
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReCast.exe
+          path: target/release/recast.exe
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # One job collects all three and makes a single commit. Three jobs each
+  # pushing to the same branch would race.
+  # ───────────────────────────────────────────────────────────────────────────
+  commit:
+    name: Update exec/
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+
+      # Artifacts arrive without the executable bit — the upload action does
+      # not carry file modes — so it is set back here.
+      - name: Place the binaries
+        run: |
+          set -euo pipefail
+          install -m 755 incoming/recastLinux/recast   exec/recastLinux
+          install -m 755 incoming/recastMac/recastMac  exec/recastMac
+          install -m 755 incoming/ReCast.exe/recast.exe exec/ReCast.exe
+          # The .app bundle runs the same macOS binary; its Info.plist is
+          # generated from Cargo.toml so the version inside it tracks the crate.
+          install -m 755 incoming/recastMac/recastMac \
+            exec/ReCast.app/Contents/MacOS/recast
+          make bundle-plist
+
+      - name: Report what was built
+        run: |
+          file exec/recastLinux exec/recastMac exec/ReCast.exe
+          ls -lh exec/recastLinux exec/recastMac exec/ReCast.exe
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add exec/
+          if git diff --cached --quiet; then
+            echo "exec/ already matches this build — nothing to commit."
+            exit 0
+          fi
+          version=$(make version)
+          # Written through a heredoc rather than `-m`, so the body is not
+          # indented by this file's own YAML block indentation.
+          git commit -F - <<EOF
+          build: refresh exec/ binaries for $version
+
+          Built by the Binaries workflow from ${GITHUB_SHA}.
+          macOS is a universal (arm64 + x86_64) binary.
+
+          [skip ci]
+          EOF
+          git push

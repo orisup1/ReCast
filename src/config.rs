@@ -102,3 +102,63 @@ fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
+
+/// Every numeric setting, so a value that could not be read can be named.
+const NUMERIC_KEYS: &[&str] = &[
+    "RECAST_SPELL_MIN",
+    "RECAST_SPELL_RANK",
+    "RECAST_SPELL_DIST",
+    "RECAST_COMPLETE_MIN",
+    "RECAST_COMPLETE_RANK",
+];
+
+/// Settings that were set but could not be understood, described for the user.
+///
+/// [`env_num`] falls back to the shipped default on anything it cannot parse,
+/// which is the right behaviour — a bad value should not stop the program —
+/// but doing it *silently* inverts the user's intent in the one case that
+/// matters. `RECAST_SPELL_DIST=l` (an el for a one) reads as the default 3,
+/// the loosest setting there is, from someone who was plainly trying to
+/// tighten it. Nothing said so. This is what `--status` reads out.
+pub fn env_complaints() -> Vec<String> {
+    let mut out = Vec::new();
+    for key in NUMERIC_KEYS {
+        if let Ok(raw) = std::env::var(key) {
+            if raw.trim().parse::<u64>().is_err() {
+                out.push(format!(
+                    "{key}={raw:?} is not a number — using the default instead."
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parse is what decides whether a complaint is warranted, so it is
+    /// what gets tested — the env itself is process-global and shared with
+    /// every other test in the binary.
+    #[test]
+    fn a_typoed_number_is_worth_complaining_about() {
+        // The failure this exists for: an el where a one was meant.
+        assert!("l".parse::<u64>().is_err());
+        assert!("".parse::<u64>().is_err());
+        assert!(" 2 ".trim().parse::<u64>().is_ok());
+    }
+
+    #[test]
+    fn every_numeric_setting_is_covered() {
+        // A new RECAST_*_MIN/RANK/DIST added to `from_env` without being added
+        // here would go back to failing silently.
+        let doc = include_str!("config.rs");
+        for key in NUMERIC_KEYS {
+            assert!(doc.contains(key), "{key} listed but not used");
+        }
+        for key in ["RECAST_SPELL_MIN", "RECAST_COMPLETE_RANK"] {
+            assert!(NUMERIC_KEYS.contains(&key), "{key} is numeric but unchecked");
+        }
+    }
+}

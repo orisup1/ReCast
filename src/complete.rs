@@ -234,9 +234,54 @@ fn without_word(text: &str, word: &str) -> String {
 /// Deliberately not persisted: this is the list you land on by reflex, and
 /// `ignore.txt` is the one you land on by deciding. [`unlist`] clears entries
 /// from both.
-fn suppressed_words() -> &'static Mutex<HashSet<String>> {
-    static WORDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    WORDS.get_or_init(|| Mutex::new(HashSet::new()))
+fn suppressed_words() -> &'static Mutex<SuppressList> {
+    static WORDS: OnceLock<Mutex<SuppressList>> = OnceLock::new();
+    WORDS.get_or_init(|| Mutex::new(SuppressList::default()))
+}
+
+/// How many undone words are remembered at once.
+///
+/// The list grew without limit before: every undo added an entry and only the
+/// explicit un-ignore gesture ever removed one, so a long-running daemon —
+/// which is how this program is meant to run, for weeks — accumulated a word
+/// per undo forever. Nothing here is worth unbounded memory.
+///
+/// 256 is far past what the list is for. It exists so that a word you just
+/// took back is not corrected again on the next line; a word you undid two
+/// hundred words ago and have not typed since is one `ignore.txt` should be
+/// holding instead, which is the gesture's other half.
+const MAX_SUPPRESSED: usize = 256;
+
+/// Undone words, newest kept: a set for the lookup, and the order they arrived
+/// in so the oldest can be dropped once the list is full.
+#[derive(Default)]
+struct SuppressList {
+    set: HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl SuppressList {
+    fn insert(&mut self, word: String) {
+        if !self.set.insert(word.clone()) {
+            return; // already listed; leave its position alone
+        }
+        self.order.push_back(word);
+        while self.order.len() > MAX_SUPPRESSED {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, word: &str) {
+        if self.set.remove(word) {
+            self.order.retain(|w| w != word);
+        }
+    }
+
+    fn contains(&self, word: &str) -> bool {
+        self.set.contains(word)
+    }
 }
 
 /// Stop correcting `word` for the rest of the session (see

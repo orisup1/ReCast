@@ -11,7 +11,7 @@ use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix};
 use crate::keymap::{
     english_char_to_key, key_to_english_char, key_to_english_char_shifted, key_to_hebrew_char,
 };
-use crate::types::{AppControl, FixKind, Language};
+use crate::types::{AppControl, FixKind, Language, WordBuffer};
 
 /// Maximum time the replace thread will wait for the user to physically
 /// release the keys we are about to retype before injecting anyway.
@@ -126,9 +126,9 @@ pub struct Cycle {
 }
 
 pub struct AppState {
-    pub keys: Vec<Typed>,
+    pub keys: WordBuffer<Typed>,
     pub is_replacing: bool,
-    pub buffered_keys: Vec<Typed>,
+    pub buffered_keys: WordBuffer<Typed>,
     /// Physical keys currently held down. Tracked from press/release events
     /// so the replace thread can wait for the user to lift the keys it is
     /// about to retype — otherwise the OS sees the synthetic press as a
@@ -582,7 +582,7 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                     // that the user has it listed. Arm the gesture to change
                     // their mind about it.
                     let skip = LastSkip {
-                        keys: st.keys.clone(),
+                        keys: st.keys.to_vec(),
                         terminator: Some(key),
                         word,
                     };
@@ -684,7 +684,7 @@ fn handle_key_release(ctx: &TapContext, key: Key) {
             if candidates.is_empty() {
                 return;
             }
-            (st.keys.clone(), candidates, 0, st.keys.len())
+            (st.keys.to_vec(), candidates, 0, st.keys.len())
         }
     };
 
@@ -969,9 +969,9 @@ pub fn setup_event_tap(
 
     let ctx = TapContext {
         state: Arc::new(Mutex::new(AppState {
-            keys: Vec::new(),
+            keys: WordBuffer::new(),
             is_replacing: false,
-            buffered_keys: Vec::new(),
+            buffered_keys: WordBuffer::new(),
             held_keys: HashSet::new(),
             caps_lock: false,
             right_shift_tap: false,
@@ -1156,7 +1156,7 @@ fn replace_word(
 
     let buf = {
         let st = state_mutex.lock().unwrap();
-        st.buffered_keys.clone()
+        st.buffered_keys.to_vec()
     };
 
     // Press + release a single key with pacing that macOS won't drop. Only the
@@ -1202,7 +1202,7 @@ fn replace_word(
     thread::sleep(INJECT_SETTLE);
     let mut st = state_mutex.lock().unwrap();
     let buffered_typed = !buf.is_empty();
-    st.keys = keep;
+    st.keys.replace_with(keep);
     st.keys.extend(buf);
     // Undo erases backwards from the cursor, so it is only valid while the
     // cursor is still sitting on what we just injected. Keys the user got in

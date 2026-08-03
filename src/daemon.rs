@@ -1,7 +1,9 @@
+// Everything that touches the filesystem here is part of the Linux daemon
+// path — daemonize, the pidfile, and the stop that reads it. macOS and Windows
+// run in the foreground under a launch agent or the `Run` key and never write
+// one, so on those targets these would all be unused imports.
+#[cfg(target_os = "linux")]
 use std::fs;
-// Only the Linux daemon path (daemonize + write_pidfile) uses these; on
-// macOS/Windows they would be unused imports. `stop_daemon` still uses `fs`
-// on every target, so that import stays ungated.
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 #[cfg(target_os = "linux")]
@@ -91,6 +93,37 @@ pub fn write_pidfile() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Where the Linux daemon records its PID.
+#[cfg(target_os = "linux")]
+fn pidfile_path() -> Option<std::path::PathBuf> {
+    Some(dirs::cache_dir()?.join("recast").join("pid"))
+}
+
+/// Whether `pid` is a live process that is *this* program.
+///
+/// The liveness half is obvious; the identity half is the one that matters.
+/// PIDs are reused, so a pidfile left behind by a daemon that was killed (or
+/// that crashed before it could clean up) eventually names somebody else's
+/// process — and acting on that number is how a stop command turns into
+/// killing an unrelated program. `/proc/<pid>/comm` settles it for free.
+///
+/// Compared against our own executable name rather than a hardcoded "recast",
+/// so a renamed binary still recognises itself; `comm` is truncated to 15
+/// bytes by the kernel, which is what the shortened comparison is for.
+#[cfg(target_os = "linux")]
+fn is_our_process(pid: u32) -> bool {
+    let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+        return false; // no such process
+    };
+    let comm = comm.trim();
+    let ours = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "recast".to_string());
+    let truncated: String = ours.chars().take(15).collect();
+    comm == ours || comm == truncated
+}
+
 /// The PID of a running daemon, if there is one.
 ///
 /// Linux-only, because it is the only platform that daemonizes and writes a
@@ -100,45 +133,76 @@ pub fn write_pidfile() -> std::io::Result<()> {
 /// the question.
 #[cfg(target_os = "linux")]
 pub fn running_pid() -> Option<u32> {
-    let pidfile = dirs::cache_dir()?.join("recast").join("pid");
-    let pid: u32 = fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
-    std::path::Path::new(&format!("/proc/{pid}"))
-        .exists()
-        .then_some(pid)
+    let pid: u32 = fs::read_to_string(pidfile_path()?).ok()?.trim().parse().ok()?;
+    is_our_process(pid).then_some(pid)
 }
 
-/// Read the pidfile and attempt to kill that process.
-pub fn stop_daemon() -> std::io::Result<()> {
-    let mut dir = dirs::cache_dir().ok_or_else(|| std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "Unable to locate cache directory",
-    ))?;
-    dir.push("recast");
-    let pidfile = dir.join("pid");
-    // If no pidfile, assume daemon not running.
-    let pid_str = match fs::read_to_string(&pidfile) {
-        Ok(s) => s,
-        Err(_) => return Ok(()),
+/// What `--stop` was actually able to do.
+///
+/// It used to return `Ok(())` for every one of these, and the caller printed
+/// "Stopped recast daemon." on all of them — including on macOS and Windows,
+/// where no pidfile is ever written and so nothing could possibly have been
+/// stopped. A stop command that reports success without stopping anything is
+/// worse than one that fails, because it sends the user looking somewhere else.
+///
+/// Which variants can occur is decided by the target — Linux produces the
+/// first three and never the last, the others produce only the last — so all
+/// four are dead code somewhere, and `main` matches on the whole enum
+/// regardless.
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+pub enum Stopped {
+    /// SIGTERM was sent to a live daemon.
+    Signalled(u32),
+    /// The pidfile named a process that is gone; the stale file was removed.
+    Stale,
+    /// There was no pidfile.
+    NotRunning,
+    /// This platform never writes one, so this is not how ReCast is stopped
+    /// here. Carries the way that it is.
+    Unsupported(&'static str),
+}
+
+/// Stop a running daemon, if this platform has one and it is really there.
+#[cfg(target_os = "linux")]
+pub fn stop_daemon() -> std::io::Result<Stopped> {
+    let pidfile = pidfile_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Unable to locate cache directory",
+        )
+    })?;
+    let Ok(contents) = fs::read_to_string(&pidfile) else {
+        return Ok(Stopped::NotRunning);
     };
-    let pid: u32 = pid_str.trim().parse().map_err(|_| std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "Invalid PID in pidfile",
-    ))?;
-    // Send SIGTERM via the `kill` utility (avoids pulling nix's signal feature
-    // in for one call and works on macOS too).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use std::process::Command;
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+    let pid: u32 = contents.trim().parse().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid PID in pidfile")
+    })?;
+    // Checked before the signal is sent, not after: this is the whole
+    // difference between stopping our daemon and killing whatever inherited
+    // its PID.
+    if !is_our_process(pid) {
+        let _ = fs::remove_file(&pidfile);
+        return Ok(Stopped::Stale);
     }
+    // SIGTERM via the `kill` utility, which avoids pulling nix's signal
+    // feature in for this one call.
+    use std::process::Command;
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let _ = fs::remove_file(&pidfile);
+    Ok(Stopped::Signalled(pid))
+}
+
+/// macOS and Windows run ReCast in the foreground under a launch agent or the
+/// per-user `Run` key, so there is no pidfile and never was one — `--stop` has
+/// nothing to read and must say so rather than claim a stop it did not make.
+#[cfg(not(target_os = "linux"))]
+pub fn stop_daemon() -> std::io::Result<Stopped> {
+    #[cfg(target_os = "macos")]
+    let how = "quit it from the menubar icon, or: launchctl unload -w ~/Library/LaunchAgents/org.recast.plist";
     #[cfg(target_os = "windows")]
-    {
-        use std::process::Command;
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .status();
-    }
-    // Remove pidfile
-    let _ = fs::remove_file(pidfile);
-    Ok(())
+    let how = "quit it from the tray icon, or end the `recast` task in Task Manager";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let how = "this platform has no daemon mode";
+    Ok(Stopped::Unsupported(how))
 }

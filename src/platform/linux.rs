@@ -26,7 +26,7 @@ use crate::keymap::{
     english_char_to_evkey_shifted, evkey_to_english_char, evkey_to_english_char_shifted,
     evkey_to_hebrew_char,
 };
-use crate::types::{AppControl, FixKind, Language};
+use crate::types::{AppControl, FixKind, Language, WordBuffer};
 
 /// One key of the word being typed, with the shift state it was typed under.
 /// The buffer holds key *positions*, which carry no case of their own, so the
@@ -115,11 +115,11 @@ pub struct Cycle {
 
 /// Per-keyboard state tracked across events.
 pub struct AppState {
-    pub keys: Vec<Typed>,
+    pub keys: WordBuffer<Typed>,
     pub last_event_time: Instant,
     pub last_keycode: Option<KeyCode>,
     pub is_replacing: bool,
-    pub buffered_keys: Vec<Typed>,
+    pub buffered_keys: WordBuffer<Typed>,
     /// Physical keys currently held down. Tracked from press/release events
     /// so the replace_word thread can wait for the user to lift the keys it
     /// is about to retype — otherwise the compositor squashes our synthetic
@@ -270,11 +270,11 @@ pub fn run(
     // println!("Found {} input device(s).", device_paths.len());
 
     let state = Arc::new(Mutex::new(AppState {
-        keys: Vec::new(),
+        keys: WordBuffer::new(),
         last_event_time: Instant::now(),
         last_keycode: None,
         is_replacing: false,
-        buffered_keys: Vec::new(),
+        buffered_keys: WordBuffer::new(),
         held_keys: HashSet::new(),
         caps_lock: false,
         right_shift_tap: false,
@@ -437,7 +437,7 @@ fn handle_key(
                     // that the user has it listed. Arm the gesture to change
                     // their mind about it.
                     let skip = LastSkip {
-                        keys: st.keys.clone(),
+                        keys: st.keys.to_vec(),
                         terminator: Some(key),
                         word,
                     };
@@ -550,7 +550,7 @@ fn handle_release(
             if candidates.is_empty() {
                 return;
             }
-            (st.keys.clone(), candidates, 0, st.keys.len())
+            (st.keys.to_vec(), candidates, 0, st.keys.len())
         }
     };
 
@@ -973,7 +973,7 @@ fn replace_word(
     // the injected space/terminator.
     let buffered = {
         let st = state_mutex.lock().unwrap();
-        st.buffered_keys.clone()
+        st.buffered_keys.to_vec()
     };
 
     // Build the whole erase+retype sequence as one event batch and emit it in
@@ -1032,8 +1032,8 @@ fn replace_word(
 
     // Re-acquire the lock only to clean up state.
     let mut st = state_mutex.lock().unwrap();
-    st.keys = keep;
-    st.keys.extend_from_slice(&buffered);
+    st.keys.replace_with(keep);
+    st.keys.extend(buffered.iter().copied());
     // Undo erases backwards from the cursor, so it is only valid while the
     // cursor is still sitting on what we just injected. Keys the user got in
     // during the replacement were replayed after it and have moved it on.

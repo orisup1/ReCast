@@ -1,0 +1,78 @@
+# CI — the parity guard.
+#
+# The correction pipeline is pure and covered by `cargo test`, but capture and
+# injection live in three near-identical copies (`src/platform/{linux,macos,
+# windows}.rs`) that nothing keeps in step. A change landed in one and forgotten
+# in the other two still *compiles* on the machine it was written on, which is
+# why every job below runs on a real runner for its own OS rather than
+# cross-checking from Linux.
+
+name: CI
+
+# PARKED. The automatic triggers are commented out, so this runs only when
+# started by hand from the Actions tab ("Run workflow"). Nothing happens on a
+# push or a pull request.
+#
+# To turn it back on, uncomment the two blocks below:
+on:
+  # push:
+  #   branches: ["**"]
+  # pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation only pays off across repeated builds on one
+  # machine. CI never gets that, and the artifacts are bulky to cache.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide the state of the other two — that
+      # is the whole reason this matrix exists.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: Linux }
+          - { os: macos-latest, name: macOS }
+          - { os: windows-latest, name: Windows }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # A GitHub runner has no desktop libraries. eframe (a Linux-only
+      # dependency, for `--window`) opens X11, Wayland and GL at *runtime*
+      # rather than linking them — the release binary here shows no such
+      # `ldd` entries — so this is insurance for the crates' pkg-config
+      # probes, not a link-time requirement. Cheap; the alternative is a red
+      # run to find out which one was wanted. Not needed on the other two OSes.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Compiling the release profile is the only thing that exercises each
+      # platform module's injection path at all — there are no tests below
+      # `src/platform/`, so "it builds" is the entire guarantee here.
+      - name: Build (release)
+        run: cargo build --release

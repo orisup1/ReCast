@@ -110,6 +110,11 @@ pub fn switch_layout_to(lang: Language) -> bool {
 // ─────────────────────────────────────────────────────────────────────────────
 // Windows: switch layout via HKL activation (LoadKeyboardLayoutW)
 // ─────────────────────────────────────────────────────────────────────────────
+// The Win32 spellings are kept exactly as the API documents them — `HKL`,
+// `HWND`, `DWORD` — because these declarations have to be checked against
+// Microsoft's headers by eye, and a renamed `Hkl` makes that harder for the
+// one reader who ever needs to.
+#[allow(clippy::upper_case_acronyms)]
 #[cfg(target_os = "windows")]
 fn query_layout() -> Option<Language> {
     use std::ffi::c_void;
@@ -143,6 +148,11 @@ fn query_layout() -> Option<Language> {
     }
 }
 
+// The Win32 spellings are kept exactly as the API documents them — `HKL`,
+// `HWND`, `DWORD` — because these declarations have to be checked against
+// Microsoft's headers by eye, and a renamed `Hkl` makes that harder for the
+// one reader who ever needs to.
+#[allow(clippy::upper_case_acronyms)]
 #[cfg(target_os = "windows")]
 pub fn switch_layout_to(lang: Language) -> bool {
     use std::ffi::c_void;

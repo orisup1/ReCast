@@ -12,6 +12,7 @@
 mod banner;
 mod complete;
 mod dictionary;
+mod footprint;
 #[cfg(target_os = "linux")]
 mod gui;
 mod keymap;
@@ -42,7 +43,8 @@ Options:
   -g, --gui         Run in the foreground with a terminal dashboard (TUI)
   -w, --window      Run in the foreground with a small control window
                     (Linux only)
-  -s, --stop        Stop a running recast daemon (via its pidfile)
+  -s, --stop        Stop a running recast daemon (Linux only — macOS and
+                    Windows run in the foreground; quit from the tray)
   -f, --foreground  Linux: don't daemonize (implied when run under systemd)
       --status      Print what is running and what is configured, then exit
   -v, --version     Print the version and exit
@@ -113,12 +115,28 @@ fn main() {
     }
 
     if with_kill {
-        // Try to kill existing daemon using pidfile.
-        if let Err(e) = daemon::stop_daemon() {
-            eprintln!("Failed to stop daemon: {e}");
-            process::exit(1);
+        match daemon::stop_daemon() {
+            Ok(daemon::Stopped::Signalled(pid)) => {
+                println!("Stopped recast daemon (pid {pid}).");
+            }
+            Ok(daemon::Stopped::Stale) => {
+                println!("No recast daemon running — cleared a stale pidfile.");
+            }
+            Ok(daemon::Stopped::NotRunning) => {
+                println!("No recast daemon is running.");
+            }
+            // Not an error the user made, but not a stop either: say which it
+            // is and how to actually do it here.
+            Ok(daemon::Stopped::Unsupported(how)) => {
+                eprintln!("--stop is Linux-only — ReCast does not daemonize on this platform.");
+                eprintln!("To stop it: {how}");
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed to stop daemon: {e}");
+                process::exit(1);
+            }
         }
-        println!("Stopped recast daemon.");
         return;
     }
 
@@ -166,6 +184,81 @@ if banner::ran_from_terminal() {
     platform::windows::start(en, he, control, with_gui);
 }
 
+/// Answer the two questions a user asks when something isn't happening: is it
+/// running, and is it configured the way I think it is.
+///
+/// Deliberately readable without a running daemon — it reports the state on
+/// disk, which is what the next launch will pick up.
+fn print_status() {
+    println!("recast {}", env!("CARGO_PKG_VERSION"));
+
+    #[cfg(target_os = "linux")]
+    match daemon::running_pid() {
+        Some(pid) => println!("  running:        yes (pid {pid})"),
+        None => println!("  running:        no"),
+    }
+
+    println!(
+        "  correction:     {}",
+        if prefs::load_enabled() { "enabled" } else { "disabled" }
+    );
+    match prefs::autostart_enabled() {
+        Some(true) => println!("  start at login: yes"),
+        Some(false) => println!("  start at login: no"),
+        None => {}
+    }
+    match complete::config_dir() {
+        Some(dir) => println!("  config dir:     {}", dir.display()),
+        None => println!("  config dir:     (none — no OS config directory)"),
+    }
+    let (abbrevs, ignored) = complete::list_counts();
+    println!("  abbrev.txt:     {abbrevs} abbreviation(s)");
+    println!("  ignore.txt:     {ignored} word(s)");
+    // This process, not the daemon's — `--status` is a separate invocation and
+    // cannot see the running one's figure. Still worth showing: it is the same
+    // binary doing the same page-faulting, so it answers "roughly what does
+    // this cost" without attaching to anything.
+    if let Some(rss) = footprint::rss_human() {
+        println!("  memory (this):  {rss}");
+    }
+
+    // The other half of "is it configured the way I think it is". Every one of
+    // these can be overridden from the environment and none of them used to be
+    // reported, so someone who set RECAST_SPELL_DIST had no way to confirm it
+    // had been read — least of all when the value was a typo and had silently
+    // fallen back to the default.
+    let cfg = config::Config::from_env();
+    println!("\n  settings (with any RECAST_* override applied):");
+    println!("    short words          {}", on_off(cfg.short_enabled));
+    println!("    missing-space split  {}", on_off(cfg.split_enabled));
+    println!("    frequency tie-break  {}", on_off(cfg.freq_enabled));
+    println!(
+        "    spelling             {}  (min length {}, max rank {}, max distance {})",
+        on_off(cfg.spell_enabled),
+        cfg.spell_min_len,
+        cfg.spell_max_rank,
+        cfg.spell_max_dist,
+    );
+    println!(
+        "    auto-complete        {}  (min prefix {}, max rank {})",
+        on_off(cfg.complete_enabled),
+        cfg.complete_min_len,
+        cfg.complete_max_rank,
+    );
+
+    for complaint in config::env_complaints() {
+        eprintln!("\n  ! {complaint}");
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Every version string in the program is `env!("CARGO_PKG_VERSION")` — the
@@ -204,36 +297,4 @@ mod tests {
             );
         }
     }
-}
-
-/// Answer the two questions a user asks when something isn't happening: is it
-/// running, and is it configured the way I think it is.
-///
-/// Deliberately readable without a running daemon — it reports the state on
-/// disk, which is what the next launch will pick up.
-fn print_status() {
-    println!("recast {}", env!("CARGO_PKG_VERSION"));
-
-    #[cfg(target_os = "linux")]
-    match daemon::running_pid() {
-        Some(pid) => println!("  running:        yes (pid {pid})"),
-        None => println!("  running:        no"),
-    }
-
-    println!(
-        "  correction:     {}",
-        if prefs::load_enabled() { "enabled" } else { "disabled" }
-    );
-    match prefs::autostart_enabled() {
-        Some(true) => println!("  start at login: yes"),
-        Some(false) => println!("  start at login: no"),
-        None => {}
-    }
-    match complete::config_dir() {
-        Some(dir) => println!("  config dir:     {}", dir.display()),
-        None => println!("  config dir:     (none — no OS config directory)"),
-    }
-    let (abbrevs, ignored) = complete::list_counts();
-    println!("  abbrev.txt:     {abbrevs} abbreviation(s)");
-    println!("  ignore.txt:     {ignored} word(s)");
 }

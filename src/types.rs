@@ -45,6 +45,119 @@ impl Config {
     }
 }
 
+/// Longest run of keys that can still be treated as one word.
+///
+/// Both pipelines already refuse anything much shorter than this — the speller
+/// stops at 20 characters (`spell::MAX_LEN`) and the completer at 20
+/// (`complete::MAX_PREFIX_LEN`) — so past this point the buffer is being filled
+/// with something that is provably never going to be corrected: a base64 blob,
+/// a URL, a path, a key held down. Held at 64 rather than 20 because the buffer
+/// also has to hold the punctuation a word ends with and, once the split
+/// fallback is on, two words run together.
+pub const MAX_WORD_KEYS: usize = 64;
+
+/// The keys of the word being typed, with a hard ceiling.
+///
+/// This used to be a bare `Vec` that only ever shrank when the user finished a
+/// word, pressed a cursor key or clicked — so a long unbroken token grew it
+/// without limit and then paid to fold the whole thing into two strings that
+/// no dictionary was ever going to match.
+///
+/// The ceiling cannot simply drop the excess keys: the buffer has to keep
+/// agreeing character-for-character with what is on screen, because that is
+/// what the erase count is computed from, and a buffer holding the first 64
+/// characters of a 200-character token would erase 64 of the wrong ones. Nor
+/// can it keep the *last* 64, which stays consistent but lets a fragment of a
+/// long token be "corrected" as if it were a word.
+///
+/// So an over-long run gives up on the word entirely: the buffer empties and
+/// stays empty until something ends the word. Every existing reset already
+/// calls [`clear`](Self::clear), and an emptied buffer already means "nothing
+/// to check" at a terminator, so the give-up state needs no handling anywhere
+/// else — it reads as a word that was never typed, which is exactly what a
+/// 200-character token is.
+pub struct WordBuffer<T> {
+    keys: Vec<T>,
+    /// Set when the run got too long. Cleared by [`clear`](Self::clear), i.e.
+    /// at the next word boundary.
+    given_up: bool,
+}
+
+impl<T> WordBuffer<T> {
+    pub fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            given_up: false,
+        }
+    }
+
+    /// Add a key to the word, unless the word has already grown past being one.
+    pub fn push(&mut self, key: T) {
+        if self.given_up {
+            return;
+        }
+        if self.keys.len() >= MAX_WORD_KEYS {
+            self.give_up();
+            return;
+        }
+        self.keys.push(key);
+    }
+
+    /// Backspace. A word already given up on has nothing to take back.
+    pub fn pop(&mut self) {
+        self.keys.pop();
+    }
+
+    /// End the word: drop the keys and start listening again.
+    ///
+    /// Also releases the buffer's capacity, so one long token does not leave a
+    /// 64-key allocation behind for the rest of the process's life.
+    pub fn clear(&mut self) {
+        self.keys.clear();
+        self.keys.shrink_to_fit();
+        self.given_up = false;
+    }
+
+    /// Give up on the current word without ending it — the keys still being
+    /// typed belong to a token that is not a word, and must not be checked as
+    /// the tail of one.
+    fn give_up(&mut self) {
+        self.keys.clear();
+        self.keys.shrink_to_fit();
+        self.given_up = true;
+    }
+
+    /// Start the word again from `keys` — what is on screen after a correction
+    /// has landed. Never more than the ceiling.
+    pub fn replace_with(&mut self, keys: impl IntoIterator<Item = T>) {
+        self.keys.clear();
+        self.given_up = false;
+        self.extend(keys);
+    }
+
+    /// Append, respecting the ceiling — the keys typed while a correction was
+    /// being injected, replayed after it.
+    pub fn extend(&mut self, keys: impl IntoIterator<Item = T>) {
+        for key in keys {
+            self.push(key);
+        }
+    }
+}
+
+impl<T> Default for WordBuffer<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// So `&buffer` still reads as `&[T]` everywhere it is passed to the pipelines.
+impl<T> std::ops::Deref for WordBuffer<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.keys
+    }
+}
+
 /// Which pipeline produced a correction — the one thing a user reading the
 /// history needs that the two words alone don't tell them, since "this was a
 /// layout switch" and "this was a guess about my spelling" are answered very
@@ -115,6 +228,28 @@ impl AppControl {
             paused_until: Mutex::new(None),
             history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
         }
+    }
+
+    /// A control wired to the shipped defaults, for tests that need one
+    /// without caring how it is configured.
+    ///
+    /// `GLOBAL_CONFIG` is a `OnceLock` shared by every test in the binary, so
+    /// the first caller wins and the rest are no-ops — which is why this uses
+    /// the defaults rather than anything a single test would want to vary.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::new_with_config(Config {
+            short_enabled: true,
+            split_enabled: false,
+            freq_enabled: true,
+            spell_enabled: true,
+            spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
+            spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
+            spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
+            complete_enabled: true,
+            complete_min_len: crate::config::DEFAULT_COMPLETE_MIN_LEN,
+            complete_max_rank: crate::config::DEFAULT_COMPLETE_MAX_RANK,
+        })
     }
 
     /// As [`new_with_config`](Self::new_with_config), but starting from the
@@ -246,18 +381,7 @@ mod tests {
     use super::*;
 
     fn control() -> AppControl {
-        AppControl::new_with_config(Config {
-            short_enabled: true,
-            split_enabled: false,
-            freq_enabled: true,
-            spell_enabled: true,
-            spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
-            spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
-            spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
-            complete_enabled: true,
-            complete_min_len: crate::config::DEFAULT_COMPLETE_MIN_LEN,
-            complete_max_rank: crate::config::DEFAULT_COMPLETE_MAX_RANK,
-        })
+        AppControl::new_for_test()
     }
 
     #[test]

@@ -1274,7 +1274,7 @@ mod tests {
         assert_eq!(adjacent_cost(b'g', b't'), Some(COST_ADJACENT_DIAG));
         assert_eq!(adjacent_cost(b'g', b'b'), Some(COST_ADJACENT_DIAG));
         assert_eq!(adjacent_cost(b'g', b'p'), None);
-        assert!(COST_ADJACENT_ROW < COST_ADJACENT_DIAG);
+        const { assert!(COST_ADJACENT_ROW < COST_ADJACENT_DIAG) };
     }
 
     #[test]
