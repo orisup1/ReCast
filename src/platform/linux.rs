@@ -153,6 +153,65 @@ fn shift_active(st: &AppState) -> bool {
     held != st.caps_lock
 }
 
+/// Every device ReCast listens on: keyboards, plus mice so that a click can
+/// reset the in-progress word buffer (parity with the macOS / Windows
+/// `ButtonPress` handler). Its own injector is skipped.
+///
+/// A device the user has no permission to read is not returned at all —
+/// `evdev::enumerate` cannot open it, so it never reaches the filter. That is
+/// what makes an empty result the signal for "not in the `input` group"
+/// rather than "no keyboard attached".
+fn input_device_paths() -> Vec<std::path::PathBuf> {
+    evdev::enumerate()
+        .filter_map(|(path, dev)| {
+            if dev.name() == Some("recast-injector") {
+                return None;
+            }
+            let keys = dev.supported_keys();
+            let is_keyboard = keys.is_some_and(|k| k.contains(KeyCode::KEY_A));
+            let is_mouse = keys.is_some_and(|k| k.contains(KeyCode::BTN_LEFT));
+            (is_keyboard || is_mouse).then_some(path)
+        })
+        .collect()
+}
+
+/// Everything that has to be true before the process detaches from the
+/// terminal, checked while there is still a terminal to complain to.
+///
+/// `start` daemonizes by default, and daemonizing redirects stdout and stderr
+/// to `/dev/null` (see `daemon::daemonize`). Both failures below are raised
+/// *after* that point by `run`, which meant the overwhelmingly common first-run
+/// problem — a user who is not in the `input` group — produced no output at
+/// all: the shell prompt came straight back, the exit status was 0, and
+/// nothing was ever corrected. The messages existed; nobody could read them.
+fn preflight() -> Result<(), String> {
+    // Injection. `builder()` is what opens `/dev/uinput`, so calling it is the
+    // permission check; it is dropped again without `build()`, which means no
+    // virtual device is registered — and no device-added event is sent to the
+    // compositor — by the check itself.
+    if let Err(e) = VirtualDevice::builder() {
+        return Err(format!(
+            "Cannot open /dev/uinput ({e}) — ReCast needs it to type corrections back.\n\
+             Hint: load the module and give yourself access:\n\
+             \x20 sudo modprobe uinput\n\
+             \x20 echo 'KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\"' \
+             | sudo tee /etc/udev/rules.d/99-recast.rules\n\
+             \x20 sudo udevadm control --reload-rules && sudo udevadm trigger"
+        ));
+    }
+
+    // Capture.
+    if input_device_paths().is_empty() {
+        return Err(
+            "No readable input devices — ReCast cannot see what you type.\n\
+             Hint: sudo usermod -aG input $USER, then log out and back in."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Full Linux startup. Owns everything that used to live in `main`'s Linux
 /// `cfg` block: pick a foreground UI (control window or TUI) with the listener
 /// on a background thread, or daemonize and run the listener headless. Keeping
@@ -165,6 +224,13 @@ pub fn start(
     with_window: bool,
     with_foreground: bool,
 ) {
+    // Before any of the three paths below, because two of them take the
+    // terminal away: the daemon closes it, the TUI draws over it.
+    if let Err(problem) = preflight() {
+        eprintln!("{problem}");
+        std::process::exit(1);
+    }
+
     if with_window {
         // Control window: eframe owns the main thread, listener runs in the
         // background.
@@ -200,6 +266,13 @@ pub fn start(
         std::process::exit(1);
     }
     run(en, he, control);
+
+    // `run` blocks for the life of the daemon — a normal shutdown is a signal,
+    // which never gets here. Returning means it gave up: no injector, or every
+    // device thread ended. Exiting 0 there told systemd the service had
+    // finished its work, and `Restart=on-failure` (Makefile) left the unit
+    // stopped instead of bringing it back.
+    std::process::exit(1);
 }
 
 pub fn run(
@@ -242,30 +315,15 @@ pub fn run(
     thread::sleep(Duration::from_millis(300));
     let injector = Arc::new(Mutex::new(injector));
 
-    // Find all physical keyboard and mouse devices. Mice are included so
-    // that a click can reset the in-progress word buffer (parity with the
-    // macOS / Windows ButtonPress handler).
-    let device_paths: Vec<std::path::PathBuf> = evdev::enumerate()
-        .filter_map(|(path, dev)| {
-            if dev.name() == Some("recast-injector") {
-                return None;
-            }
-            let keys = dev.supported_keys();
-            let is_keyboard = keys.is_some_and(|k| k.contains(KeyCode::KEY_A));
-            let is_mouse = keys.is_some_and(|k| k.contains(KeyCode::BTN_LEFT));
-            if is_keyboard || is_mouse {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-     if device_paths.is_empty() {
-         eprintln!("No input devices found. Make sure you are in the 'input' group.");
-         eprintln!("Hint: Run 'sudo usermod -aG input $USER' and log out/in.");
-         return;
-     }
+    // Normally already checked by `preflight` before we detached from the
+    // terminal; still handled here because a device can be unplugged in
+    // between, and because `run` is also reached from the foreground UIs.
+    let device_paths = input_device_paths();
+    if device_paths.is_empty() {
+        eprintln!("No input devices found. Make sure you are in the 'input' group.");
+        eprintln!("Hint: Run 'sudo usermod -aG input $USER' and log out/in.");
+        return;
+    }
 
     // println!("Found {} input device(s).", device_paths.len());
 
