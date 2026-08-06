@@ -11,24 +11,9 @@ use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix};
 use crate::keymap::{
     english_char_to_key, key_to_english_char, key_to_english_char_shifted, key_to_hebrew_char,
 };
-use crate::types::{AppControl, FixKind, Language, WordBuffer};
-
-/// Maximum time the replace thread will wait for the user to physically
-/// release the keys we are about to retype before injecting anyway.
-const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(150);
-
-/// Gap between a synthetic key-down and its key-up. macOS coalesces or drops
-/// `CGEvent`s posted too close together; the previous 50µs spacing let a
-/// backspace go missing (the original first letter survived) or a retyped key
-/// be lost. A couple of milliseconds makes injection reliable.
-const KEY_PRESS_GAP: Duration = Duration::from_millis(1);
-/// Gap between consecutive injected keys, for the same reason.
-const INTER_KEY_GAP: Duration = Duration::from_millis(1);
-/// Grace period between the last injected event and un-gating the listener.
-/// `CGEventPost` hands the event to the system, which delivers it to our tap on
-/// the main thread a moment later; clearing the gate immediately can let our
-/// own injected text come back in as user input.
-const INJECT_SETTLE: Duration = Duration::from_millis(2);
+use crate::types::{
+    lock_forgiving, AppControl, FixKind, Language, Replaceable, ReplaceGuard, WordBuffer,
+};
 
 /// Longest a Ctrl press may last and still count as a *tap* rather than a hold.
 /// Ctrl held down is the start of a shortcut; Ctrl let straight back up types
@@ -153,6 +138,15 @@ pub struct AppState {
     pub last_action: Option<LastAction>,
     /// The completion cycle in progress, if the user is tapping through guesses.
     pub cycle: Option<Cycle>,
+}
+
+impl Replaceable for AppState {
+    fn set_replacing(&mut self, replacing: bool) {
+        self.is_replacing = replacing;
+    }
+    fn clear_buffered(&mut self) {
+        self.buffered_keys.clear();
+    }
 }
 
 /// Whether a letter pressed right now would come out capitalized.
@@ -452,7 +446,7 @@ unsafe extern "C" fn tap_callback(
         KCG_EVENT_LEFT_MOUSE_DOWN
         | KCG_EVENT_RIGHT_MOUSE_DOWN
         | KCG_EVENT_OTHER_MOUSE_DOWN => {
-            let mut st = ctx.state.lock().unwrap();
+            let mut st = lock_forgiving(&ctx.state);
             if st.is_replacing {
                 st.buffered_keys.clear();
             } else {
@@ -481,7 +475,7 @@ unsafe extern "C" fn tap_callback(
 fn handle_flags_changed(ctx: &TapContext, key: Key, flags: u64) {
     if key == Key::CapsLock {
         // A latch rather than a held key: the flag is the state itself.
-        ctx.state.lock().unwrap().caps_lock = flags & FLAG_ALPHA_SHIFT != 0;
+        lock_forgiving(&ctx.state).caps_lock = flags & FLAG_ALPHA_SHIFT != 0;
         return;
     }
     let Some(bit) = device_flag(key) else {
@@ -507,7 +501,7 @@ fn device_flag(key: Key) -> Option<u64> {
 }
 
 fn handle_key_press(ctx: &TapContext, key: Key) {
-    let mut st = ctx.state.lock().unwrap();
+    let mut st = lock_forgiving(&ctx.state);
     st.held_keys.insert(key);
     // Any key other than Right Shift itself means the shift is being *held* for
     // something, not tapped, so it is no longer a completion request.
@@ -645,7 +639,7 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
 /// (for a capital, for a shortcut) is unaffected; only a press and release with
 /// nothing in between counts.
 fn handle_key_release(ctx: &TapContext, key: Key) {
-    let mut st = ctx.state.lock().unwrap();
+    let mut st = lock_forgiving(&ctx.state);
     st.held_keys.remove(&key);
 
     if key == Key::ControlLeft || key == Key::ControlRight {
@@ -1128,6 +1122,13 @@ fn replace_word(
     state_mutex: &Arc<Mutex<AppState>>,
     injecting: &Arc<AtomicBool>,
 ) {
+    let gaps = crate::timing::injection();
+    // Armed for the whole replacement: whatever happens below — including a
+    // panic — `is_replacing` and the `injecting` gate are cleared. Leaving
+    // `injecting` set is the worse of the two failures: the tap keeps running
+    // and every key the user types is discarded as though it were ours.
+    let _gate = ReplaceGuard::new(state_mutex.as_ref(), Some(injecting.as_ref()));
+
     // 1. The corrected word goes in as text, so the only real key we press is
     //    Return (a space rides along inside the text instead). Wait for the
     //    user to lift it first: a synthetic press of a still-held key is
@@ -1138,13 +1139,13 @@ fn replace_word(
         let wait_start = Instant::now();
         loop {
             let still_held = {
-                let st = state_mutex.lock().unwrap();
+                let st = lock_forgiving(state_mutex);
                 st.held_keys.contains(&Key::Return)
             };
-            if !still_held || wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
+            if !still_held || wait_start.elapsed() >= gaps.held_release_timeout {
                 break;
             }
-            thread::sleep(Duration::from_micros(100));
+            crate::timing::pause(gaps.held_poll);
         }
     }
 
@@ -1155,7 +1156,7 @@ fn replace_word(
     injecting.store(true, Ordering::Relaxed);
 
     let buf = {
-        let st = state_mutex.lock().unwrap();
+        let st = lock_forgiving(state_mutex);
         st.buffered_keys.to_vec()
     };
 
@@ -1164,9 +1165,9 @@ fn replace_word(
     // is one event.
     let tap_key = |k: Key| {
         let _ = simulate(&EventType::KeyPress(k));
-        thread::sleep(KEY_PRESS_GAP);
+        crate::timing::pause(gaps.press_gap);
         let _ = simulate(&EventType::KeyRelease(k));
-        thread::sleep(INTER_KEY_GAP);
+        crate::timing::pause(gaps.inter_key_gap);
     };
 
     let delete_count = erase + buf.len();
@@ -1190,17 +1191,19 @@ fn replace_word(
     for t in buf.iter() {
         if t.shift {
             let _ = simulate(&EventType::KeyPress(Key::ShiftLeft));
-            thread::sleep(KEY_PRESS_GAP);
+            crate::timing::pause(gaps.press_gap);
             tap_key(t.key);
             let _ = simulate(&EventType::KeyRelease(Key::ShiftLeft));
-            thread::sleep(INTER_KEY_GAP);
+            crate::timing::pause(gaps.inter_key_gap);
         } else {
             tap_key(t.key);
         }
     }
 
-    thread::sleep(INJECT_SETTLE);
-    let mut st = state_mutex.lock().unwrap();
+    // The last injected key already paid `inter_key_gap`, and settling is the
+    // same kind of wait for the same events — so only the difference is owed.
+    crate::timing::pause(gaps.settle.saturating_sub(gaps.inter_key_gap));
+    let mut st = lock_forgiving(state_mutex);
     let buffered_typed = !buf.is_empty();
     st.keys.replace_with(keep);
     st.keys.extend(buf);
@@ -1212,7 +1215,7 @@ fn replace_word(
     } else {
         undo.map(LastAction::Fixed)
     };
-    st.buffered_keys.clear();
-    st.is_replacing = false;
-    injecting.store(false, Ordering::Relaxed);
+    // `buffered_keys`, `is_replacing` and the `injecting` gate are the guard's,
+    // cleared after this lock is dropped — on this path and a panicking one
+    // alike.
 }

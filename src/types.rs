@@ -45,6 +45,85 @@ impl Config {
     }
 }
 
+/// Take a lock, accepting one poisoned by a panic elsewhere.
+///
+/// Poisoning is a warning that some other thread died partway through a write,
+/// and for most programs `unwrap` is the right response: fail loudly rather
+/// than read half-updated data. This one is a keyboard listener, and the
+/// calculation is different in both directions.
+///
+/// The state behind these locks is a few keystrokes of a word in progress.
+/// Nothing about it is worth a crash, and the recovery — a wrong correction on
+/// the word being typed, at worst — is one the undo gesture already exists for.
+/// Against that: every keystroke handler, on every device thread, takes this
+/// lock. `unwrap` there means one panic anywhere does not stop one thread, it
+/// stops every thread that touches the keyboard afterwards, one keystroke at a
+/// time, while the process stays up and looks healthy. That is the failure this
+/// avoids — see [`ReplaceGuard`], which handles the other half of it.
+pub fn lock_forgiving<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The part of a platform's listener state that a replacement has to put back.
+///
+/// Each platform owns its own `AppState` (the key types differ: `evdev::KeyCode`,
+/// `rdev::Key`), so this is the sliver they have in common — enough for
+/// [`ReplaceGuard`] to be written once instead of three times.
+pub trait Replaceable {
+    /// The gate that makes the listener ignore keystrokes while a correction is
+    /// being injected, so it does not read its own output as user input.
+    fn set_replacing(&mut self, replacing: bool);
+    /// Keys the user managed to type during the replacement. Dropped rather
+    /// than replayed when a replacement fails: they belong after text that was
+    /// never typed.
+    fn clear_buffered(&mut self);
+}
+
+/// Clears the replacement gates however the replacement ends — including by
+/// panic.
+///
+/// Injection runs on its own thread and sets two flags before it starts:
+/// `is_replacing` in the listener state and, on macOS and Windows, an
+/// `injecting` atomic. Both used to be cleared only by the last lines of
+/// `replace_word`, which is fine right up until something in between panics.
+/// Then they stay set: `is_replacing` makes every future correction return
+/// early, and `injecting` makes the listener discard every key the user types.
+/// The daemon keeps running, the tray still says "Enabled", and the keyboard
+/// quietly stops working.
+///
+/// A guard makes the clearing structural rather than something the happy path
+/// remembers to do. The normal path still writes back the corrected buffer
+/// itself — only the gates are the guard's business, because they are the two
+/// pieces of state whose failure mode is silence.
+pub struct ReplaceGuard<'a, S: Replaceable> {
+    state: &'a Mutex<S>,
+    injecting: Option<&'a AtomicBool>,
+}
+
+impl<'a, S: Replaceable> ReplaceGuard<'a, S> {
+    /// Arm the guard for a replacement that is about to start. `injecting` is
+    /// `None` on Linux, which gates on `is_replacing` alone.
+    pub fn new(state: &'a Mutex<S>, injecting: Option<&'a AtomicBool>) -> Self {
+        Self { state, injecting }
+    }
+}
+
+impl<S: Replaceable> Drop for ReplaceGuard<'_, S> {
+    fn drop(&mut self) {
+        // `lock_forgiving`, not `lock().unwrap()`: unwinding through a second
+        // panic would abort the process, and this runs precisely when the first
+        // one may already have poisoned this lock.
+        {
+            let mut st = lock_forgiving(self.state);
+            st.set_replacing(false);
+            st.clear_buffered();
+        }
+        if let Some(flag) = self.injecting {
+            flag.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Longest run of keys that can still be treated as one word.
 ///
 /// Both pipelines already refuse anything much shorter than this — the speller
@@ -382,6 +461,79 @@ mod tests {
 
     fn control() -> AppControl {
         AppControl::new_for_test()
+    }
+
+    /// Stands in for the three platforms' `AppState`, which cannot be built in
+    /// a test — they hold `evdev` and `rdev` key types and are only compiled on
+    /// their own OS. The two fields below are the only ones the guard touches.
+    #[derive(Default)]
+    struct FakeState {
+        replacing: bool,
+        buffered: usize,
+    }
+
+    impl Replaceable for FakeState {
+        fn set_replacing(&mut self, replacing: bool) {
+            self.replacing = replacing;
+        }
+        fn clear_buffered(&mut self) {
+            self.buffered = 0;
+        }
+    }
+
+    #[test]
+    fn a_panicking_replacement_still_opens_the_gates() {
+        let state = Mutex::new(FakeState {
+            replacing: true,
+            buffered: 3,
+        });
+        let injecting = AtomicBool::new(true);
+
+        // Exactly what the injection thread does, up to and including dying
+        // partway through.
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gate = ReplaceGuard::new(&state, Some(&injecting));
+            panic!("injection blew up halfway through");
+        }));
+        assert!(died.is_err(), "the panic is the point of this test");
+
+        // Before the guard, both of these stayed set: every later correction
+        // returned early, and the listener discarded every key as its own.
+        let st = lock_forgiving(&state);
+        assert!(!st.replacing, "is_replacing left set — corrections wedged");
+        assert_eq!(st.buffered, 0, "keys typed during a failed replacement kept");
+        assert!(
+            !injecting.load(Ordering::Relaxed),
+            "injecting left set — the keyboard would stop working entirely"
+        );
+    }
+
+    #[test]
+    fn the_gates_open_on_the_ordinary_path_too() {
+        let state = Mutex::new(FakeState {
+            replacing: true,
+            buffered: 2,
+        });
+        let injecting = AtomicBool::new(true);
+        {
+            let _gate = ReplaceGuard::new(&state, Some(&injecting));
+        }
+        assert!(!lock_forgiving(&state).replacing);
+        assert!(!injecting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_still_usable() {
+        let state = Mutex::new(FakeState::default());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut st = state.lock().unwrap();
+            st.buffered = 9;
+            panic!("die while holding the lock");
+        }));
+        assert!(state.is_poisoned(), "the panic should have poisoned it");
+        // `lock().unwrap()` here is what used to take every keyboard thread
+        // down, one keystroke at a time, after any single panic.
+        assert_eq!(lock_forgiving(&state).buffered, 9);
     }
 
     #[test]

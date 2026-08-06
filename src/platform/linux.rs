@@ -5,12 +5,6 @@ use std::time::{Duration, Instant};
 
 use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode};
 
-/// Maximum time `replace_word` will wait for the user to physically release
-/// the keys we are about to retype before injecting anyway. Kept short: the
-/// correction should feel instant, and a key still held when it expires gets a
-/// synthetic release instead of more waiting (see `replace_word`).
-const HELD_RELEASE_TIMEOUT: Duration = Duration::from_millis(40);
-
 /// Longest a Ctrl press may last and still count as a *tap* rather than a hold.
 /// Ctrl held down is the start of a shortcut; Ctrl let straight back up types
 /// nothing and means nothing, which is what makes it usable as a gesture.
@@ -26,7 +20,9 @@ use crate::keymap::{
     english_char_to_evkey_shifted, evkey_to_english_char, evkey_to_english_char_shifted,
     evkey_to_hebrew_char,
 };
-use crate::types::{AppControl, FixKind, Language, WordBuffer};
+use crate::types::{
+    lock_forgiving, AppControl, FixKind, Language, Replaceable, ReplaceGuard, WordBuffer,
+};
 
 /// One key of the word being typed, with the shift state it was typed under.
 /// The buffer holds key *positions*, which carry no case of their own, so the
@@ -144,6 +140,15 @@ pub struct AppState {
     pub last_action: Option<LastAction>,
     /// The completion cycle in progress, if the user is tapping through guesses.
     pub cycle: Option<Cycle>,
+}
+
+impl Replaceable for AppState {
+    fn set_replacing(&mut self, replacing: bool) {
+        self.is_replacing = replacing;
+    }
+    fn clear_buffered(&mut self) {
+        self.buffered_keys.clear();
+    }
 }
 
 /// Whether a letter pressed right now would come out capitalized.
@@ -312,7 +317,7 @@ pub fn run(
     };
 
     // Allow time for the OS/compositor to detect the new injection device.
-    thread::sleep(Duration::from_millis(300));
+    crate::timing::pause(crate::timing::injection().device_settle);
     let injector = Arc::new(Mutex::new(injector));
 
     // Normally already checked by `preflight` before we detached from the
@@ -362,11 +367,36 @@ pub fn run(
 
             // println!("Passively listening on {:?}", path_clone);
 
+            // A read error used to be retried forever. Unplugging a keyboard
+            // does not make its node readable again — it makes every read fail
+            // with the same error — so the thread settled into waking twice a
+            // second, for the life of the daemon, to be told the device is
+            // still gone. It also kept `run` from ever returning, because it
+            // joins these handles.
+            //
+            // A handful of retries still covers what retrying is *for*: a
+            // transient EINTR, or a device that drops out for a moment during
+            // suspend/resume.
+            const GIVE_UP_AFTER: u32 = 10;
+            let mut failures = 0u32;
+
             loop {
                 let events = match dev.fetch_events() {
-                    Ok(ev) => ev.collect::<Vec<_>>(),
+                    Ok(ev) => {
+                        failures = 0;
+                        ev.collect::<Vec<_>>()
+                    }
                     Err(e) => {
+                        failures += 1;
                         eprintln!("Error reading {:?}: {}", path_clone, e);
+                        if failures >= GIVE_UP_AFTER {
+                            eprintln!(
+                                "Giving up on {:?} after {} consecutive errors — \
+                                 it is most likely unplugged.",
+                                path_clone, failures
+                            );
+                            return;
+                        }
                         thread::sleep(Duration::from_millis(500));
                         continue;
                     }
@@ -407,7 +437,7 @@ fn handle_key(
 ) {
     use evdev::KeyCode as KC;
 
-    let mut st = state_mutex.lock().unwrap();
+    let mut st = lock_forgiving(state_mutex);
 
     // Deduplicate the same key-press arriving from multiple event nodes within 5 ms.
     let now = Instant::now();
@@ -569,7 +599,7 @@ fn handle_release(
 ) {
     use evdev::KeyCode as KC;
 
-    let mut st = state_mutex.lock().unwrap();
+    let mut st = lock_forgiving(state_mutex);
     st.held_keys.remove(&key);
 
     if key == KC::KEY_LEFTCTRL || key == KC::KEY_RIGHTCTRL {
@@ -740,7 +770,9 @@ fn undo_fix(
     // leave the text alone rather than churn it, and leave the word correctable
     // rather than retire it on the strength of an undo that never happened.
     if let Some(lang) = fix.layout {
-        if !crate::layout::switch_layout_to(lang) {
+        // `.ready()`, not the old bare bool: "already on that layout" is a
+        // reason to carry on, not to abandon the undo.
+        if !crate::layout::switch_layout_to(lang).ready() {
             return;
         }
     }
@@ -950,6 +982,37 @@ fn undo_of(keys: &[Typed], rep: &Replacement, terminator: Option<KeyCode>) -> La
     }
 }
 
+/// Hand the correction to the kernel in pieces rather than in one write.
+///
+/// The whole sequence used to go out as a single `emit`, on the reasoning that
+/// one locked write beats several. It does — but only for as long as the reader
+/// keeps up. The buffer the events land in belongs to whoever is reading the
+/// device, it holds 64 events, and a correction is `8 × word length + 8`: past
+/// about seven letters a single write can fill it outright, and anything that
+/// does not fit is dropped by the kernel rather than queued. The events emitted
+/// last are the ones with nowhere to go, and the last thing a correction emits
+/// is the space after the word.
+///
+/// Splitting the write does not make the buffer bigger. It bounds how much of
+/// it we can occupy at once, and the gap in between is the reader's chance to
+/// empty it — which is all that was missing.
+fn emit_paced(injector: &Arc<Mutex<VirtualDevice>>, evs: &[evdev::InputEvent], gap: Duration) {
+    let Ok(mut dev) = injector.lock() else {
+        return;
+    };
+    let mut chunks = evs.chunks(crate::timing::EVENTS_PER_WRITE).peekable();
+    while let Some(chunk) = chunks.next() {
+        if dev.emit(chunk).is_err() {
+            return;
+        }
+        // Only *between* writes. A gap after the last one would delay nothing
+        // but the release of the injector lock.
+        if chunks.peek().is_some() {
+            crate::timing::pause(gap);
+        }
+    }
+}
+
 /// Erase `erase` characters the user typed and inject a replacement: the same
 /// keys after a layout switch, different keys for a spelling fix, or the rest of
 /// the word for a completion.
@@ -957,6 +1020,8 @@ fn undo_of(keys: &[Typed], rep: &Replacement, terminator: Option<KeyCode>) -> La
 /// `terminator` is the key that ended the word (space/enter) and gets pressed
 /// again after the replacement. It is `None` for a completion, which is
 /// triggered by a key that types nothing and therefore has nothing to restore.
+/// Pressing it again means waiting for the user to lift it first — see 1b — so
+/// a correction lands when the space comes up rather than when it goes down.
 ///
 /// `keep` is the word buffer to leave behind — what is now on screen for the
 /// word still in progress, so a completion the user keeps typing over is
@@ -975,6 +1040,11 @@ fn replace_word(
 ) {
     use evdev::{EventType, InputEvent, KeyCode as KC, SynchronizationCode};
 
+    // Armed for the whole replacement: whatever happens below — including a
+    // panic — `is_replacing` is cleared and the buffered keys are dropped,
+    // rather than leaving the listener gated shut for the rest of the session.
+    let _gate = ReplaceGuard::new(state_mutex.as_ref(), None);
+
     let syn = || {
         InputEvent::new(
             EventType::SYNCHRONIZATION.0,
@@ -983,54 +1053,65 @@ fn replace_word(
         )
     };
 
-    // 1a. Only the keys we are about to *press* matter here: a synthetic press
-    //     of a key the physical keyboard is still holding looks like a
-    //     duplicate to the compositor and gets dropped — which is how the
-    //     trailing space (and occasionally the last word letter) went missing.
-    //     The erased keys are not in that set; they only cost backspaces.
+    let gaps = crate::timing::injection();
+    // Wait for every key in `keys` to be physically up, or for `ceiling` to
+    // pass. A ceiling, not a cost: it returns the moment the last one lifts.
+    let wait_for_release = |keys: &HashSet<KeyCode>, ceiling: Duration| {
+        let start = Instant::now();
+        loop {
+            let held = {
+                let st = lock_forgiving(state_mutex);
+                keys.iter().any(|k| st.held_keys.contains(k))
+            };
+            if !held || start.elapsed() >= ceiling {
+                return;
+            }
+            crate::timing::pause(gaps.held_poll);
+        }
+    };
+
+    // 1a. Only the keys we are about to *press* matter here: a press injected
+    //     while the physical key is still down never reaches the focused
+    //     window — the compositor already has that key down and discards the
+    //     second press as a duplicate. The erased keys are not in that set;
+    //     they only cost backspaces.
     //
-    //     The user is usually still holding the space that triggered this, so
-    //     waiting it out is the single biggest source of delay before the
-    //     correction appears. Wait only briefly, then inject a synthetic
-    //     *release* for whatever is still down so the press that follows is no
-    //     longer a duplicate, and go ahead anyway.
-    let mut keys_of_interest: HashSet<KeyCode> = retype.iter().map(|(k, _)| *k).collect();
-    keys_of_interest.extend(terminator);
+    //     There is no injecting our way out of it. Sending a *release* first —
+    //     which is what this did when the wait ran out — does nothing at all:
+    //     the kernel tracks key state per input device, and this device never
+    //     pressed the key, so the release is discarded before any compositor
+    //     sees it. Measured against Hyprland, a press from the injector stays
+    //     swallowed for as long as the real key is down, however many
+    //     press/release pairs are sent after it. Only the user's own finger
+    //     clears it, which leaves waiting as the only thing that works.
+    let mut retyped_keys: HashSet<KeyCode> = retype.iter().map(|(k, _)| *k).collect();
     //     Both shifts are always in the set. We inject each key with exactly the
     //     shift state we decided on — none at all for a Hebrew target, where
     //     shift types punctuation rather than a capital — so a shift the *user*
     //     happens to still be holding has to come up first, and one we press
     //     ourselves would be a duplicate of it.
-    keys_of_interest.insert(KC::KEY_LEFTSHIFT);
-    keys_of_interest.insert(KC::KEY_RIGHTSHIFT);
-    let wait_start = Instant::now();
-    let still_held: Vec<KeyCode> = loop {
-        let held: Vec<KeyCode> = {
-            let st = state_mutex.lock().unwrap();
-            keys_of_interest
-                .iter()
-                .copied()
-                .filter(|k| st.held_keys.contains(k))
-                .collect()
-        };
-        if held.is_empty() || wait_start.elapsed() >= HELD_RELEASE_TIMEOUT {
-            break held;
-        }
-        thread::sleep(Duration::from_micros(100));
-    };
+    retyped_keys.insert(KC::KEY_LEFTSHIFT);
+    retyped_keys.insert(KC::KEY_RIGHTSHIFT);
+    wait_for_release(&retyped_keys, gaps.held_release_timeout);
 
-    // 1b. Wait for the hyprctl layout switch to take effect in the compositor.
-    //     hyprctl returns synchronously, so this is only the compositor's
-    //     internal absorption gap — 8 ms matches the macOS TIS-settle and
-    //     is enough in practice on Hyprland.
-    // reduced pause, usually unnecessary
+    // 1b. The terminator gets its own, much longer ceiling, because it is the
+    //     one key that is *always* still down here: pressing it is what asked
+    //     for the correction, and the general ceiling is a fraction of an
+    //     ordinary keypress. Giving up on it early is what left the corrected
+    //     word with no space after it — every time, for anyone who does not
+    //     type in taps.
+    //
+    //     This is the one wait the user can feel, and it ends when they lift a
+    //     key they were lifting anyway to type the next word.
+    let terminator_key: HashSet<KeyCode> = terminator.into_iter().collect();
+    wait_for_release(&terminator_key, gaps.terminator_release_timeout);
 
     // Clone buffered keys while holding the lock, then release it before injecting
     // any keys. The injected keystrokes re-enter handle_key which also needs the
     // state lock, so holding it here would cause a deadlock that silently drops
     // the injected space/terminator.
     let buffered = {
-        let st = state_mutex.lock().unwrap();
+        let st = lock_forgiving(state_mutex);
         st.buffered_keys.to_vec()
     };
 
@@ -1042,13 +1123,6 @@ fn replace_word(
     let delete_count = erase + buffered.len();
     let total_keys = delete_count + retype.len() * 3 + 1 + buffered.len();
     let mut evs: Vec<InputEvent> = Vec::with_capacity(total_keys * 4);
-    // 1c. Release anything the user is still holding (see 1a). A release for a
-    //     key this device never pressed is harmless — the compositor just sees
-    //     the key go up early, and the user's own release later is a no-op.
-    for kc in &still_held {
-        evs.push(InputEvent::new(EventType::KEY.0, kc.0, 0));
-        evs.push(syn());
-    }
 
     // A capital is Left Shift held around the letter — the only way to type one
     // through a device that speaks key positions.
@@ -1084,12 +1158,10 @@ fn replace_word(
         push_char(t.key, t.shift);
     }
 
-    if let Ok(mut dev) = injector.lock() {
-        let _ = dev.emit(&evs);
-    }
+    emit_paced(injector, &evs, gaps.batch_gap);
 
     // Re-acquire the lock only to clean up state.
-    let mut st = state_mutex.lock().unwrap();
+    let mut st = lock_forgiving(state_mutex);
     st.keys.replace_with(keep);
     st.keys.extend(buffered.iter().copied());
     // Undo erases backwards from the cursor, so it is only valid while the
@@ -1100,10 +1172,10 @@ fn replace_word(
     } else {
         None
     };
-    st.buffered_keys.clear();
-    st.is_replacing = false;
     // Reset the dedup guard so the injected terminator (space/enter) is not
     // silently dropped because it shares the same keycode as the physical
     // keypress that triggered this replacement (both arrive within 5 ms).
     st.last_keycode = None;
+    // `buffered_keys` and `is_replacing` are the guard's, and it clears them
+    // after this lock is dropped — on this path and on a panicking one alike.
 }

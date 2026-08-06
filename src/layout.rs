@@ -17,6 +17,49 @@ use crate::types::Language;
 static LAYOUT_CACHE: Mutex<Option<(Instant, Language)>> = Mutex::new(None);
 const LAYOUT_TTL: Duration = Duration::from_millis(300);
 
+/// What happened when a correction asked for a layout.
+///
+/// This used to be a `bool`, and the bool conflated the two things a caller
+/// most needs to tell apart: "already on that layout, nothing to do" and "the
+/// switch did not happen". Both were `false`. The undo path
+/// (`platform::linux`) reads it as *may I retype now?* and bailed out on
+/// `false` — so undoing a correction whose layout happened to already be
+/// right did nothing at all, silently, and looked exactly like a missed
+/// keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutSwitch {
+    /// Already on the requested layout. Nothing was sent, and nothing needed
+    /// to be — this is success.
+    AlreadyThere,
+    /// Switched, and the OS confirmed the new layout is live.
+    Switched,
+    /// Refused, or never took effect before the deadline. Retyping now would
+    /// spell the word out under the wrong layout.
+    Failed,
+}
+
+impl LayoutSwitch {
+    /// Whether the requested layout is live, so keys may be injected.
+    ///
+    /// Read only on Linux, and that is not an oversight: `uinput` speaks
+    /// keycodes, so what a replayed key *spells* depends on the layout being
+    /// live when it lands, and injecting early produces garbage. macOS and
+    /// Windows insert the restored word as text, which is layout-independent —
+    /// they switch the layout purely so the user's *next* keystroke is in the
+    /// right language, and a refusal there costs nothing worth abandoning an
+    /// undo over.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn ready(self) -> bool {
+        !matches!(self, LayoutSwitch::Failed)
+    }
+
+    /// Whether this call is what changed the layout — for the debug log, which
+    /// reports what happened rather than what is now true.
+    pub fn changed(self) -> bool {
+        matches!(self, LayoutSwitch::Switched)
+    }
+}
+
 /// Best-effort current keyboard layout. `None` when it can't be determined;
 /// callers then fall back to a layout-agnostic decision.
 pub fn current_layout() -> Option<Language> {
@@ -48,63 +91,198 @@ fn query_layout() -> Option<Language> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Linux: switch layout via hyprctl
 // ─────────────────────────────────────────────────────────────────────────────
+/// Talk to Hyprland over its control socket instead of spawning `hyprctl`.
+///
+/// `hyprctl` is a small C++ program whose entire job is to write the command to
+/// this socket and print the reply. Shelling out to it cost a fork, an exec, a
+/// dynamic link and a wait — measured at **6.3 ms per call** against **0.11 ms**
+/// for the socket, a 57× difference — and a correction that changes layout
+/// makes two such calls. That was the single largest cost in the retype path,
+/// larger than every injection gap in `crate::timing` put together.
+///
+/// It also removes a dependency on `hyprctl` being installed and on `PATH` for
+/// whatever session started the daemon.
 #[cfg(target_os = "linux")]
-fn query_layout() -> Option<Language> {
-    use std::process::Command;
+mod hypr {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::time::Duration;
 
-    let output = Command::new("hyprctl")
-        .args(["devices", "-j"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    for block in stdout.split('{') {
-        if block.contains("\"main\": true") || block.contains("\"main\":true") {
-            if let Some(idx) = block.find("\"active_keymap\":") {
-                let remainder = &block[idx + 16..];
-                if let Some(start) = remainder.find('"') {
-                    let val_remainder = &remainder[start + 1..];
-                    if let Some(end) = val_remainder.find('"') {
-                        let keymap = val_remainder[..end].to_lowercase();
-                        if keymap.contains("hebrew") || keymap.contains("il") {
-                            return Some(Language::Hebrew);
-                        } else if keymap.contains("english") || keymap.contains("us") {
-                            return Some(Language::English);
-                        }
-                    }
-                }
-            }
-        }
+    /// A wedged compositor must not wedge the injection thread with it: this
+    /// runs on the thread a correction is waiting on.
+    const IO_TIMEOUT: Duration = Duration::from_millis(250);
+
+    fn socket_path() -> Option<&'static PathBuf> {
+        static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+            // Hyprland moved this under XDG_RUNTIME_DIR in 0.40; older builds
+            // kept it in /tmp. Both are checked so the daemon works either way.
+            let runtime = std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from);
+            [
+                runtime.map(|r| r.join("hypr").join(&sig).join(".socket.sock")),
+                Some(PathBuf::from("/tmp/hypr").join(&sig).join(".socket.sock")),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| p.exists())
+        })
+        .as_ref()
     }
-    None
+
+    /// Send one command and return the reply, or `None` if this is not a
+    /// Hyprland session or the socket would not answer.
+    pub fn request(command: &str) -> Option<String> {
+        let mut stream = UnixStream::connect(socket_path()?).ok()?;
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        stream.write_all(command.as_bytes()).ok()?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).ok()?;
+        Some(reply)
+    }
+
+    /// Whether this session is one we can drive at all.
+    pub fn available() -> bool {
+        socket_path().is_some()
+    }
+}
+
+/// The value of a flat `"key": "value"` string field inside one JSON object.
+#[cfg(target_os = "linux")]
+fn json_field<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+    let at = block.find(&format!("\"{key}\""))?;
+    let rest = &block[at + key.len() + 2..];
+    let open = rest.find('"')?;
+    let rest = &rest[open + 1..];
+    let close = rest.find('"')?;
+    Some(&rest[..close])
+}
+
+/// The language a Hyprland keymap name describes.
+#[cfg(target_os = "linux")]
+fn language_of_keymap(keymap: &str) -> Option<Language> {
+    let keymap = keymap.to_lowercase();
+    if keymap.contains("hebrew") || keymap.contains("il") {
+        Some(Language::Hebrew)
+    } else if keymap.contains("english") || keymap.contains("us") {
+        Some(Language::English)
+    } else {
+        None
+    }
+}
+
+/// The active layout, read out of a `j/devices` reply.
+///
+/// Deliberately not "whatever keyboard is flagged `main`". On a session with an
+/// input method running, `main` is the *input method's own virtual keyboard* —
+/// on the machine this was written on, `hl-virtual-keyboard-fcitx5` — and our
+/// own `recast-injector` is in that list too. Reading either means reporting
+/// the layout of a device nobody types on, and a wrong reading here is worse
+/// than none: `switch_layout_to` skips the switch when it believes the layout
+/// is already right, and the correction then types itself out under the layout
+/// that was actually live.
+///
+/// So: our injector never counts, `main` is preferred among the rest, and
+/// anything else recognizable is the fallback.
+#[cfg(target_os = "linux")]
+fn parse_layout(devices_json: &str) -> Option<Language> {
+    let keyboards = devices_json.find("\"keyboards\"").map(|at| &devices_json[at..])?;
+    let mut fallback = None;
+    for block in keyboards.split('{').skip(1) {
+        // Stop at the end of the keyboards array; later sections (mice,
+        // tablets) have no keymaps but should not be walked regardless.
+        if block.starts_with(']') {
+            break;
+        }
+        let name = json_field(block, "name").unwrap_or("");
+        if name == "recast-injector" {
+            continue;
+        }
+        let Some(lang) = json_field(block, "active_keymap").and_then(language_of_keymap) else {
+            continue;
+        };
+        let is_main = block.contains("\"main\": true") || block.contains("\"main\":true");
+        if is_main {
+            return Some(lang);
+        }
+        fallback.get_or_insert(lang);
+    }
+    fallback
 }
 
 #[cfg(target_os = "linux")]
-pub fn switch_layout_to(lang: Language) -> bool {
-    use std::process::Command;
+fn query_layout() -> Option<Language> {
+    let json = match hypr::request("j/devices") {
+        Some(reply) => reply,
+        // Not a Hyprland session, or the socket refused. Fall back to the
+        // subprocess so a setup that only has `hyprctl` still works.
+        None => {
+            let out = std::process::Command::new("hyprctl")
+                .args(["devices", "-j"])
+                .output()
+                .ok()?;
+            String::from_utf8(out.stdout).ok()?
+        }
+    };
+    parse_layout(&json)
+}
 
-    // Already on the requested layout — nothing to do.
+#[cfg(target_os = "linux")]
+pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
+    // Already on the requested layout. Nothing to send — and, unlike before,
+    // this is reported as the success it is.
     if current_layout() == Some(lang) {
-        return false;
+        return LayoutSwitch::AlreadyThere;
     }
 
     let index = match lang {
         Language::English => "0",
         Language::Hebrew => "1",
     };
-    let ok = match Command::new("hyprctl")
-        .args(["switchxkblayout", "all", index])
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(e) => {
-            eprintln!("Failed to switch layout using hyprctl: {}", e);
-            false
+    let sent = if hypr::available() {
+        // Hyprland answers "ok" and nothing else on success.
+        hypr::request(&format!("/switchxkblayout all {index}"))
+            .is_some_and(|reply| reply.trim() == "ok")
+    } else {
+        match std::process::Command::new("hyprctl")
+            .args(["switchxkblayout", "all", index])
+            .status()
+        {
+            Ok(status) => status.success(),
+            Err(e) => {
+                eprintln!("Failed to switch layout using hyprctl: {e}");
+                false
+            }
         }
     };
-    if ok {
-        set_layout_cache(lang);
+    if !sent {
+        return LayoutSwitch::Failed;
     }
-    ok
+
+    // Then wait for it to actually be live. Accepting the command is not the
+    // same as having applied it — measured at 0.3–0.9 ms apart on an idle
+    // Hyprland — and `uinput` speaks keycodes, so a word injected inside that
+    // gap is spelled out under the *old* layout and arrives as garbage. macOS
+    // and Windows have polled for this all along; Linux fired and hoped, which
+    // is why corrections involving a layout change failed intermittently.
+    //
+    // Cheap now that a query is a socket round trip rather than a subprocess:
+    // the usual case confirms on the first or second poll.
+    let gaps = crate::timing::injection();
+    let deadline = Instant::now() + gaps.layout_confirm;
+    loop {
+        if query_layout() == Some(lang) {
+            set_layout_cache(lang);
+            return LayoutSwitch::Switched;
+        }
+        if Instant::now() >= deadline {
+            return LayoutSwitch::Failed;
+        }
+        crate::timing::pause(gaps.layout_poll);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,10 +332,8 @@ fn query_layout() -> Option<Language> {
 // one reader who ever needs to.
 #[allow(clippy::upper_case_acronyms)]
 #[cfg(target_os = "windows")]
-pub fn switch_layout_to(lang: Language) -> bool {
+pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     use std::ffi::c_void;
-    use std::thread;
-    use std::time::Duration;
 
     type DWORD = u32;
     type HKL = isize;
@@ -211,7 +387,7 @@ pub fn switch_layout_to(lang: Language) -> bool {
         let current_hkl = GetKeyboardLayout(tid);
         let current_langid = (current_hkl as usize & 0xFFFF) as u16;
         if current_langid & 0x03ff == desired_primary {
-            return false;
+            return LayoutSwitch::AlreadyThere;
         }
 
         // Find an installed keyboard layout whose primary language matches —
@@ -245,7 +421,7 @@ pub fn switch_layout_to(lang: Language) -> bool {
         };
 
         if target_hkl == 0 {
-            return false;
+            return LayoutSwitch::Failed;
         }
 
         // Prefer notifying the focused window (foreground thread) to switch.
@@ -266,24 +442,25 @@ pub fn switch_layout_to(lang: Language) -> bool {
             // foreground app, but keeps behavior best-effort).
             let hkl = ActivateKeyboardLayout(target_hkl, KLF_ACTIVATE);
             if hkl == 0 {
-                return false;
+                return LayoutSwitch::Failed;
             }
         }
 
         // Poll for the input subsystem to apply the change instead of a fixed
-        // pessimistic sleep. Returns as soon as the layout flips, capped at 180 ms.
-        let deadline = std::time::Instant::now() + Duration::from_millis(180);
+        // pessimistic sleep. Returns as soon as the layout flips.
+        let gaps = crate::timing::injection();
+        let deadline = std::time::Instant::now() + gaps.layout_confirm;
         loop {
             let updated_hkl = GetKeyboardLayout(tid);
             let updated_langid = (updated_hkl as usize & 0xFFFF) as u16;
             if updated_langid & 0x03ff == desired_primary {
                 set_layout_cache(lang);
-                return true;
+                return LayoutSwitch::Switched;
             }
             if std::time::Instant::now() >= deadline {
-                return false;
+                return LayoutSwitch::Failed;
             }
-            thread::sleep(Duration::from_millis(2));
+            crate::timing::pause(gaps.layout_poll);
         }
     }
 }
@@ -326,14 +503,13 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-pub fn switch_layout_to(lang: Language) -> bool {
+pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     use std::time::{Duration, Instant};
 
-    // Already on the target layout — nothing to switch, and (matching the
-    // Linux/Windows early-exit) report "no switch performed". Uses the
-    // language-based detection so any English/Hebrew *variant* counts.
+    // Already on the target layout. Uses the language-based detection so any
+    // English/Hebrew *variant* counts.
     if current_layout() == Some(lang) {
-        return false;
+        return LayoutSwitch::AlreadyThere;
     }
 
     let code = match lang {
@@ -345,7 +521,7 @@ pub fn switch_layout_to(lang: Language) -> bool {
         let src = TISCopyInputSourceForLanguage(cf_lang.as_concrete_TypeRef());
         if src.is_null() {
             eprintln!("No input source found for language code '{}'", code);
-            return false;
+            return LayoutSwitch::Failed;
         }
 
         let status = TISSelectInputSource(src);
@@ -355,7 +531,7 @@ pub fn switch_layout_to(lang: Language) -> bool {
                 code, status
             );
             CFRelease(src as CFTypeRef);
-            return false;
+            return LayoutSwitch::Failed;
         }
 
         // TISSelectInputSource is asynchronous: the focused app does not see
@@ -384,10 +560,14 @@ pub fn switch_layout_to(lang: Language) -> bool {
         if landed {
             set_layout_cache(lang);
         }
-        // Only report success once the switch is confirmed. On timeout, return
-        // false so the caller skips the retype rather than typing the word out
-        // under the old layout (garbage) — parity with the Windows poller.
-        landed
+        // Only report success once the switch is confirmed. On timeout this is
+        // `Failed`, so the caller skips the retype rather than typing the word
+        // out under the old layout (garbage) — parity with the other two.
+        if landed {
+            LayoutSwitch::Switched
+        } else {
+            LayoutSwitch::Failed
+        }
     }
 }
 
@@ -430,5 +610,92 @@ fn query_layout() -> Option<Language> {
         }
         CFRelease(cur as CFTypeRef);
         result
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    /// Trimmed from a real `j/devices` reply on a Hyprland session running
+    /// fcitx5, which is where this bug was found: the keyboard flagged `main`
+    /// is the input method's virtual one, and ReCast's own injector is in the
+    /// list beside it.
+    const DEVICES: &str = r#"{"mice": [], "keyboards": [
+        {"address": "0x1", "name": "at-translated-set-2-keyboard", "rules": "",
+         "model": "", "layout": "us,il", "variant": "", "options": "",
+         "active_keymap": "Hebrew", "capsLock": false, "numLock": false, "main": false},
+        {"address": "0x2", "name": "recast-injector", "rules": "",
+         "model": "", "layout": "us", "variant": "", "options": "",
+         "active_keymap": "English (US)", "capsLock": false, "numLock": false, "main": false},
+        {"address": "0x3", "name": "hl-virtual-keyboard-fcitx5", "rules": "",
+         "model": "", "layout": "us,il", "variant": "", "options": "",
+         "active_keymap": "Hebrew", "capsLock": false, "numLock": false, "main": true}
+    ], "tablets": []}"#;
+
+    #[test]
+    fn the_layout_comes_from_a_keyboard_someone_types_on() {
+        assert_eq!(parse_layout(DEVICES), Some(Language::Hebrew));
+    }
+
+    #[test]
+    fn our_own_injector_never_decides_the_answer() {
+        // The injector says English while every real keyboard says Hebrew. If
+        // it were allowed to win, `switch_layout_to` would believe a switch to
+        // English was unnecessary and the correction would be typed out in
+        // Hebrew — the intermittent garbage this was reported as.
+        let only_injector_is_main = DEVICES
+            .replace(r#""name": "recast-injector"#, r#""name": "recast-injector-x"#)
+            .replace(r#""name": "hl-virtual-keyboard-fcitx5", "rules": "",
+         "model": "", "layout": "us,il", "variant": "", "options": "",
+         "active_keymap": "Hebrew", "capsLock": false, "numLock": false, "main": true"#,
+                     r#""name": "recast-injector", "rules": "",
+         "model": "", "layout": "us", "variant": "", "options": "",
+         "active_keymap": "English (US)", "capsLock": false, "numLock": false, "main": true"#);
+        // With our injector as `main` and claiming English, the answer must
+        // still come from the physical keyboard.
+        assert_eq!(parse_layout(&only_injector_is_main), Some(Language::Hebrew));
+    }
+
+    #[test]
+    fn a_reply_with_nothing_recognizable_is_not_guessed_at() {
+        assert_eq!(parse_layout("{}"), None);
+        assert_eq!(parse_layout(r#"{"keyboards": []}"#), None);
+    }
+
+    /// Against the compositor that is actually running, when there is one.
+    /// Skips elsewhere — CI has no Hyprland — but on a developer's machine it
+    /// is the only thing that checks the socket path, the protocol and the
+    /// parser against reality rather than against a fixture I wrote.
+    #[test]
+    fn the_live_session_answers_if_there_is_one() {
+        if !hypr::available() {
+            eprintln!("no Hyprland socket — skipping the live check");
+            return;
+        }
+        let reply = hypr::request("j/devices").expect("the socket answers");
+        assert!(
+            reply.contains("\"keyboards\""),
+            "unexpected reply shape: {}",
+            &reply[..reply.len().min(120)]
+        );
+        assert!(
+            parse_layout(&reply).is_some(),
+            "a live session must yield a layout"
+        );
+        // And the cached front door agrees with the raw read.
+        assert_eq!(query_layout(), parse_layout(&reply));
+    }
+
+    #[test]
+    fn already_being_there_is_success_not_failure() {
+        // The distinction the undo path turned on: only `Failed` may stop a
+        // retype. This is what a bare bool could not express.
+        assert!(LayoutSwitch::AlreadyThere.ready());
+        assert!(LayoutSwitch::Switched.ready());
+        assert!(!LayoutSwitch::Failed.ready());
+        // ...and only an actual switch counts as a change, for the debug log.
+        assert!(!LayoutSwitch::AlreadyThere.changed());
+        assert!(LayoutSwitch::Switched.changed());
     }
 }

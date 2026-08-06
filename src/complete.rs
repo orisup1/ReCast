@@ -428,38 +428,120 @@ pub fn list_counts() -> (usize, usize) {
     )
 }
 
-/// How often the user's list files are checked for edits. Slow enough to be
-/// free (two `stat`s), fast enough that adding an abbreviation and typing it
-/// feels like the same action.
+/// How often the user's list files are checked for edits, where they have to be
+/// checked at all. Slow enough to be cheap (two `stat`s), fast enough that
+/// adding an abbreviation and typing it feels like the same action.
 const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The files this watches, and the only ones the user is meant to edit.
+const WATCHED: [&str; 2] = ["abbrev.txt", "ignore.txt"];
 
 /// Watch `abbrev.txt` and `ignore.txt` for edits and reload them in place.
 ///
 /// Reading these once at startup made the files a restart away from taking
 /// effect, which for `abbrev.txt` is most of the cost of using it at all: an
-/// abbreviation is written *because* you are about to type it. Polling two
-/// modification times beats a filesystem-watch dependency here — the files are
-/// tiny, the interval is long, and a missing file (the default state) has to be
-/// handled either way.
+/// abbreviation is written *because* you are about to type it.
+///
+/// On Linux this blocks on `inotify` and costs nothing at all until something
+/// changes. Everywhere else it polls — see [`poll_watch`] for why that is worth
+/// the difference rather than a filesystem-watch dependency on three platforms.
 pub fn spawn_watcher() {
-    std::thread::spawn(|| {
-        let stamp = || {
-            ["abbrev.txt", "ignore.txt"].map(|name| {
-                user_path(name)
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .and_then(|m| m.modified().ok())
-            })
+    // Named so that a stray thread in `top -H` or a debugger identifies itself
+    // instead of showing up as another anonymous copy of the process name.
+    let spawned = std::thread::Builder::new()
+        .name("recast-watch".into())
+        .spawn(watch_forever);
+    // A thread that cannot be created is not worth failing startup over: the
+    // lists still load once at startup and the tray's "Reload lists" still
+    // works. Only the automatic pickup is lost.
+    if spawned.is_err() {
+        eprintln!("Could not start the list watcher — edits to abbrev.txt and ignore.txt will need a reload.");
+    }
+}
+
+/// Block until one of the watched files changes, reload, repeat.
+#[cfg(target_os = "linux")]
+fn watch_forever() {
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+
+    // The *directory*, not the two files. Editors overwhelmingly save by
+    // writing a temporary file and renaming it over the target, which replaces
+    // the inode — a watch on the file itself would survive exactly one save and
+    // then be watching something that no longer has a name.
+    let Some(dir) = config_dir() else {
+        return poll_watch();
+    };
+    // It may not exist yet: the user has never written either file. Creating it
+    // is reasonable here — it is our own directory, and the alternative is
+    // watching nothing until a restart that happens to come after they save.
+    if std::fs::create_dir_all(&dir).is_err() {
+        return poll_watch();
+    }
+
+    let Ok(inotify) = Inotify::init(InitFlags::empty()) else {
+        return poll_watch();
+    };
+    // CLOSE_WRITE catches an in-place save, MOVED_TO the rename-over kind,
+    // CREATE a first-ever write, DELETE a list emptied by removing the file.
+    let flags = AddWatchFlags::IN_CLOSE_WRITE
+        | AddWatchFlags::IN_MOVED_TO
+        | AddWatchFlags::IN_CREATE
+        | AddWatchFlags::IN_DELETE;
+    if inotify.add_watch(&dir, flags).is_err() {
+        return poll_watch();
+    }
+
+    loop {
+        // Blocks. No timer, no wakeups, nothing scheduled — the whole point of
+        // this over the poll it replaces.
+        let Ok(events) = inotify.read_events() else {
+            // The watch descriptor is gone (the directory was deleted, or the
+            // filesystem does not support inotify after all). Polling still
+            // works on whatever replaces it.
+            return poll_watch();
         };
-        let mut last = stamp();
-        loop {
-            std::thread::sleep(WATCH_INTERVAL);
-            let now = stamp();
-            if now != last {
-                last = now;
-                reload_user_files();
-            }
+        let ours = events.iter().any(|e| {
+            e.name
+                .as_ref()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| WATCHED.contains(&n))
+        });
+        if ours {
+            reload_user_files();
         }
-    });
+    }
+}
+
+/// Modification-time polling, for the platforms without a watch this cheap.
+///
+/// macOS and Windows both have an equivalent — FSEvents and
+/// `ReadDirectoryChangesW` — but each is a chunk of FFI, and the thing being
+/// saved is two `stat`s every couple of seconds on files that are almost always
+/// absent. That is not the same trade as on Linux, where the daemon is expected
+/// to run for weeks and this was the only thing keeping it from being fully
+/// idle.
+#[cfg(not(target_os = "linux"))]
+fn watch_forever() {
+    poll_watch()
+}
+
+fn poll_watch() {
+    let stamp = || {
+        WATCHED.map(|name| {
+            user_path(name)
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok())
+        })
+    };
+    let mut last = stamp();
+    loop {
+        std::thread::sleep(WATCH_INTERVAL);
+        let now = stamp();
+        if now != last {
+            last = now;
+            reload_user_files();
+        }
+    }
 }
 
 /// Parse the abbreviation file: one `abbreviation = expansion` per line, `=` or
@@ -728,5 +810,57 @@ mod real_data {
         // Wrong-layout Hebrew never reaches here (the completer is English-only
         // by layout), but a prefix that spells nothing must still decline.
         assert!(offers("qwrt").is_empty());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod watch_tests {
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+
+    /// The flag set in `watch_forever` is the whole design decision there, and
+    /// getting it wrong fails silently — the watcher runs, blocks, and simply
+    /// never notices a save. The two cases below are the two ways editors
+    /// actually write a file, and both have to land.
+    #[test]
+    fn both_kinds_of_save_are_noticed() {
+        let dir = std::env::temp_dir().join(format!("recast-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let inotify = Inotify::init(InitFlags::empty()).expect("inotify");
+        let flags = AddWatchFlags::IN_CLOSE_WRITE
+            | AddWatchFlags::IN_MOVED_TO
+            | AddWatchFlags::IN_CREATE
+            | AddWatchFlags::IN_DELETE;
+        inotify.add_watch(&dir, flags).expect("watch");
+
+        let named = |events: Vec<nix::sys::inotify::InotifyEvent>| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|e| e.name.as_ref()?.to_str().map(str::to_owned))
+                .collect()
+        };
+
+        // 1. Saved in place — what `echo >>` and most simple editors do.
+        std::fs::write(dir.join("abbrev.txt"), "btw = by the way\n").expect("write");
+        let seen = named(inotify.read_events().expect("events"));
+        assert!(
+            seen.iter().any(|n| n == "abbrev.txt"),
+            "an in-place save went unnoticed: {seen:?}"
+        );
+
+        // 2. Written elsewhere and renamed over the target — what vim, emacs
+        //    and every "atomic save" does. This is the case a watch on the
+        //    *file* would miss, because the inode it was watching is gone.
+        let tmp = dir.join(".abbrev.txt.swp");
+        std::fs::write(&tmp, "btw = by the way\nomw = on my way\n").expect("write tmp");
+        let _ = inotify.read_events().expect("drain the temp file's own events");
+        std::fs::rename(&tmp, dir.join("abbrev.txt")).expect("rename over");
+        let seen = named(inotify.read_events().expect("events"));
+        assert!(
+            seen.iter().any(|n| n == "abbrev.txt"),
+            "a rename-over save went unnoticed: {seen:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -110,6 +110,18 @@ const NUMERIC_KEYS: &[&str] = &[
     "RECAST_SPELL_DIST",
     "RECAST_COMPLETE_MIN",
     "RECAST_COMPLETE_RANK",
+    // The injection timings (`crate::timing`). Worth complaining about for the
+    // same reason as the rest, and more so: someone setting these is tuning by
+    // trial, so a value that silently did not apply looks like a measurement.
+    "RECAST_INJECT_PRESS_GAP",
+    "RECAST_INJECT_KEY_GAP",
+    "RECAST_INJECT_SETTLE",
+    "RECAST_INJECT_HELD_TIMEOUT",
+    "RECAST_INJECT_HELD_POLL",
+    "RECAST_INJECT_DEVICE_SETTLE",
+    "RECAST_INJECT_LAYOUT_CONFIRM",
+    "RECAST_INJECT_LAYOUT_POLL",
+    "RECAST_INJECT_BATCH_GAP",
 ];
 
 /// Settings that were set but could not be understood, described for the user.

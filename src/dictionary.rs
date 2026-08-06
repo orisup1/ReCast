@@ -881,7 +881,7 @@ pub fn check_and_correct<K: Copy>(
 
     match plan {
         Plan::Switch { lang, start } => {
-            let switched = switch_layout_to(lang);
+            let switched = switch_layout_to(lang).changed();
             if debug_enabled() && start > 0 {
                 println!("split @ {}", start);
             }

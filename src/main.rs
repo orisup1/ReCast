@@ -68,6 +68,21 @@ Environment:
   RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)
   RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
 
+Injection timing (microseconds; only worth touching if corrections come out
+scrambled, or if you want them faster and are willing to measure):
+  RECAST_INJECT_PRESS_GAP=n     Key-down to key-up (macOS only)
+  RECAST_INJECT_KEY_GAP=n       Between injected keys (macOS only)
+  RECAST_INJECT_SETTLE=n        After the last event, before listening again
+  RECAST_INJECT_HELD_TIMEOUT=n  Longest wait for you to lift a key being retyped
+  RECAST_INJECT_TERM_TIMEOUT=n  Longest wait for you to lift space/enter (Linux);
+                                the space after a correction cannot be typed
+                                until you do
+  RECAST_INJECT_HELD_POLL=n     How often those waits re-check
+  RECAST_INJECT_DEVICE_SETTLE=n Injector device detection at startup (Linux)
+  RECAST_INJECT_BATCH_GAP=n     Between writes of a correction (Linux); 0 sends
+                                it as one write, which risks the kernel dropping
+                                the end of long words
+
 Auto-complete:
   Tap Right Shift mid-word to finish it; tap again to cycle through the
   next guesses, and once more to get back exactly what you typed.
