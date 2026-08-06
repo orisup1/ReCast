@@ -35,7 +35,9 @@ winresource = "0.1"
 
 [dependencies]
 dirs = "4.0"
-nix = { version = "0.27", features = ["process", "fs"] }
+# `inotify` powers the list watcher on Linux (complete::watch_forever) and
+# `signal` lets --stop send SIGTERM directly instead of forking /bin/kill.
+nix = { version = "0.27", features = ["process", "fs", "inotify", "signal"] }
 crossterm = "0.28"
 ratatui = { version = "0.26", features = ["crossterm"] }
 chrono = "0.4"
@@ -64,6 +66,10 @@ winapi = { version = "0.3", features = [
     # Listed explicitly rather than relied on through tao/tray-icon's own
     # feature set, which cargo happens to unify with ours today.
     "winreg", "winerror", "minwindef",
+    # Finding and stopping an already-running ReCast at startup
+    # (src/instance.rs): the Toolhelp snapshot enumerates processes,
+    # OpenProcess/TerminateProcess stops them, WaitForSingleObject waits.
+    "tlhelp32", "processthreadsapi", "synchapi",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

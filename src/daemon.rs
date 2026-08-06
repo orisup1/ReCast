@@ -13,8 +13,9 @@ use std::process;
 
 #[cfg(target_os = "linux")]
 use nix::{
-    unistd::{fork, ForkResult, chdir, setsid},
+    sys::signal::{self, Signal},
     sys::wait::waitpid,
+    unistd::{chdir, fork, setsid, Pid, ForkResult},
 };
 
 /// Daemonize the current process on Linux (fork, setsid, chdir).
@@ -111,7 +112,7 @@ fn pidfile_path() -> Option<std::path::PathBuf> {
 /// so a renamed binary still recognises itself; `comm` is truncated to 15
 /// bytes by the kernel, which is what the shortened comparison is for.
 #[cfg(target_os = "linux")]
-fn is_our_process(pid: u32) -> bool {
+pub fn is_our_process(pid: u32) -> bool {
     let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
         return false; // no such process
     };
@@ -135,6 +136,29 @@ fn is_our_process(pid: u32) -> bool {
 pub fn running_pid() -> Option<u32> {
     let pid: u32 = fs::read_to_string(pidfile_path()?).ok()?.trim().parse().ok()?;
     is_our_process(pid).then_some(pid)
+}
+
+/// Remove the pidfile if — and only if — it names `pid`.
+///
+/// For whoever stopped that process to call afterwards. The daemon cannot clean
+/// up after itself here: it is stopped by a signal it does not handle, so it
+/// never gets the chance, and the file it leaves behind is what makes
+/// `running_pid` (and so `--status`) claim a daemon that is not there.
+///
+/// The equality test is the whole point. A blind `remove_file` would delete the
+/// *new* instance's pidfile in the ordinary case, because by the time an
+/// instance is confirmed gone its replacement has often already written one.
+#[cfg(target_os = "linux")]
+pub fn forget_pidfile(pid: u32) {
+    let Some(path) = pidfile_path() else {
+        return;
+    };
+    let named: Option<u32> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| c.trim().parse().ok());
+    if named == Some(pid) {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 /// What `--stop` was actually able to do.
@@ -185,12 +209,27 @@ pub fn stop_daemon() -> std::io::Result<Stopped> {
         let _ = fs::remove_file(&pidfile);
         return Ok(Stopped::Stale);
     }
-    // SIGTERM via the `kill` utility, which avoids pulling nix's signal
-    // feature in for this one call.
-    use std::process::Command;
-    let _ = Command::new("kill").arg(pid.to_string()).status();
-    let _ = fs::remove_file(&pidfile);
-    Ok(Stopped::Signalled(pid))
+    // SIGTERM directly. This used to fork and exec `/bin/kill` — a whole
+    // process, a PATH lookup and a wait, to make one syscall we can make here.
+    // Worse than wasteful: it depended on `kill` being on the PATH of whatever
+    // shell was in use, and reported success whether or not the signal landed,
+    // because it never looked at the exit status.
+    match signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+        Ok(()) => {
+            let _ = fs::remove_file(&pidfile);
+            Ok(Stopped::Signalled(pid))
+        }
+        // The identity check above passed, so the process was ours a moment
+        // ago; ESRCH here means it exited in between. Nothing to stop, and the
+        // pidfile is now stale.
+        Err(nix::errno::Errno::ESRCH) => {
+            let _ = fs::remove_file(&pidfile);
+            Ok(Stopped::Stale)
+        }
+        Err(e) => Err(std::io::Error::other(format!(
+            "could not signal pid {pid}: {e}"
+        ))),
+    }
 }
 
 /// macOS and Windows run ReCast in the foreground under a launch agent or the

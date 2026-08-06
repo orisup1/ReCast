@@ -184,6 +184,20 @@ recast -v       # version
 recast -h       # full option list
 ```
 
+**Starting ReCast replaces the ReCast that is already running.** Two at once is
+never what you want: both see the same keystroke, both decide the same word
+needs fixing, and both retype it — over the top of each other. So a new instance
+stops the old one and waits for it to actually be gone before it starts. Pass
+`--keep-others` if you really do want a second copy.
+
+The exception is an instance held up by a service manager set to restart it
+whenever it dies — the macOS LaunchAgent written by "Start at login" does this.
+Stopping that one would only make launchd start it again, and the copy it starts
+would stop *this* one, so ReCast says how to stop the service properly and exits
+instead. On Linux, systemd is told to restart ReCast only when it *fails*, so the
+service can be replaced; ReCast prints the `systemctl --user start recast` needed
+to bring it back afterwards.
+
 The TUI (`-g`, Linux/Windows) shows the enabled state, the counters and the
 corrections themselves as they happen; `e`/`Space` toggles correction on and
 off, `p` pauses it for half an hour, `r` re-reads your files, `q` quits. The

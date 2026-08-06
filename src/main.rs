@@ -13,6 +13,7 @@ mod banner;
 mod complete;
 mod dictionary;
 mod footprint;
+mod instance;
 #[cfg(target_os = "linux")]
 mod gui;
 mod keymap;
@@ -21,6 +22,7 @@ mod notify;
 mod platform;
 mod prefs;
 mod spell;
+mod timing;
 mod types;
 mod config;
 mod daemon;
@@ -46,6 +48,9 @@ Options:
   -s, --stop        Stop a running recast daemon (Linux only — macOS and
                     Windows run in the foreground; quit from the tray)
   -f, --foreground  Linux: don't daemonize (implied when run under systemd)
+      --keep-others Don't stop instances that are already running (by default a
+                    new ReCast replaces the old one — two at once correct every
+                    word twice)
       --status      Print what is running and what is configured, then exit
   -v, --version     Print the version and exit
   -h, --help        Show this help
@@ -89,12 +94,14 @@ fn main() {
     let mut with_window = false;
     let mut with_kill = false;
     let mut with_foreground = false;
+    let mut keep_others = false;
     for arg in &args {
         match arg.as_str() {
             "-g" | "--gui" => with_gui = true,
             "-w" | "--window" => with_window = true,
             "-s" | "--stop" => with_kill = true,
             "-f" | "--foreground" => with_foreground = true,
+            "--keep-others" => keep_others = true,
             "--status" => {
                 print_status();
                 return;
@@ -150,6 +157,13 @@ if banner::ran_from_terminal() {
   banner::print_logo();
 }
 
+    // Before anything is opened or listened on: an old instance still holding
+    // its injector and its device threads would correct every word alongside
+    // this one. `--keep-others` is for the rare deliberate second copy.
+    if !keep_others {
+        clear_the_way();
+    }
+
     let cfg = config::Config::from_env();
     let en = en_dict();
     let he = he_dict();
@@ -182,6 +196,47 @@ if banner::ran_from_terminal() {
 
     #[cfg(target_os = "windows")]
     platform::windows::start(en, he, control, with_gui);
+}
+
+/// Make sure this is the only ReCast running, and say what that took.
+///
+/// Silent when nothing else was running, which is almost always. Everything it
+/// does print is something the user would otherwise have to work out from
+/// symptoms: a service that is now off, or a duplicate that could not be
+/// stopped and is about to double every correction.
+fn clear_the_way() {
+    let mut supervised = None;
+    for (pid, outcome) in instance::replace_running() {
+        match outcome {
+            instance::Outcome::Ended => {
+                println!("Replaced the running ReCast (pid {pid}).");
+            }
+            instance::Outcome::EndedService(restart) => {
+                println!("Replaced the running ReCast service (pid {pid}).");
+                println!("  The service stays stopped until you start it again: {restart}");
+            }
+            // Nothing was signalled — see `instance`. Collected rather than
+            // printed in the loop so the exit happens after every one of them
+            // has been named.
+            instance::Outcome::Supervised(stop) => {
+                eprintln!("ReCast is already running under a service manager (pid {pid}).");
+                supervised = Some(stop);
+            }
+            instance::Outcome::Survived => {
+                eprintln!(
+                    "Warning: could not stop the ReCast already running (pid {pid}) — \
+                     with two running, every correction happens twice."
+                );
+            }
+        }
+    }
+    if let Some(stop) = supervised {
+        eprintln!(
+            "Stopping it here would only make the service manager start it again.\n\
+             To stop it: {stop}"
+        );
+        process::exit(1);
+    }
 }
 
 /// Answer the two questions a user asks when something isn't happening: is it
