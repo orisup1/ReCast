@@ -5,8 +5,8 @@
 # Scheduled Task that starts recast at logon.
 #
 # The binary is self-contained: dictionaries are embedded at compile time
-# (`include_str!` in src/main.rs), so the executable runs identically from
-# any working directory — no wrapper or data dir is required.
+# (prepared by build.rs, embedded in src/dictionary.rs), so the executable runs
+# identically from any working directory — no wrapper or data dir is required.
 #
 # Usage:
 #   .\deploy.ps1                        # = .\deploy.ps1 -Target deploy

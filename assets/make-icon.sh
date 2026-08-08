@@ -1,6 +1,11 @@
 #!/bin/sh
-# Create correct 32x32 raw RGBA for tray-icon.rgba from SVG
-convert recast-icon.svg -background none -alpha remove -resize 32x32 RGBA:tray-icon.rgba
+# Create correct 32x32 raw RGBA for tray-icon.rgba from the current logo.
+# Source is banner-logo.svg — the newest keycap+loop mark, whose thicker strokes
+# stay legible at 32px (recast-icon.svg's thin, tilted arrows collapse into a
+# featureless blue square at tray size). rsvg-convert renders the SVG far more
+# faithfully than ImageMagick's built-in SVG rasterizer, so go via a PNG.
+rsvg-convert -w 32 -h 32 banner-logo.svg -o tray-icon.png
+convert tray-icon.png RGBA:tray-icon.rgba
 # Verify byte count
 if [ -f tray-icon.rgba ]; then
   size=$(wc -c < tray-icon.rgba | tr -d ' ')

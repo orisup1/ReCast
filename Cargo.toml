@@ -1,7 +1,15 @@
 [package]
 name = "recast"
-version = "0.1.0"
+version = "0.7.0"
 edition = "2021"
+authors = ["Ori Supino <ori@supino.org>"]
+description = "Automatic English/Hebrew keyboard-layout correction that lives in your tray/menubar and retypes words you typed in the wrong layout."
+readme = "README.md"
+repository = "https://github.com/orisup1/recast"
+homepage = "https://github.com/orisup1/recast"
+license = "Apache-2.0"
+keywords = ["keyboard", "layout", "hebrew", "typing", "productivity"]
+categories = ["command-line-utilities", "text-processing"]
 
 # Smaller, faster release binary — the embedded dictionaries dominate size,
 # but LTO + a single codegen unit still shave several MB and help the hot
@@ -11,9 +19,25 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# `objc` 0.2's `msg_send!` / `class!` macros expand to a
+# `cfg(feature = "cargo-clippy")` test, which rustc now reports as an unexpected
+# cfg — on every one of the dozens of call sites in platform/tray.rs, which is
+# enough to fail a `-D warnings` build on macOS. The value is declared expected
+# here rather than allowing the lint: a codebase this full of `cfg(target_os)`
+# wants to keep being told when it invents a cfg that nothing sets.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[build-dependencies]
+# Embeds the app icon + version metadata into the Windows .exe (see build.rs).
+# Build-only and host-compiled; a no-op for non-Windows targets.
+winresource = "0.1"
+
 [dependencies]
 dirs = "4.0"
-nix = { version = "0.27", features = ["process", "fs"] }
+# `inotify` powers the list watcher on Linux (complete::watch_forever) and
+# `signal` lets --stop send SIGTERM directly instead of forking /bin/kill.
+nix = { version = "0.27", features = ["process", "fs", "inotify", "signal"] }
 crossterm = "0.28"
 ratatui = { version = "0.26", features = ["crossterm"] }
 chrono = "0.4"
@@ -31,7 +55,22 @@ objc = "0.2"  # needed for raw msg_send! to NSAlert (cocoa 0.24 does not expose 
 rdev = "0.5.3"
 tray-icon = "0.24"
 tao = "0.35"
-winapi = { version = "0.3", features = ["winuser", "windef"] }
+winapi = { version = "0.3", features = [
+    "winuser", "windef",
+    # Reattaching the parent console at startup so the banner can print even
+    # though release builds run under `windows_subsystem = "windows"` (see
+    # platform::windows::attach_parent_console).
+    "wincon", "consoleapi", "processenv", "winbase",
+    "fileapi", "handleapi", "winnt",
+    # "Start at login": the per-user Run key (see prefs::windows_autostart).
+    # Listed explicitly rather than relied on through tao/tray-icon's own
+    # feature set, which cargo happens to unify with ours today.
+    "winreg", "winerror", "minwindef",
+    # Finding and stopping an already-running ReCast at startup
+    # (src/instance.rs): the Toolhelp snapshot enumerates processes,
+    # OpenProcess/TerminateProcess stops them, WaitForSingleObject waits.
+    "tlhelp32", "processthreadsapi", "synchapi",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"

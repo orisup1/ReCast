@@ -1,8 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::io;
-use chrono::Local;
-use crate::types::AppControl;
+use crate::types::{AppControl, Correction};
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crossterm::{
@@ -20,37 +19,21 @@ use ratatui::{
     Frame, Terminal,
 };
 
-/// Shared log for TUI
-#[derive(Default)]
-struct TuiLog {
-    lines: Mutex<Vec<String>>,
-    max_lines: usize,
-}
+/// How long a pause started from the TUI lasts — the same half hour the tray
+/// offers, so the two UIs mean the same thing by the word.
+const PAUSE_LENGTH: Duration = Duration::from_secs(30 * 60);
 
-impl TuiLog {
-    fn new(max_lines: usize) -> Self {
-        Self {
-            lines: Mutex::new(Vec::new()),
-            max_lines,
-        }
-    }
-
-    fn push(&self, line: String) {
-        let mut guard = self.lines.lock().unwrap();
-        guard.push(line);
-        if guard.len() > self.max_lines {
-            guard.remove(0);
-        }
-    }
-
-    fn items(&self) -> Vec<ListItem<'_>> {
-        let guard = self.lines.lock().unwrap();
-        guard
-            .iter()
-            .rev()
-            .map(|l| ListItem::new(l.clone()))
-            .collect()
-    }
+/// One line of the corrections log: when it happened, what it was, and whether
+/// the user took it back.
+fn correction_line(c: &Correction) -> String {
+    format!(
+        "[{}] {} → {} ({}){}",
+        c.at.format("%H:%M:%S"),
+        c.from,
+        c.to,
+        c.kind.tag(),
+        if c.undone { "  ↩ undone" } else { "" }
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -62,32 +45,8 @@ pub fn run_tui(control: Arc<AppControl>) -> std::io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let log = Arc::new(TuiLog::new(100));
-    let log_clone = Arc::clone(&log);
-    let control_clone = control.clone();
-    // Status heartbeat: log a line whenever the enabled state or the fixed
-    // counter changes (plus one initial line), for as long as the TUI runs.
-    std::thread::spawn(move || {
-        let mut last: Option<(bool, u64)> = None;
-        loop {
-            let enabled = control_clone.is_enabled();
-            let fixed = control_clone.fixed_count();
-            if last != Some((enabled, fixed)) {
-                last = Some((enabled, fixed));
-                log_clone.push(format!(
-                    "[{}] recast: enabled={}, fixed={}",
-                    Local::now().format("%H:%M:%S"),
-                    if enabled { "ON" } else { "OFF" },
-                    fixed
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    });
-
     let app = App {
         control,
-        log,
         start: Instant::now(),
         tab: 0,
     };
@@ -128,9 +87,20 @@ fn run_app<B: Backend>(
                     }
                     // Toggle layout correction on/off.
                     KeyCode::Char('e') | KeyCode::Char(' ') => {
-                        let enabled = !app.control.is_enabled();
+                        let enabled = !app.control.is_switched_on();
                         app.control.set_enabled(enabled);
                     }
+                    // Pause for a while, or end a pause already running.
+                    KeyCode::Char('p') => {
+                        if app.control.pause_remaining().is_some() {
+                            app.control.resume();
+                        } else {
+                            app.control.pause_for(PAUSE_LENGTH);
+                        }
+                    }
+                    // Re-read abbrev.txt / ignore.txt now rather than waiting
+                    // for the watcher's next pass.
+                    KeyCode::Char('r') => crate::complete::reload_user_files(),
                     KeyCode::F(1) | KeyCode::Char('?') => app.tab = 2,
                     _ => {}
                 }
@@ -144,8 +114,8 @@ fn run_app<B: Backend>(
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn ui(f: &mut Frame, app: &App) {
     let enabled = app.control.is_enabled();
-    let fixed = app.control.fixed_count();
     let uptime = app.start.elapsed().as_secs();
+    let history = app.control.history();
 
     // Styles
     let title_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -215,8 +185,8 @@ fn ui(f: &mut Frame, app: &App) {
         ].as_ref())
         .split(body_chunks[0]);
     match app.tab {
-        0 => render_info(f, tab_area[1], enabled, fixed, uptime, &normal, &enabled_col, &disabled_col),
-        1 => render_log(f, tab_area[1], &app.log, &normal),
+        0 => render_info(f, tab_area[1], app, uptime, &normal, &enabled_col, &disabled_col),
+        1 => render_log(f, tab_area[1], &history, &normal),
         2 => render_help(f, tab_area[1], &normal),
         _ => {}
     }
@@ -245,15 +215,14 @@ fn ui(f: &mut Frame, app: &App) {
                 .title_alignment(Alignment::Center),
         );
     f.render_widget(gauge, right_chunks[0]);
-    let recent = Paragraph::new({
-        let guard = app.log.lines.lock().unwrap();
-        let start = guard.len().saturating_sub(3);
-        guard[start..]
+    let recent = Paragraph::new(
+        history
             .iter()
-            .map(|l| l.as_str())
-            .collect::<Vec<&str>>()
-            .join("\n")
-    })
+            .take(3)
+            .map(correction_line)
+            .collect::<Vec<String>>()
+            .join("\n"),
+    )
     .block(
         Block::default()
             .borders(Borders::ALL)
@@ -266,7 +235,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Footer
     let footer = Paragraph::new(Span::styled(
-        " ← → / h l : switch tab   e/Space : toggle   q/Esc : quit   F1 : help ",
+        " ← → : tab   e/Space : toggle   p : pause 30m   r : reload lists   q : quit   F1 : help ",
         Style::default().fg(Color::Gray),
     ))
     .block(
@@ -282,31 +251,49 @@ fn ui(f: &mut Frame, app: &App) {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
-fn render_info(f: &mut Frame, area: ratatui::layout::Rect, enabled: bool, fixed: u64, uptime: u64, normal: &Style, enabled_col: &Style, disabled_col: &Style) {
+fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u64, normal: &Style, enabled_col: &Style, disabled_col: &Style) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled("Information", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
         .title_alignment(Alignment::Center);
-    let text = vec![
+    let enabled = app.control.is_enabled();
+    let paused = app.control.pause_remaining();
+    let state = match paused {
+        Some(left) => format!("[PAUSED {} min]", left.as_secs() / 60 + 1),
+        None if enabled => "[ON]".to_string(),
+        None => "[OFF]".to_string(),
+    };
+    let mut text = vec![
         Line::from(vec![
             Span::styled("Enabled: ", *normal),
-            Span::styled(
-                if enabled { "[ON]" } else { "[OFF]" },
-                if enabled { *enabled_col } else { *disabled_col },
-            ),
+            Span::styled(state, if enabled { *enabled_col } else { *disabled_col }),
         ]),
         Line::from(vec![
             Span::from("Fixed words: "),
-            Span::styled(fixed.to_string(), *normal),
+            Span::styled(app.control.fixed_count().to_string(), *normal),
+        ]),
+        // The undo tally sits next to the fixed one because the pair is the
+        // reading: corrections that stick are invisible, so only the ratio
+        // says whether the thresholds suit this user.
+        Line::from(vec![
+            Span::from("Taken back: "),
+            Span::styled(app.control.undo_count().to_string(), *normal),
         ]),
         Line::from(vec![
             Span::from("Uptime: "),
             Span::styled(uptime.to_string(), *normal),
             Span::from(" s"),
         ]),
-        Line::from(""),
-        Line::from("Recast corrects mistyped keyboard layouts by switching the layout and re‑typing the word."),
     ];
+    if let Some(hint) = app.control.tighten_hint() {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from("Recast corrects mistyped keyboard layouts by switching the layout and re‑typing the word."));
     let paragraph = Paragraph::new(text)
         .block(block)
         .wrap(Wrap { trim: true });
@@ -314,12 +301,20 @@ fn render_info(f: &mut Frame, area: ratatui::layout::Rect, enabled: bool, fixed:
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn render_log(f: &mut Frame, area: ratatui::layout::Rect, log: &Arc<TuiLog>, normal: &Style) {
+/// The corrections themselves, newest first. This used to be a heartbeat of
+/// "enabled=ON, fixed=3" lines, which said that something had happened without
+/// ever saying what — the one question a log of silent text replacement exists
+/// to answer.
+fn render_log(f: &mut Frame, area: ratatui::layout::Rect, history: &[Correction], normal: &Style) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Log", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        .title(Span::styled("Corrections", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
         .title_alignment(Alignment::Center);
-    let items: Vec<ListItem> = log.items();
+    let items: Vec<ListItem> = if history.is_empty() {
+        vec![ListItem::new("No corrections yet.")]
+    } else {
+        history.iter().map(|c| ListItem::new(correction_line(c))).collect()
+    };
     let list = List::new(items)
         .block(block)
         .style(*normal)
@@ -334,20 +329,29 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         .borders(Borders::ALL)
         .title(Span::styled("Help", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
         .title_alignment(Alignment::Center);
+    // What the user needs from a help tab is the two gestures and where their
+    // files live — none of which is visible anywhere else, since ReCast has no
+    // window of its own and does its work inside other applications.
     let text = vec![
-        Line::from("Keyboard-centric navigation:"),
+        Line::from("This dashboard:"),
         Line::from("  ← / h     : previous tab"),
         Line::from("  → / l     : next tab"),
-        Line::from("  e / Space : toggle layout correction on/off"),
+        Line::from("  e / Space : turn correction on/off (remembered across restarts)"),
+        Line::from("  p         : pause for 30 minutes, or resume"),
+        Line::from("  r         : re-read abbrev.txt and ignore.txt now"),
         Line::from("  q / Esc   : quit"),
         Line::from("  F1 / ?    : show this help"),
         Line::from(""),
-        Line::from("Features:"),
-        Line::from("  • Responsive layout using Ratatui"),
-        Line::from("  • Semantic colors (green=enabled, red=disabled)"),
-        Line::from("  • Modular panels: Info, Log, Help"),
-        Line::from("  • Activity gauge and recent log"),
-        Line::from("  • Low‑CPU, terminal‑only UI"),
+        Line::from("While typing anywhere:"),
+        Line::from("  Right Shift (tap)  : finish the word; tap again to cycle guesses"),
+        Line::from("  Ctrl Ctrl (tap x2) : undo the correction the cursor is sitting on,"),
+        Line::from("                       and stop correcting that word. On a word that"),
+        Line::from("                       was skipped because it is listed, it does the"),
+        Line::from("                       opposite: unlists it and corrects it."),
+        Line::from(""),
+        Line::from("Your files (edits are picked up within ~2s, no restart):"),
+        Line::from("  abbrev.txt : `btw = by the way`, one per line"),
+        Line::from("  ignore.txt : one word per line, never corrected"),
     ];
     let paragraph = Paragraph::new(text)
         .block(block)
@@ -359,7 +363,6 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct App {
     control: Arc<AppControl>,
-    log: Arc<TuiLog>,
     start: Instant,
     tab: usize,
 }

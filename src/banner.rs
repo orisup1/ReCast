@@ -221,6 +221,10 @@ fn plain_banner() -> String {
 
 /// Same half-block renderer but downsamples the 32×32 source to 16 rows so
 /// the output is a single compact line (good for a menubar/tray title).
+///
+/// Only the macOS menubar shows an inline text title, so this is macOS-only;
+/// gating it keeps other targets from flagging it as unused.
+#[cfg(target_os = "macos")]
 pub fn logo_rows_compact(depth: ColorDepth) -> String {
   let px = |x: usize, y: usize| -> (u8, u8, u8, u8) {
     let i = (y * LOGO_W + x) * 4;

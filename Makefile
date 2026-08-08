@@ -1,8 +1,8 @@
 # recast — build / install / deploy
 #
 # The binary is self-contained: dictionaries are embedded at compile time
-# (`include_str!` in src/main.rs) so it can be invoked from any directory
-# without a wrapper or environment variable.
+# (prepared by build.rs, embedded in src/dictionary.rs) so it can be invoked
+# from any directory without a wrapper or environment variable.
 #
 # Common targets:
 #   make              build (release)
@@ -52,6 +52,19 @@ LAUNCHD_PLIST := $(LAUNCHD_DIR)/$(LAUNCHD_LABEL).plist
 CARGO   ?= cargo
 INSTALL ?= install
 
+# Cargo.toml is the single source of the version. Everything that has to state
+# it either reads CARGO_PKG_VERSION at compile time (all of src/) or is
+# generated from this — nothing is typed twice, because the copy that is typed
+# twice is the one that goes stale (the .app bundle said 1.0 for four
+# releases). Anchored at the line start so the dependency versions below the
+# [package] table can't match.
+VERSION := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+
+# macOS .app bundle: a committed artifact, but its Info.plist is generated so
+# the version in it tracks the crate.
+APP_BUNDLE := exec/ReCast.app
+APP_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
+
 BIN_NAME := recast
 BIN_SRC  := target/release/$(BIN_NAME)
 BIN_DST  := $(BINDIR)/$(BIN_NAME)
@@ -69,7 +82,7 @@ assets/tray-icon.rgba: assets/recast-icon.svg  assets/recast.icns
 	  || (echo "ERROR: ImageMagick (magick) required. Install via: brew install imagemagick" && exit 1)
 
 .PHONY: all build clean rebuild install uninstall deploy run help \
-	tray-icon \
+	tray-icon version bundle-plist \
 	service service-uninstall \
 	service-linux service-uninstall-linux \
 	service-macos service-uninstall-macos \
@@ -195,6 +208,35 @@ service-unsupported:
 	@echo "Windows users: run deploy.ps1 -Target service from PowerShell." >&2
 	@exit 1
 
+version:
+	@echo $(VERSION)
+
+# Rewrite the .app bundle's Info.plist from Cargo.toml. Run it after a version
+# bump — or before refreshing the committed macOS artifact — so the bundle
+# reports the version the binary inside it was built from.
+bundle-plist:
+	@mkdir -p $(dir $(APP_PLIST))
+	@printf '%s\n' \
+	  '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+	  '<plist version="1.0">' \
+	  '<dict>' \
+	  '    <key>CFBundleName</key><string>ReCast</string>' \
+	  '    <key>CFBundleDisplayName</key><string>ReCast</string>' \
+	  '    <key>CFBundleIdentifier</key><string>com.recast.app</string>' \
+	  '    <key>CFBundleExecutable</key><string>recast</string>' \
+	  '    <key>CFBundleIconFile</key><string>AppIcon</string>' \
+	  '    <key>CFBundlePackageType</key><string>APPL</string>' \
+	  '    <key>CFBundleVersion</key><string>$(VERSION)</string>' \
+	  '    <key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
+	  '    <key>LSMinimumSystemVersion</key><string>11.0</string>' \
+	  '    <key>LSUIElement</key><true/>' \
+	  '    <key>NSHighResolutionCapable</key><true/>' \
+	  '</dict>' \
+	  '</plist>' \
+	  > $(APP_PLIST)
+	@echo "$(APP_PLIST) → $(VERSION)"
+
 help:
 	@echo "recast Makefile (host OS detected as: $(OS_NAME))"
 	@echo
@@ -208,6 +250,8 @@ help:
 	@echo "  service            install + register OS autostart unit"
 	@echo "  service-uninstall  remove autostart unit"
 	@echo "  run                cargo run --release (use ARGS=... for flags)"
+	@echo "  version            print the version from Cargo.toml"
+	@echo "  bundle-plist       regenerate the .app Info.plist from that version"
 	@echo
 	@echo "Variables:"
 	@echo "  PREFIX             install root (default: \$$HOME/.local)"
@@ -219,7 +263,7 @@ help:
 	@echo "  BINDIR  = $(BINDIR)"
 	@echo "  BIN_DST = $(BIN_DST)"
 	@echo
-@echo "The binary is self-contained — dictionaries are embedded at"
-@echo "compile time, so it runs identically from any working directory."
-@echo "Targets: tray-icon to regenerate macOS tray icon; run make help."
-@echo "For Windows: use deploy.ps1 (PowerShell)."
+	@echo "The binary is self-contained — dictionaries are embedded at"
+	@echo "compile time, so it runs identically from any working directory."
+	@echo "Targets: tray-icon to regenerate macOS tray icon; run make help."
+	@echo "For Windows: use deploy.ps1 (PowerShell)."
