@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/recast-icon.svg" width="128" height="128" alt="ReCast logo">
+  <img src="assets/icons/icon-256.png" width="128" height="128" alt="ReCast logo">
 </p>
 
 <h1 align="center">ReCast</h1>
@@ -58,11 +58,13 @@ merely misspelled gets fixed in place instead — and completes words you are st
 Linux additionally requires the user to be in the `input` group (for `evdev` read access)
 and creates a `uinput` virtual device named `recast-injector` to replay corrected words.
 
-## Setup
+## Requirements
 
-1. Install Rust (`rustup`, `cargo`).
-2. Make sure both English and Hebrew layouts are installed in your OS keyboard settings.
-   On Linux/Hyprland the xkb config must list English as layout 0 and Hebrew as layout 1.
+- **Rust** toolchain (`rustup`, `cargo`).
+- Both **English and Hebrew layouts installed** in your OS keyboard settings. On
+  Linux/Hyprland, the xkb config must list English as layout `0` and Hebrew as layout `1`.
+- **Linux only:** membership in the `input` group (for `evdev` read access). ReCast creates
+  a `uinput` virtual device named `recast-injector` to replay corrected words.
 
 ### Prebuilt binaries
 
@@ -105,74 +107,78 @@ meaningful memory, and that the total stays under a 50 MB ceiling. On this machi
 settles at **about 9 MB and grows by hundredths of one** across the tenfold increase. `recast --status`
 prints the figure so you can check a daemon that has been up for a month against it.
 
-## Linux: full install + autostart
+### Linux
 
-One-shot setup. Adds your user to the `input` group (required for `evdev` access),
-builds in release mode, installs the binary to `~/.local/bin/recast`, and registers a
-`systemd --user` unit that starts ReCast at login:
+One-shot setup: adds your user to the `input` group, builds in release mode, installs the
+binary to `~/.local/bin/recast`, and registers a `systemd --user` unit that starts ReCast
+at login.
 
 ```bash
 sudo usermod -aG input $USER && exec newgrp input <<< 'make service'
 ```
 
-`newgrp` applies the new group to the current shell so you don't have to log out;
-omit the `newgrp` part and re-login instead if you prefer. Make sure `~/.local/bin`
-is on your `PATH`.
+`newgrp` applies the new group to the current shell so you don't have to log out; omit it
+and re-login instead if you prefer. Ensure `~/.local/bin` is on your `PATH`.
 
 Manage the service:
 
 ```bash
-systemctl --user status  recast       # health check
-systemctl --user restart recast       # apply a rebuild
-journalctl  --user -u    recast -f    # logs
-make service-uninstall                  # stop + remove the unit
+systemctl --user status  recast    # health check
+systemctl --user restart recast    # apply a rebuild
+journalctl  --user -u    recast -f  # follow logs
+make service-uninstall             # stop and remove the unit
 ```
 
-### Other Make targets
+Common Make targets:
 
-```bash
-make              # cargo build --release
-make install      # build + copy bin to ~/.local/bin
-make deploy       # clean + build + install
-make uninstall    # remove the installed bin
-make run ARGS=-g  # cargo run with the GUI flag
-make help         # full target list
-```
+| Target             | Action                                    |
+| ------------------ | ----------------------------------------- |
+| `make`             | `cargo build --release`                   |
+| `make install`     | build + copy binary to `~/.local/bin`     |
+| `make deploy`      | clean + build + install                   |
+| `make uninstall`   | remove the installed binary               |
+| `make run ARGS=-g` | `cargo run` with a flag (here, the TUI)   |
+| `make help`        | full target list                          |
 
 Override the install root with `PREFIX=`, e.g. `make install PREFIX=/opt/recast`.
 
-## macOS
+### macOS
 
 ```bash
 make service
 ```
 
-Writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.recast.plist` and starts it.
-You will need to grant the binary **Input Monitoring** and **Accessibility** permissions
-in System Settings → Privacy & Security the first time it runs.
+This writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.recast.plist` and starts
+it. The first time it runs, grant the binary **Input Monitoring** and **Accessibility**
+permissions in *System Settings → Privacy & Security*.
 
-reset app permision with 
+To reset ReCast's permissions:
+
 ```bash
 tccutil reset All com.recast.app
 ```
 
-## Windows
+Once installed, `recast` is on your `PATH` and supports the same flags as every other
+platform (see [Usage](#usage)) — e.g. `recast -h`, `recast -g`, `recast -s`. Note that the
+LaunchAgent runs with `KeepAlive`, so `recast -s` stops a manually-launched instance but the
+*service* will be relaunched by launchd; to stop the service, run `make service-uninstall`.
 
-PowerShell:
+### Windows
+
+In PowerShell:
 
 ```powershell
 .\deploy.ps1 -Target service
 ```
 
-Builds, installs to `%USERPROFILE%\.local\bin`, and registers a Scheduled Task that
-runs ReCast at logon. `.\deploy.ps1 -Target help` lists every target.
+This builds, installs to `%USERPROFILE%\.local\bin`, and registers a Scheduled Task that
+runs ReCast at logon. Run `.\deploy.ps1 -Target help` to list every target.
 
-## Running directly
+## Usage
 
-If you don't want a service, just run the binary (or `cargo run --release`) from any
-shell. On Linux it daemonizes into the background by default (`-f`/`--foreground`
-keeps it attached; under systemd this is detected automatically); on macOS/Windows
-it stays in the tray/menubar.
+You don't need the service — you can run the binary (or `cargo run --release`) directly
+from any shell. On Linux it daemonizes into the background by default (under systemd this
+is detected automatically); on macOS and Windows it lives in the tray/menubar.
 
 ```bash
 recast          # start (Linux: forks into the background and writes a pidfile)
@@ -236,7 +242,18 @@ plainly trying to tighten it:
   ! RECAST_SPELL_DIST="l" is not a number — using the default instead.
 ```
 
-Environment variables:
+The **TUI** (`-g`, Linux/Windows) shows the enabled state, the fixed-word counter, and a
+live log; press `e` or `Space` to toggle correction on and off, and `q` to quit. The
+**control window** (`-w`) offers the same toggle and counter in a small GUI window. On
+macOS, use the menubar menu instead.
+
+### Environment variables
+
+| Variable            | Effect                                                          |
+| ------------------- | -------------------------------------------------------------- |
+| `RECAST_DEBUG=1`    | Print every word check and switch decision                     |
+| `RECAST_SPLIT=1`    | Enable the opt-in missing-space splitting fallback             |
+| `RECAST_SHORT=0`    | Never auto-switch on short (≤3 char) words                      |
 
 ```bash
 RECAST_DEBUG=1 recast   # print every word check and switch decision

@@ -943,6 +943,13 @@ pub fn start(
     if with_gui {
         eprintln!("--gui is not supported on macOS; running with the menubar tray instead.");
     }
+    // Record our PID so `recast -s` can find and terminate this instance. macOS
+    // runs in the foreground (no fork/daemonize), so process::id() is the tray
+    // process the user wants to stop. Without this the pidfile is never written
+    // and `-s` silently no-ops.
+    if let Err(e) = crate::daemon::write_pidfile() {
+        eprintln!("Failed to write pidfile: {e}");
+    }
     // Bind the tap to a named local so it stays alive for the whole session;
     // dropping it would disable and release the tap.
     let _tap = setup_event_tap(en, he, Arc::clone(&control));
