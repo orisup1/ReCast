@@ -179,8 +179,8 @@ pub fn run(control: Arc<AppControl>) {
                 let new_enabled = !control.is_switched_on();
                 control.set_enabled(new_enabled);
                 toggle_item.set_text(toggle_label(new_enabled));
-                // Update tooltip immediately
-                // Fix: set_tooltip requires Option<S>, so wrap in Some(...)
+                // The hover text carries the same state as the menu, so it is
+                // refreshed here rather than waiting for the next timer wake.
                 let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
             } else if event.id == pause_id {
                 // The same item ends the pause it started: while one is
@@ -226,16 +226,14 @@ pub fn run(control: Arc<AppControl>) {
                     }
                 }
             } else if event.id == about_id {
-                // Show about dialog - platform specific
                 #[cfg(target_os = "macos")]
                 {
-                    // NSAlert is configured via setMessageText:/setInformativeText:
-                    // and shown with runModal. The previous code sent a
-                    // UIAlertController-style `initWithTitle:message:preferredStyle:`
-                    // selector (which NSAlert does not implement) and passed Rust
-                    // &str where NSString* was expected — an unrecognized-selector
-                    // Objective-C exception that aborted the whole process whenever
-                    // About was clicked. Build real NSStrings and use NSAlert's API.
+                    // NSAlert only: configured with setMessageText: /
+                    // setInformativeText: and shown with runModal, and every
+                    // string built as a real NSString. Sending it a selector it
+                    // does not implement, or a Rust &str where NSString* is
+                    // expected, is an Objective-C exception — which aborts the
+                    // whole process rather than failing the click.
                     use cocoa::appkit::NSApp;
                     use cocoa::base::{id, nil, YES};
                     use cocoa::foundation::NSString;

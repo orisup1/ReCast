@@ -713,10 +713,18 @@ cargo check --target x86_64-apple-darwin
 ```
 
 CI (`.github/workflows/ci.yml`) runs `cargo test`, `cargo clippy -- -D warnings` and a
-release build on Linux, macOS and Windows runners for every push. The three platform
-modules are near-identical copies that nothing keeps in step, so a change made in one and
-forgotten in the other two is the most likely regression here — building each on its own
-OS is what catches it.
+release build on Linux, macOS and Windows runners. Nothing below `src/platform/` has
+tests, so "it builds on its own OS" is the whole guarantee there.
+
+The three platform modules used to be near-identical copies of one another — the word
+buffer, both gestures, undo, the completion cycle and the replacement planning were
+written out three times, and a change made in one and forgotten in the other two was the
+most likely regression in the codebase. That state machine now lives once in
+`src/platform/engine.rs`, generic over a `Platform` trait, and each OS module supplies
+only what is genuinely its own: how keystrokes arrive, how a replacement is put on screen,
+and how the process starts up. `src/platform/textkeys.rs` holds the further half that
+macOS and Windows share, since both capture `rdev::Key` and both insert corrections as
+text. Per-platform code went from ~3400 lines to ~1450.
 
 ## License
 
