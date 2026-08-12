@@ -35,15 +35,14 @@ impl eframe::App for App {
                 let mut enabled = self.control.is_switched_on();
                 let checkbox = egui::Checkbox::new(
                     &mut enabled,
-                    egui::RichText::new("Enable layout correction")
-                        .color(egui::Color32::LIGHT_GRAY),
+                    egui::RichText::new("Enable correction").color(egui::Color32::LIGHT_GRAY),
                 );
                 let response = ui.add(checkbox);
                 if response.changed() {
                     self.control.set_enabled(enabled);
                 }
                 response.on_hover_ui(|ui| {
-                    ui.label("Turn layout correction on or off");
+                    ui.label("Layout switching, spelling and completion — the one switch for all three");
                 });
 
                 ui.add_space(12.0);
@@ -72,8 +71,12 @@ impl eframe::App for App {
                     );
                 }
                 ui.add_space(16.0);
+                // `--window` runs ReCast in the foreground with the listener on
+                // a background thread, so closing this window ends the process.
+                // The label used to claim the opposite, which is the worst way
+                // to find out: you close it and corrections stop.
                 ui.label(
-                    RichText::new("Running in background. Closes window but keeps service.")
+                    RichText::new("Closing this window quits ReCast.\nRun `make service` to keep it running at login.")
                         .small()
                         .italics()
                         .color(egui::Color32::LIGHT_GRAY),

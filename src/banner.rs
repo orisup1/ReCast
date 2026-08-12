@@ -50,7 +50,7 @@ pub fn print_logo() {
 fn info_lines(cyan: &str, dim: &str, bold: &str, reset: &str) -> Vec<String> {
     let v = env!("CARGO_PKG_VERSION");
     vec![
-        format!("{bold}{cyan}reCast{reset} {dim}v{v}{reset}"),
+        format!("{bold}{cyan}ReCast{reset} {dim}v{v}{reset}"),
         format!("{dim}──────────────────────────────{reset}"),
         format!("{cyan}Layouts{reset}   English ⇄ Hebrew"),
         format!("{cyan}Options{reset}   recast --help"),
@@ -210,7 +210,7 @@ fn plain_banner() -> String {
     let v = env!("CARGO_PKG_VERSION");
     format!(
         "\n\
-   ,----------.      reCast v{v}\n\
+   ,----------.      ReCast v{v}\n\
    | ,------. |      ------------------------------\n\
    | |  /\\  | |      Layouts   English <-> Hebrew\n\
    | | /  \\ | |      Options   recast --help\n\
