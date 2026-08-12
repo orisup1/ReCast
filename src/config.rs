@@ -139,6 +139,15 @@ pub const NUMERIC_KEYS: &[&str] = &[
     "RECAST_INJECT_BATCH_GAP",
 ];
 
+/// Settings whose value is a word rather than a number or a switch. Not
+/// checked for parseability here — each reader knows its own vocabulary and
+/// says so when it does not recognise a value.
+pub const NAMED_KEYS: &[&str] = &[
+    // Which mechanism drives the keyboard layout on Linux: hyprland, sway,
+    // kde, gnome, x11, none. Detected when unset; see `layout::linux`.
+    "RECAST_LAYOUT_BACKEND",
+];
+
 /// Every setting that is a plain on/off switch.
 pub const BOOLEAN_KEYS: &[&str] = &[
     "RECAST_SHORT",
@@ -157,8 +166,8 @@ pub const BOOLEAN_KEYS: &[&str] = &[
 /// neither list is reported to the user as not being a setting.
 pub const ALL_KEYS: &[&str] = &{
     // Concatenating `&[&str]` in a const needs the length written down, so it
-    // is asserted against the two sources rather than trusted.
-    let mut all = [""; 21];
+    // is asserted against the three sources rather than trusted.
+    let mut all = [""; 22];
     let mut n = 0;
     let mut i = 0;
     while i < NUMERIC_KEYS.len() {
@@ -171,6 +180,12 @@ pub const ALL_KEYS: &[&str] = &{
         all[n] = BOOLEAN_KEYS[j];
         n += 1;
         j += 1;
+    }
+    let mut k = 0;
+    while k < NAMED_KEYS.len() {
+        all[n] = NAMED_KEYS[k];
+        n += 1;
+        k += 1;
     }
     assert!(n == all.len(), "ALL_KEYS is the wrong length");
     all
@@ -226,8 +241,11 @@ mod tests {
 
     #[test]
     fn all_keys_is_every_list_and_nothing_else() {
-        assert_eq!(ALL_KEYS.len(), NUMERIC_KEYS.len() + BOOLEAN_KEYS.len());
-        for key in NUMERIC_KEYS.iter().chain(BOOLEAN_KEYS) {
+        assert_eq!(
+            ALL_KEYS.len(),
+            NUMERIC_KEYS.len() + BOOLEAN_KEYS.len() + NAMED_KEYS.len()
+        );
+        for key in NUMERIC_KEYS.iter().chain(BOOLEAN_KEYS).chain(NAMED_KEYS) {
             assert!(ALL_KEYS.contains(key), "{key} missing from ALL_KEYS");
         }
     }

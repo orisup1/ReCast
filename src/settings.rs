@@ -225,6 +225,11 @@ pub fn sample() -> String {
 #complete_rank = {complete_rank}   # worst frequency rank a completion may have
 #debug = false         # log every word check and switch decision
 
+# Linux only: what drives the keyboard layout. Detected from the session when
+# unset — set it if the guess is wrong. One of hyprland, sway, kde, gnome,
+# x11, none. `recast --status` prints what was chosen and the layouts it found.
+#layout_backend = x11
+
 # Injection timings, in microseconds. Only worth touching if corrections come
 # out scrambled, or if you want them faster and are willing to measure.
 #inject_press_gap = {press_gap}       # key-down to key-up (macOS)

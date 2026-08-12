@@ -80,6 +80,9 @@ Settings:
   RECAST_COMPLETE=0   Disable auto-complete (word completion + abbreviations)
   RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)
   RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
+  RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
+                      sway, kde, gnome, x11 or none. Detected when unset;
+                      --status prints what was chosen.
 
 Injection timing (microseconds; only worth touching if corrections come out
 scrambled, or if you want them faster and are willing to measure):
@@ -311,6 +314,10 @@ fn print_status() {
         "  correction:     {}",
         if prefs::load_enabled() { "enabled" } else { "disabled" }
     );
+    // The layout pipeline is the headline feature and the one that can be
+    // silently unavailable: on a Linux session ReCast cannot drive, mistyped
+    // words go through untouched and nothing else says why.
+    println!("  layout switch:  {}", layout::describe_backend());
     match prefs::autostart_enabled() {
         Some(true) => println!("  start at login: yes"),
         Some(false) => println!("  start at login: no"),

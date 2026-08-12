@@ -51,7 +51,7 @@ merely misspelled gets fixed in place instead — and completes words you are st
 
 | OS      | Capture         | Injection                        | Layout switch                                       |
 | ------- | --------------- | -------------------------------- | --------------------------------------------------- |
-| Linux   | `evdev`         | `uinput` keycodes, one batch     | `hyprctl switchxkblayout` (Hyprland only)           |
+| Linux   | `evdev`         | `uinput` keycodes, one batch     | Hyprland / sway / KDE / GNOME / any X11 (see below) |
 | macOS   | `CGEventTap`    | `CGEvent` Unicode string         | Carbon `TISSelectInputSource`                       |
 | Windows | `rdev`          | one `SendInput` Unicode batch    | `LoadKeyboardLayoutW` + `WM_INPUTLANGCHANGEREQUEST` |
 
@@ -61,10 +61,48 @@ and creates a `uinput` virtual device named `recast-injector` to replay correcte
 ## Requirements
 
 - **Rust** toolchain (`rustup`, `cargo`).
-- Both **English and Hebrew layouts installed** in your OS keyboard settings. On
-  Linux/Hyprland, the xkb config must list English as layout `0` and Hebrew as layout `1`.
+- Both **English and Hebrew layouts installed** in your OS keyboard settings. Their order
+  does not matter — ReCast looks up which position each one is in.
 - **Linux only:** membership in the `input` group (for `evdev` read access). ReCast creates
   a `uinput` virtual device named `recast-injector` to replay corrected words.
+
+### Switching the layout on Linux
+
+There is no single way to do this on Linux: X11 lets anyone set the XKB group,
+and Wayland deliberately does not — the compositor owns the keymap and each one
+exposes its own way to ask. So ReCast probes the session once at startup and
+picks one of five backends:
+
+| Session                             | How                                    |
+| ----------------------------------- | -------------------------------------- |
+| Hyprland                            | its control socket                     |
+| sway (or any i3-IPC compositor)     | the `$SWAYSOCK` socket                 |
+| KDE Plasma (Wayland or X11)         | `org.kde.KeyboardLayouts` over D-Bus   |
+| GNOME (Wayland or X11)              | `org.gnome.desktop.input-sources`      |
+| Any X11 session — i3, xfce, MATE, … | the XKB group, via `libX11`            |
+
+The first two talk to the compositor over its socket rather than shelling out
+to `hyprctl`/`swaymsg`: that was measured at 6.3 ms against 0.11 ms for the same
+question, and a correction that changes layout asks twice. X11 uses `libX11`,
+loaded with `dlopen` so a pure Wayland machine that has no X libraries installed
+still runs. KDE and GNOME go through `gdbus`/`busctl`/`qdbus` and `gsettings`
+respectively, which is a process per query — the 300 ms cache is what makes that
+survivable.
+
+`recast --status` prints which backend was chosen and the layouts it found:
+
+```
+  layout switch:  Hyprland (control socket) — layouts: us, il
+```
+
+If the probe guesses wrong, `layout_backend` in `config.toml` (or
+`RECAST_LAYOUT_BACKEND`) forces one: `hyprland`, `sway`, `kde`, `gnome`, `x11`
+or `none`.
+
+ReCast used to support Hyprland alone, and hardcoded *layout 0 is English,
+layout 1 is Hebrew* — so anyone with a third layout got switched into it, and
+everyone else got no layout correction at all while the speller kept working,
+which is a confusing way for a feature to be missing.
 
 ### Prebuilt binaries
 
