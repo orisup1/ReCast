@@ -2,9 +2,10 @@
 #
 # Build ReCast and install it into /Applications as a .app bundle.
 #
-# The bundle in exec/ is a committed artifact: Info.plist, the icon and an
-# executable that is only ever a copy of the last release build. This script is
-# what refreshes that copy and puts the result where macOS expects to find it.
+# The bundle in exec/ is scratch space, not a committed artifact: `make bundle`
+# assembles it from the release binary, an Info.plist generated from Cargo.toml
+# and assets/recast.icns. This script builds it and puts the result where macOS
+# expects to find it.
 #
 # The tccutil reset at the end is the part that is easy to leave out and then
 # spend an afternoon on. macOS keys Input Monitoring and Accessibility grants to
@@ -36,23 +37,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SRC_BUNDLE="$REPO_ROOT/exec/$APP_NAME"
 BINARY="$REPO_ROOT/target/release/recast"
 
-# ─── 2. Build ────────────────────────────────────────────────────────────────
-echo "==> Building (release)"
-cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml"
+# ─── 2. Build the bundle ─────────────────────────────────────────────────────
+# `make bundle` builds the release binary and assembles the whole .app around
+# it — executable, Info.plist, icon. Nothing here assumes exec/ already holds
+# anything, because since the binaries were untracked it usually does not.
+echo "==> Building (release) and assembling the bundle"
+make -C "$REPO_ROOT" bundle
 
 if [[ ! -x "$BINARY" ]]; then
     echo "Build reported success but $BINARY is not there." >&2
     exit 1
 fi
 
-# ─── 3. Stage the binary into the bundle ─────────────────────────────────────
-# CFBundleExecutable is "recast", so the name here is not a preference.
-echo "==> Staging binary into $SRC_BUNDLE"
-mkdir -p "$SRC_BUNDLE/Contents/MacOS"
-cp "$BINARY" "$SRC_BUNDLE/Contents/MacOS/recast"
-chmod 755 "$SRC_BUNDLE/Contents/MacOS/recast"
-
-# ─── 4. Install the bundle ───────────────────────────────────────────────────
+# ─── 3. Install the bundle ───────────────────────────────────────────────────
 # /Applications is group-writable by admins on most machines but not all, so
 # fall back to sudo rather than failing halfway through with a copied binary and
 # no installed app.
@@ -80,7 +77,7 @@ echo "==> Installing to $INSTALL_DIR/$APP_NAME"
 $SUDO rm -rf "${INSTALL_DIR:?}/$APP_NAME"
 $SUDO ditto "$SRC_BUNDLE" "$INSTALL_DIR/$APP_NAME"
 
-# ─── 5. Reset the privacy grants ─────────────────────────────────────────────
+# ─── 4. Reset the privacy grants ─────────────────────────────────────────────
 # Non-fatal: tccutil exits non-zero when the bundle id has no records yet, which
 # is exactly the state a first install is in and is not a problem.
 echo "==> Resetting privacy permissions for $BUNDLE_ID"

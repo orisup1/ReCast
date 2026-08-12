@@ -60,10 +60,13 @@ INSTALL ?= install
 # [package] table can't match.
 VERSION := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
 
-# macOS .app bundle: a committed artifact, but its Info.plist is generated so
-# the version in it tracks the crate.
+# macOS .app bundle. Nothing in it is committed any more: the executable is a
+# build output, the Info.plist is generated from the version above, and the
+# icon is a copy of assets/recast.icns. `make bundle` assembles all three, so
+# exec/ is scratch space that can be deleted at any time.
 APP_BUNDLE := exec/ReCast.app
 APP_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
+APP_ICON   := $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
 
 BIN_NAME := recast
 BIN_SRC  := target/release/$(BIN_NAME)
@@ -81,8 +84,12 @@ assets/tray-icon.rgba: assets/recast-icon.svg  assets/recast.icns
 	@magick "$<" -background none -flatten none -alpha remove -resize 32x32 RGBA:"$@" \
 	  || (echo "ERROR: ImageMagick (magick) required. Install via: brew install imagemagick" && exit 1)
 
+# `make tray-icon` was listed in .PHONY and in `help` without ever existing as a
+# target, so asking for it by name was an error. It is the file rule above.
+tray-icon: assets/tray-icon.rgba
+
 .PHONY: all build clean rebuild install uninstall deploy run help \
-	tray-icon version bundle-plist \
+	tray-icon version bundle bundle-plist app \
 	service service-uninstall \
 	service-linux service-uninstall-linux \
 	service-macos service-uninstall-macos \
@@ -211,9 +218,26 @@ service-unsupported:
 version:
 	@echo $(VERSION)
 
+# macOS .app: build, restage the bundle in exec/, install it to /Applications
+# and reset the TCC grants (macOS keys Input Monitoring and Accessibility to a
+# bundle's signature, so a replaced executable keeps a ticked box and receives
+# nothing). The script refuses to run anywhere but Darwin.
+app:
+	@src/platform/deploy-macos.sh
+
+# Assemble exec/ReCast.app from its three ingredients. The bundle used to be
+# committed and only its executable restaged, which meant the layout itself —
+# the Resources directory, the icon — existed nowhere but in git history. A
+# fresh clone can now produce it, which is what makes untracking exec/ safe.
+bundle: $(BIN_SRC) bundle-plist
+	@mkdir -p $(APP_BUNDLE)/Contents/MacOS $(dir $(APP_ICON))
+	@$(INSTALL) -m 755 $(BIN_SRC) $(APP_BUNDLE)/Contents/MacOS/recast
+	@cp assets/recast.icns $(APP_ICON)
+	@echo "$(APP_BUNDLE) → $(VERSION)"
+
 # Rewrite the .app bundle's Info.plist from Cargo.toml. Run it after a version
-# bump — or before refreshing the committed macOS artifact — so the bundle
-# reports the version the binary inside it was built from.
+# bump — or before packaging the macOS artifact — so the bundle reports the
+# version the binary inside it was built from.
 bundle-plist:
 	@mkdir -p $(dir $(APP_PLIST))
 	@printf '%s\n' \
@@ -251,7 +275,10 @@ help:
 	@echo "  service-uninstall  remove autostart unit"
 	@echo "  run                cargo run --release (use ARGS=... for flags)"
 	@echo "  version            print the version from Cargo.toml"
+	@echo "  bundle             assemble exec/ReCast.app (binary + plist + icon)"
 	@echo "  bundle-plist       regenerate the .app Info.plist from that version"
+	@echo "  app                macOS: build + install ReCast.app to /Applications"
+	@echo "  tray-icon          regenerate assets/tray-icon.rgba from the SVG"
 	@echo
 	@echo "Variables:"
 	@echo "  PREFIX             install root (default: \$$HOME/.local)"
@@ -265,5 +292,4 @@ help:
 	@echo
 	@echo "The binary is self-contained — dictionaries are embedded at"
 	@echo "compile time, so it runs identically from any working directory."
-	@echo "Targets: tray-icon to regenerate macOS tray icon; run make help."
 	@echo "For Windows: use deploy.ps1 (PowerShell)."

@@ -1,6 +1,13 @@
 # Rust build artifacts
 /target
 
+# Build output staged for release: the three binaries and the macOS .app that
+# `make bundle` assembles around one of them. These were tracked until the
+# repository had ~45 MB of them per refresh, permanently — git history cannot
+# be made smaller after the fact. They are Release assets now (see the Binaries
+# workflow), and everything in here is reproducible with `make bundle`.
+/exec/
+
 # Local notes / scratch
 /info.md
 /AGENTS.md

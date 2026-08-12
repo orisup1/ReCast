@@ -68,24 +68,23 @@ and creates a `uinput` virtual device named `recast-injector` to replay correcte
 
 ### Prebuilt binaries
 
-`exec/` holds ready-to-run builds if you would rather not install a toolchain. They are
-self-contained — the dictionaries are inside the executable — so there is nothing to
-unpack alongside them:
+The [Releases page](https://github.com/orisup1/recast/releases) has ready-to-run builds if
+you would rather not install a toolchain. They are self-contained — the dictionaries are
+inside the executable — so there is nothing to unpack alongside them:
 
-| File               | Target                                                     |
-| ------------------ | ---------------------------------------------------------- |
-| `exec/recastLinux` | Linux x86-64                                               |
-| `exec/ReCast.exe`  | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
-| `exec/recastMac`   | macOS arm64                                                |
-| `exec/ReCast.app`  | macOS bundle                                               |
+| Asset            | Target                                                     |
+| ---------------- | ---------------------------------------------------------- |
+| `recastLinux`    | Linux x86-64                                               |
+| `ReCast.exe`     | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
+| `recastMac`      | macOS universal (arm64 + x86-64)                           |
+| `ReCast.app.zip` | macOS bundle, same universal binary inside                 |
 
-They are committed artifacts rather than build output, so they are only as current as the
-last time someone refreshed them. That refresh is now a button: the **Binaries** workflow
-(`.github/workflows/binaries.yml`, run from the Actions tab) builds all three on their own
-runners and commits the results back here, so they no longer drift apart one platform at a
-time. The next run also replaces the arm64-only macOS builds above with universal
-(arm64 + x86-64) ones, which an Intel Mac can actually run. Building yourself is still the
-recommended path; these exist so you can try it in one step.
+They are built by the **Binaries** workflow (`.github/workflows/binaries.yml`, run from
+the Actions tab), which compiles each one on its own runner and attaches the results to a
+release. They were committed into `exec/` until that had cost the repository ~45 MB per
+refresh, permanently — a release asset can be replaced, a git object cannot. `exec/` is
+still where a local `make bundle` stages the macOS `.app`, but nothing in it is tracked.
+Building yourself is still the recommended path; these exist so you can try it in one step.
 
 The English and Hebrew dictionaries are baked into the binary at compile time, so the
 executable is self-contained and runs identically from any working directory — no data

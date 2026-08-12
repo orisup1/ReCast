@@ -1,19 +1,28 @@
-# Refresh the committed binaries in `exec/`.
+# Build the downloadable binaries and attach them to a GitHub Release.
 #
-# `exec/` holds release builds tracked in git, so someone can download a working
-# ReCast without a Rust toolchain. Keeping them current by hand means building
-# on three machines; this does it on three runners instead and commits the
-# result back to the branch it was started from.
+# These used to be committed into `exec/`, which meant every refresh added
+# ~45 MB to the repository *permanently* — git history cannot be made smaller
+# after the fact, so a download nobody keeps forever was being kept forever.
+# Release assets live outside the object database and can be replaced or
+# deleted, which is what a build artifact wants.
 #
-# Deliberately `workflow_dispatch` only. Each refresh adds ~45 MB to the
-# repository permanently — git history cannot be made smaller after the fact —
-# so this is a button pressed at release time, not something that fires on
-# every push.
+# Still `workflow_dispatch` only: this is a button pressed at release time.
+# `tag` defaults to the crate version, so the usual run needs no input at all.
 
 name: Binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (default: v<Cargo.toml version>)"
+        required: false
+        type: string
+      draft:
+        description: "Publish as a draft"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -75,10 +84,26 @@ jobs:
             target/x86_64-apple-darwin/release/recast
           lipo -info recastMac
 
+      # The .app is assembled here rather than downloaded from git: `make
+      # bundle` builds it out of the release binary, a generated Info.plist and
+      # assets/recast.icns. The universal binary replaces the single-arch one
+      # `make bundle` staged, so the bundle ships both slices too.
+      - name: Assemble the .app bundle
+        run: |
+          set -euo pipefail
+          make bundle
+          install -m 755 recastMac exec/ReCast.app/Contents/MacOS/recast
+          # A .zip, not a bare directory: a bundle uploaded file-by-file
+          # arrives as a folder and loses the executable bit. `ditto` keeps the
+          # macOS metadata that makes it launchable.
+          ditto -c -k --sequesterRsrc --keepParent exec/ReCast.app ReCast.app.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: recastMac
-          path: recastMac
+          path: |
+            recastMac
+            ReCast.app.zip
           if-no-files-found: error
 
   windows:
@@ -107,11 +132,11 @@ jobs:
           if-no-files-found: error
 
   # ───────────────────────────────────────────────────────────────────────────
-  # One job collects all three and makes a single commit. Three jobs each
-  # pushing to the same branch would race.
+  # One job collects all three and publishes them as release assets. Nothing is
+  # committed, so there is no branch to race over any more.
   # ───────────────────────────────────────────────────────────────────────────
-  commit:
-    name: Update exec/
+  release:
+    name: Publish release
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     steps:
@@ -122,43 +147,41 @@ jobs:
           path: incoming
 
       # Artifacts arrive without the executable bit — the upload action does
-      # not carry file modes — so it is set back here.
-      - name: Place the binaries
+      # not carry file modes — so it is set back here, under the names the
+      # README tells people to look for.
+      - name: Stage the assets
+        id: stage
         run: |
           set -euo pipefail
-          install -m 755 incoming/recastLinux/recast   exec/recastLinux
-          install -m 755 incoming/recastMac/recastMac  exec/recastMac
-          install -m 755 incoming/ReCast.exe/recast.exe exec/ReCast.exe
-          # The .app bundle runs the same macOS binary; its Info.plist is
-          # generated from Cargo.toml so the version inside it tracks the crate.
-          install -m 755 incoming/recastMac/recastMac \
-            exec/ReCast.app/Contents/MacOS/recast
-          make bundle-plist
-
-      - name: Report what was built
-        run: |
-          file exec/recastLinux exec/recastMac exec/ReCast.exe
-          ls -lh exec/recastLinux exec/recastMac exec/ReCast.exe
-
-      - name: Commit
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add exec/
-          if git diff --cached --quiet; then
-            echo "exec/ already matches this build — nothing to commit."
-            exit 0
-          fi
+          mkdir -p dist
+          install -m 755 incoming/recastLinux/recast     dist/recastLinux
+          install -m 755 incoming/recastMac/recastMac    dist/recastMac
+          install -m 755 incoming/ReCast.exe/recast.exe  dist/ReCast.exe
+          cp incoming/recastMac/ReCast.app.zip           dist/ReCast.app.zip
+          file dist/recastLinux dist/recastMac dist/ReCast.exe
+          ls -lh dist
           version=$(make version)
-          # Written through a heredoc rather than `-m`, so the body is not
-          # indented by this file's own YAML block indentation.
-          git commit -F - <<EOF
-          build: refresh exec/ binaries for $version
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "default_tag=v${version}" >> "$GITHUB_OUTPUT"
 
-          Built by the Binaries workflow from ${GITHUB_SHA}.
-          macOS is a universal (arm64 + x86_64) binary.
-
-          [skip ci]
-          EOF
-          git push
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.stage.outputs.tag || steps.stage.outputs.default_tag }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          draft_flag=""
+          if [ "$DRAFT" = "true" ]; then draft_flag="--draft"; fi
+          # `create` fails if the tag already has a release, so an existing one
+          # is updated in place instead — re-running after a failed build
+          # replaces the assets rather than erroring out.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              $draft_flag \
+              --title "$TAG" \
+              --notes "Built by the Binaries workflow from ${GITHUB_SHA}.
+          macOS assets are universal (arm64 + x86_64)."
+          fi
