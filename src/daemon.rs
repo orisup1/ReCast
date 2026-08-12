@@ -1,21 +1,30 @@
-// Everything that touches the filesystem here is part of the Linux daemon
-// path — daemonize, the pidfile, and the stop that reads it. macOS and Windows
-// run in the foreground under a launch agent or the `Run` key and never write
-// one, so on those targets these would all be unused imports.
-#[cfg(target_os = "linux")]
+// The pidfile and the stop that reads it are shared by Linux and macOS: Linux
+// daemonizes and writes one, and macOS runs in the foreground under a launch
+// agent but writes one too, so `--stop` has something to act on there rather
+// than telling the user to go and find the menubar icon. Windows has neither —
+// its instance is ended through the tray or Task Manager — so on that target
+// these would all be unused imports.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::OpenOptions;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Write;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::{
     sys::signal::{self, Signal},
+    unistd::Pid,
+};
+
+// Forking is the Linux daemon's alone: macOS stays in the foreground because
+// the event tap has to own the main run loop.
+#[cfg(target_os = "linux")]
+use nix::{
     sys::wait::waitpid,
-    unistd::{chdir, fork, setsid, Pid, ForkResult},
+    unistd::{chdir, fork, setsid, ForkResult},
 };
 
 /// Daemonize the current process on Linux (fork, setsid, chdir).
@@ -77,10 +86,14 @@ pub fn daemonize() {
 
 /// Write the current process ID to a pidfile in the user's cache directory.
 ///
-/// Only the Linux daemon writes a pidfile (macOS/Windows run in the foreground
-/// under a launch agent / scheduled task), so this is Linux-only; gating it
-/// avoids a dead-code warning on the other targets.
-#[cfg(target_os = "linux")]
+/// Record our PID so `--stop` has something to act on.
+///
+/// Written by the Linux daemon and, since it runs in the foreground with no
+/// fork, by the macOS tray process itself — `process::id()` is the process the
+/// user means either way. Windows is the exception: its instance is ended from
+/// the tray or Task Manager, so nothing there reads a pidfile and gating this
+/// out avoids a dead-code warning.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn write_pidfile() -> std::io::Result<()> {
     let mut dir = dirs::cache_dir().ok_or_else(|| std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -94,8 +107,8 @@ pub fn write_pidfile() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Where the Linux daemon records its PID.
-#[cfg(target_os = "linux")]
+/// Where the running instance records its PID.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn pidfile_path() -> Option<std::path::PathBuf> {
     Some(dirs::cache_dir()?.join("recast").join("pid"))
 }
@@ -117,22 +130,64 @@ pub fn is_our_process(pid: u32) -> bool {
         return false; // no such process
     };
     let comm = comm.trim();
-    let ours = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "recast".to_string());
-    let truncated: String = ours.chars().take(15).collect();
-    comm == ours || comm == truncated
+    let truncated: String = our_name().chars().take(15).collect();
+    comm == our_name() || comm == truncated
 }
 
-/// The PID of a running daemon, if there is one.
+/// The macOS half of the same question, asked of `libproc` because there is no
+/// `/proc` to read.
 ///
-/// Linux-only, because it is the only platform that daemonizes and writes a
-/// pidfile — macOS and Windows run in the foreground under a launch agent or
-/// scheduled task, where the OS is the thing that knows. A stale pidfile left
-/// by a killed process reads as "not running", which is what the user means by
-/// the question.
-#[cfg(target_os = "linux")]
+/// `proc_pidpath` refuses a process belonging to another user, which is the
+/// ownership check the Linux side has to make explicitly in `instance`.
+///
+/// This lives here rather than in `instance` so that both callers — the stop
+/// path below and the duplicate-instance sweep — ask the same question of the
+/// same code, which is already how Linux is arranged.
+#[cfg(target_os = "macos")]
+pub fn is_our_process(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    /// `PROC_PIDPATHINFO_MAXSIZE` from `<sys/proc_info.h>`.
+    const PATH_MAX: usize = 4 * 1024;
+
+    // libproc, from libSystem — no crate needed, and no `ps` subprocess either.
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
+    }
+
+    let mut buf = vec![0u8; PATH_MAX];
+    let written =
+        unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr() as *mut c_void, PATH_MAX as u32) };
+    if written <= 0 {
+        return false; // no such process, or it is not ours to look at
+    }
+    buf.truncate(written as usize);
+    let Ok(path) = String::from_utf8(buf) else {
+        return false;
+    };
+    std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .is_some_and(|name| name == our_name())
+}
+
+/// The file name of our own executable, which is what a process is recognised
+/// by. Taken from the running binary rather than hardcoded, so a renamed copy
+/// still recognises itself and an unrelated `recast` does not.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn our_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "recast".to_string())
+}
+
+/// The PID of a running instance, if there is one.
+///
+/// Linux and macOS, the two that write a pidfile; on Windows the OS is the
+/// thing that knows. A stale pidfile left by a killed process reads as "not
+/// running", which is what the user means by the question.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn running_pid() -> Option<u32> {
     let pid: u32 = fs::read_to_string(pidfile_path()?).ok()?.trim().parse().ok()?;
     is_our_process(pid).then_some(pid)
@@ -148,7 +203,7 @@ pub fn running_pid() -> Option<u32> {
 /// The equality test is the whole point. A blind `remove_file` would delete the
 /// *new* instance's pidfile in the ordinary case, because by the time an
 /// instance is confirmed gone its replacement has often already written one.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn forget_pidfile(pid: u32) {
     let Some(path) = pidfile_path() else {
         return;
@@ -188,7 +243,7 @@ pub enum Stopped {
 }
 
 /// Stop a running daemon, if this platform has one and it is really there.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn stop_daemon() -> std::io::Result<Stopped> {
     let pidfile = pidfile_path().ok_or_else(|| {
         std::io::Error::new(
@@ -232,16 +287,14 @@ pub fn stop_daemon() -> std::io::Result<Stopped> {
     }
 }
 
-/// macOS and Windows run ReCast in the foreground under a launch agent or the
-/// per-user `Run` key, so there is no pidfile and never was one — `--stop` has
-/// nothing to read and must say so rather than claim a stop it did not make.
-#[cfg(not(target_os = "linux"))]
+/// Windows runs ReCast in the foreground under the per-user `Run` key and
+/// writes no pidfile — `--stop` has nothing to read and must say so rather than
+/// claim a stop it did not make.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn stop_daemon() -> std::io::Result<Stopped> {
-    #[cfg(target_os = "macos")]
-    let how = "quit it from the menubar icon, or: launchctl unload -w ~/Library/LaunchAgents/org.recast.plist";
     #[cfg(target_os = "windows")]
     let how = "quit it from the tray icon, or end the `recast` task in Task Manager";
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(target_os = "windows"))]
     let how = "this platform has no daemon mode";
     Ok(Stopped::Unsupported(how))
 }

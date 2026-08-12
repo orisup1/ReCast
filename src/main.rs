@@ -46,8 +46,8 @@ Options:
   -g, --gui         Run in the foreground with a terminal dashboard (TUI)
   -w, --window      Run in the foreground with a small control window
                     (Linux only)
-  -s, --stop        Stop a running recast daemon (Linux only — macOS and
-                    Windows run in the foreground; quit from the tray)
+  -s, --stop        Stop the running ReCast (Linux and macOS; on Windows,
+                    quit it from the tray)
   -f, --foreground  Linux: don't daemonize (implied when run under systemd)
       --keep-others Don't stop instances that are already running (by default a
                     new ReCast replaces the old one — two at once correct every
@@ -173,23 +173,23 @@ fn main() {
     if with_kill {
         match daemon::stop_daemon() {
             Ok(daemon::Stopped::Signalled(pid)) => {
-                println!("Stopped recast daemon (pid {pid}).");
+                println!("Stopped ReCast (pid {pid}).");
             }
             Ok(daemon::Stopped::Stale) => {
-                println!("No recast daemon running — cleared a stale pidfile.");
+                println!("ReCast is not running — cleared a stale pidfile.");
             }
             Ok(daemon::Stopped::NotRunning) => {
-                println!("No recast daemon is running.");
+                println!("ReCast is not running.");
             }
             // Not an error the user made, but not a stop either: say which it
             // is and how to actually do it here.
             Ok(daemon::Stopped::Unsupported(how)) => {
-                eprintln!("--stop is Linux-only — ReCast does not daemonize on this platform.");
+                eprintln!("--stop is not supported on this platform.");
                 eprintln!("To stop it: {how}");
                 process::exit(1);
             }
             Err(e) => {
-                eprintln!("Failed to stop daemon: {e}");
+                eprintln!("Failed to stop ReCast: {e}");
                 process::exit(1);
             }
         }
@@ -304,7 +304,10 @@ fn clear_the_way() {
 fn print_status() {
     println!("recast {}", env!("CARGO_PKG_VERSION"));
 
-    #[cfg(target_os = "linux")]
+    // Linux and macOS write a pidfile, so both can answer this from disk
+    // without attaching to anything. Windows does not: its instance is found
+    // through the process table instead, which `--status` does not walk.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     match daemon::running_pid() {
         Some(pid) => println!("  running:        yes (pid {pid})"),
         None => println!("  running:        no"),

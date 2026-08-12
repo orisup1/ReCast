@@ -146,14 +146,14 @@ fn wait_for_exit(pids: &[u32], grace: Duration) -> Vec<u32> {
 
 /// Drop the daemon pidfile if it named the instance just stopped.
 ///
-/// Only the Linux daemon writes one, and only the Linux daemon overwrites it at
-/// startup — a new instance that goes on to run a TUI or a control window never
-/// touches it, so without this the file would outlive its process and
-/// `--status` would keep reporting a daemon that is not there.
+/// Only Linux and macOS write one, and a new instance that goes on to run a TUI
+/// or a control window never overwrites it, so without this the file would
+/// outlive its process and `--status` would keep reporting an instance that is
+/// not there.
 fn forget_pidfile(pid: u32) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     crate::daemon::forget_pidfile(pid);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = pid;
 }
 
@@ -258,48 +258,20 @@ mod imp {
     const LABEL: &str = "org.recast";
 
     const PROC_ALL_PIDS: u32 = 1;
-    /// `PROC_PIDPATHINFO_MAXSIZE` from `<sys/proc_info.h>`.
-    const PATH_MAX: usize = 4 * 1024;
 
     // libproc, from libSystem — no crate needed, and no `ps` subprocess either.
     extern "C" {
         fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: i32) -> i32;
-        fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
     }
 
-    /// The file name of our own executable, which is what a peer is recognised
-    /// by. Taken from the running binary rather than hardcoded, so a renamed
-    /// copy still recognises itself and an unrelated `recast` does not.
-    fn our_name() -> String {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "recast".to_string())
-    }
-
-    /// The executable behind `pid`, or `None` if there is no such process or it
-    /// belongs to another user — `proc_pidpath` refuses those, which is the
-    /// ownership check the Linux side has to make explicitly.
-    fn exe_of(pid: u32) -> Option<String> {
-        let mut buf = vec![0u8; PATH_MAX];
-        let written = unsafe {
-            proc_pidpath(pid as i32, buf.as_mut_ptr() as *mut c_void, PATH_MAX as u32)
-        };
-        if written <= 0 {
-            return None;
-        }
-        buf.truncate(written as usize);
-        String::from_utf8(buf).ok()
-    }
-
+    /// Whether `pid` is another copy of us.
+    ///
+    /// Asked of `crate::daemon`, which is where the same question is answered
+    /// for the stop path — and where Linux has always answered it, so both
+    /// targets are now arranged the same way. It was duplicated here while the
+    /// pidfile was Linux-only and there was nothing on macOS to share with.
     fn is_ours(pid: u32) -> bool {
-        exe_of(pid)
-            .and_then(|path| {
-                std::path::Path::new(&path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-            })
-            .is_some_and(|name| name == our_name())
+        crate::daemon::is_our_process(pid)
     }
 
     pub fn peers() -> Vec<u32> {
