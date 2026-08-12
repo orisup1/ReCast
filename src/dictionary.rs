@@ -185,9 +185,15 @@ pub const fn he_freq() -> Freq {
     Freq::new(include_str!(concat!(env!("OUT_DIR"), "/he_freq.blob")))
 }
 
+/// Whether to log every word check and switch decision.
+///
+/// `RECAST_DEBUG=0` used to mean *on* — the flag was presence-only, as an
+/// environment variable can afford to be. It goes through the same reader as
+/// every other switch now, because `debug = false` sitting in a config file and
+/// turning logging on would be indefensible.
 fn debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("RECAST_DEBUG").is_some())
+    *FLAG.get_or_init(|| crate::config::flag("RECAST_DEBUG", false))
 }
 
 /// Missing-space split correction is opt-in. It can only ever fire when the

@@ -152,7 +152,7 @@ pub struct Injection {
 /// The per-key gaps are macOS's, because macOS is the only platform that paces
 /// keys at all; the other two leave them unread rather than pretend to a
 /// different value.
-const DEFAULTS: Injection = Injection {
+pub const DEFAULTS: Injection = Injection {
     press_gap: Duration::from_micros(700),
     inter_key_gap: Duration::from_micros(700),
     settle: Duration::from_millis(1),
@@ -186,7 +186,9 @@ const DEFAULTS: Injection = Injection {
     batch_gap: Duration::from_micros(500),
 };
 
-/// Environment overrides, all in microseconds:
+/// Overrides, all in microseconds, from the environment or `config.toml` (see
+/// [`crate::settings`]) — the file names them without the `RECAST_` prefix and
+/// in lowercase, so `RECAST_INJECT_BATCH_GAP` is `inject_batch_gap`:
 ///
 /// * `RECAST_INJECT_PRESS_GAP`
 /// * `RECAST_INJECT_KEY_GAP`
@@ -195,10 +197,17 @@ const DEFAULTS: Injection = Injection {
 /// * `RECAST_INJECT_TERM_TIMEOUT`
 /// * `RECAST_INJECT_HELD_POLL`
 /// * `RECAST_INJECT_DEVICE_SETTLE`
+/// * `RECAST_INJECT_LAYOUT_CONFIRM`
+/// * `RECAST_INJECT_LAYOUT_POLL`
+/// * `RECAST_INJECT_BATCH_GAP`
 ///
 /// Microseconds rather than milliseconds because the interesting range for the
 /// first two is below a millisecond, and an integer setting whose useful values
 /// are all `0` is not a setting.
+///
+/// The same ten names are listed in `config::NUMERIC_KEYS` (so a typoed value
+/// is complained about rather than silently ignored) and in `main`'s `--help`.
+/// A test in `config` keeps the three lists in step.
 pub fn injection() -> &'static Injection {
     static POLICY: std::sync::OnceLock<Injection> = std::sync::OnceLock::new();
     POLICY.get_or_init(|| Injection {
@@ -261,8 +270,7 @@ const _: () = {
 /// legitimate thing to want to measure, and on a platform that batches its
 /// events it is very likely correct.
 fn micros(key: &str, default: Duration) -> Duration {
-    std::env::var(key)
-        .ok()
+    crate::settings::get(key)
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_micros)
         .unwrap_or(default)

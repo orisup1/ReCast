@@ -11,21 +11,22 @@
 // when started by a background service / LaunchAgent whose stdout has no TTY.
 mod banner;
 mod complete;
+mod config;
+mod daemon;
 mod dictionary;
 mod footprint;
-mod instance;
 #[cfg(target_os = "linux")]
 mod gui;
+mod instance;
 mod keymap;
 mod layout;
 mod notify;
 mod platform;
 mod prefs;
+mod settings;
 mod spell;
 mod timing;
 mod types;
-mod config;
-mod daemon;
 // The terminal dashboard is Linux/Windows only: on macOS the event tap owns the
 // main run loop, so `--gui` is refused there and the whole module would be dead
 // code — which is what it was, warning about itself on every macOS build.
@@ -52,10 +53,22 @@ Options:
                     new ReCast replaces the old one — two at once correct every
                     word twice)
       --status      Print what is running and what is configured, then exit
+      --write-config  Write a commented config.toml with every setting in it
+                    (never overwrites an existing one), then exit
   -v, --version     Print the version and exit
   -h, --help        Show this help
 
-Environment:
+Settings:
+  Everything below can be set two ways: as the environment variable named
+  here, or in <config dir>/recast/config.toml as `key = value` with the
+  RECAST_ prefix dropped and the name lowercased — RECAST_SPELL_DIST is
+  `spell_dist`. The environment wins where both are set. Run
+  `recast --write-config` to get a commented file with all of them in it.
+
+  A service manager starts ReCast on every platform and none of them pass
+  the shell environment through, so the file is the one that works when
+  ReCast is started the way it is meant to be.
+
   RECAST_DEBUG=1      Print every word check and switch decision
   RECAST_SPLIT=1      Enable the opt-in missing-space split fallback
   RECAST_SHORT=0      Never auto-switch on short (≤3 char) words
@@ -79,6 +92,9 @@ scrambled, or if you want them faster and are willing to measure):
                                 until you do
   RECAST_INJECT_HELD_POLL=n     How often those waits re-check
   RECAST_INJECT_DEVICE_SETTLE=n Injector device detection at startup (Linux)
+  RECAST_INJECT_LAYOUT_CONFIRM=n  Longest wait for a layout switch to take
+                                effect before the correction is given up on
+  RECAST_INJECT_LAYOUT_POLL=n   How often that confirmation re-checks
   RECAST_INJECT_BATCH_GAP=n     Between writes of a correction (Linux); 0 sends
                                 it as one write, which risks the kernel dropping
                                 the end of long words
@@ -99,9 +115,11 @@ Undo (Ctrl tapped twice, quickly):
   gesture has nothing to act on.
 
 Your files (<config dir>/recast/):
+  config.toml `key = value` per line, everything under Settings above
   abbrev.txt  `abbr = expansion` per line
   ignore.txt  one word per line, never corrected
-  Both are re-read within a couple of seconds of being edited — no restart.";
+  The two lists are re-read within a couple of seconds of being edited;
+  config.toml is read once, so a change to it takes a restart.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -119,6 +137,19 @@ fn main() {
             "--keep-others" => keep_others = true,
             "--status" => {
                 print_status();
+                return;
+            }
+            "--write-config" => {
+                match settings::write_sample() {
+                    Ok(path) => {
+                        println!("Wrote {}", path.display());
+                        println!("Every setting is in there, commented out, showing its default.");
+                    }
+                    Err(why) => {
+                        eprintln!("{why}");
+                        process::exit(1);
+                    }
+                }
                 return;
             }
             "-v" | "-V" | "--version" => {
@@ -162,15 +193,15 @@ fn main() {
         return;
     }
 
-// Windows release builds run as a GUI-subsystem app with no console, so
-// reattach the launching terminal's console first — otherwise stdout is not a
-// TTY and the banner never prints. No-op when launched without a parent console.
-#[cfg(target_os = "windows")]
-platform::windows::attach_parent_console();
+    // Windows release builds run as a GUI-subsystem app with no console, so
+    // reattach the launching terminal's console first — otherwise stdout is not
+    // a TTY and the banner never prints. No-op without a parent console.
+    #[cfg(target_os = "windows")]
+    platform::windows::attach_parent_console();
 
-if banner::ran_from_terminal() {
-  banner::print_logo();
-}
+    if banner::ran_from_terminal() {
+        banner::print_logo();
+    }
 
     // Before anything is opened or listened on: an old instance still holding
     // its injector and its device threads would correct every word alongside
@@ -179,7 +210,15 @@ if banner::ran_from_terminal() {
         clear_the_way();
     }
 
-    let cfg = config::Config::from_env();
+    // Every complaint the settings raise is about something the user wrote and
+    // ReCast could not use. Printed here rather than only under `--status`,
+    // because a daemon launched at login is one nobody runs `--status` on until
+    // they have already spent a while wondering why their setting did nothing.
+    for complaint in config::complaints() {
+        eprintln!("Warning: {complaint}");
+    }
+
+    let cfg = config::Config::load();
     let en = en_dict();
     let he = he_dict();
     // The switch is remembered across restarts: someone who turned correction
@@ -281,6 +320,13 @@ fn print_status() {
         Some(dir) => println!("  config dir:     {}", dir.display()),
         None => println!("  config dir:     (none — no OS config directory)"),
     }
+    // Whether the file exists is the first thing to check when a setting in it
+    // did nothing, and the most likely answer is that it is somewhere else.
+    match settings::file_path() {
+        Some(path) if path.exists() => println!("  config.toml:    {}", path.display()),
+        Some(path) => println!("  config.toml:    none ({} — --write-config makes one)", path.display()),
+        None => println!("  config.toml:    (none — no OS config directory)"),
+    }
     let (abbrevs, ignored) = complete::list_counts();
     println!("  abbrev.txt:     {abbrevs} abbreviation(s)");
     println!("  ignore.txt:     {ignored} word(s)");
@@ -297,8 +343,8 @@ fn print_status() {
     // reported, so someone who set RECAST_SPELL_DIST had no way to confirm it
     // had been read — least of all when the value was a typo and had silently
     // fallen back to the default.
-    let cfg = config::Config::from_env();
-    println!("\n  settings (with any RECAST_* override applied):");
+    let cfg = config::Config::load();
+    println!("\n  settings (config.toml and RECAST_* applied):");
     println!("    short words          {}", on_off(cfg.short_enabled));
     println!("    missing-space split  {}", on_off(cfg.split_enabled));
     println!("    frequency tie-break  {}", on_off(cfg.freq_enabled));
@@ -316,7 +362,7 @@ fn print_status() {
         cfg.complete_max_rank,
     );
 
-    for complaint in config::env_complaints() {
+    for complaint in config::complaints() {
         eprintln!("\n  ! {complaint}");
     }
 }

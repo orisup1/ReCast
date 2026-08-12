@@ -219,11 +219,12 @@ recast 0.7.0
   correction:     enabled
   start at login: yes
   config dir:     /home/you/.config/recast
+  config.toml:    /home/you/.config/recast/config.toml
   abbrev.txt:     3 abbreviation(s)
   ignore.txt:     7 word(s)
   memory (this):  8.9 MB
 
-  settings (with any RECAST_* override applied):
+  settings (config.toml and RECAST_* applied):
     short words          on
     missing-space split  off
     frequency tie-break  on
@@ -245,6 +246,35 @@ The **TUI** (`-g`, Linux/Windows) shows the enabled state, the fixed-word counte
 live log; press `e` or `Space` to toggle correction on and off, and `q` to quit. The
 **control window** (`-w`) offers the same toggle and counter in a small GUI window. On
 macOS, use the menubar menu instead.
+
+### config.toml
+
+Every setting can be written down instead of exported. `recast --write-config`
+creates `<config dir>/recast/config.toml` with all of them in it, commented out
+and showing their defaults; uncomment what you want to change:
+
+```toml
+spell_dist = 1        # cap the autocorrect at single-edit typos
+complete_min = 4      # shortest prefix Right Shift will complete
+inject_batch_gap = 0  # send a correction as one write (Linux)
+```
+
+The keys are the environment names with `RECAST_` dropped and the rest
+lowercased — `RECAST_SPELL_DIST` is `spell_dist` — and the environment still
+wins where both are set. It is a flat `key = value` file with `#` comments: a
+subset of TOML, so an editor's TOML mode works, but there are no tables and no
+arrays because every setting here is a bool or a number.
+
+**This is the one that works under a service.** ReCast is started by systemd,
+launchd or a Scheduled Task on the three platforms, none of which pass your
+shell environment through — so a `RECAST_*` variable set in `.bashrc` reaches
+a hand-launched ReCast and nothing else. The file is read whichever way it
+started.
+
+Unlike `abbrev.txt` and `ignore.txt`, it is read once, at startup: changing it
+takes a restart. Anything in it that ReCast could not use — a misspelled key, a
+line with no `=`, a number that is not a number — is named at startup and again
+under `--status`, rather than being ignored in silence.
 
 ### Environment variables
 
