@@ -88,14 +88,25 @@ jobs:
       # bundle` builds it out of the release binary, a generated Info.plist and
       # assets/recast.icns. The universal binary replaces the single-arch one
       # `make bundle` staged, so the bundle ships both slices too.
-      - name: Assemble the .app bundle
+      - name: Assemble and sign the .app bundle
         run: |
           set -euo pipefail
           make bundle
           install -m 755 recastMac exec/ReCast.app/Contents/MacOS/recast
+          # Signing has to happen *after* the universal binary replaces the one
+          # `make bundle` staged and signed, and before the zip: a signature
+          # covers the bundle's contents, so swapping the executable under it
+          # invalidates it, and an invalid or missing signature is what makes a
+          # downloaded build announce itself as damaged.
+          make sign
+          # The bare binary is a separate download and needs its own signature
+          # for the same reason; `lipo` writes a fat file that carries none.
+          codesign --force --sign - --timestamp=none recastMac
+          codesign --verify --strict recastMac
           # A .zip, not a bare directory: a bundle uploaded file-by-file
           # arrives as a folder and loses the executable bit. `ditto` keeps the
-          # macOS metadata that makes it launchable.
+          # macOS metadata that makes it launchable — and the _CodeSignature
+          # directory the signature lives in.
           ditto -c -k --sequesterRsrc --keepParent exec/ReCast.app ReCast.app.zip
 
       - uses: actions/upload-artifact@v4

@@ -124,6 +124,40 @@ refresh, permanently — a release asset can be replaced, a git object cannot. `
 still where a local `make bundle` stages the macOS `.app`, but nothing in it is tracked.
 Building yourself is still the recommended path; these exist so you can try it in one step.
 
+#### macOS: "ReCast is damaged and can't be opened"
+
+If you see this, nothing is damaged. macOS attaches a `com.apple.quarantine` flag to
+anything that arrives from a browser, an AirDrop, a zip or a USB stick, and Gatekeeper
+then judges the download by its code signature. A build with **no** signature comes back
+as *damaged* rather than as *unsigned* — the same misleading wording either way. The
+machine that built it never sees this, because files it produced itself are not
+quarantined; that is why the message appears only on the other side of a transfer,
+including a transfer back to the machine the build came from.
+
+The downloads are ad-hoc signed, which is enough to clear that. Because the signature
+carries no Apple-issued certificate, macOS still asks once before the first launch —
+right-click the app → **Open**, or *System Settings → Privacy & Security → Open Anyway*.
+For the bare `recastMac` binary, or if you would rather skip the prompt:
+
+```bash
+xattr -dr com.apple.quarantine ReCast.app     # or: recastMac
+```
+
+Building it yourself sidesteps all of this, since a local build is never quarantined.
+`make bundle` ad-hoc signs the bundle it assembles; `make notarize
+CODESIGN_ID="Developer ID Application: …"` produces one that opens with no prompt at all,
+which needs a paid Apple Developer account.
+
+To move a build you made to another Mac, use **`make dist`** rather than compressing
+`exec/ReCast.app` by hand. A `.app` is a directory, and its signature depends on the exact
+file layout and modes inside it; most zip tools and most non-APFS filesystems do not
+preserve them, and a bundle whose signature no longer matches its contents is reported as
+damaged in the same words as one with no signature at all. `make dist` verifies the
+signature and packages it with `ditto`, which keeps that structure intact. That is also the only way ReCast's Input
+Monitoring and Accessibility grants survive an upgrade: macOS keys them to the signature,
+and an ad-hoc signature is a fresh identity on every build, so each new version has to be
+granted permission again.
+
 The English and Hebrew dictionaries are baked into the binary at compile time, so the
 executable is self-contained and runs identically from any working directory — no data
 files or wrapper scripts to install. They are baked in *sorted*, so a lookup is a binary

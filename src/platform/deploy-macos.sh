@@ -77,6 +77,24 @@ echo "==> Installing to $INSTALL_DIR/$APP_NAME"
 $SUDO rm -rf "${INSTALL_DIR:?}/$APP_NAME"
 $SUDO ditto "$SRC_BUNDLE" "$INSTALL_DIR/$APP_NAME"
 
+# ─── 3a. Clear quarantine, confirm the signature ─────────────────────────────
+# A locally built bundle is not normally quarantined, but the ingredients can
+# be: unpack the repository from a downloaded .zip and every file in it —
+# assets/recast.icns included — carries com.apple.quarantine, which then rides
+# into the bundle on the copy. Gatekeeper judges the bundle by the flag, and an
+# app it will not vouch for is reported as "damaged", not as unsigned. Stripping
+# the flag from a bundle we just built ourselves costs nothing and removes the
+# whole class of failure.
+$SUDO xattr -dr com.apple.quarantine "$INSTALL_DIR/$APP_NAME" 2>/dev/null || true
+
+# The signature is what makes this bundle survive a trip to another machine, so
+# a broken one is worth hearing about here rather than over there.
+if ! codesign --verify --strict "$INSTALL_DIR/$APP_NAME" 2>/dev/null; then
+    echo "    warning: the installed bundle has no valid signature." >&2
+    echo "    It will run here but report itself damaged if you copy it elsewhere." >&2
+    echo "    Re-run 'make bundle' to sign it." >&2
+fi
+
 # ─── 4. Reset the privacy grants ─────────────────────────────────────────────
 # Non-fatal: tccutil exits non-zero when the bundle id has no records yet, which
 # is exactly the state a first install is in and is not a problem.
