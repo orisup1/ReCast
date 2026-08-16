@@ -167,6 +167,29 @@ impl Backend {
         }
     }
 
+    /// A stream that yields once every time the session changes the layout, or
+    /// `None` when this backend has no way to say so and polling is all there
+    /// is.
+    ///
+    /// Nothing about *which* layout is carried: the watcher asks in the ordinary
+    /// way once it is told there is something to ask about. That keeps the
+    /// per-backend part down to "recognise an interesting line", instead of four
+    /// more payload formats to parse, and it is what moves the query off the
+    /// thread a correction is waiting on.
+    fn subscribe(self) -> Option<Signals> {
+        match self {
+            Backend::Hyprland => hypr::subscribe(),
+            Backend::Sway => sway::subscribe(),
+            Backend::Kde => kde::subscribe(),
+            Backend::Gnome => gnome::subscribe(),
+            // XKB does have a change event (`XkbStateNotify`), but this backend
+            // already answers over a connection it keeps open, so the query it
+            // would save costs a round trip rather than a process — the poll it
+            // would replace is the cheap one.
+            Backend::X11 | Backend::None => None,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Backend::Hyprland => "Hyprland (control socket)",
@@ -256,6 +279,121 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
         }
         crate::timing::pause(gaps.layout_poll);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Watching for a layout change, instead of asking whether there has been one
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A stream of "the layout just changed" signals. Blocking: the thread reading
+/// one has nothing else to do.
+type Signals = Box<dyn Iterator<Item = ()> + Send>;
+
+/// Follow the session's own layout-change notifications and keep the cache
+/// current, so a correction never has to ask.
+///
+/// This is the other half of [`crate::layout::invalidate`], and the more
+/// general one: the hotkey guess catches the user pressing a key combination,
+/// while this catches every change however it was made — a click in the tray, a
+/// `swaymsg` from a script, another application's own switch.
+///
+/// It also takes the *cost* off the correction path. GNOME and KDE answer
+/// through a subprocess, so a cache miss at the end of a word used to mean a
+/// fork and an exec before the word could be corrected; now the fork happens
+/// here, on a thread nobody is waiting on, and only when something has actually
+/// changed.
+///
+/// Failure is quiet and safe by construction. A backend with no subscription, a
+/// compositor that restarts and closes the socket, a `gsettings` that is not
+/// there — all of them end this thread, and what is left is the 300 ms cache
+/// that was the whole story before. Nothing here is load-bearing.
+pub fn spawn_watcher() {
+    let spawned = std::thread::Builder::new()
+        .name("recast-layout".into())
+        .spawn(watch_forever);
+    if spawned.is_err() {
+        eprintln!("Could not start the layout watcher — layout changes will be picked up within 300 ms instead.");
+    }
+}
+
+fn watch_forever() {
+    let Some(signals) = backend().subscribe() else {
+        return;
+    };
+    for () in signals {
+        // Ask in the ordinary way. The cache is not consulted on this path —
+        // `query_layout` goes straight to the backend — so this is the fresh
+        // answer, taken at the one moment it is known to have changed.
+        if let Some(lang) = query_layout() {
+            set_layout_cache(lang);
+        }
+    }
+}
+
+/// A signal stream built out of lines of text, which is what three of the four
+/// sources are: two of them a subprocess's stdout, one a compositor socket.
+struct Lines<R> {
+    lines: std::io::Lines<R>,
+    /// Whether a line means the layout changed. The rest are the other traffic
+    /// on the same stream — a `gdbus monitor` reports every signal the
+    /// destination emits, and Hyprland's event socket carries thirty-odd event
+    /// kinds we have no interest in.
+    interesting: fn(&str) -> bool,
+    /// The process behind `lines`, when there is one, kept alive as long as it
+    /// is being read.
+    _child: Option<std::process::Child>,
+}
+
+impl<R: std::io::BufRead> Iterator for Lines<R> {
+    type Item = ();
+
+    fn next(&mut self) -> Option<()> {
+        loop {
+            // A read error ends the stream rather than spinning on it: the
+            // socket is gone, or the child died, and neither gets better by
+            // being read again.
+            let line = self.lines.next()?.ok()?;
+            if (self.interesting)(&line) {
+                return Some(());
+            }
+        }
+    }
+}
+
+impl<R: std::io::BufRead + Send + 'static> Lines<R> {
+    fn stream(
+        reader: R,
+        interesting: fn(&str) -> bool,
+        child: Option<std::process::Child>,
+    ) -> Signals {
+        Box::new(Lines {
+            lines: reader.lines(),
+            interesting,
+            _child: child,
+        })
+    }
+}
+
+/// Start `bin args…` with its stdout piped, for the two backends whose
+/// notifications come from a command rather than a socket.
+///
+/// stderr goes to `/dev/null`: this is a best-effort background watch, and a
+/// client complaining on a session without the service would otherwise print
+/// into whatever the daemon's stderr happens to be.
+fn watch_command(bin: &str, args: &[&str], interesting: fn(&str) -> bool) -> Option<Signals> {
+    let mut child = std::process::Command::new(bin)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    Some(Lines::stream(
+        std::io::BufReader::new(stdout),
+        interesting,
+        Some(child),
+    ))
 }
 
 /// Our own injector, which must never be mistaken for a keyboard the user
@@ -464,6 +602,31 @@ mod hypr {
         parse_names(&devices()?)
     }
 
+    /// Whether an event-socket line is a layout change on a keyboard the user
+    /// types on.
+    ///
+    /// The line is `activelayout>>KEYBOARD,LAYOUT`, and our own injector emits
+    /// one of these every time a correction switches the layout — which is a
+    /// change we made rather than one to react to, and already in the cache.
+    pub fn is_layout_event(line: &str) -> bool {
+        line.starts_with("activelayout>>") && !line.contains(INJECTOR)
+    }
+
+    /// Hyprland's second socket, which pushes events rather than answering
+    /// questions. Same directory as the control socket, so it is found by the
+    /// same probe.
+    pub fn subscribe() -> Option<super::Signals> {
+        let path = socket_path()?.parent()?.join(".socket2.sock");
+        // No read timeout, unlike `request`: waiting is the whole job here, and
+        // a timeout would end the stream on the first quiet quarter-second.
+        let stream = UnixStream::connect(path).ok()?;
+        Some(super::Lines::stream(
+            std::io::BufReader::new(stream),
+            is_layout_event,
+            None,
+        ))
+    }
+
     pub fn set_index(index: usize) -> bool {
         if available() {
             // Hyprland answers "ok" and nothing else on success.
@@ -505,6 +668,7 @@ mod sway {
 
     const MAGIC: &[u8; 6] = b"i3-ipc";
     const RUN_COMMAND: u32 = 0;
+    const SUBSCRIBE: u32 = 2;
     const GET_INPUTS: u32 = 100;
     const IO_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -527,21 +691,22 @@ mod sway {
         socket_path().is_some()
     }
 
-    fn request(kind: u32, payload: &str) -> Option<String> {
-        let mut stream = UnixStream::connect(socket_path()?).ok()?;
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-
+    fn send(stream: &mut UnixStream, kind: u32, payload: &str) -> Option<()> {
         let mut message = Vec::with_capacity(14 + payload.len());
         message.extend_from_slice(MAGIC);
         message.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
         message.extend_from_slice(&kind.to_ne_bytes());
         message.extend_from_slice(payload.as_bytes());
-        stream.write_all(&message).ok()?;
+        stream.write_all(&message).ok()
+    }
 
-        // The header is fixed-width, and the length in it is what says how much
-        // more to read — a `read_to_string` here would block until sway closed
-        // the connection, which it does not do between messages.
+    /// Read one whole message off the stream.
+    ///
+    /// The header is fixed-width and the length in it is what says how much more
+    /// to read — a `read_to_string` here would block until sway closed the
+    /// connection, which it does not do between messages. Shared with the event
+    /// stream, where that property is the point rather than a hazard.
+    fn recv(stream: &mut UnixStream) -> Option<String> {
         let mut header = [0u8; 14];
         stream.read_exact(&mut header).ok()?;
         if &header[..6] != MAGIC {
@@ -551,6 +716,53 @@ mod sway {
         let mut body = vec![0u8; len];
         stream.read_exact(&mut body).ok()?;
         String::from_utf8(body).ok()
+    }
+
+    fn request(kind: u32, payload: &str) -> Option<String> {
+        let mut stream = UnixStream::connect(socket_path()?).ok()?;
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        send(&mut stream, kind, payload)?;
+        recv(&mut stream)
+    }
+
+    /// A connection of its own, subscribed to input events.
+    ///
+    /// It has to be a second connection: this one blocks forever waiting to be
+    /// told something, and the one `request` uses has a timeout because a
+    /// correction is waiting on it.
+    pub fn subscribe() -> Option<super::Signals> {
+        let mut stream = UnixStream::connect(socket_path()?).ok()?;
+        send(&mut stream, SUBSCRIBE, "[\"input\"]")?;
+        // sway replies to the subscription itself before any event; reading it
+        // here keeps the iterator's messages aligned with actual events.
+        let reply = recv(&mut stream)?;
+        if !reply.contains("\"success\": true") && !reply.contains("\"success\":true") {
+            return None;
+        }
+        Some(Box::new(Events { stream }))
+    }
+
+    /// Input events, narrowed to the ones that are layout changes.
+    ///
+    /// Everything about a keyboard or a pointer arrives on this subscription —
+    /// devices added and removed, pointer settings, key repeat rates — and the
+    /// payload names which it is.
+    struct Events {
+        stream: UnixStream,
+    }
+
+    impl Iterator for Events {
+        type Item = ();
+
+        fn next(&mut self) -> Option<()> {
+            loop {
+                let body = recv(&mut self.stream)?;
+                if body.contains("xkb_layout") {
+                    return Some(());
+                }
+            }
+        }
     }
 
     /// The keyboard entries of a `GET_INPUTS` reply, our own injector left out.
@@ -760,6 +972,25 @@ mod kde {
         parse_names(&call("getLayoutsList", None)?)
     }
 
+    /// Plasma emits `layoutChanged` on the same interface it answers questions
+    /// on, so the change can be followed instead of polled for.
+    ///
+    /// `gdbus` only. `busctl` and `qdbus` can both call a method, which is why
+    /// they are accepted above, but neither prints a signal stream in a shape
+    /// worth parsing — and a session that has one of them and not gdbus simply
+    /// keeps the cache it had before.
+    pub fn subscribe() -> Option<super::Signals> {
+        let (bin, style) = *client()?;
+        if !matches!(style, Style::Gdbus) {
+            return None;
+        }
+        super::watch_command(
+            bin,
+            &["monitor", "--session", "--dest", "org.kde.keyboard"],
+            |line| line.contains("layoutChanged"),
+        )
+    }
+
     pub fn current_index() -> Option<usize> {
         // `getLayout` returns the index; `uint32` in the reply would be read as
         // the number by a naive scan, which is why the type prefix is stripped
@@ -822,6 +1053,19 @@ mod gnome {
 
     pub fn names() -> Option<Vec<String>> {
         parse_names(&get("sources")?)
+    }
+
+    /// `gsettings monitor` prints a line every time the key is written, and
+    /// keeps running until it is killed — one process for the life of the
+    /// daemon, in place of one per word that misses the cache.
+    pub fn subscribe() -> Option<super::Signals> {
+        super::watch_command(
+            "gsettings",
+            &["monitor", "org.gnome.desktop.input-sources", "current"],
+            // Every line is about the key we asked to be told about, so the only
+            // thing to exclude is the blank one at the end.
+            |line| !line.trim().is_empty(),
+        )
     }
 
     pub fn current_index() -> Option<usize> {
@@ -1147,6 +1391,22 @@ mod tests {
             hypr::parse_names(DEVICES),
             Some(vec!["us".to_string(), "il".to_string()])
         );
+    }
+
+    #[test]
+    fn only_a_layout_change_on_a_real_keyboard_wakes_the_watcher() {
+        // The event socket carries every kind of event Hyprland emits; the
+        // watcher re-queries on each signal, so anything else is a wasted query.
+        assert!(hypr::is_layout_event(
+            "activelayout>>at-translated-set-2-keyboard,Hebrew"
+        ));
+        assert!(!hypr::is_layout_event("workspace>>2"));
+        assert!(!hypr::is_layout_event("openwindow>>a1b2,1,kitty,shell"));
+        // Our own injector switching layouts is a change we just made, and it
+        // is already in the cache.
+        assert!(!hypr::is_layout_event(&format!(
+            "activelayout>>{INJECTOR},Hebrew"
+        )));
     }
 
     // ── sway ─────────────────────────────────────────────────────────────────

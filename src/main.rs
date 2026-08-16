@@ -233,6 +233,9 @@ fn main() {
     let control = Arc::new(types::AppControl::new_with_config_and_state(cfg, enabled));
     // Pick up edits to abbrev.txt / ignore.txt without a restart.
     complete::spawn_watcher();
+    // …and layout changes made by hand, as they happen rather than within the
+    // cache's 300 ms.
+    layout::spawn_watcher();
 
     #[cfg(not(target_os = "linux"))]
     if with_window {

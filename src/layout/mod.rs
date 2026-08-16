@@ -42,6 +42,18 @@ pub use windows::switch_layout_to;
 #[cfg(target_os = "linux")]
 pub use linux::describe_backend;
 
+/// Follow the session's layout-change notifications, where it has any.
+///
+/// Linux only, and only for the backends that can push: it is the one platform
+/// where asking can mean a subprocess, and the one where the answer comes from
+/// something other than the OS. macOS and Windows both answer from a library
+/// call cheap enough that the cache alone is the whole of the optimisation.
+#[cfg(target_os = "linux")]
+pub use linux::spawn_watcher;
+
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_watcher() {}
+
 #[cfg(not(target_os = "linux"))]
 pub fn describe_backend() -> String {
     // macOS and Windows each have exactly one way to do this, and it is part of
