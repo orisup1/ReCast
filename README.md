@@ -26,10 +26,16 @@ merely misspelled gets fixed in place instead — and completes words you are st
   punctuation *inside* a word stays part of it (`don't`).
 - It **anchors on your live keyboard layout** (queried from the OS, with any English or
   Hebrew regional variant recognised). A sequence that already reads as a real word in your
-  current layout is left untouched — including prefixed Hebrew forms (ו/ה/ל/ב/כ/מ/ש) and
-  words whose other-layout reading happens to also be a dictionary word. It only switches
-  when the *other* layout yields a confident word and the current one yields nothing real.
+  current layout is left untouched — including prefixed Hebrew forms, one prefix or two
+  where Hebrew genuinely stacks them (`והבית`, `כשבית`, `שהשלום`), and words whose
+  other-layout reading happens to also be a dictionary word. It only switches when the
+  *other* layout yields a confident word and the current one yields nothing real.
   This is what stops valid (and nested/prefixed) words from being mangled.
+- It **reads the words around the one it is deciding**. Language comes in runs — nobody
+  writes one Hebrew word between two English ones — so a key sequence that is a real word
+  in *both* layouts, which no amount of dictionary work can resolve on its own, is settled
+  by what you were writing a moment ago. The run only ever tips a genuine tie; it can never
+  make ReCast switch on a reading that is not a word at all.
 - On a switch it erases the mistyped word and puts the corrected one back **in one shot**,
   the way a paste lands rather than the way typing does — followed by the original
   Space/Enter. On macOS and Windows the word is inserted as text in a single event, so it
@@ -98,6 +104,17 @@ survivable.
 If the probe guesses wrong, `layout_backend` in `config.toml` (or
 `RECAST_LAYOUT_BACKEND`) forces one: `hyprland`, `sway`, `kde`, `gnome`, `x11`
 or `none`.
+
+Four of the five are also *watched* rather than only asked: Hyprland's event
+socket, sway's i3-IPC `input` subscription, `gsettings monitor` on GNOME and
+`gdbus monitor` on KDE all say when the layout changes, so the answer is already
+in hand by the time a word ends. That matters most for GNOME and KDE, where
+asking means a subprocess — it now happens on a thread nobody is waiting on, and
+only when something has actually changed. X11 keeps polling, because it answers
+over a connection ReCast already holds open and the query it would save costs a
+round trip rather than a process. ReCast also drops its cached answer whenever
+you release something shaped like a layout hotkey (two modifiers, or a modifier
+with space, or Caps Lock), so a hand-switched layout is never one word behind.
 
 ReCast used to support Hyprland alone, and hardcoded *layout 0 is English,
 layout 1 is Hebrew* — so anyone with a third layout got switched into it, and
@@ -389,7 +406,12 @@ trigger on their own).
 Short words are the most collision-prone (many 2–3 letter abbreviations are
 valid in one dictionary while spelling a real word in the other layout), so
 `RECAST_SHORT=0` is the knob to reach "never wrongly switch" at the cost of
-not fixing short mistyped words.
+not fixing short mistyped words. It is not a bare length cutoff: length was only
+ever standing in for "probably an accidental dictionary hit", and the frequency
+lists answer that directly. So even with the gate on, a short reading that is one
+of the 500 most common words in its language — `the`, `של`, `זה` — still
+switches, because those are the short words people actually mistype the layout
+of rather than the collisions the gate is for.
 
 ## English autocorrect
 
@@ -410,12 +432,24 @@ word is only corrected when all of this holds:
   survive (the punctuation you *ended* the word with is set aside first, and
   typed back with the correction),
 - it is not typed in ALL CAPS — acronyms are not misspellings,
-- it is not listed in your own `ignore.txt` (see below),
+- it is not listed in your own `ignore.txt`, and not a word you have taken the
+  same correction back from twice (see [Undo](#undo)),
 - the correction is inside the edit budget for a word that length: one edit up to
   6 characters, two from 7, three from 10, capped by `RECAST_SPELL_DIST`
   (default 3 — set it to 1 for single-typo fixes only),
 - the correction is a common word, within `RECAST_SPELL_RANK` (default 20000),
-  halved past one edit and divided by five past two.
+  halved past one edit and divided by five past two — except for a word of 9
+  characters or more whose two edits were both the *cheap*, well-explained kind
+  (a doubled letter, a neighbouring key, a spelling confusion people share),
+  which keeps the full budget.
+
+That last exception is what the corpus asked for. `occurance` → `occurrence` is a
+doubled letter and a known suffix confusion, and `occurrence` sits at rank 19205
+— just outside the halved budget, so the obvious fix used to be declined.
+`restaraunt` reaches `restraint` (rank 14085) in the same band and the same
+number of edits, but by moving letters that were not wrong, and it is not the
+word anyone meant. Length alone cannot tell those apart; what the edits *were*
+can, which is why the exception is conditioned on both.
 
 ### How it picks
 
@@ -471,10 +505,15 @@ range. It is also what lets a phonetic respelling be found at all — `fisical` 
 
 Edits are priced by *where* in the word they land, too. Getting the opening of a
 word wrong is rare and rewriting it is the most damaging thing this can do, so a
-first-letter edit carries a heavy surcharge and a plain wrong first letter is out
-of reach entirely — with two exceptions, both of which keep the letters you
-typed: a transposed opening (`hte` → `the`) and a word-initial spelling rule
-(`fone` → `phone`).
+first-letter edit carries a heavy surcharge and a first letter from the other
+side of the keyboard is out of reach entirely. Three things can still reach an
+opening, and all three are events rather than guesses: a transposed opening
+(`hte` → `the`), a word-initial spelling rule (`fone` → `phone`), and the key
+physically *next to* the one meant (`vecause` → `because`, `fovernment` →
+`government`). The last of those costs the neighbouring-key price plus the
+first-letter surcharge, which needs a two-edit budget — so it only ever happens
+to a word long enough to afford one, and never to the short tokens that are
+overwhelmingly names.
 
 Together that is what makes badly mangled words reachable — `recieveing` →
 `receiving`, `beutifull` → `beautiful`, `maintainance` → `maintenance`,
@@ -489,11 +528,14 @@ per line; set `RECAST_SPELL_DIST=1` for the old single-edit behaviour; or
 `RECAST_SPELL=0` to turn the pipeline off. The double-tap is also how a word
 comes *back off* either list, so nothing you retire is retired for good.
 
-What it deliberately does not do is look at the surrounding words. Every
-published evaluation of this kind of corrector puts the ceiling for single-word
-correction well below what context-aware models reach, and correcting a word that
-is *already* a real word (`from` for `form`) needs that context. ReCast never
-touches a word the dictionary knows, so it stays on the safe side of that line.
+What the *speller* deliberately does not do is look at the surrounding words.
+(The layout pipeline does — see the language run above — but that is a different
+question: which of two real words you meant, not which real word to invent.)
+Every published evaluation of this kind of corrector puts the ceiling for
+single-word correction well below what context-aware models reach, and correcting
+a word that is *already* a real word (`from` for `form`) needs that context.
+ReCast never touches a word the dictionary knows, so it stays on the safe side of
+that line.
 
 ## Auto-complete
 
@@ -561,8 +603,16 @@ Putting the letters back is only half of it. A correction is a *function* of wha
 you typed, so retyping the same word reaches the same conclusion — an undo that
 only rewrote the screen would put you on a treadmill. So undoing a word also
 **retires** it: nothing corrects that word again until ReCast restarts. That is
-the fast path for the `hostname` → `hostage` case, and `ignore.txt` is still how
-you make it permanent.
+the fast path for the `hostname` → `hostage` case.
+
+**Undo the same word twice and it stays retired**, across restarts, without your
+having to go and write anything down. Once is a reflex and is worth a session;
+twice, on two separate occasions, is a decision — the correction is not a one-off
+annoyance but something that will keep happening to a word you keep typing.
+ReCast counts undos in `<config dir>/recast/learned.txt` and stops at two, which
+reaches the same place `ignore.txt` does by hand. `recast --status` reports how
+many words are retired that way, and the un-retire gesture below clears the count
+along with everything else.
 
 A completion can be taken back the same way, though tapping Right Shift around
 the cycle gets you there without the gesture.
@@ -643,11 +693,21 @@ nothing to fetch and nothing to ask.
 The word being typed lives in memory and is dropped at every word boundary, on
 Tab / Escape / an arrow key, and on a mouse click. The recent-corrections list
 the tray and TUI show is the last 20, held in RAM and gone when the process
-exits — it is a glance, not a log, and it is never persisted. The one exception
-is `ignore.txt`, which gains a word only when you put it there yourself, by
-double-tapping Ctrl on a correction or clicking one in `Recent`. That is your
-file, in plain text, and you can read or edit it (see
-[Your files](#your-files)).
+exits — it is a glance, not a log, and it is never persisted. The exceptions are
+two files, both of which gain a word only through a deliberate gesture of yours,
+and both of which are plain text you can read, edit or delete (see
+[Your files](#your-files)):
+
+- `ignore.txt`, when you double-tap Ctrl on a correction or click one in
+  `Recent`.
+- `learned.txt`, when you undo a correction — the word you typed, and how many
+  times you have taken that correction back. Nothing else about the word is
+  recorded: not what it was corrected *to*, not when, not what surrounded it.
+
+Both grow only by your undoing or listing something, so what they contain is the
+set of words you have explicitly told ReCast to stop touching — never a
+transcript. If you would rather ReCast learned nothing, delete `learned.txt`; it
+is rewritten only at the next undo.
 
 **Your clipboard is never touched.** A corrected word is injected as synthetic
 input carrying the characters directly — `CGEventKeyboardSetUnicodeString` on
@@ -691,10 +751,12 @@ be made there.
 
 ## Your files
 
-Both are optional and absent by default — nothing is created for you. They are
-re-read within about two seconds of being edited, so adding an abbreviation and
-typing it are the same action rather than a restart apart. They live under the
-OS config directory:
+`abbrev.txt` and `ignore.txt` are yours: both optional, both absent by default —
+nothing is created for you — and both re-read within about two seconds of being
+edited, so adding an abbreviation and typing it are the same action rather than a
+restart apart. The rest of the table is ReCast's own bookkeeping, written when
+there is something to write and read at startup. Everything lives under the OS
+config directory:
 
 | OS      | Directory                               |
 | ------- | --------------------------------------- |
@@ -707,6 +769,7 @@ OS config directory:
 | `abbrev.txt` | `abbr = expansion` per line, `#` comments. Expands when you finish the word, and is offered by the first Right Shift tap. |
 | `ignore.txt` | One word per line, `#` comments. Words the autocorrect must never touch.                                                  |
 | `state.txt`  | Written by ReCast: the Enable/Disable switch, so it survives a restart.                                                   |
+| `learned.txt` | Written by ReCast: `word<TAB>count` of the corrections you have undone. Two and the word is retired for good. Editable — a bare word on a line counts as one. |
 | `welcomed`   | Written by ReCast: a marker saying the one-time hint below has been shown. Delete it to see it again.                     |
 
 `ignore.txt` is the only file of *yours* that ReCast writes. Double-tapping Ctrl on a
