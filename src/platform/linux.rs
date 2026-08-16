@@ -87,6 +87,21 @@ impl Platform for Linux {
         )
     }
 
+    fn is_modifier(key: KeyCode) -> bool {
+        matches!(
+            key,
+            KeyCode::KEY_LEFTSHIFT
+                | KeyCode::KEY_RIGHTSHIFT
+                | KeyCode::KEY_LEFTCTRL
+                | KeyCode::KEY_RIGHTCTRL
+                | KeyCode::KEY_LEFTALT
+                | KeyCode::KEY_RIGHTALT
+                | KeyCode::KEY_LEFTMETA
+                | KeyCode::KEY_RIGHTMETA
+                | KeyCode::KEY_CAPSLOCK
+        )
+    }
+
     fn english_char(key: KeyCode, shift: bool) -> Option<char> {
         evkey_to_english_char_shifted(key, shift)
     }

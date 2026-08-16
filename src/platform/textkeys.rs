@@ -51,6 +51,23 @@ pub fn is_reset(key: Key) -> bool {
     )
 }
 
+/// The modifiers, in rdev's spelling. Both sides of each, and `Alt`/`AltGr`
+/// rather than a left/right pair, because that is how rdev names them.
+pub fn is_modifier(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::Alt
+            | Key::AltGr
+            | Key::MetaLeft
+            | Key::MetaRight
+            | Key::CapsLock
+    )
+}
+
 pub fn english_char(key: Key, shift: bool) -> Option<char> {
     key_to_english_char_shifted(key, shift)
 }

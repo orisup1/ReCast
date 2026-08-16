@@ -41,6 +41,9 @@ impl Platform for MacOs {
     fn is_reset(key: Key) -> bool {
         textkeys::is_reset(key)
     }
+    fn is_modifier(key: Key) -> bool {
+        textkeys::is_modifier(key)
+    }
     fn english_char(key: Key, shift: bool) -> Option<char> {
         textkeys::english_char(key, shift)
     }

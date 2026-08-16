@@ -133,6 +133,26 @@ fn set_layout_cache(lang: Language) {
     }
 }
 
+/// Forget the cached layout, so the next question goes to the OS.
+///
+/// The cache exists because a per-word query can be a socket round trip or a
+/// subprocess, and it is right almost all of the time — our own switches update
+/// it directly, and nothing else changes the layout except the user. But the
+/// user changing it *by hand* is exactly the case the TTL handles badly: for up
+/// to [`LAYOUT_TTL`] afterwards the anchor is stale, and a stale anchor does not
+/// merely miss a correction. It decides against the wrong layout and then injects
+/// under the live one, which is the garbage the whole program exists to prevent.
+///
+/// The listener sees every keystroke, so it can see the *shape* of a
+/// layout-switch hotkey — two modifiers, or a modifier and space — and say so
+/// here. It cannot know whether that combination is bound to anything, and it
+/// does not need to: the cost of being wrong is one extra query.
+pub fn invalidate() {
+    if let Ok(mut guard) = LAYOUT_CACHE.lock() {
+        *guard = None;
+    }
+}
+
 #[cfg(target_os = "linux")]
 use linux::query_layout;
 #[cfg(target_os = "macos")]
@@ -188,6 +208,21 @@ mod tests {
         // ...and only an actual switch counts as a change, for the debug log.
         assert!(!LayoutSwitch::AlreadyThere.changed());
         assert!(LayoutSwitch::Switched.changed());
+    }
+
+    #[test]
+    fn invalidating_sends_the_next_question_back_to_the_os() {
+        set_layout_cache(Language::Hebrew);
+        assert_eq!(
+            LAYOUT_CACHE.lock().unwrap().map(|(_, lang)| lang),
+            Some(Language::Hebrew),
+            "the cache holds what it was told"
+        );
+        invalidate();
+        assert!(
+            LAYOUT_CACHE.lock().unwrap().is_none(),
+            "a hand-switched layout must not be answered from the old cache"
+        );
     }
 
     #[test]

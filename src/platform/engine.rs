@@ -98,6 +98,16 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// buffer cannot leak into the next one.
     fn is_reset(key: Self::Key) -> bool;
 
+    /// Whether this key is a modifier: shift, control, alt, super, caps lock.
+    ///
+    /// Used for one thing — spotting the *shape* of a keyboard-layout hotkey, so
+    /// the cached layout can be dropped before it goes stale (see
+    /// [`crate::layout::invalidate`]). Every combination anyone binds to a
+    /// layout switch is either two modifiers or a modifier and space, and
+    /// naming the modifiers is the whole of what the engine needs to recognise
+    /// that.
+    fn is_modifier(key: Self::Key) -> bool;
+
     // ── characters ──────────────────────────────────────────────────────────
 
     /// The English character this key types with `shift` in the state it was
@@ -295,6 +305,10 @@ pub struct AppState<P: Platform> {
     /// When the last completed Ctrl tap happened; a second one inside
     /// [`DOUBLE_TAP_WINDOW`] is the undo gesture.
     pub last_ctrl_tap: Option<Instant>,
+    /// A key combination shaped like a layout-switch hotkey has been pressed and
+    /// the modifiers holding it have not all come back up yet. When they do, the
+    /// cached layout is dropped — see [`crate::layout::invalidate`].
+    pub layout_hotkey: bool,
     /// What the Ctrl double-tap would do to the word the cursor is sitting on,
     /// if it would do anything.
     pub last_action: Option<LastAction<P>>,
@@ -324,6 +338,7 @@ impl<P: Platform> AppState<P> {
             right_shift_tap: false,
             ctrl_down: None,
             last_ctrl_tap: None,
+            layout_hotkey: false,
             last_action: None,
             cycle: None,
             history: History::default(),
@@ -337,6 +352,30 @@ impl<P: Platform> AppState<P> {
         let held =
             self.held_keys.contains(&P::SHIFT_LEFT) || self.held_keys.contains(&P::SHIFT_RIGHT);
         held != self.caps_lock
+    }
+
+    /// Whether pressing `key` right now completes something shaped like a
+    /// keyboard-layout hotkey.
+    ///
+    /// Every binding anyone actually uses is one of three shapes: a modifier on
+    /// top of another modifier (Alt+Shift, Ctrl+Shift, Shift+Super), a modifier
+    /// with Space (Super+Space, the GNOME default), or Caps Lock on its own.
+    /// This does not — cannot — know what the session has bound, and does not
+    /// need to: a false positive costs one layout query, and a false negative
+    /// costs a wrongly-anchored correction.
+    ///
+    /// `key` is already in `held_keys` by the time this is asked, so the search
+    /// for a *second* modifier has to skip it.
+    fn is_layout_hotkey(&self, key: P::Key) -> bool {
+        if key == P::CAPS_LOCK {
+            return true;
+        }
+        if !P::is_modifier(key) && !P::is_terminator(key) {
+            return false;
+        }
+        self.held_keys
+            .iter()
+            .any(|&held| held != key && P::is_modifier(held))
     }
 
     /// Add a key to whichever buffer is live: the word being typed, or the one
@@ -498,6 +537,10 @@ impl<P: Platform> Engine<P> {
         st.last_key = Some(key);
 
         st.held_keys.insert(key);
+        // Noted on the way down, acted on when the modifiers come back up: that
+        // is when the compositor has had the whole combination and the layout it
+        // was asking for is live.
+        st.layout_hotkey |= st.is_layout_hotkey(key);
         if key == P::CAPS_LOCK {
             st.caps_lock = !st.caps_lock;
         }
@@ -619,6 +662,15 @@ impl<P: Platform> Engine<P> {
     pub fn key_release(self: &Arc<Self>, key: P::Key) {
         let mut st = self.lock();
         st.held_keys.remove(&key);
+
+        // A layout hotkey has been let go of. Drop the cached layout rather than
+        // let the next word be anchored on what was true before it — the 300 ms
+        // TTL is otherwise long enough to decide a word or two against the wrong
+        // layout and inject the result under the right one.
+        if st.layout_hotkey && P::is_modifier(key) {
+            st.layout_hotkey = false;
+            crate::layout::invalidate();
+        }
 
         if key == P::CTRL_LEFT || key == P::CTRL_RIGHT {
             self.ctrl_tap(st);
