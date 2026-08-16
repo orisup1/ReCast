@@ -521,10 +521,11 @@ fn valid_loose(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool
 ///      can be turned off for them via `RECAST_SHORT=0`.
 ///   3. Otherwise it's an unknown word (name/typo/slang) → leave it alone.
 ///
-/// Note: the guard is deliberately *strict*, not loose. A prefixed Hebrew form
-/// whose keys also spell a real English word switches to English — when both
-/// readings are plausible the strict dictionary hit wins over the inferred
-/// prefix match (see `prefixed_hebrew_with_english_collision_always_switches`).
+/// Note: the guard is deliberately *strict*, not loose — a looked-up word is
+/// better evidence than an inferred one. But a prefixed Hebrew form whose keys
+/// also spell a real English word is not thereby worthless: it used to lose
+/// outright, and now it costs the English reading a frequency contest to win
+/// (see `a_prefixed_hebrew_form_only_loses_to_a_common_english_word`).
 #[allow(clippy::too_many_arguments)]
 fn decide_known(
     text_en: &str,
@@ -572,6 +573,24 @@ fn decide_known(
     }
     // Trigger: the other layout yields a confident word → switch.
     if oth_strict {
+        // …unless the current reading is a *loose* match — a Hebrew form the
+        // prefix rules recognise without the dictionary holding it outright.
+        // That is weaker evidence than a strict hit, since it is inferred
+        // rather than looked up, but it is a long way from nothing: switching
+        // on top of it rewrites a real Hebrew word into an unrelated English
+        // one, which is the most damaging thing this function can do. So the
+        // English reading has to win a frequency contest first, and the run
+        // counts towards it exactly as it does for a homograph above.
+        //
+        // Only Hebrew can reach this: English has no inflectional prefixes, so
+        // its loose test is its strict one and the guard above already fired.
+        if valid_loose(cur_text, current, en_dict, he_dict)
+            && !other_decisively_more_common(
+                cur_text, current, oth_text, other, run, en_freq, he_freq,
+            )
+        {
+            return None;
+        }
         return Some(other);
     }
     None
@@ -1481,12 +1500,62 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_hebrew_with_english_collision_always_switches() {
-        // "ושלום" prefixed Hebrew word collides with English "uakuo".
-        // New logic switches to other layout when other dict has word.
+    fn a_prefixed_hebrew_form_only_loses_to_a_common_english_word() {
+        // "ושלום" is a real Hebrew word the dictionary only knows through the
+        // prefix rule, and the same keys spell a real English word. The English
+        // reading is a strict dictionary hit and the Hebrew one is inferred, so
+        // English is the better-evidenced reading — but not by enough to rewrite
+        // a Hebrew word on its own.
         let en = dict(&["uakuo"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), Some(Language::English));
+        // Nothing known about how common the English word is: leave it alone.
+        assert_eq!(
+            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()),
+            None
+        );
+        // A genuinely common English word does win.
+        let en_f = freq(&[("uakuo", 300)]);
+        assert_eq!(
+            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, en_f, nofreq()),
+            Some(Language::English)
+        );
+        // And a rare one does not, however real it is.
+        let rare = freq(&[("uakuo", 30_000)]);
+        assert_eq!(
+            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, rare, nofreq()),
+            None
+        );
+        // A run of English words is the other way to pay for it: the same rare
+        // word, arriving in the middle of English text.
+        let run = Run { lang: Some(Language::English), len: 3 };
+        assert_eq!(
+            decide_known("uakuo", "ושלום", Language::Hebrew, run, en, he, rare, nofreq()),
+            None,
+            "30000 is past even the run-relaxed FREQ_COMMON_MAX_RUN"
+        );
+        let middling = freq(&[("uakuo", 9_000)]);
+        assert_eq!(
+            decide_known("uakuo", "ושלום", Language::Hebrew, run, en, he, middling, nofreq()),
+            Some(Language::English)
+        );
+        assert_eq!(
+            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, middling, nofreq()),
+            None,
+            "the same word without the run behind it is not enough"
+        );
+    }
+
+    #[test]
+    fn an_unprefixed_hebrew_collision_still_switches() {
+        // The softening above is only about the *inferred* prefix match. A key
+        // sequence the Hebrew dictionary does not recognise at all, prefix rule
+        // included, is still a plain wrong-layout mistype.
+        let en = dict(&["uakuo"]);
+        let he = dict(&["שלום"]);
+        assert_eq!(
+            decide_known("uakuo", "זזזזז", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()),
+            Some(Language::English)
+        );
     }
 
 
