@@ -417,24 +417,61 @@ fn too_short_to_trigger(
 /// ו (and), ה (the), ל (to/for), ב (in), כ (as/like), מ (from), ש (that).
 const HE_PREFIXES: &[char] = &['ו', 'ה', 'ל', 'ב', 'כ', 'מ', 'ש'];
 
-/// Hebrew lookup with single-prefix fallback: if the word is not in the dict
-/// directly, try stripping a leading prefix letter and looking up the rest.
-/// Only one prefix is stripped to avoid over-matching; the dictionary already
-/// holds many common prefixed forms as full entries.
+/// The prefix *pairs* Hebrew actually stacks, outermost letter first.
+///
+/// Hebrew does not stack these freely, so this is a whitelist rather than a
+/// loop: the definite article ה contracts into a preceding ב/ל/כ (ב+ה+בית is
+/// written בבית, never בהבית), and ה is innermost anyway and never sits over
+/// another prefix. What is genuinely written is the conjunction ו over any of
+/// the others, the relativiser ש over the simple prepositions, כש, and מ over
+/// ה or ש.
+///
+/// Capped at two. Three-letter stacks exist (לכשה־) but they are rare enough
+/// that the recall is not worth widening a *guard* for, and the dictionary
+/// already holds many prefixed forms outright.
+const HE_PREFIX_PAIRS: &[&str] = &[
+    "וה", "ול", "וב", "וכ", "ומ", "וש", "שה", "של", "שב", "שכ", "שמ", "כש", "מה", "מש",
+];
+
+/// Shortest stem two stripped prefixes may leave behind. A single letter is not
+/// a word anyone was writing — it is what is left over when the stripping was
+/// wrong, and matching on it would make the guard fire on almost anything
+/// starting with two of these letters.
+const HE_STEM_MIN: usize = 2;
+
+/// Hebrew lookup with a prefix fallback: if the word is not in the dict
+/// directly, try stripping the inflectional prefixes off the front and looking
+/// up the stem.
+///
+/// One prefix is stripped unconditionally; a second only for the pairs in
+/// [`HE_PREFIX_PAIRS`], because stacking is what Hebrew does but not with every
+/// combination. Over-matching here is the safe direction — this is the *guard*
+/// test, so a word it recognises is a word left alone rather than a word
+/// rewritten.
 fn matches_hebrew(word: &str, dict: Dict) -> bool {
     if dict.contains(word) {
         return true;
     }
-    let mut iter = word.chars();
-    if let Some(first) = iter.next() {
-        if HE_PREFIXES.contains(&first) {
-            let rest = iter.as_str();
-            if !rest.is_empty() && dict.contains(rest) {
-                return true;
-            }
-        }
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !HE_PREFIXES.contains(&first) {
+        return false;
     }
-    false
+    let rest = chars.as_str();
+    if !rest.is_empty() && dict.contains(rest) {
+        return true;
+    }
+    let mut rest_chars = rest.chars();
+    let Some(second) = rest_chars.next() else {
+        return false;
+    };
+    let stem = rest_chars.as_str();
+    let pair: String = [first, second].into_iter().collect();
+    HE_PREFIX_PAIRS.contains(&pair.as_str())
+        && stem.chars().count() >= HE_STEM_MIN
+        && dict.contains(stem)
 }
 
 /// Strict dictionary membership for `lang`. This is the *trigger* test — "these
@@ -1879,6 +1916,30 @@ mod tests {
             decide_known("qqqq", "ננננ", Language::English, run, en, he, nofreq(), nofreq()),
             None
         );
+    }
+
+    #[test]
+    fn hebrew_prefixes_stack_but_only_the_way_hebrew_stacks_them() {
+        let he = dict(&["בית", "שלום"]);
+        // The word itself, and one prefix, as before.
+        assert!(matches_hebrew("בית", he));
+        assert!(matches_hebrew("הבית", he));
+        assert!(matches_hebrew("ובית", he));
+        // Two, for the pairs that are actually written.
+        assert!(matches_hebrew("והבית", he), "and-the-house");
+        assert!(matches_hebrew("ולבית", he), "and-to-house");
+        assert!(matches_hebrew("כשבית", he), "when-house");
+        assert!(matches_hebrew("שהשלום", he), "that-the-peace");
+        // Not the pairs that are not: ל+ה contracts to plain ל in writing, so
+        // "להבית" is not a form anyone types and matching it would only widen
+        // the guard for nothing.
+        assert!(!matches_hebrew("להבית", he));
+        assert!(!matches_hebrew("בהבית", he));
+        // A stem too short to be a stem, and a stem that is not a word.
+        assert!(!matches_hebrew("ושב", he));
+        assert!(!matches_hebrew("והספר", he));
+        // Three prefixes are past what is stripped.
+        assert!(!matches_hebrew("וכשהבית", he));
     }
 
     #[test]
