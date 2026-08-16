@@ -841,6 +841,10 @@ impl<P: Platform> Engine<P> {
         // corrected again and undo would be a treadmill.
         if let Some(word) = &fix.suppress {
             crate::complete::suppress(word);
+            // …and remember that it happened. Retiring the word for the session
+            // is right for a reflex; doing this twice is a decision, and the
+            // second time it sticks for good (see `complete::learn`).
+            crate::complete::learn(word);
         }
         self.control.record_undo();
         st.cycle = None;

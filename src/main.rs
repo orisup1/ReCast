@@ -340,9 +340,10 @@ fn print_status() {
         Some(path) => println!("  config.toml:    none ({} — --write-config makes one)", path.display()),
         None => println!("  config.toml:    (none — no OS config directory)"),
     }
-    let (abbrevs, ignored) = complete::list_counts();
+    let (abbrevs, ignored, learned) = complete::list_counts();
     println!("  abbrev.txt:     {abbrevs} abbreviation(s)");
     println!("  ignore.txt:     {ignored} word(s)");
+    println!("  learned.txt:    {learned} word(s) retired by undo");
     // This process, not the daemon's — `--status` is a separate invocation and
     // cannot see the running one's figure. Still worth showing: it is the same
     // binary doing the same page-faulting, so it answers "roughly what does

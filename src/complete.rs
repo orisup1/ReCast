@@ -178,6 +178,10 @@ pub fn unlist(word: &str) {
     if let Ok(mut set) = suppressed_words().lock() {
         set.remove(&word);
     }
+    // Including what earlier undos taught: the gesture is asking for this word
+    // to be corrected after all, and a count from a previous session would
+    // quietly decline.
+    unlearn(&word);
     let was_in_file = ignore_list()
         .lock()
         .map(|mut list| list.remove(&word))
@@ -220,6 +224,138 @@ fn without_word(text: &str, word: &str) -> String {
         kept.push('\n');
     }
     kept
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What the undo gesture teaches, kept past the end of the session
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How many undos of the same word retire it for good.
+///
+/// Two, not one. A single undo already stops the word being corrected for the
+/// rest of the session ([`suppress`]), which is the right answer for a word the
+/// user took back by reflex — and a reflex is not a decision. Doing it twice, on
+/// two separate occasions, is: it means the correction is not a one-off
+/// annoyance but something that will keep happening, and that is exactly what
+/// `ignore.txt` is for. This is the same conclusion reached without asking the
+/// user to go and find a file.
+const LEARNED_MIN: u32 = 2;
+
+/// The undo counts, read from `learned.txt` on first use.
+///
+/// The gap this fills: the session list is forgotten at restart and
+/// `ignore.txt` has to be written by hand, so a name the speller dislikes was
+/// undone once a session, for as long as the user kept using the daemon. Nothing
+/// in between remembered anything. This does — and it remembers the one signal
+/// there is real evidence behind, since an undo is the user saying, about a
+/// specific word, that we were wrong.
+///
+/// Deliberately *not* fed by "a word that was typed and not corrected": the
+/// speller only ever leaves those alone anyway, so counting them would gather
+/// evidence about every word except the ones this exists to protect.
+fn learned_words() -> &'static Mutex<HashMap<String, u32>> {
+    static WORDS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    WORDS.get_or_init(|| Mutex::new(parse_learned(&read_user_file(LEARNED_FILE))))
+}
+
+/// `<config dir>/learned.txt` — beside `ignore.txt`, and the same idea kept by
+/// hand rather than by gesture.
+const LEARNED_FILE: &str = "learned.txt";
+
+/// One `word<TAB>count` per line, `#` starting a comment. A line without a
+/// count, or with one that does not parse, is read as a single undo — the file
+/// is meant to be editable, and "just put the word in" should work.
+fn parse_learned(text: &str) -> HashMap<String, u32> {
+    let mut counts = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (word, count) = match line.split_once('\t') {
+            Some((word, count)) => (word.trim(), count.trim().parse().unwrap_or(1)),
+            None => (line, 1),
+        };
+        if !word.is_empty() {
+            counts.insert(word.to_lowercase(), count);
+        }
+    }
+    counts
+}
+
+/// Serialise the counts, newest-largest first so the file reads as a list of
+/// what the user most disagrees with.
+fn learned_text(counts: &HashMap<String, u32>) -> String {
+    let mut entries: Vec<_> = counts.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let mut out = String::from(
+        "# Words you have taken back a correction of, and how many times.\n\
+         # Written by ReCast; safe to edit or delete.\n",
+    );
+    for (word, count) in entries {
+        out.push_str(word);
+        out.push('\t');
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// Note that the user undid a correction of `word`.
+///
+/// Written through to disk immediately, as `ignore.txt` is: an undo is a
+/// deliberate gesture that happens a handful of times an hour, and the file is a
+/// few hundred bytes. Nothing here is on the path a keystroke takes.
+pub fn learn(word: &str) {
+    let word = word.trim().to_lowercase();
+    if word.is_empty() {
+        return;
+    }
+    let Ok(mut counts) = learned_words().lock() else {
+        return;
+    };
+    *counts.entry(word).or_insert(0) += 1;
+    write_learned(&counts);
+}
+
+/// Forget what the undos taught about `word` — the un-ignore gesture's half of
+/// the toggle. A user asking for a word to be corrected after all must not have
+/// it declined by a count from last month.
+fn unlearn(word: &str) {
+    let Ok(mut counts) = learned_words().lock() else {
+        return;
+    };
+    if counts.remove(word).is_some() {
+        write_learned(&counts);
+    }
+}
+
+/// Whether `word` has been undone often enough to be left alone for good.
+pub fn learned(word: &str) -> bool {
+    learned_words()
+        .lock()
+        .is_ok_and(|counts| counts.get(&word.to_lowercase()).is_some_and(|n| *n >= LEARNED_MIN))
+}
+
+/// Replace `learned.txt` with `counts`, via a temporary file and a rename so an
+/// interrupted write cannot leave a truncated list behind.
+///
+/// Unlike `ignore.txt` this file is entirely ours, so it is rewritten wholesale
+/// rather than appended to a line at a time — there is no user formatting to
+/// preserve.
+fn write_learned(counts: &HashMap<String, u32>) {
+    let Some(path) = user_path(LEARNED_FILE) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let tmp = path.with_extension("txt.tmp");
+    if std::fs::write(&tmp, learned_text(counts)).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Words the user has taken back with the undo gesture this session.
@@ -421,10 +557,17 @@ fn appended_line(existing: &str, word: &str) -> String {
 
 /// How many abbreviations and ignored words are loaded — what `--status`
 /// reports, so a user who has just edited a file can see it took.
-pub fn list_counts() -> (usize, usize) {
+pub fn list_counts() -> (usize, usize, usize) {
     (
         abbreviations().lock().map(|t| t.len()).unwrap_or(0),
         ignore_list().lock().map(|l| l.len()).unwrap_or(0),
+        // Only the words that have actually crossed the threshold: a single
+        // undo is in the file but is not yet doing anything, and reporting it
+        // as a retired word would be a lie about why a correction still fires.
+        learned_words()
+            .lock()
+            .map(|c| c.values().filter(|n| **n >= LEARNED_MIN).count())
+            .unwrap_or(0),
     )
 }
 
@@ -566,6 +709,66 @@ fn parse_abbreviations(text: &str) -> HashMap<String, String> {
         table.insert(key.to_lowercase(), value.to_string());
     }
     table
+}
+
+#[cfg(test)]
+mod learned_list {
+    use super::*;
+
+    #[test]
+    fn a_count_survives_being_written_and_read_back() {
+        let mut counts = HashMap::new();
+        counts.insert("supino".to_string(), 3);
+        counts.insert("recast".to_string(), 1);
+        assert_eq!(parse_learned(&learned_text(&counts)), counts);
+    }
+
+    #[test]
+    fn the_file_is_editable_by_hand() {
+        // Comments and blanks are skipped, and a bare word with no count is
+        // read as one undo — "just put the word in" has to work, because that
+        // is what a user editing this file will do.
+        let counts = parse_learned(
+            "# mine\n\
+             \n\
+             supino\t4\n\
+             ori\n\
+             Github\t2\n\
+             \tnonsense\n",
+        );
+        assert_eq!(counts.get("supino"), Some(&4));
+        assert_eq!(counts.get("ori"), Some(&1), "a bare word counts once");
+        assert_eq!(counts.get("github"), Some(&2), "folded like every reading");
+        assert_eq!(counts.get("#"), None);
+        assert_eq!(counts.len(), 4, "the empty word is not an entry");
+    }
+
+    #[test]
+    fn one_undo_is_a_reflex_and_two_are_a_decision() {
+        // The threshold is the whole design: undoing once already retires the
+        // word for the session, so this only has to catch the word that keeps
+        // coming back.
+        let mut counts = HashMap::new();
+        counts.insert("sami".to_string(), 1);
+        assert!(counts["sami"] < LEARNED_MIN, "one undo does not stick");
+        counts.insert("sami".to_string(), 2);
+        assert!(counts["sami"] >= LEARNED_MIN);
+    }
+
+    #[test]
+    fn the_file_leads_with_what_is_most_disagreed_with() {
+        let mut counts = HashMap::new();
+        counts.insert("once".to_string(), 1);
+        counts.insert("often".to_string(), 9);
+        counts.insert("twice".to_string(), 2);
+        let text = learned_text(&counts);
+        let listed: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split('\t').next())
+            .collect();
+        assert_eq!(listed, ["often", "twice", "once"]);
+    }
 }
 
 #[cfg(test)]

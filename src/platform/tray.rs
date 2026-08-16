@@ -198,7 +198,10 @@ pub fn run(control: Arc<AppControl>) {
                 // seconds; this is for the user who has just saved the file
                 // and wants to know *now* that it took.
                 crate::complete::reload_user_files();
-                let (abbrevs, ignored) = crate::complete::list_counts();
+                // `learned.txt` is ours rather than the user's, and is not
+                // among the files a reload re-reads — so it is not reported by
+                // the notification about having re-read them.
+                let (abbrevs, ignored, _) = crate::complete::list_counts();
                 crate::notify::notify(
                     "ReCast reloaded your lists",
                     &format!("{abbrevs} abbreviation(s), {ignored} ignored word(s)"),

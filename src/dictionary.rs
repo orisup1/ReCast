@@ -963,8 +963,10 @@ fn plan_spelling(
     if case == Case::Upper {
         return None;
     }
-    // A word the user has declared theirs is never second-guessed.
-    if crate::complete::ignored(full_en) {
+    // A word the user has declared theirs is never second-guessed — whether
+    // they declared it by writing it in `ignore.txt` or by taking the same
+    // correction back twice.
+    if crate::complete::ignored(full_en) || crate::complete::learned(full_en) {
         return None;
     }
     if valid_loose(full_he, Language::Hebrew, en_dict, he_dict) {
@@ -1274,7 +1276,9 @@ pub fn declined_by_list<K: Copy>(
         return Some(typed.to_string());
     }
     let word_en = &full_en[..word_end_en];
-    if current == Some(Language::English) && crate::complete::ignored(word_en) {
+    if current == Some(Language::English)
+        && (crate::complete::ignored(word_en) || crate::complete::learned(word_en))
+    {
         return Some(word_en.to_string());
     }
     None
