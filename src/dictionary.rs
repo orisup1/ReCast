@@ -374,6 +374,45 @@ fn other_decisively_more_common(
     }
 }
 
+/// Longest reading the short-word gate has an opinion about.
+const SHORT_MAX: usize = 3;
+
+/// A short reading ranked this common is not a collision.
+///
+/// The top of a frequency list is where the words people actually mistype the
+/// layout of live — `the`, `and`, `של`, `זה`. Two or three letters of one of
+/// those is not the accidental dictionary hit the gate exists to suppress.
+const SHORT_COMMON_MAX: u32 = 500;
+
+/// Whether `text`, read as `lang`, is too short to be believed as a trigger.
+///
+/// Only has an opinion when the user has turned short-word switching off
+/// (`short_enabled`, from `RECAST_SHORT=0`), and length is not the whole of the
+/// answer even then. Length was always a proxy for "this is probably an
+/// accidental dictionary collision rather than a word anyone meant", and the
+/// frequency list answers that question directly: a two-letter reading nobody
+/// types is the collision the gate is for, and a two-letter reading everybody
+/// types is not.
+///
+/// `short_enabled` is passed rather than read from the global config so the
+/// gate can be tested at all — the global is a `OnceLock` holding the shipped
+/// default, and every test would otherwise exercise only the disabled path.
+fn too_short_to_trigger(
+    text: &str,
+    lang: Language,
+    short_enabled: bool,
+    en_freq: Freq,
+    he_freq: Freq,
+) -> bool {
+    if short_enabled {
+        return false;
+    }
+    if text.chars().count() > SHORT_MAX {
+        return false;
+    }
+    freq_rank(text, lang, en_freq, he_freq).is_none_or(|rank| rank > SHORT_COMMON_MAX)
+}
+
 /// One-letter inflectional prefixes that Hebrew attaches to nouns/verbs:
 /// ו (and), ה (the), ל (to/for), ב (in), כ (as/like), מ (from), ש (that).
 const HE_PREFIXES: &[char] = &['ו', 'ה', 'ל', 'ב', 'כ', 'מ', 'ש'];
@@ -465,10 +504,17 @@ fn decide_known(
     let oth_text = if other == Language::English { text_en } else { text_he };
 
     let oth_strict = valid_strict(oth_text, other, en_dict, he_dict);
-    // Short-word gate: ≤3-char words are dictionary-collision-prone; when
-    // disabled (RECAST_SHORT=0) an other-layout reading of that length never
-    // triggers a switch — neither the plain trigger nor the frequency tie-break.
-    let short_block = !Config::global().short_enabled && oth_text.chars().count() <= 3;
+    // Short-word gate: short words are dictionary-collision-prone; when disabled
+    // (RECAST_SHORT=0) an other-layout reading of that length never triggers a
+    // switch — neither the plain trigger nor the frequency tie-break — unless it
+    // is common enough that the collision reading does not hold up.
+    let short_block = too_short_to_trigger(
+        oth_text,
+        other,
+        Config::global().short_enabled,
+        en_freq,
+        he_freq,
+    );
 
     // Guard: the current layout already forms a strict word (including the
     // homograph case where both layouts do) → preserve user intent, unless the
@@ -507,15 +553,15 @@ fn decide_unknown(
     en_freq: Freq,
     he_freq: Freq,
 ) -> Option<Language> {
-    // Short-word gate: when disabled, a ≤3-char reading never counts as a
+    // Short-word gate: when disabled, a short uncommon reading never counts as a
     // trigger — the same collision guard as in `decide_known`.
-    let short_ok = |text: &str| {
-        Config::global().short_enabled || text.chars().count() > 3
-    };
-    let en_strict =
-        short_ok(text_en) && valid_strict(text_en, Language::English, en_dict, he_dict);
-    let he_strict =
-        short_ok(text_he) && valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
+    let enabled = Config::global().short_enabled;
+    let short_ok =
+        |text: &str, lang| !too_short_to_trigger(text, lang, enabled, en_freq, he_freq);
+    let en_strict = short_ok(text_en, Language::English)
+        && valid_strict(text_en, Language::English, en_dict, he_dict);
+    let he_strict = short_ok(text_he, Language::Hebrew)
+        && valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
     // If exactly one layout has a strict match, switch to that layout.
     if en_strict && !he_strict {
         Some(Language::English)
@@ -1833,6 +1879,27 @@ mod tests {
             decide_known("qqqq", "ננננ", Language::English, run, en, he, nofreq(), nofreq()),
             None
         );
+    }
+
+    #[test]
+    fn the_short_word_gate_asks_how_common_a_word_is_not_only_how_long() {
+        let common = freq(&[("של", 40), ("go", 120)]);
+        // With the gate switched on (the shipped default) it never fires.
+        assert!(!too_short_to_trigger("של", Language::Hebrew, true, nofreq(), common));
+        // Switched off, a short reading nobody types is the collision it is for…
+        assert!(too_short_to_trigger("סלב", Language::Hebrew, false, nofreq(), common));
+        assert!(too_short_to_trigger("xkc", Language::English, false, nofreq(), common));
+        // …and a short reading everybody types is the opposite of one. This is
+        // what the bare length cutoff could not tell apart: "של" and "סלב" are
+        // both three characters.
+        assert!(!too_short_to_trigger("של", Language::Hebrew, false, nofreq(), common));
+        assert!(!too_short_to_trigger("go", Language::English, false, common, nofreq()));
+        // A short word that is merely *in* the list is not enough — it has to be
+        // near the top of it.
+        let rare = freq(&[("עט", 9_000)]);
+        assert!(too_short_to_trigger("עט", Language::Hebrew, false, nofreq(), rare));
+        // Long readings are none of the gate's business either way.
+        assert!(!too_short_to_trigger("שלום", Language::Hebrew, false, nofreq(), nofreq()));
     }
 
     #[test]
