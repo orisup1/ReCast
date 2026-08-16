@@ -37,7 +37,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::dictionary::{check_and_correct, complete_candidates, declined_by_list, Dict, Fix};
+use crate::dictionary::{
+    check_and_correct, complete_candidates, declined_by_list, Dict, Fix, History, Outcome, Run,
+};
 use crate::types::{
     lock_forgiving, AppControl, FixKind, Language, Replaceable, ReplaceGuard, WordBuffer,
 };
@@ -298,6 +300,13 @@ pub struct AppState<P: Platform> {
     pub last_action: Option<LastAction<P>>,
     /// The completion cycle in progress, if the user is tapping through guesses.
     pub cycle: Option<Cycle<P>>,
+    /// What language the last few finished words were in — the context every
+    /// ambiguous decision is missing when it looks at one word on its own.
+    ///
+    /// Kept here because this is the only place that knows when a word is
+    /// finished, and cleared alongside the gestures whenever the cursor moves
+    /// somewhere else: the run is a claim about the text being written *here*.
+    pub history: History,
     /// The last key seen and when — the multi-node deduplication guard. Only
     /// read where [`Platform::DEDUP_WINDOW`] is set, which is Linux.
     last_key: Option<P::Key>,
@@ -317,6 +326,7 @@ impl<P: Platform> AppState<P> {
             last_ctrl_tap: None,
             last_action: None,
             cycle: None,
+            history: History::default(),
             last_key: None,
             last_key_at: Instant::now(),
         }
@@ -448,6 +458,7 @@ impl<P: Platform> Engine<P> {
         st.keys.clear();
         st.last_action = None;
         st.cycle = None;
+        st.history.clear();
     }
 
     /// A mouse button went down. The cursor can now be anywhere, so the word in
@@ -465,6 +476,9 @@ impl<P: Platform> Engine<P> {
             st.keys.clear();
         }
         st.forget_gestures();
+        // The language run is a claim about the text being written here, and
+        // after a click "here" is somewhere else.
+        st.history.clear();
     }
 
     // ── capture ─────────────────────────────────────────────────────────────
@@ -514,6 +528,10 @@ impl<P: Platform> Engine<P> {
             } else {
                 st.keys.clear();
             }
+            // These are the keys that move the cursor or the focus — the same
+            // reason the word buffer is dropped is the reason the run is: what
+            // comes next is not a continuation of what came before.
+            st.history.clear();
         } else if P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some() {
             st.push_key(Typed { key, shift });
         }
@@ -534,7 +552,15 @@ impl<P: Platform> Engine<P> {
             return;
         }
 
-        let result = self.check(&st.keys);
+        let outcome = self.check(&st.keys, st.history.run());
+        // Record what this word turned out to be before anything else happens
+        // to it: the next word is decided with this one behind it. A word whose
+        // language could not be told is not recorded at all — see
+        // `dictionary::observed`.
+        if let Some(lang) = outcome.lang {
+            st.history.push(lang);
+        }
+        let result = outcome.fix;
         // Describe the fix for the history before `replacement` consumes it.
         let note = result.as_ref().map(|fix| note_of::<P>(&st.keys, fix));
         if let Some(rep) = replacement::<P>(&st.keys, result) {
@@ -789,7 +815,10 @@ impl<P: Platform> Engine<P> {
     /// straight onto the list the gesture just took it off.
     fn unlist_and_correct(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, skip: LastSkip<P>) {
         crate::complete::unlist(&skip.word);
-        let result = self.check(&skip.keys);
+        // The run is read but not added to: this word was already recorded when
+        // it was first finished, and the gesture is a second opinion about it
+        // rather than a second word.
+        let result = self.check(&skip.keys, st.history.run()).fix;
         let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
         // Off the list, but the pipelines have nothing to say about it after
         // all — which is a fine outcome, and not one to rewrite the screen over.
@@ -813,12 +842,16 @@ impl<P: Platform> Engine<P> {
         );
     }
 
-    fn check(&self, keys: &[Typed<P::Key>]) -> Option<Fix> {
+    /// Run the pipelines over a finished word. `run` is the language of the
+    /// words before it, which the caller reads off [`AppState::history`] while
+    /// it still holds the lock.
+    fn check(&self, keys: &[Typed<P::Key>], run: Run) -> Outcome {
         check_and_correct(
             keys,
             |t: Typed<P::Key>| P::english_char(t.key, t.shift),
             |t: Typed<P::Key>| P::hebrew_char(t.key),
             |t: Typed<P::Key>| t.shift,
+            run,
             self.en_dict,
             self.he_dict,
         )

@@ -9,6 +9,7 @@
 //! pages of the executable that the OS can drop under memory pressure rather
 //! than ~100 MB of resident heap.
 
+use std::collections::VecDeque;
 use std::sync::OnceLock;
 
 use crate::layout::switch_layout_to;
@@ -215,39 +216,158 @@ fn freq_rank(text: &str, lang: Language, en_freq: Freq, he_freq: Freq) -> Option
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The language run — what the words before this one were written in.
+//
+// Every decision below used to be made about one word in isolation, which threw
+// away the strongest signal there is: language comes in runs. Nobody writes one
+// Hebrew word between two English ones. A key sequence that reads as a real word
+// in both layouts is genuinely ambiguous on its own and not ambiguous at all
+// after three Hebrew words, and that is precisely the case the tie-break below
+// had to be tuned painfully tight for.
+//
+// The history itself lives in the listener (`platform::engine::AppState`), which
+// is the only thing that knows when a word is finished. What reaches the pure
+// decision code is this summary, so the decision stays a function of its
+// arguments and stays testable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How many finished words back the run is remembered. Long enough to establish
+/// a language, short enough that a paragraph in the other one takes over
+/// quickly.
+const RUN_MEMORY: usize = 8;
+
+/// The unbroken run of one language immediately before the word being decided.
+///
+/// `len` counts only the words at the end of the history that agree, so a run is
+/// broken by the first word of the other language rather than diluted by it —
+/// "the last eight words were mostly Hebrew" is a much weaker claim than "the
+/// last three words were Hebrew", and it is the second one that should move a
+/// decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Run {
+    /// The language of the run, or `None` when there is no history at all.
+    pub lang: Option<Language>,
+    /// How many words long it is.
+    pub len: u8,
+}
+
+impl Run {
+    /// Whether the run is long enough, and in the right language, to count as
+    /// evidence for `lang`.
+    fn favours(self, lang: Language) -> bool {
+        self.lang == Some(lang) && self.len >= RUN_MIN
+    }
+}
+
+/// Shortest run that is allowed to influence anything.
+///
+/// Two rather than one: a single word is the weakest possible evidence, and it
+/// is also the word most likely to have been mis-attributed — the run is built
+/// out of the pipelines' own conclusions, so letting one of them feed straight
+/// back in would let a single wrong call justify the next one.
+const RUN_MIN: u8 = 2;
+
+/// The languages of the last few finished words, newest last.
+///
+/// Only words whose language is actually *knowable* are recorded (see
+/// [`observed`]): an unknown token — a name, a handle, a typo nothing matched —
+/// is not evidence about the language being written, and pushing a guess for it
+/// would turn the run into noise.
+#[derive(Default)]
+pub struct History {
+    recent: VecDeque<Language>,
+}
+
+impl History {
+    /// Note the language a finished word turned out to be.
+    pub fn push(&mut self, lang: Language) {
+        self.recent.push_back(lang);
+        while self.recent.len() > RUN_MEMORY {
+            self.recent.pop_front();
+        }
+    }
+
+    /// Forget everything. Called when the cursor moves somewhere else — a
+    /// click, an arrow key, a new window — because the run is a claim about the
+    /// text being written *here*, and it stops being true the moment that is a
+    /// different piece of text.
+    pub fn clear(&mut self) {
+        self.recent.clear();
+    }
+
+    /// The run at the end of the history.
+    pub fn run(&self) -> Run {
+        let mut iter = self.recent.iter().rev();
+        let Some(&lang) = iter.next() else {
+            return Run::default();
+        };
+        let len = 1 + iter.take_while(|&&l| l == lang).count();
+        Run {
+            lang: Some(lang),
+            // Saturating rather than wrapping: `RUN_MEMORY` keeps this far
+            // inside a `u8` today, and a cast that silently becomes 0 if that
+            // ever changes is not worth the byte it saves.
+            len: len.min(u8::MAX as usize) as u8,
+        }
+    }
+}
+
 // Homograph tie-break tuning. When a key sequence is a real word in *both*
 // layouts we normally keep the current layout; we only override that when the
 // OTHER reading is decisively the one the user more likely meant.
+//
+// Two sets of thresholds, because the question is a different one depending on
+// what came before. With no run to go on, the only thing arguing for the other
+// layout is the word itself, and the bar is high enough that it almost never
+// fires. With the run already in the other language, the same evidence arrives
+// on top of a standing reason to believe the user is writing that language, and
+// holding out for a top-2000 word ten times commoner than the alternative would
+// be ignoring most of what we know.
 const FREQ_COMMON_MAX: u32 = 2000; // the "other" reading must rank at least this common
 const FREQ_RARER_FACTOR: u32 = 10; // and be >= this many times more common than current
+
+/// The same two, for a word arriving at the end of a run in the other language.
+const FREQ_COMMON_MAX_RUN: u32 = 20_000;
+const FREQ_RARER_FACTOR_RUN: u32 = 2;
 
 /// Homograph tie-break: both `cur_text` (current layout) and `oth_text` (other
 /// layout) are real words. Returns `true` when the other reading is decisively
 /// more common and should win. Conservative — it fires only when the other
-/// reading is a top-`FREQ_COMMON_MAX` word AND the current reading is either
-/// absent from the frequency list or at least `FREQ_RARER_FACTOR`× rarer. With
-/// empty frequency lists (as in unit tests) it always returns `false`, so the
-/// prior "keep current layout" behaviour is unchanged.
+/// reading is a common word AND the current reading is either absent from the
+/// frequency list or several times rarer. With empty frequency lists (as in unit
+/// tests) it always returns `false`, so the prior "keep current layout"
+/// behaviour is unchanged.
+///
+/// `run` is what the words before this one were written in. A run already in the
+/// other language loosens both thresholds: the frequency evidence is then
+/// corroborating something rather than carrying the whole decision on its own.
 fn other_decisively_more_common(
     cur_text: &str,
     current: Language,
     oth_text: &str,
     other: Language,
+    run: Run,
     en_freq: Freq,
     he_freq: Freq,
 ) -> bool {
     if !Config::global().freq_enabled {
         return false;
     }
+    let (common_max, rarer_factor) = if run.favours(other) {
+        (FREQ_COMMON_MAX_RUN, FREQ_RARER_FACTOR_RUN)
+    } else {
+        (FREQ_COMMON_MAX, FREQ_RARER_FACTOR)
+    };
     let Some(oth_rank) = freq_rank(oth_text, other, en_freq, he_freq) else {
         return false; // the other reading isn't even a common word — don't override.
     };
-    if oth_rank > FREQ_COMMON_MAX {
+    if oth_rank > common_max {
         return false;
     }
     match freq_rank(cur_text, current, en_freq, he_freq) {
         // Current reading is also ranked: switch only if the other is many times more common.
-        Some(cur_rank) => cur_rank >= oth_rank.saturating_mul(FREQ_RARER_FACTOR),
+        Some(cur_rank) => cur_rank >= oth_rank.saturating_mul(rarer_factor),
         // Current reading is absent from the top-N list while the other is very
         // common: the common reading almost certainly wins.
         None => true,
@@ -329,10 +449,12 @@ fn valid_loose(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool
 /// whose keys also spell a real English word switches to English — when both
 /// readings are plausible the strict dictionary hit wins over the inferred
 /// prefix match (see `prefixed_hebrew_with_english_collision_always_switches`).
+#[allow(clippy::too_many_arguments)]
 fn decide_known(
     text_en: &str,
     text_he: &str,
     current: Language,
+    run: Run,
     en_dict: Dict,
     he_dict: Dict,
     en_freq: Freq,
@@ -354,7 +476,9 @@ fn decide_known(
     if valid_strict(cur_text, current, en_dict, he_dict) {
         if oth_strict
             && !short_block
-            && other_decisively_more_common(cur_text, current, oth_text, other, en_freq, he_freq)
+            && other_decisively_more_common(
+                cur_text, current, oth_text, other, run, en_freq, he_freq,
+            )
         {
             return Some(other);
         }
@@ -377,6 +501,7 @@ fn decide_known(
 fn decide_unknown(
     text_en: &str,
     text_he: &str,
+    run: Run,
     en_dict: Dict,
     he_dict: Dict,
     en_freq: Freq,
@@ -397,11 +522,16 @@ fn decide_unknown(
     } else if he_strict && !en_strict {
         Some(Language::Hebrew)
     } else if en_strict && he_strict {
-        // Both layouts read as words: break the tie by frequency, else leave it
-        // alone. (Winner must be decisively more common than the loser.)
-        if other_decisively_more_common(text_he, Language::Hebrew, text_en, Language::English, en_freq, he_freq) {
+        // Both layouts read as words: break the tie by frequency (and by the
+        // run, which is usually the stronger of the two), else leave it alone.
+        // The winner must be decisively more common than the loser.
+        if other_decisively_more_common(
+            text_he, Language::Hebrew, text_en, Language::English, run, en_freq, he_freq,
+        ) {
             Some(Language::English)
-        } else if other_decisively_more_common(text_en, Language::English, text_he, Language::Hebrew, en_freq, he_freq) {
+        } else if other_decisively_more_common(
+            text_en, Language::English, text_he, Language::Hebrew, run, en_freq, he_freq,
+        ) {
             Some(Language::Hebrew)
         } else {
             None
@@ -494,6 +624,36 @@ pub enum Fix {
     /// typeable through the English keymap, but — unlike before case tracking —
     /// it may contain capitals, and an expansion may contain spaces.
     Spelling { text: String },
+}
+
+/// Everything a finished word produced: what to do about it, and what language
+/// it turned out to be.
+///
+/// The second half is not for this word — it is for the next one. The listener
+/// feeds it into [`History`], and the run that comes back out is what lets a
+/// genuinely ambiguous key sequence be resolved by what was being written around
+/// it rather than by frequency tables alone.
+pub struct Outcome {
+    /// The correction to apply, or `None` to leave the word alone.
+    pub fix: Option<Fix>,
+    /// The language the word turned out to be, when that is knowable at all.
+    pub lang: Option<Language>,
+}
+
+/// The language a key sequence is in, when the dictionaries agree on an answer.
+///
+/// `None` for a sequence that reads as a word in both layouts (which says
+/// nothing) and for one that reads as a word in neither (a name, a handle, a
+/// typo — also nothing). Only an unambiguous reading is evidence, and evidence
+/// is all the run is allowed to be built from.
+fn observed(word_en: &str, word_he: &str, en_dict: Dict, he_dict: Dict) -> Option<Language> {
+    let en = valid_loose(word_en, Language::English, en_dict, he_dict);
+    let he = valid_loose(word_he, Language::Hebrew, en_dict, he_dict);
+    match (en, he) {
+        (true, false) => Some(Language::English),
+        (false, true) => Some(Language::Hebrew),
+        _ => None,
+    }
 }
 
 /// One key sequence read under one layout, split at the word's end.
@@ -619,6 +779,7 @@ fn plan(
     offsets_he: &[usize],
     keys_len: usize,
     current: Option<Language>,
+    run: Run,
     case: Case,
     en_dict: Dict,
     he_dict: Dict,
@@ -652,8 +813,8 @@ fn plan(
     // Whole-buffer decision first — this is what fires for virtually every real
     // correction.
     let whole = match current {
-        Some(cur) => decide_known(word_en, word_he, cur, en_dict, he_dict, en_freq, he_freq),
-        None => decide_unknown(word_en, word_he, en_dict, he_dict, en_freq, he_freq),
+        Some(cur) => decide_known(word_en, word_he, cur, run, en_dict, he_dict, en_freq, he_freq),
+        None => decide_unknown(word_en, word_he, run, en_dict, he_dict, en_freq, he_freq),
     };
     if let Some(lang) = whole {
         return Some(Plan::Switch { lang, start: 0 });
@@ -792,20 +953,27 @@ fn plan_split(
 /// it cannot be made reliably safe. Only if none of that fires does the English
 /// spelling autocorrect get a look at the word.
 ///
-/// Returns the single [`Fix`] to apply, or `None` to leave the word alone. For
-/// `Fix::Layout` the layout switch has already happened by the time this
-/// returns (and `None` is returned instead if the OS refused it); for
-/// `Fix::Spelling` no layout call is made at all.
+/// Returns the single [`Fix`] to apply — or `None` to leave the word alone —
+/// alongside the language the word turned out to be, which the caller records
+/// so the *next* word can be decided with a run behind it. For `Fix::Layout` the
+/// layout switch has already happened by the time this returns (and no fix is
+/// returned if the OS refused it); for `Fix::Spelling` no layout call is made at
+/// all.
+///
+/// `run` is the language of the words immediately before this one — see
+/// [`History`].
+#[allow(clippy::too_many_arguments)]
 pub fn check_and_correct<K: Copy>(
     keys: &[K],
     to_en: impl Fn(K) -> Option<char>,
     to_he: impl Fn(K) -> Option<char>,
     shift_of: impl Fn(K) -> bool,
+    run: Run,
     en_dict: Dict,
     he_dict: Dict,
-) -> Option<Fix> {
+) -> Outcome {
     if keys.is_empty() {
-        return None;
+        return Outcome { fix: None, lang: None };
     }
 
     // Build the full English/Hebrew folds once and record where each key's
@@ -868,6 +1036,11 @@ pub fn check_and_correct<K: Copy>(
     let he = Reading::new(&full_he, word_end_he);
 
     let current = crate::layout::current_layout();
+    // What the word says about the language being written, independent of
+    // whatever is about to be done to it. A layout switch overrides this below
+    // — that decision is the better answer — but for every word the pipelines
+    // leave alone, this is the only answer there is.
+    let seen = observed(en.word, he.word, en_dict, he_dict);
     let Some(plan) = plan(
         en,
         he,
@@ -875,6 +1048,7 @@ pub fn check_and_correct<K: Copy>(
         &offsets_he,
         keys.len(),
         current,
+        run,
         case,
         en_dict,
         he_dict,
@@ -882,10 +1056,10 @@ pub fn check_and_correct<K: Copy>(
         he_freq(),
     ) else {
         debug_log(&full_en, &full_he, None, false);
-        return None;
+        return Outcome { fix: None, lang: seen };
     };
 
-    match plan {
+    let (fix, lang) = match plan {
         Plan::Switch { lang, start } => {
             let switched = switch_layout_to(lang).changed();
             if debug_enabled() && start > 0 {
@@ -914,7 +1088,15 @@ pub fn check_and_correct<K: Copy>(
             };
             // The OS refused (or was already on) the target layout: retyping now
             // would re-enter the same characters, so do nothing.
-            switched.then_some(Fix::Layout { start, text, lang })
+            //
+            // The word is still recorded as being in the target language either
+            // way. That is what the pipeline concluded about it, and a refusal
+            // by the compositor is a fact about the compositor rather than about
+            // what the user was writing.
+            (
+                switched.then_some(Fix::Layout { start, text, lang }),
+                Some(lang),
+            )
         }
         Plan::Spell { text } | Plan::Expand { text } => {
             // No layout call at all — the word stays in English, only its
@@ -923,11 +1105,16 @@ pub fn check_and_correct<K: Copy>(
             if debug_enabled() {
                 println!("spell: {} -> {}{}", full_en, text, en.tail);
             }
-            Some(Fix::Spelling {
-                text: respelled(&text, case, en.tail),
-            })
+            (
+                Some(Fix::Spelling {
+                    text: respelled(&text, case, en.tail),
+                }),
+                Some(Language::English),
+            )
         }
-    }
+    };
+
+    Outcome { fix, lang }
 }
 
 /// The word `keys` spells, if the pipelines left it alone *only* because the
@@ -1165,9 +1352,9 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         // Typing "hello" while in English layout: do nothing.
-        assert_eq!(decide_known("hello", "ימךךם", Language::English, en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_known("hello", "ימךךם", Language::English, Run::default(), en, he, nofreq(), nofreq()), None);
         // Typing "שלום" while in Hebrew layout: do nothing.
-        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -1176,12 +1363,12 @@ mod tests {
         let he = dict(&["שלום"]);
         // In Hebrew layout but the keys spell "hello" in English -> switch EN.
         assert_eq!(
-            decide_known("hello", "ימךךם", Language::Hebrew, en, he, nofreq(), nofreq()),
+            decide_known("hello", "ימךךם", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()),
             Some(Language::English)
         );
         // In English layout but the keys spell "שלום" in Hebrew -> switch HE.
         assert_eq!(
-            decide_known("akuo", "שלום", Language::English, en, he, nofreq(), nofreq()),
+            decide_known("akuo", "שלום", Language::English, Run::default(), en, he, nofreq(), nofreq()),
             Some(Language::Hebrew)
         );
     }
@@ -1191,7 +1378,7 @@ mod tests {
         // "שלום" is in the dict; "ושלום" not, but matches via one‑letter prefix.
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -1199,7 +1386,7 @@ mod tests {
         let en = dict(&["fun"]);
         let he = dict(&[]);
         // Hebrew reading = "כום"
-        assert_eq!(decide_known("fun", "כום", Language::Hebrew, en, he, nofreq(), nofreq()), Some(Language::English));
+        assert_eq!(decide_known("fun", "כום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), Some(Language::English));
     }
 
     #[test]
@@ -1207,7 +1394,7 @@ mod tests {
         let en = dict(&["very"]);
         let he = dict(&[]);
         // Hebrew reading = "הקרט"
-        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, en, he, nofreq(), nofreq()), Some(Language::English));
+        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), Some(Language::English));
     }
 
     #[test]
@@ -1216,7 +1403,7 @@ mod tests {
         // New logic switches to other layout when other dict has word.
         let en = dict(&["uakuo"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, en, he, nofreq(), nofreq()), Some(Language::English));
+        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), Some(Language::English));
     }
 
 
@@ -1226,8 +1413,8 @@ mod tests {
         // switch, regardless of the short-word config.
         let en = dict(&[]);
         let he = dict(&[]);
-        assert_eq!(decide_known("xkc", "סלב", Language::English, en, he, nofreq(), nofreq()), None);
-        assert_eq!(decide_unknown("xkc", "סלב", en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_known("xkc", "סלב", Language::English, Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_unknown("xkc", "סלב", Run::default(), en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -1235,15 +1422,15 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         assert_eq!(
-            decide_unknown("hello", "ימךךם", en, he, nofreq(), nofreq()),
+            decide_unknown("hello", "ימךךם", Run::default(), en, he, nofreq(), nofreq()),
             Some(Language::English)
         );
         assert_eq!(
-            decide_unknown("akuo", "שלום", en, he, nofreq(), nofreq()),
+            decide_unknown("akuo", "שלום", Run::default(), en, he, nofreq(), nofreq()),
             Some(Language::Hebrew)
         );
         // In neither dict → no switch.
-        assert_eq!(decide_unknown("qqqq", "ננננ", en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_unknown("qqqq", "ננננ", Run::default(), en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -1251,8 +1438,8 @@ mod tests {
         // Keys valid as a word in BOTH layouts: do not switch, preserve user intent.
         let en = dict(&["go"]);
         let he = dict(&["עט"]); // whatever the keys read as in Hebrew
-        assert_eq!(decide_known("go", "עט", Language::English, en, he, nofreq(), nofreq()), None);
-        assert_eq!(decide_known("go", "עט", Language::Hebrew, en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_known("go", "עט", Language::English, Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), None);
     }
 
     #[test]
@@ -1265,7 +1452,7 @@ mod tests {
         let en_f = freq(&[("go", 30)]); // very common
         let he_f = nofreq(); // "עט" absent from the top-N list
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, en, he, en_f, he_f),
+            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
             Some(Language::English)
         );
     }
@@ -1278,7 +1465,7 @@ mod tests {
         let en_f = freq(&[("go", 30)]);
         let he_f = freq(&[("עט", 40)]); // comparably common, within the factor
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, en, he, en_f, he_f),
+            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
             None
         );
     }
@@ -1313,6 +1500,7 @@ mod tests {
             &[],
             0,
             current,
+            Run::default(),
             case,
             en,
             he,
@@ -1499,6 +1687,7 @@ mod tests {
             &[],
             0,
             Some(Language::English),
+            Run::default(),
             Case::Lower,
             en,
             he,
@@ -1532,6 +1721,7 @@ mod tests {
                 &[],
                 0,
                 Some(Language::English),
+                Run::default(),
                 Case::Lower,
                 en,
                 he,
@@ -1539,6 +1729,109 @@ mod tests {
                 nofreq(),
             ),
             Some(Plan::Spell { text: "hello".to_string() })
+        );
+    }
+
+    #[test]
+    fn the_run_is_the_streak_at_the_end_not_the_majority() {
+        let mut h = History::default();
+        assert_eq!(h.run(), Run { lang: None, len: 0 });
+        h.push(Language::Hebrew);
+        h.push(Language::Hebrew);
+        h.push(Language::Hebrew);
+        assert_eq!(h.run(), Run { lang: Some(Language::Hebrew), len: 3 });
+        // One English word breaks the run rather than being outvoted by the
+        // three Hebrew ones behind it.
+        h.push(Language::English);
+        assert_eq!(h.run(), Run { lang: Some(Language::English), len: 1 });
+    }
+
+    #[test]
+    fn the_run_forgets_the_distant_past_and_a_moved_cursor() {
+        let mut h = History::default();
+        for _ in 0..RUN_MEMORY * 3 {
+            h.push(Language::Hebrew);
+        }
+        // Bounded: a daemon running for weeks must not accumulate one entry per
+        // word for the whole of it.
+        assert_eq!(h.recent.len(), RUN_MEMORY);
+        assert_eq!(h.run().len as usize, RUN_MEMORY);
+        h.clear();
+        assert_eq!(h.run(), Run { lang: None, len: 0 });
+    }
+
+    #[test]
+    fn only_an_unambiguous_reading_counts_as_evidence() {
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        assert_eq!(observed("hello", "ימךךם", en, he), Some(Language::English));
+        assert_eq!(observed("akuo", "שלום", en, he), Some(Language::Hebrew));
+        // A word in both layouts says nothing about which one is being written…
+        let both_en = dict(&["go"]);
+        let both_he = dict(&["עט"]);
+        assert_eq!(observed("go", "עט", both_en, both_he), None);
+        // …and neither does a word in neither: a name or a typo is not evidence
+        // about the language, and guessing one would make the run noise.
+        assert_eq!(observed("qqqq", "ננננ", en, he), None);
+    }
+
+    #[test]
+    fn a_run_in_the_other_language_resolves_a_homograph() {
+        // Both readings are real words, and the frequency gap is nowhere near
+        // the FREQ_RARER_FACTOR the tie-break demands on its own — "go" is only
+        // three times commoner than "עט", and well outside the top 2000.
+        let en = dict(&["go"]);
+        let he = dict(&["עט"]);
+        let en_f = freq(&[("go", 6_000)]);
+        let he_f = freq(&[("עט", 18_000)]);
+        // Typing in Hebrew with no history: the user's own layout wins, which
+        // is the behaviour every other test here pins.
+        assert_eq!(
+            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
+            None
+        );
+        // The same word after two English words is not ambiguous any more.
+        let run = Run { lang: Some(Language::English), len: 2 };
+        assert_eq!(
+            decide_known("go", "עט", Language::Hebrew, run, en, he, en_f, he_f),
+            Some(Language::English)
+        );
+        // A run in the layout the user is already in argues for nothing — it
+        // agrees with the guard, which was going to keep the word anyway.
+        let same = Run { lang: Some(Language::Hebrew), len: 5 };
+        assert_eq!(
+            decide_known("go", "עט", Language::Hebrew, same, en, he, en_f, he_f),
+            None
+        );
+    }
+
+    #[test]
+    fn one_word_is_not_a_run() {
+        // The run is built out of the pipelines' own conclusions, so a single
+        // word must not be enough to justify the next one — otherwise one wrong
+        // call licenses the one after it.
+        let en = dict(&["go"]);
+        let he = dict(&["עט"]);
+        let en_f = freq(&[("go", 6_000)]);
+        let he_f = freq(&[("עט", 18_000)]);
+        let one = Run { lang: Some(Language::English), len: 1 };
+        assert_eq!(
+            decide_known("go", "עט", Language::Hebrew, one, en, he, en_f, he_f),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_never_overrides_a_word_the_other_layout_does_not_know() {
+        // The run loosens the *tie-break* between two real words. It is not a
+        // licence to switch on a reading that is not a word at all, which is
+        // what would turn a name typed mid-sentence into gibberish.
+        let en = dict(&["hello"]);
+        let he = dict(&["שלום"]);
+        let run = Run { lang: Some(Language::Hebrew), len: 5 };
+        assert_eq!(
+            decide_known("qqqq", "ננננ", Language::English, run, en, he, nofreq(), nofreq()),
+            None
         );
     }
 
@@ -1551,7 +1844,7 @@ mod tests {
         let en_f = freq(&[("go", 9000)]); // real word, but rare
         let he_f = nofreq();
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, en, he, en_f, he_f),
+            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
             None
         );
     }
