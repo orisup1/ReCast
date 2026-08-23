@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icons/icon-256.png" width="128" height="128" alt="ReCast logo">
+  <img src="assets/recast-icon.svg" width="128" height="128" alt="ReCast logo">
 </p>
 
 <h1 align="center">ReCast</h1>
@@ -26,16 +26,10 @@ merely misspelled gets fixed in place instead — and completes words you are st
   punctuation *inside* a word stays part of it (`don't`).
 - It **anchors on your live keyboard layout** (queried from the OS, with any English or
   Hebrew regional variant recognised). A sequence that already reads as a real word in your
-  current layout is left untouched — including prefixed Hebrew forms, one prefix or two
-  where Hebrew genuinely stacks them (`והבית`, `כשבית`, `שהשלום`), and words whose
-  other-layout reading happens to also be a dictionary word. It only switches when the
-  *other* layout yields a confident word and the current one yields nothing real.
+  current layout is left untouched — including prefixed Hebrew forms (ו/ה/ל/ב/כ/מ/ש) and
+  words whose other-layout reading happens to also be a dictionary word. It only switches
+  when the *other* layout yields a confident word and the current one yields nothing real.
   This is what stops valid (and nested/prefixed) words from being mangled.
-- It **reads the words around the one it is deciding**. Language comes in runs — nobody
-  writes one Hebrew word between two English ones — so a key sequence that is a real word
-  in *both* layouts, which no amount of dictionary work can resolve on its own, is settled
-  by what you were writing a moment ago. The run only ever tips a genuine tie; it can never
-  make ReCast switch on a reading that is not a word at all.
 - On a switch it erases the mistyped word and puts the corrected one back **in one shot**,
   the way a paste lands rather than the way typing does — followed by the original
   Space/Enter. On macOS and Windows the word is inserted as text in a single event, so it
@@ -57,123 +51,39 @@ merely misspelled gets fixed in place instead — and completes words you are st
 
 | OS      | Capture         | Injection                        | Layout switch                                       |
 | ------- | --------------- | -------------------------------- | --------------------------------------------------- |
-| Linux   | `evdev`         | `uinput` keycodes, one batch     | Hyprland / sway / KDE / GNOME / any X11 (see below) |
+| Linux   | `evdev`         | `uinput` keycodes, one batch     | `hyprctl switchxkblayout` (Hyprland only)           |
 | macOS   | `CGEventTap`    | `CGEvent` Unicode string         | Carbon `TISSelectInputSource`                       |
 | Windows | `rdev`          | one `SendInput` Unicode batch    | `LoadKeyboardLayoutW` + `WM_INPUTLANGCHANGEREQUEST` |
 
 Linux additionally requires the user to be in the `input` group (for `evdev` read access)
 and creates a `uinput` virtual device named `recast-injector` to replay corrected words.
 
-## Requirements
+## Setup
 
-- **Rust** toolchain (`rustup`, `cargo`).
-- Both **English and Hebrew layouts installed** in your OS keyboard settings. Their order
-  does not matter — ReCast looks up which position each one is in.
-- **Linux only:** membership in the `input` group (for `evdev` read access). ReCast creates
-  a `uinput` virtual device named `recast-injector` to replay corrected words.
-
-### Switching the layout on Linux
-
-There is no single way to do this on Linux: X11 lets anyone set the XKB group,
-and Wayland deliberately does not — the compositor owns the keymap and each one
-exposes its own way to ask. So ReCast probes the session once at startup and
-picks one of five backends:
-
-| Session                             | How                                    |
-| ----------------------------------- | -------------------------------------- |
-| Hyprland                            | its control socket                     |
-| sway (or any i3-IPC compositor)     | the `$SWAYSOCK` socket                 |
-| KDE Plasma (Wayland or X11)         | `org.kde.KeyboardLayouts` over D-Bus   |
-| GNOME (Wayland or X11)              | `org.gnome.desktop.input-sources`      |
-| Any X11 session — i3, xfce, MATE, … | the XKB group, via `libX11`            |
-
-The first two talk to the compositor over its socket rather than shelling out
-to `hyprctl`/`swaymsg`: that was measured at 6.3 ms against 0.11 ms for the same
-question, and a correction that changes layout asks twice. X11 uses `libX11`,
-loaded with `dlopen` so a pure Wayland machine that has no X libraries installed
-still runs. KDE and GNOME go through `gdbus`/`busctl`/`qdbus` and `gsettings`
-respectively, which is a process per query — the 300 ms cache is what makes that
-survivable.
-
-`recast --status` prints which backend was chosen and the layouts it found:
-
-```
-  layout switch:  Hyprland (control socket) — layouts: us, il
-```
-
-If the probe guesses wrong, `layout_backend` in `config.toml` (or
-`RECAST_LAYOUT_BACKEND`) forces one: `hyprland`, `sway`, `kde`, `gnome`, `x11`
-or `none`.
-
-Four of the five are also *watched* rather than only asked: Hyprland's event
-socket, sway's i3-IPC `input` subscription, `gsettings monitor` on GNOME and
-`gdbus monitor` on KDE all say when the layout changes, so the answer is already
-in hand by the time a word ends. That matters most for GNOME and KDE, where
-asking means a subprocess — it now happens on a thread nobody is waiting on, and
-only when something has actually changed. X11 keeps polling, because it answers
-over a connection ReCast already holds open and the query it would save costs a
-round trip rather than a process. ReCast also drops its cached answer whenever
-you release something shaped like a layout hotkey (two modifiers, or a modifier
-with space, or Caps Lock), so a hand-switched layout is never one word behind.
-
-ReCast used to support Hyprland alone, and hardcoded *layout 0 is English,
-layout 1 is Hebrew* — so anyone with a third layout got switched into it, and
-everyone else got no layout correction at all while the speller kept working,
-which is a confusing way for a feature to be missing.
+1. Install Rust (`rustup`, `cargo`).
+2. Make sure both English and Hebrew layouts are installed in your OS keyboard settings.
+   On Linux/Hyprland the xkb config must list English as layout 0 and Hebrew as layout 1.
 
 ### Prebuilt binaries
 
-The [Releases page](https://github.com/orisup1/recast/releases) has ready-to-run builds if
-you would rather not install a toolchain. They are self-contained — the dictionaries are
-inside the executable — so there is nothing to unpack alongside them:
+`exec/` holds ready-to-run builds if you would rather not install a toolchain. They are
+self-contained — the dictionaries are inside the executable — so there is nothing to
+unpack alongside them:
 
-| Asset            | Target                                                     |
-| ---------------- | ---------------------------------------------------------- |
-| `recastLinux`    | Linux x86-64                                               |
-| `ReCast.exe`     | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
-| `recastMac`      | macOS universal (arm64 + x86-64)                           |
-| `ReCast.app.zip` | macOS bundle, same universal binary inside                 |
+| File               | Target                                                     |
+| ------------------ | ---------------------------------------------------------- |
+| `exec/recastLinux` | Linux x86-64                                               |
+| `exec/ReCast.exe`  | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
+| `exec/recastMac`   | macOS arm64                                                |
+| `exec/ReCast.app`  | macOS bundle                                               |
 
-They are built by the **Binaries** workflow (`.github/workflows/binaries.yml`, run from
-the Actions tab), which compiles each one on its own runner and attaches the results to a
-release. They were committed into `exec/` until that had cost the repository ~45 MB per
-refresh, permanently — a release asset can be replaced, a git object cannot. `exec/` is
-still where a local `make bundle` stages the macOS `.app`, but nothing in it is tracked.
-Building yourself is still the recommended path; these exist so you can try it in one step.
-
-#### macOS: "ReCast is damaged and can't be opened"
-
-If you see this, nothing is damaged. macOS attaches a `com.apple.quarantine` flag to
-anything that arrives from a browser, an AirDrop, a zip or a USB stick, and Gatekeeper
-then judges the download by its code signature. A build with **no** signature comes back
-as *damaged* rather than as *unsigned* — the same misleading wording either way. The
-machine that built it never sees this, because files it produced itself are not
-quarantined; that is why the message appears only on the other side of a transfer,
-including a transfer back to the machine the build came from.
-
-The downloads are ad-hoc signed, which is enough to clear that. Because the signature
-carries no Apple-issued certificate, macOS still asks once before the first launch —
-right-click the app → **Open**, or *System Settings → Privacy & Security → Open Anyway*.
-For the bare `recastMac` binary, or if you would rather skip the prompt:
-
-```bash
-xattr -dr com.apple.quarantine ReCast.app     # or: recastMac
-```
-
-Building it yourself sidesteps all of this, since a local build is never quarantined.
-`make bundle` ad-hoc signs the bundle it assembles; `make notarize
-CODESIGN_ID="Developer ID Application: …"` produces one that opens with no prompt at all,
-which needs a paid Apple Developer account.
-
-To move a build you made to another Mac, use **`make dist`** rather than compressing
-`exec/ReCast.app` by hand. A `.app` is a directory, and its signature depends on the exact
-file layout and modes inside it; most zip tools and most non-APFS filesystems do not
-preserve them, and a bundle whose signature no longer matches its contents is reported as
-damaged in the same words as one with no signature at all. `make dist` verifies the
-signature and packages it with `ditto`, which keeps that structure intact. That is also the only way ReCast's Input
-Monitoring and Accessibility grants survive an upgrade: macOS keys them to the signature,
-and an ad-hoc signature is a fresh identity on every build, so each new version has to be
-granted permission again.
+They are committed artifacts rather than build output, so they are only as current as the
+last time someone refreshed them. That refresh is now a button: the **Binaries** workflow
+(`.github/workflows/binaries.yml`, run from the Actions tab) builds all three on their own
+runners and commits the results back here, so they no longer drift apart one platform at a
+time. The next run also replaces the arm64-only macOS builds above with universal
+(arm64 + x86-64) ones, which an Intel Mac can actually run. Building yourself is still the
+recommended path; these exist so you can try it in one step.
 
 The English and Hebrew dictionaries are baked into the binary at compile time, so the
 executable is self-contained and runs identically from any working directory — no data
@@ -195,78 +105,92 @@ meaningful memory, and that the total stays under a 50 MB ceiling. On this machi
 settles at **about 9 MB and grows by hundredths of one** across the tenfold increase. `recast --status`
 prints the figure so you can check a daemon that has been up for a month against it.
 
-### Linux
+## Linux: full install + autostart
 
-One-shot setup: adds your user to the `input` group, builds in release mode, installs the
-binary to `~/.local/bin/recast`, and registers a `systemd --user` unit that starts ReCast
-at login.
+One-shot setup. Adds your user to the `input` group (required for `evdev` access),
+builds in release mode, installs the binary to `~/.local/bin/recast`, and registers a
+`systemd --user` unit that starts ReCast at login:
 
 ```bash
 sudo usermod -aG input $USER && exec newgrp input <<< 'make service'
 ```
 
-`newgrp` applies the new group to the current shell so you don't have to log out; omit it
-and re-login instead if you prefer. Ensure `~/.local/bin` is on your `PATH`.
+`newgrp` applies the new group to the current shell so you don't have to log out;
+omit the `newgrp` part and re-login instead if you prefer. Make sure `~/.local/bin`
+is on your `PATH`.
 
 Manage the service:
 
 ```bash
-systemctl --user status  recast    # health check
-systemctl --user restart recast    # apply a rebuild
-journalctl  --user -u    recast -f  # follow logs
-make service-uninstall             # stop and remove the unit
+systemctl --user status  recast       # health check
+systemctl --user restart recast       # apply a rebuild
+journalctl  --user -u    recast -f    # logs
+make service-uninstall                # stop + remove the unit
 ```
 
-Common Make targets:
+### Other Make targets
 
-| Target             | Action                                    |
-| ------------------ | ----------------------------------------- |
-| `make`             | `cargo build --release`                   |
-| `make install`     | build + copy binary to `~/.local/bin`     |
-| `make deploy`      | clean + build + install                   |
-| `make uninstall`   | remove the installed binary               |
-| `make run ARGS=-g` | `cargo run` with a flag (here, the TUI)   |
-| `make help`        | full target list                          |
+```bash
+make              # cargo build --release
+make install      # build + copy bin to ~/.local/bin
+make deploy       # clean + build + install
+make uninstall    # remove the installed bin
+make run ARGS=-g  # cargo run with the GUI flag
+make app          # macOS only: install ReCast.app to /Applications
+make help         # full target list
+```
 
 Override the install root with `PREFIX=`, e.g. `make install PREFIX=/opt/recast`.
 
-### macOS
+## macOS
+
+Two ways to install, depending on whether you want a bare binary or an app bundle.
 
 ```bash
-make service
+make service   # binary + launchd LaunchAgent
 ```
 
-This writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.recast.plist` and starts
-it. The first time it runs, grant the binary **Input Monitoring** and **Accessibility**
-permissions in *System Settings → Privacy & Security*.
+Writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.recast.plist` and starts it.
 
-To reset ReCast's permissions:
+```bash
+make app       # ReCast.app in /Applications
+```
+
+Builds, restages `exec/ReCast.app` around the fresh binary, installs it to
+`/Applications` and resets the app's privacy grants (`src/platform/deploy-macos.sh`
+does the work). Use this one if you want ReCast to look like an application rather
+than a background job — "Start at login" in the menubar menu then registers it.
+
+Either way you will need to grant **Input Monitoring** and **Accessibility** in
+System Settings → Privacy & Security the first time it runs.
+
+macOS keys those two grants to the bundle's code signature rather than to its path,
+so replacing the executable inside a bundle that already has them leaves the checkbox
+ticked while the app receives nothing — no keystrokes, no corrections, no error.
+`make app` resets them for you; after any other kind of manual reinstall, do it
+yourself and re-grant when prompted:
 
 ```bash
 tccutil reset All com.recast.app
 ```
 
-Once installed, `recast` is on your `PATH` and supports the same flags as every other
-platform (see [Usage](#usage)) — e.g. `recast -h`, `recast -g`, `recast -s`. Note that the
-LaunchAgent runs with `KeepAlive`, so `recast -s` stops a manually-launched instance but the
-*service* will be relaunched by launchd; to stop the service, run `make service-uninstall`.
+## Windows
 
-### Windows
-
-In PowerShell:
+PowerShell:
 
 ```powershell
 .\deploy.ps1 -Target service
 ```
 
-This builds, installs to `%USERPROFILE%\.local\bin`, and registers a Scheduled Task that
-runs ReCast at logon. Run `.\deploy.ps1 -Target help` to list every target.
+Builds, installs to `%USERPROFILE%\.local\bin`, and registers a Scheduled Task that
+runs ReCast at logon. `.\deploy.ps1 -Target help` lists every target.
 
-## Usage
+## Running directly
 
-You don't need the service — you can run the binary (or `cargo run --release`) directly
-from any shell. On Linux it daemonizes into the background by default (under systemd this
-is detected automatically); on macOS and Windows it lives in the tray/menubar.
+If you don't want a service, just run the binary (or `cargo run --release`) from any
+shell. On Linux it daemonizes into the background by default (`-f`/`--foreground`
+keeps it attached; under systemd this is detected automatically); on macOS/Windows
+it stays in the tray/menubar.
 
 ```bash
 recast          # start (Linux: forks into the background and writes a pidfile)
@@ -298,6 +222,9 @@ off, `p` pauses it for half an hour, `r` re-reads your files, `q` quits. The
 control window (`-w`) offers the toggle and counters in a tiny GUI window. On
 macOS use the menubar menu instead.
 
+Both are **foreground** modes: quitting the dashboard or closing the window ends
+ReCast with it. Install the service if you want it to outlive the window.
+
 The enabled/disabled switch is **remembered across restarts** — turning
 correction off is a decision about the machine, not about one run of the
 process — and `--status` reports it whether or not anything is running:
@@ -308,18 +235,22 @@ recast 0.7.0
   correction:     enabled
   start at login: yes
   config dir:     /home/you/.config/recast
-  config.toml:    /home/you/.config/recast/config.toml
   abbrev.txt:     3 abbreviation(s)
   ignore.txt:     7 word(s)
   memory (this):  8.9 MB
 
-  settings (config.toml and RECAST_* applied):
+  settings (with any RECAST_* override applied):
     short words          on
     missing-space split  off
     frequency tie-break  on
     spelling             on  (min length 4, max rank 20000, max distance 3)
     auto-complete        on  (min prefix 3, max rank 30000)
 ```
+
+Two of those rows are platform-specific and only one platform ever shows both:
+`running:` is Linux (nothing else daemonizes, so there is no pid to report), and
+`start at login:` appears only where the autostart registration is wired up —
+launchd on macOS, the per-user `Run` key on Windows.
 
 The settings block reads back what the program actually resolved, which is the
 only way to tell an override that was applied from one that was not. A value it
@@ -331,47 +262,7 @@ plainly trying to tighten it:
   ! RECAST_SPELL_DIST="l" is not a number — using the default instead.
 ```
 
-The **TUI** (`-g`, Linux/Windows) shows the enabled state, the fixed-word counter, and a
-live log; press `e` or `Space` to toggle correction on and off, and `q` to quit. The
-**control window** (`-w`) offers the same toggle and counter in a small GUI window. On
-macOS, use the menubar menu instead.
-
-### config.toml
-
-Every setting can be written down instead of exported. `recast --write-config`
-creates `<config dir>/recast/config.toml` with all of them in it, commented out
-and showing their defaults; uncomment what you want to change:
-
-```toml
-spell_dist = 1        # cap the autocorrect at single-edit typos
-complete_min = 4      # shortest prefix Right Shift will complete
-inject_batch_gap = 0  # send a correction as one write (Linux)
-```
-
-The keys are the environment names with `RECAST_` dropped and the rest
-lowercased — `RECAST_SPELL_DIST` is `spell_dist` — and the environment still
-wins where both are set. It is a flat `key = value` file with `#` comments: a
-subset of TOML, so an editor's TOML mode works, but there are no tables and no
-arrays because every setting here is a bool or a number.
-
-**This is the one that works under a service.** ReCast is started by systemd,
-launchd or a Scheduled Task on the three platforms, none of which pass your
-shell environment through — so a `RECAST_*` variable set in `.bashrc` reaches
-a hand-launched ReCast and nothing else. The file is read whichever way it
-started.
-
-Unlike `abbrev.txt` and `ignore.txt`, it is read once, at startup: changing it
-takes a restart. Anything in it that ReCast could not use — a misspelled key, a
-line with no `=`, a number that is not a number — is named at startup and again
-under `--status`, rather than being ignored in silence.
-
-### Environment variables
-
-| Variable            | Effect                                                          |
-| ------------------- | -------------------------------------------------------------- |
-| `RECAST_DEBUG=1`    | Print every word check and switch decision                     |
-| `RECAST_SPLIT=1`    | Enable the opt-in missing-space splitting fallback             |
-| `RECAST_SHORT=0`    | Never auto-switch on short (≤3 char) words                      |
+Environment variables:
 
 ```bash
 RECAST_DEBUG=1 recast   # print every word check and switch decision
@@ -406,12 +297,7 @@ trigger on their own).
 Short words are the most collision-prone (many 2–3 letter abbreviations are
 valid in one dictionary while spelling a real word in the other layout), so
 `RECAST_SHORT=0` is the knob to reach "never wrongly switch" at the cost of
-not fixing short mistyped words. It is not a bare length cutoff: length was only
-ever standing in for "probably an accidental dictionary hit", and the frequency
-lists answer that directly. So even with the gate on, a short reading that is one
-of the 500 most common words in its language — `the`, `של`, `זה` — still
-switches, because those are the short words people actually mistype the layout
-of rather than the collisions the gate is for.
+not fixing short mistyped words.
 
 ## English autocorrect
 
@@ -432,24 +318,12 @@ word is only corrected when all of this holds:
   survive (the punctuation you *ended* the word with is set aside first, and
   typed back with the correction),
 - it is not typed in ALL CAPS — acronyms are not misspellings,
-- it is not listed in your own `ignore.txt`, and not a word you have taken the
-  same correction back from twice (see [Undo](#undo)),
+- it is not listed in your own `ignore.txt` (see below),
 - the correction is inside the edit budget for a word that length: one edit up to
   6 characters, two from 7, three from 10, capped by `RECAST_SPELL_DIST`
   (default 3 — set it to 1 for single-typo fixes only),
 - the correction is a common word, within `RECAST_SPELL_RANK` (default 20000),
-  halved past one edit and divided by five past two — except for a word of 9
-  characters or more whose two edits were both the *cheap*, well-explained kind
-  (a doubled letter, a neighbouring key, a spelling confusion people share),
-  which keeps the full budget.
-
-That last exception is what the corpus asked for. `occurance` → `occurrence` is a
-doubled letter and a known suffix confusion, and `occurrence` sits at rank 19205
-— just outside the halved budget, so the obvious fix used to be declined.
-`restaraunt` reaches `restraint` (rank 14085) in the same band and the same
-number of edits, but by moving letters that were not wrong, and it is not the
-word anyone meant. Length alone cannot tell those apart; what the edits *were*
-can, which is why the exception is conditioned on both.
+  halved past one edit and divided by five past two.
 
 ### How it picks
 
@@ -505,15 +379,10 @@ range. It is also what lets a phonetic respelling be found at all — `fisical` 
 
 Edits are priced by *where* in the word they land, too. Getting the opening of a
 word wrong is rare and rewriting it is the most damaging thing this can do, so a
-first-letter edit carries a heavy surcharge and a first letter from the other
-side of the keyboard is out of reach entirely. Three things can still reach an
-opening, and all three are events rather than guesses: a transposed opening
-(`hte` → `the`), a word-initial spelling rule (`fone` → `phone`), and the key
-physically *next to* the one meant (`vecause` → `because`, `fovernment` →
-`government`). The last of those costs the neighbouring-key price plus the
-first-letter surcharge, which needs a two-edit budget — so it only ever happens
-to a word long enough to afford one, and never to the short tokens that are
-overwhelmingly names.
+first-letter edit carries a heavy surcharge and a plain wrong first letter is out
+of reach entirely — with two exceptions, both of which keep the letters you
+typed: a transposed opening (`hte` → `the`) and a word-initial spelling rule
+(`fone` → `phone`).
 
 Together that is what makes badly mangled words reachable — `recieveing` →
 `receiving`, `beutifull` → `beautiful`, `maintainance` → `maintenance`,
@@ -528,14 +397,11 @@ per line; set `RECAST_SPELL_DIST=1` for the old single-edit behaviour; or
 `RECAST_SPELL=0` to turn the pipeline off. The double-tap is also how a word
 comes *back off* either list, so nothing you retire is retired for good.
 
-What the *speller* deliberately does not do is look at the surrounding words.
-(The layout pipeline does — see the language run above — but that is a different
-question: which of two real words you meant, not which real word to invent.)
-Every published evaluation of this kind of corrector puts the ceiling for
-single-word correction well below what context-aware models reach, and correcting
-a word that is *already* a real word (`from` for `form`) needs that context.
-ReCast never touches a word the dictionary knows, so it stays on the safe side of
-that line.
+What it deliberately does not do is look at the surrounding words. Every
+published evaluation of this kind of corrector puts the ceiling for single-word
+correction well below what context-aware models reach, and correcting a word that
+is *already* a real word (`from` for `form`) needs that context. ReCast never
+touches a word the dictionary knows, so it stays on the safe side of that line.
 
 ## Auto-complete
 
@@ -603,16 +469,8 @@ Putting the letters back is only half of it. A correction is a *function* of wha
 you typed, so retyping the same word reaches the same conclusion — an undo that
 only rewrote the screen would put you on a treadmill. So undoing a word also
 **retires** it: nothing corrects that word again until ReCast restarts. That is
-the fast path for the `hostname` → `hostage` case.
-
-**Undo the same word twice and it stays retired**, across restarts, without your
-having to go and write anything down. Once is a reflex and is worth a session;
-twice, on two separate occasions, is a decision — the correction is not a one-off
-annoyance but something that will keep happening to a word you keep typing.
-ReCast counts undos in `<config dir>/recast/learned.txt` and stops at two, which
-reaches the same place `ignore.txt` does by hand. `recast --status` reports how
-many words are retired that way, and the un-retire gesture below clears the count
-along with everything else.
+the fast path for the `hostname` → `hostage` case, and `ignore.txt` is still how
+you make it permanent.
 
 A completion can be taken back the same way, though tapping Right Shift around
 the cycle gets you there without the gesture.
@@ -693,21 +551,11 @@ nothing to fetch and nothing to ask.
 The word being typed lives in memory and is dropped at every word boundary, on
 Tab / Escape / an arrow key, and on a mouse click. The recent-corrections list
 the tray and TUI show is the last 20, held in RAM and gone when the process
-exits — it is a glance, not a log, and it is never persisted. The exceptions are
-two files, both of which gain a word only through a deliberate gesture of yours,
-and both of which are plain text you can read, edit or delete (see
-[Your files](#your-files)):
-
-- `ignore.txt`, when you double-tap Ctrl on a correction or click one in
-  `Recent`.
-- `learned.txt`, when you undo a correction — the word you typed, and how many
-  times you have taken that correction back. Nothing else about the word is
-  recorded: not what it was corrected *to*, not when, not what surrounded it.
-
-Both grow only by your undoing or listing something, so what they contain is the
-set of words you have explicitly told ReCast to stop touching — never a
-transcript. If you would rather ReCast learned nothing, delete `learned.txt`; it
-is rewritten only at the next undo.
+exits — it is a glance, not a log, and it is never persisted. The one exception
+is `ignore.txt`, which gains a word only when you put it there yourself, by
+double-tapping Ctrl on a correction or clicking one in `Recent`. That is your
+file, in plain text, and you can read or edit it (see
+[Your files](#your-files)).
 
 **Your clipboard is never touched.** A corrected word is injected as synthetic
 input carrying the characters directly — `CGEventKeyboardSetUnicodeString` on
@@ -751,12 +599,10 @@ be made there.
 
 ## Your files
 
-`abbrev.txt` and `ignore.txt` are yours: both optional, both absent by default —
-nothing is created for you — and both re-read within about two seconds of being
-edited, so adding an abbreviation and typing it are the same action rather than a
-restart apart. The rest of the table is ReCast's own bookkeeping, written when
-there is something to write and read at startup. Everything lives under the OS
-config directory:
+Both are optional and absent by default — nothing is created for you. They are
+re-read within about two seconds of being edited, so adding an abbreviation and
+typing it are the same action rather than a restart apart. They live under the
+OS config directory:
 
 | OS      | Directory                               |
 | ------- | --------------------------------------- |
@@ -769,7 +615,6 @@ config directory:
 | `abbrev.txt` | `abbr = expansion` per line, `#` comments. Expands when you finish the word, and is offered by the first Right Shift tap. |
 | `ignore.txt` | One word per line, `#` comments. Words the autocorrect must never touch.                                                  |
 | `state.txt`  | Written by ReCast: the Enable/Disable switch, so it survives a restart.                                                   |
-| `learned.txt` | Written by ReCast: `word<TAB>count` of the corrections you have undone. Two and the word is retired for good. Editable — a bare word on a line counts as one. |
 | `welcomed`   | Written by ReCast: a marker saying the one-time hint below has been shown. Delete it to see it again.                     |
 
 `ignore.txt` is the only file of *yours* that ReCast writes. Double-tapping Ctrl on a
@@ -787,7 +632,7 @@ makes sure of it.
 
 ```bash
 cargo build --release     # or `make` — release is the meaningful profile (LTO + strip)
-cargo test                # 109 tests, all pure: dictionaries, speller, completer, keymaps, counters
+cargo test                # 128 tests, all pure: dictionaries, speller, completer, keymaps, counters
 RECAST_DEBUG=1 cargo run  # log every word check and switch decision
 ```
 
@@ -810,18 +655,14 @@ cargo check --target x86_64-apple-darwin
 ```
 
 CI (`.github/workflows/ci.yml`) runs `cargo test`, `cargo clippy -- -D warnings` and a
-release build on Linux, macOS and Windows runners. Nothing below `src/platform/` has
-tests, so "it builds on its own OS" is the whole guarantee there.
+release build on Linux, macOS and Windows runners. The three platform modules are
+near-identical copies that nothing keeps in step, so a change made in one and forgotten in
+the other two is the most likely regression here — building each on its own OS is what
+catches it.
 
-The three platform modules used to be near-identical copies of one another — the word
-buffer, both gestures, undo, the completion cycle and the replacement planning were
-written out three times, and a change made in one and forgotten in the other two was the
-most likely regression in the codebase. That state machine now lives once in
-`src/platform/engine.rs`, generic over a `Platform` trait, and each OS module supplies
-only what is genuinely its own: how keystrokes arrive, how a replacement is put on screen,
-and how the process starts up. `src/platform/textkeys.rs` holds the further half that
-macOS and Windows share, since both capture `rdev::Key` and both insert corrections as
-text. Per-platform code went from ~3400 lines to ~1450.
+It is **started by hand**, from the Actions tab ("Run workflow"): the `push` and
+`pull_request` triggers are commented out at the top of the file, so nothing fires
+automatically. Uncomment those two blocks to turn it back on.
 
 ## License
 

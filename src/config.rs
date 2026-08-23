@@ -51,74 +51,60 @@ pub const DEFAULT_COMPLETE_MIN_LEN: usize = 3;
 pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
 
 impl Config {
-    /// Load configuration from the environment and `config.toml`, in that
-    /// order of precedence (see [`crate::settings`]).
-    ///
-    /// * `RECAST_SHORT` / `short` – `0` to stop switching on short (≤3 char)
-    ///   words (default: enabled).
-    /// * `RECAST_SPLIT` / `split` – enable the missing-space split fallback
-    ///   (default: disabled).
-    /// * `RECAST_FREQ` / `freq` – `0` to disable the homograph frequency
-    ///   tie-break (default: enabled).
-    /// * `RECAST_SPELL` / `spell` – `0` to disable the English spelling
-    ///   autocorrect (default: enabled).
-    /// * `RECAST_SPELL_MIN` / `spell_min` – shortest correctable word
-    ///   (default: 4).
-    /// * `RECAST_SPELL_RANK` / `spell_rank` – worst frequency rank a suggestion
-    ///   may have (default: 20000).
-    /// * `RECAST_SPELL_DIST` / `spell_dist` – maximum edit distance, 1 to 3
-    ///   (default: 3).
-    /// * `RECAST_COMPLETE` / `complete` – `0` to disable auto-complete
-    ///   (default: enabled).
-    /// * `RECAST_COMPLETE_MIN` / `complete_min` – shortest completable prefix
-    ///   (default: 3).
-    /// * `RECAST_COMPLETE_RANK` / `complete_rank` – worst frequency rank a
-    ///   completion may have (default: 30000).
-    pub fn load() -> Self {
+    /// Load configuration from environment variables.
+    /// RECAST_SHORT – set to `0` to disable switching on short (≤3 char) words
+    ///                (default: enabled).
+    /// RECAST_SPLIT – set (to anything but `0`) to enable the missing-space
+    ///                split fallback (default: disabled).
+    /// RECAST_FREQ  – set to `0` to disable the homograph frequency tie-break
+    ///                (default: enabled).
+    /// RECAST_SPELL – set to `0` to disable the English spelling autocorrect
+    ///                (default: enabled).
+    /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
+    /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
+    ///                     (default: 20000).
+    /// RECAST_SPELL_DIST – maximum edit distance, 1 to 3 (default: 3).
+    /// RECAST_COMPLETE   – set to `0` to disable auto-complete (default:
+    ///                     enabled).
+    /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 3).
+    /// RECAST_COMPLETE_RANK – worst frequency rank a completion may have
+    ///                        (default: 30000).
+    pub fn from_env() -> Self {
         Self {
-            short_enabled: flag("RECAST_SHORT", true),
-            split_enabled: flag("RECAST_SPLIT", false),
-            freq_enabled: flag("RECAST_FREQ", true),
-            spell_enabled: flag("RECAST_SPELL", true),
-            spell_min_len: num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),
-            spell_max_rank: num("RECAST_SPELL_RANK", DEFAULT_SPELL_MAX_RANK),
-            spell_max_dist: num("RECAST_SPELL_DIST", DEFAULT_SPELL_MAX_DIST),
-            complete_enabled: flag("RECAST_COMPLETE", true),
-            complete_min_len: num("RECAST_COMPLETE_MIN", DEFAULT_COMPLETE_MIN_LEN),
-            complete_max_rank: num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
+            short_enabled: std::env::var("RECAST_SHORT")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            split_enabled: std::env::var("RECAST_SPLIT")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false),
+            freq_enabled: std::env::var("RECAST_FREQ")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            spell_enabled: std::env::var("RECAST_SPELL")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            spell_min_len: env_num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),
+            spell_max_rank: env_num("RECAST_SPELL_RANK", DEFAULT_SPELL_MAX_RANK),
+            spell_max_dist: env_num("RECAST_SPELL_DIST", DEFAULT_SPELL_MAX_DIST),
+            complete_enabled: std::env::var("RECAST_COMPLETE")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            complete_min_len: env_num("RECAST_COMPLETE_MIN", DEFAULT_COMPLETE_MIN_LEN),
+            complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
         }
     }
 }
 
-/// Whether a setting's value means "on".
-///
-/// The environment only ever had `0` for off, because a variable that is set at
-/// all is usually meant as "yes". A file has to do better: someone writing
-/// `spell = false` on a line of their own has said something unambiguous, and
-/// reading it as *enabled* — which a bare `!= "0"` does — would be the worst
-/// kind of quiet wrong answer. An empty value is off for the same reason:
-/// `spell =` with nothing after it is not an endorsement.
-fn truthy(value: &str) -> bool {
-    !matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "" | "0" | "false" | "no" | "off"
-    )
-}
-
-/// A boolean setting, falling back to `default` when neither source sets it.
-pub fn flag(key: &str, default: bool) -> bool {
-    crate::settings::get(key).map_or(default, |v| truthy(&v))
-}
-
-/// A numeric setting, falling back to `default` when unset or unparsable.
-fn num<T: std::str::FromStr>(key: &str, default: T) -> T {
-    crate::settings::get(key)
+/// Numeric env override, falling back to `default` when unset or unparsable.
+fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
 
 /// Every numeric setting, so a value that could not be read can be named.
-pub const NUMERIC_KEYS: &[&str] = &[
+const NUMERIC_KEYS: &[&str] = &[
     "RECAST_SPELL_MIN",
     "RECAST_SPELL_RANK",
     "RECAST_SPELL_DIST",
@@ -139,62 +125,26 @@ pub const NUMERIC_KEYS: &[&str] = &[
     "RECAST_INJECT_BATCH_GAP",
 ];
 
-/// Settings whose value is a word rather than a number or a switch. Not
-/// checked for parseability here — each reader knows its own vocabulary and
-/// says so when it does not recognise a value.
-pub const NAMED_KEYS: &[&str] = &[
-    // Which mechanism drives the keyboard layout on Linux: hyprland, sway,
-    // kde, gnome, x11, none. Detected when unset; see `layout::linux`.
-    "RECAST_LAYOUT_BACKEND",
-];
-
-/// Every setting that is a plain on/off switch.
-pub const BOOLEAN_KEYS: &[&str] = &[
-    "RECAST_SHORT",
-    "RECAST_SPLIT",
-    "RECAST_FREQ",
-    "RECAST_SPELL",
-    "RECAST_COMPLETE",
-    // Read by `dictionary::debug_enabled` rather than stored in `Config`, but a
-    // setting the user can write down all the same — and one that has to be
-    // recognised here, or `debug = true` in the file is reported as a typo.
-    "RECAST_DEBUG",
-];
-
-/// Every setting the program reads, in its environment spelling. What
-/// `settings::complaints` checks a config file against, so a key that is in
-/// neither list is reported to the user as not being a setting.
-pub const ALL_KEYS: &[&str] = &{
-    // Concatenating `&[&str]` in a const needs the length written down, so it
-    // is asserted against the three sources rather than trusted.
-    let mut all = [""; 22];
-    let mut n = 0;
-    let mut i = 0;
-    while i < NUMERIC_KEYS.len() {
-        all[n] = NUMERIC_KEYS[i];
-        n += 1;
-        i += 1;
+/// Settings that were set but could not be understood, described for the user.
+///
+/// [`env_num`] falls back to the shipped default on anything it cannot parse,
+/// which is the right behaviour — a bad value should not stop the program —
+/// but doing it *silently* inverts the user's intent in the one case that
+/// matters. `RECAST_SPELL_DIST=l` (an el for a one) reads as the default 3,
+/// the loosest setting there is, from someone who was plainly trying to
+/// tighten it. Nothing said so. This is what `--status` reads out.
+pub fn env_complaints() -> Vec<String> {
+    let mut out = Vec::new();
+    for key in NUMERIC_KEYS {
+        if let Ok(raw) = std::env::var(key) {
+            if raw.trim().parse::<u64>().is_err() {
+                out.push(format!(
+                    "{key}={raw:?} is not a number — using the default instead."
+                ));
+            }
+        }
     }
-    let mut j = 0;
-    while j < BOOLEAN_KEYS.len() {
-        all[n] = BOOLEAN_KEYS[j];
-        n += 1;
-        j += 1;
-    }
-    let mut k = 0;
-    while k < NAMED_KEYS.len() {
-        all[n] = NAMED_KEYS[k];
-        n += 1;
-        k += 1;
-    }
-    assert!(n == all.len(), "ALL_KEYS is the wrong length");
-    all
-};
-
-/// Settings that were set but could not be used, described for the user.
-/// `--status` reads these out; see [`crate::settings::complaints`].
-pub fn complaints() -> Vec<String> {
-    crate::settings::complaints(NUMERIC_KEYS, ALL_KEYS)
+    out
 }
 
 #[cfg(test)]
@@ -213,22 +163,8 @@ mod tests {
     }
 
     #[test]
-    fn spelling_a_switch_out_in_words_works_the_way_it_reads() {
-        // The whole reason `truthy` exists rather than a bare `!= "0"`: in a
-        // file, people write the word.
-        assert!(!truthy("false"));
-        assert!(!truthy("off"));
-        assert!(!truthy("No"));
-        assert!(!truthy("0"));
-        assert!(!truthy("  "));
-        assert!(truthy("true"));
-        assert!(truthy("1"));
-        assert!(truthy("yes"));
-    }
-
-    #[test]
     fn every_numeric_setting_is_covered() {
-        // A new RECAST_*_MIN/RANK/DIST added to `load` without being added
+        // A new RECAST_*_MIN/RANK/DIST added to `from_env` without being added
         // here would go back to failing silently.
         let doc = include_str!("config.rs");
         for key in NUMERIC_KEYS {
@@ -236,34 +172,6 @@ mod tests {
         }
         for key in ["RECAST_SPELL_MIN", "RECAST_COMPLETE_RANK"] {
             assert!(NUMERIC_KEYS.contains(&key), "{key} is numeric but unchecked");
-        }
-    }
-
-    #[test]
-    fn all_keys_is_every_list_and_nothing_else() {
-        assert_eq!(
-            ALL_KEYS.len(),
-            NUMERIC_KEYS.len() + BOOLEAN_KEYS.len() + NAMED_KEYS.len()
-        );
-        for key in NUMERIC_KEYS.iter().chain(BOOLEAN_KEYS).chain(NAMED_KEYS) {
-            assert!(ALL_KEYS.contains(key), "{key} missing from ALL_KEYS");
-        }
-    }
-
-    /// Every switch the program reads has to be in one of the two lists, or a
-    /// user who writes it in `config.toml` is told it is not a setting — while
-    /// it quietly works.
-    #[test]
-    fn every_switch_read_anywhere_is_declared() {
-        for key in [
-            "RECAST_SHORT",
-            "RECAST_SPLIT",
-            "RECAST_FREQ",
-            "RECAST_SPELL",
-            "RECAST_COMPLETE",
-            "RECAST_DEBUG",
-        ] {
-            assert!(BOOLEAN_KEYS.contains(&key), "{key} is a switch but undeclared");
         }
     }
 
