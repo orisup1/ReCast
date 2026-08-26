@@ -217,11 +217,11 @@ fn main() {
     // ReCast could not use. Printed here rather than only under `--status`,
     // because a daemon launched at login is one nobody runs `--status` on until
     // they have already spent a while wondering why their setting did nothing.
-    for complaint in config::complaints() {
+    for complaint in settings::complaints(&config::NUMERIC_KEYS, &config::ALL_KEYS) {
         eprintln!("Warning: {complaint}");
     }
 
-    let cfg = config::Config::load();
+    let cfg = config::Config::from_env();
     let en = en_dict();
     let he = he_dict();
     // The switch is remembered across restarts: someone who turned correction
@@ -357,7 +357,7 @@ fn print_status() {
     // reported, so someone who set RECAST_SPELL_DIST had no way to confirm it
     // had been read — least of all when the value was a typo and had silently
     // fallen back to the default.
-    let cfg = config::Config::load();
+    let cfg = config::Config::from_env();
     println!("\n  settings (config.toml and RECAST_* applied):");
     println!("    short words          {}", on_off(cfg.short_enabled));
     println!("    missing-space split  {}", on_off(cfg.split_enabled));
@@ -376,7 +376,7 @@ fn print_status() {
         cfg.complete_max_rank,
     );
 
-    for complaint in config::complaints() {
+    for complaint in settings::complaints(&config::NUMERIC_KEYS, &config::ALL_KEYS) {
         eprintln!("\n  ! {complaint}");
     }
 }

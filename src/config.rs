@@ -104,7 +104,7 @@ fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 /// Every numeric setting, so a value that could not be read can be named.
-const NUMERIC_KEYS: &[&str] = &[
+pub const NUMERIC_KEYS: &[&str] = &[
     "RECAST_SPELL_MIN",
     "RECAST_SPELL_RANK",
     "RECAST_SPELL_DIST",
@@ -123,6 +123,34 @@ const NUMERIC_KEYS: &[&str] = &[
     "RECAST_INJECT_LAYOUT_CONFIRM",
     "RECAST_INJECT_LAYOUT_POLL",
     "RECAST_INJECT_BATCH_GAP",
+];
+
+/// All known settings, for validating the config file.
+pub const ALL_KEYS: &[&str] = &[
+    "RECAST_SHORT",
+    "RECAST_SPLIT",
+    "RECAST_FREQ",
+    "RECAST_SPELL",
+    "RECAST_SPELL_MIN",
+    "RECAST_SPELL_RANK",
+    "RECAST_SPELL_DIST",
+    "RECAST_COMPLETE",
+    "RECAST_COMPLETE_MIN",
+    "RECAST_COMPLETE_RANK",
+    "RECAST_INJECT_PRESS_GAP",
+    "RECAST_INJECT_KEY_GAP",
+    "RECAST_INJECT_SETTLE",
+    "RECAST_INJECT_HELD_TIMEOUT",
+    "RECAST_INJECT_TERM_TIMEOUT",
+    "RECAST_INJECT_HELD_POLL",
+    "RECAST_INJECT_DEVICE_SETTLE",
+    "RECAST_INJECT_LAYOUT_CONFIRM",
+    "RECAST_INJECT_LAYOUT_POLL",
+    "RECAST_INJECT_BATCH_GAP",
+    // Debug setting (not in Config struct)
+    "RECAST_DEBUG",
+    // Linux-only setting (not in Config struct)
+    "RECAST_LAYOUT_BACKEND",
 ];
 
 /// Settings that were set but could not be understood, described for the user.

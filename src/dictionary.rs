@@ -194,7 +194,7 @@ pub const fn he_freq() -> Freq {
 /// turning logging on would be indefensible.
 fn debug_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| crate::config::flag("RECAST_DEBUG", false))
+    *FLAG.get_or_init(|| crate::settings::flag("RECAST_DEBUG", false))
 }
 
 /// Missing-space split correction is opt-in. It can only ever fire when the

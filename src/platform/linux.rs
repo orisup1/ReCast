@@ -15,7 +15,7 @@ const TAP_MAX: Duration = Duration::from_millis(300);
 /// not read as one gesture.
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
 
-use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix};
+use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix, Run};
 use crate::keymap::{
     english_char_to_evkey_shifted, evkey_to_english_char, evkey_to_english_char_shifted,
     evkey_to_hebrew_char,
@@ -482,14 +482,15 @@ fn handle_key(
                     |t| evkey_to_english_char_shifted(t.key, t.shift),
                     |t| evkey_to_hebrew_char(t.key),
                     |t| t.shift,
+                    Run::default(),
                     en_dict,
                     he_dict,
                 );
 
                 // Describe the fix for the history before `replacement`
                 // consumes it.
-                let note = result.as_ref().map(|fix| note_of(&st.keys, fix));
-                if let Some(rep) = replacement(&st.keys, result) {
+                let note = result.fix.as_ref().map(|fix| note_of(&st.keys, fix));
+                if let Some(rep) = replacement(&st.keys, result.fix) {
                     if let Some((from, to, kind)) = &note {
                         control.record_fix(from, to, *kind);
                     }
@@ -822,13 +823,14 @@ fn unlist_and_correct(
         |t: Typed| evkey_to_english_char_shifted(t.key, t.shift),
         |t: Typed| evkey_to_hebrew_char(t.key),
         |t: Typed| t.shift,
+        Run::default(),
         en_dict,
         he_dict,
     );
-    let note = result.as_ref().map(|fix| note_of(&skip.keys, fix));
+    let note = result.fix.as_ref().map(|fix| note_of(&skip.keys, fix));
     // Off the list, but the pipelines have nothing to say about it after all —
     // which is a fine outcome, and not one to rewrite the screen over.
-    let Some(rep) = replacement(&skip.keys, result) else {
+    let Some(rep) = replacement(&skip.keys, result.fix) else {
         return;
     };
 

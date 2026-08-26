@@ -278,6 +278,15 @@ pub fn write_sample() -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Get a boolean setting from the environment, falling back to `default` when
+/// unset or unparsable. Accepts "0" for false and anything else for true.
+pub fn flag(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
