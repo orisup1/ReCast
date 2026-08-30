@@ -25,19 +25,40 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
+  quality:
+    name: Tests and lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev
+      - run: cargo fmt --check
+      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings
+
   # ───────────────────────────────────────────────────────────────────────────
   # Build each artifact on its own OS. No cache: what ships should come from a
   # clean build, not from whatever a previous run happened to leave behind.
   # ───────────────────────────────────────────────────────────────────────────
   linux:
     name: Linux
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,12 +84,36 @@ jobs:
 
   macos:
     name: macOS (universal)
+    needs: quality
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MACOS_CERTIFICATE" ]]; then
+            echo "No Developer ID certificate configured; using an ad-hoc signature."
+            exit 0
+          fi
+          CERTIFICATE_PATH="$RUNNER_TEMP/recast.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/recast-signing.keychain-db"
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
       # The committed binary was arm64-only, which is silently useless on an
       # Intel Mac. Both slices cost one extra compile and one `lipo`.
@@ -89,6 +134,11 @@ jobs:
       # assets/recast.icns. The universal binary replaces the single-arch one
       # `make bundle` staged, so the bundle ships both slices too.
       - name: Assemble and sign the .app bundle
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
           make bundle
@@ -98,16 +148,33 @@ jobs:
           # covers the bundle's contents, so swapping the executable under it
           # invalidates it, and an invalid or missing signature is what makes a
           # downloaded build announce itself as damaged.
-          make sign
+          if [[ -n "$MACOS_SIGNING_IDENTITY" ]]; then
+            make sign CODESIGN_ID="$MACOS_SIGNING_IDENTITY"
+            codesign --force --sign "$MACOS_SIGNING_IDENTITY" \
+              --options runtime --timestamp recastMac
+          else
+            make sign
+            codesign --force --sign - --timestamp=none recastMac
+          fi
           # The bare binary is a separate download and needs its own signature
           # for the same reason; `lipo` writes a fat file that carries none.
-          codesign --force --sign - --timestamp=none recastMac
           codesign --verify --strict recastMac
           # A .zip, not a bare directory: a bundle uploaded file-by-file
           # arrives as a folder and loses the executable bit. `ditto` keeps the
           # macOS metadata that makes it launchable — and the _CodeSignature
           # directory the signature lives in.
           ditto -c -k --sequesterRsrc --keepParent exec/ReCast.app ReCast.app.zip
+          if [[ -n "$MACOS_SIGNING_IDENTITY" && -n "$APPLE_ID" && \
+                -n "$APPLE_TEAM_ID" && -n "$APPLE_APP_PASSWORD" ]]; then
+            xcrun notarytool submit ReCast.app.zip --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+            xcrun stapler staple exec/ReCast.app
+            ditto -c -k --sequesterRsrc --keepParent \
+              exec/ReCast.app ReCast.app.notarized.zip
+            mv ReCast.app.notarized.zip ReCast.app.zip
+          else
+            echo "Notarization secrets are incomplete; publishing the signed/ad-hoc build."
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -119,6 +186,7 @@ jobs:
 
   windows:
     name: Windows
+    needs: quality
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -136,6 +204,28 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release
 
+      - name: Authenticode sign
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host 'No Windows certificate configured; publishing an unsigned executable.'
+            exit 0
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'recast.pfx'
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          $signature = Set-AuthenticodeSignature -FilePath target\release\recast.exe -Certificate $certificate -HashAlgorithm SHA256 -TimestampServer http://timestamp.digicert.com
+          if ($signature.Status -ne 'Valid') {
+            throw "Authenticode signing failed: $($signature.StatusMessage)"
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: ReCast.exe
@@ -150,6 +240,8 @@ jobs:
     name: Publish release
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -162,6 +254,8 @@ jobs:
       # README tells people to look for.
       - name: Stage the assets
         id: stage
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -172,7 +266,12 @@ jobs:
           file dist/recastLinux dist/recastMac dist/ReCast.exe
           ls -lh dist
           version=$(make version)
-          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [[ -n "$REQUESTED_TAG" && "$REQUESTED_TAG" != "v${version}" ]]; then
+            echo "Requested tag $REQUESTED_TAG does not match Cargo.toml version v${version}." >&2
+            exit 1
+          fi
+          (cd dist && sha256sum recastLinux recastMac ReCast.exe ReCast.app.zip > SHA256SUMS)
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
           echo "default_tag=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Publish

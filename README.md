@@ -35,9 +35,11 @@ merely misspelled gets fixed in place instead — and completes words you are st
   Space/Enter. On macOS and Windows the word is inserted as text in a single event, so it
   appears at once and does not depend on the layout change having propagated; on Linux the
   whole erase + retype sequence goes to the virtual keyboard as one batch.
-- If no layout switch applies and you are typing in English, a second pipeline compares the
-  word *within* English and fixes near-miss typos in place (see
-  [English autocorrect](#english-autocorrect)). Only one of the two ever acts on a word.
+- If an English reading is a near-miss rather than an exact dictionary word, the spelling
+  pipeline can follow the layout pipeline. For example, an English typo entered while the
+  Hebrew layout is active is switched to English and spell-corrected as one atomic rewrite.
+  Ordinary English-layout typos are still corrected without changing layouts (see
+  [English autocorrect](#english-autocorrect)).
 - Tapping **Right Shift** mid-word completes it — tap again to cycle through the other
   guesses — and abbreviations you define expand when the word is finished (see
   [Auto-complete](#auto-complete)).
@@ -51,7 +53,7 @@ merely misspelled gets fixed in place instead — and completes words you are st
 
 | OS      | Capture         | Injection                        | Layout switch                                       |
 | ------- | --------------- | -------------------------------- | --------------------------------------------------- |
-| Linux   | `evdev`         | `uinput` keycodes, one batch     | `hyprctl switchxkblayout` (Hyprland only)           |
+| Linux   | `evdev`         | `uinput` keycodes, one batch     | Hyprland, Sway, KDE, GNOME, or X11 backend          |
 | macOS   | `CGEventTap`    | `CGEvent` Unicode string         | Carbon `TISSelectInputSource`                       |
 | Windows | `rdev`          | one `SendInput` Unicode batch    | `LoadKeyboardLayoutW` + `WM_INPUTLANGCHANGEREQUEST` |
 
@@ -66,24 +68,22 @@ and creates a `uinput` virtual device named `recast-injector` to replay correcte
 
 ### Prebuilt binaries
 
-`exec/` holds ready-to-run builds if you would rather not install a toolchain. They are
-self-contained — the dictionaries are inside the executable — so there is nothing to
-unpack alongside them:
+GitHub Releases holds ready-to-run builds if you would rather not install a toolchain.
+They are self-contained — the dictionaries are inside the executable — so there is
+nothing to unpack alongside them:
 
 | File               | Target                                                     |
 | ------------------ | ---------------------------------------------------------- |
-| `exec/recastLinux` | Linux x86-64                                               |
-| `exec/ReCast.exe`  | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
-| `exec/recastMac`   | macOS arm64                                                |
-| `exec/ReCast.app`  | macOS bundle                                               |
+| `recastLinux`    | Linux x86-64                                               |
+| `ReCast.exe`     | Windows x86-64 (no runtime DLLs needed; UCRT, Windows 10+) |
+| `recastMac`      | macOS universal binary (arm64 + x86-64)                   |
+| `ReCast.app.zip` | macOS universal app bundle                                |
+| `SHA256SUMS`     | SHA-256 checksums for every downloadable artifact         |
 
-They are committed artifacts rather than build output, so they are only as current as the
-last time someone refreshed them. That refresh is now a button: the **Binaries** workflow
-(`.github/workflows/binaries.yml`, run from the Actions tab) builds all three on their own
-runners and commits the results back here, so they no longer drift apart one platform at a
-time. The next run also replaces the arm64-only macOS builds above with universal
-(arm64 + x86-64) ones, which an Intel Mac can actually run. Building yourself is still the
-recommended path; these exist so you can try it in one step.
+The manual **Binaries** workflow runs formatting, tests, and Clippy before building on
+native Linux, macOS, and Windows runners. It publishes release assets rather than
+committing binaries to Git. Signing and notarization are applied when the repository's
+certificate secrets are configured.
 
 The English and Hebrew dictionaries are baked into the binary at compile time, so the
 executable is self-contained and runs identically from any working directory — no data
@@ -136,6 +136,7 @@ make install      # build + copy bin to ~/.local/bin
 make deploy       # clean + build + install
 make uninstall    # remove the installed bin
 make run ARGS=-g  # cargo run with the GUI flag
+make bench        # stable ignored microbenchmarks (prints timing; no flaky limit)
 make app          # macOS only: install ReCast.app to /Applications
 make help         # full target list
 ```
@@ -245,6 +246,7 @@ recast 0.7.0
     frequency tie-break  on
     spelling             on  (min length 4, max rank 20000, max distance 3)
     auto-complete        on  (min prefix 3, max rank 30000)
+    personalization      off  (/home/you/.config/recast/personal)
 ```
 
 Two of those rows are platform-specific and only one platform ever shows both:
@@ -278,6 +280,7 @@ RECAST_SPELL_DIST=1   recast  # cap the autocorrect at single-edit typos (defaul
 RECAST_COMPLETE=0 recast        # disable auto-complete entirely (on by default)
 RECAST_COMPLETE_MIN=4 recast    # shortest prefix Right Shift will complete (default 3)
 RECAST_COMPLETE_RANK=10000 recast  # how common a completion must be (default 30000)
+RECAST_PERSONAL=1 recast  # persist local word/correction/timing data (off by default)
 ```
 
 `RECAST_DEBUG=1` prints **every word you type** — under a service that means into your
@@ -498,14 +501,15 @@ by how you tap: a word that was just corrected gets the correction taken back, a
 word that was just passed over because it is listed gets un-listed. A word that
 is simply spelled correctly arms nothing, and the gesture does nothing at all.
 
-## One fix per word
+## One atomic fix per word
 
-The pipelines are mutually exclusive: each finished word gets **one** correction
-or none. An abbreviation expansion goes first (you defined it by hand), then the
-layout switch, because it is exact — the keystrokes literally spell a real word
-in the other language — and only if that declines does the speller get a look. A word that the speller fixes is typed as
-its corrected self and never re-examined, so it is not then flipped to the other
-layout even if its keys happen to spell a Hebrew word too.
+Each finished word gets one visible rewrite or none. An abbreviation expansion
+goes first (you defined it by hand), followed by an exact layout match. If neither
+reading is an exact word, the English reading reaches the speller. Under a Hebrew
+layout, a confident spelling result composes both decisions: switch to English and
+insert the corrected spelling in the same rewrite. Under an English layout, only
+the spelling changes. A real current-layout word always blocks this approximate
+fallback.
 
 ## The tray / menubar menu
 
@@ -569,14 +573,21 @@ does not name the word it is about: a notification is a copy of text that
 outlives the moment it belonged to, sitting in a notification centre after the
 window it came from is closed.
 
-**Logging is off, and turning it on is the one thing to be careful with.**
-Normal operation writes no record of what you type. `RECAST_DEBUG=1` prints
+**Logging and personalization are off by default.** Normal operation writes no
+record of what you type. `RECAST_DEBUG=1` prints
 every word it checks to stdout — useful at a terminal, and a transcript of your
 typing anywhere else. Where that goes depends on how ReCast was started: the
 Linux daemon sends stdout to `/dev/null`, the systemd user unit sends it to the
 journal, and the macOS LaunchAgent writes `/tmp/recast.out.log` and
 `/tmp/recast.err.log`, which are readable by other users on the machine. Don't
 leave debug on under a service on any platform.
+
+`RECAST_PERSONAL=1` explicitly opts into local learning. It writes word counts,
+correction pairs, and aggregate key timings under `personal/`; on Linux and Windows,
+those word files may include text entered into password fields. The directory and files
+are user-only on Unix. Run `recast --clear-personal-data` to delete ReCast's three
+personal files without touching unexpected files in that directory. Stop the running
+ReCast service first so it cannot flush in-memory observations back to disk.
 
 **What it needs from the OS**, for the same reason, is the permission to see all
 of this: membership of the `input` group on Linux (plus a `uinput` device to
@@ -599,7 +610,7 @@ be made there.
 
 ## Your files
 
-Both are optional and absent by default — nothing is created for you. They are
+The user-managed lists are optional and absent by default — nothing is created for you. They are
 re-read within about two seconds of being edited, so adding an abbreviation and
 typing it are the same action rather than a restart apart. They live under the
 OS config directory:
@@ -616,6 +627,7 @@ OS config directory:
 | `ignore.txt` | One word per line, `#` comments. Words the autocorrect must never touch.                                                  |
 | `state.txt`  | Written by ReCast: the Enable/Disable switch, so it survives a restart.                                                   |
 | `welcomed`   | Written by ReCast: a marker saying the one-time hint below has been shown. Delete it to see it again.                     |
+| `personal/`  | Opt-in word counts, correction pairs, and timing aggregates; may contain sensitive text.                               |
 
 `ignore.txt` is the only file of *yours* that ReCast writes. Double-tapping Ctrl on a
 word that was skipped *because* it is listed takes that line back out — comments,
@@ -632,12 +644,15 @@ makes sure of it.
 
 ```bash
 cargo build --release     # or `make` — release is the meaningful profile (LTO + strip)
-cargo test                # 128 tests, all pure: dictionaries, speller, completer, keymaps, counters
+cargo test                # pure suite: dictionaries, speller, completer, keymaps, counters
+cargo clippy --all-targets -- -D warnings
+make bench                # opt-in correction/completion microbenchmarks
 RECAST_DEBUG=1 cargo run  # log every word check and switch decision
 ```
 
 The correction pipeline is platform-agnostic and lives in `src/dictionary.rs` (the
-decision core), `src/spell.rs` (the English speller) and `src/complete.rs` (completion,
+decision core, with blob lookup in `src/dictionary/blob.rs`), `src/spell.rs` (the English
+speller, with its confusion table in `src/spell/rules.rs`) and `src/complete.rs` (completion,
 abbreviations, the ignore and undo lists, and the watcher that reloads them).
 `src/types.rs` holds the shared counters and the corrections history the UIs read,
 `src/prefs.rs` the state kept between runs, and `src/notify.rs` the one-time hint.
@@ -663,6 +678,16 @@ catches it.
 It is **started by hand**, from the Actions tab ("Run workflow"): the `push` and
 `pull_request` triggers are commented out at the top of the file, so nothing fires
 automatically. Uncomment those two blocks to turn it back on.
+
+### Release signing
+
+The Binaries workflow always publishes `SHA256SUMS` and refuses a tag that differs from
+`Cargo.toml`. Real signing is enabled by repository secrets. macOS uses
+`MACOS_CERTIFICATE` (base64 PKCS#12), `MACOS_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`,
+`MACOS_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD`. Windows
+uses `WINDOWS_CERTIFICATE` (base64 PFX) and `WINDOWS_CERTIFICATE_PASSWORD`. Missing
+credentials produce an explicitly unsigned or ad-hoc-signed artifact rather than
+silently pretending it is notarized.
 
 ## License
 

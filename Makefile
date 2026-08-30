@@ -64,6 +64,9 @@ VERSION := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
 # the version in it tracks the crate.
 APP_BUNDLE := exec/ReCast.app
 APP_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
+APP_ZIP    := exec/ReCast.app.zip
+CODESIGN_ID ?= -
+NOTARY_PROFILE ?= recast-notary
 
 BIN_NAME := recast
 BIN_SRC  := target/release/$(BIN_NAME)
@@ -73,7 +76,9 @@ BIN_DST  := $(BINDIR)/$(BIN_NAME)
 # the file-target dependency does the right thing — `cargo build` itself is
 # fast on a no-op rebuild, but the explicit list lets `make install` skip
 # the cargo invocation when nothing has changed.
-SRC := Cargo.toml Cargo.lock en_dict.txt he_dict.txt assets/tray-icon.rgba \
+SRC := Cargo.toml Cargo.lock build.rs \
+        en_dict.txt he_dict.txt en_freq.txt he_freq.txt \
+        assets/tray-icon.rgba assets/recast.ico \
         $(shell find src -type f -name '*.rs' 2>/dev/null)
 
 assets/tray-icon.rgba: assets/recast-icon.svg  assets/recast.icns
@@ -85,8 +90,8 @@ assets/tray-icon.rgba: assets/recast-icon.svg  assets/recast.icns
 # target, so asking for it by name was an error. It is the file rule above.
 tray-icon: assets/tray-icon.rgba
 
-.PHONY: all build clean rebuild install uninstall deploy run help \
-	tray-icon version bundle-plist app \
+.PHONY: all build clean rebuild install uninstall deploy run bench help \
+	tray-icon version bundle bundle-plist sign dist notarize app \
 	service service-uninstall \
 	service-linux service-uninstall-linux \
 	service-macos service-uninstall-macos \
@@ -127,6 +132,11 @@ deploy: clean install
 
 run: build
 	$(CARGO) run --release -- $(ARGS)
+
+# Stable, opt-in microbenchmarks. They print latency/throughput without making
+# timing-sensitive assertions that would be unreliable on shared CI runners.
+bench:
+	$(CARGO) test benchmark_ --release -- --ignored --nocapture --test-threads=1
 
 # ─── service: dispatch to the OS-specific target ───────────────────────────
 service: $(SERVICE_TARGET)
@@ -215,6 +225,36 @@ service-unsupported:
 version:
 	@echo $(VERSION)
 
+# Assemble a fresh .app from source. `CODESIGN_ID=-` is an ad-hoc local
+# signature; release automation supplies a Developer ID identity instead.
+bundle: build bundle-plist
+	@mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
+	$(INSTALL) -m 755 $(BIN_SRC) $(APP_BUNDLE)/Contents/MacOS/recast
+	$(INSTALL) -m 644 assets/recast.icns $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
+	$(MAKE) sign
+
+sign:
+	codesign --force --deep --sign "$(CODESIGN_ID)" \
+		$(if $(filter -,$(CODESIGN_ID)),--timestamp=none,--options runtime --timestamp) \
+		$(APP_BUNDLE)
+	codesign --verify --deep --strict $(APP_BUNDLE)
+
+# `ditto` preserves the signature, executable bit, and macOS metadata.
+dist: bundle
+	@mkdir -p exec
+	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(APP_ZIP)
+
+# Store credentials first with:
+# xcrun notarytool store-credentials $(NOTARY_PROFILE) ...
+notarize: dist
+	@if [ "$(CODESIGN_ID)" = "-" ]; then \
+		echo "CODESIGN_ID must be a Developer ID Application identity" >&2; exit 1; \
+	fi
+	xcrun notarytool submit $(APP_ZIP) --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple $(APP_BUNDLE)
+	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(APP_ZIP).notarized
+	mv $(APP_ZIP).notarized $(APP_ZIP)
+
 # macOS .app: build, restage the bundle in exec/, install it to /Applications
 # and reset the TCC grants (macOS keys Input Monitoring and Accessibility to a
 # bundle's signature, so a replaced executable keeps a ticked box and receives
@@ -261,8 +301,13 @@ help:
 	@echo "  service            install + register OS autostart unit"
 	@echo "  service-uninstall  remove autostart unit"
 	@echo "  run                cargo run --release (use ARGS=... for flags)"
+	@echo "  bench              run ignored correction/completion microbenchmarks"
 	@echo "  version            print the version from Cargo.toml"
 	@echo "  bundle-plist       regenerate the .app Info.plist from that version"
+	@echo "  bundle             assemble and sign exec/ReCast.app"
+	@echo "  sign               sign the assembled app (CODESIGN_ID=- by default)"
+	@echo "  dist               package the app with ditto"
+	@echo "  notarize           notarize and staple dist (requires real signing)"
 	@echo "  app                macOS: build + install ReCast.app to /Applications"
 	@echo "  tray-icon          regenerate assets/tray-icon.rgba from the SVG"
 	@echo
