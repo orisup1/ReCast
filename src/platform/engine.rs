@@ -31,7 +31,7 @@
 //!   than left implicit: [`Platform::DEDUP_WINDOW`] and
 //!   [`Platform::ABORT_UNDO_IF_LAYOUT_REFUSED`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -325,6 +325,15 @@ pub struct AppState<P: Platform> {
     /// read where [`Platform::DEDUP_WINDOW`] is set, which is Linux.
     last_key: Option<P::Key>,
     last_key_at: Instant,
+    /// Per-key press times for dwell time recording.
+    key_press_times: HashMap<P::Key, Instant>,
+    /// Whether the next finished word should skip auto-correction. Set when
+    /// cursor movement happens mid-word, a chorded shortcut fires, or the user
+    /// backspaces into a just-fixed word. Cleared after the next terminator.
+    no_fix: bool,
+    /// True when the user is editing a word that was just fixed (backspace with
+    /// empty buffer right after a fix). Used to record a rejection for learning.
+    editing_fixed_word: bool,
 }
 
 impl<P: Platform> AppState<P> {
@@ -344,6 +353,9 @@ impl<P: Platform> AppState<P> {
             history: History::default(),
             last_key: None,
             last_key_at: Instant::now(),
+            key_press_times: HashMap::new(),
+            no_fix: false,
+            editing_fixed_word: false,
         }
     }
 
@@ -395,6 +407,7 @@ impl<P: Platform> AppState<P> {
         self.last_action = None;
         self.cycle = None;
         self.last_ctrl_tap = None;
+        self.editing_fixed_word = false;
     }
 }
 
@@ -536,6 +549,19 @@ impl<P: Platform> Engine<P> {
         st.last_key_at = Instant::now();
         st.last_key = Some(key);
 
+        // Record press time for dwell time calculation on release.
+        st.key_press_times.insert(key, Instant::now());
+
+        // Check for chorded shortcut BEFORE inserting the key into held_keys:
+        // if a non-modifier key is pressed while a modifier (Ctrl/Alt/Super,
+        // not Shift) is already held, the user is invoking a shortcut that may
+        // change the text (paste, select-all, undo, etc.). The buffer no longer
+        // matches what's on screen, so suppress the next correction.
+        let is_modifier_key = P::is_modifier(key);
+        let is_shift = key == P::SHIFT_LEFT || key == P::SHIFT_RIGHT;
+        let other_modifier_held = st.held_keys.iter().any(|&k| P::is_modifier(k) && k != P::SHIFT_LEFT && k != P::SHIFT_RIGHT);
+        let chorded_shortcut = !is_modifier_key && !is_shift && other_modifier_held;
+
         st.held_keys.insert(key);
         // Noted on the way down, acted on when the modifiers come back up: that
         // is when the compositor has had the whole combination and the layout it
@@ -557,15 +583,33 @@ impl<P: Platform> Engine<P> {
         }
         let shift = st.shift_active();
 
+        // Record key press for typing pattern analysis (dwell, digraphs).
+        // Use Debug representation as a stable-ish key name.
+        let key_name = format!("{:?}", key);
+        crate::personal::record_key_press(&key_name);
+
         if P::is_terminator(key) {
             self.word_finished(st, key, shift);
         } else if key == P::BACKSPACE {
+            // Post-fix edit detection: if buffer is empty and the last action
+            // was a fix, the user is backspacing into the corrected word.
+            if !st.is_replacing && st.keys.is_empty() {
+                if let Some(crate::platform::engine::LastAction::Fixed(_)) = &st.last_action {
+                    st.editing_fixed_word = true;
+                    st.no_fix = true;
+                }
+            }
             if st.is_replacing {
                 st.buffered_keys.pop();
             } else {
                 st.keys.pop();
             }
         } else if P::is_reset(key) {
+            // Cursor movement mid-word: the buffer no longer reflects what's on
+            // screen, so suppress correction for the next word.
+            if !st.is_replacing && !st.keys.is_empty() {
+                st.no_fix = true;
+            }
             if st.is_replacing {
                 st.buffered_keys.clear();
             } else {
@@ -575,6 +619,13 @@ impl<P: Platform> Engine<P> {
             // reason the word buffer is dropped is the reason the run is: what
             // comes next is not a continuation of what came before.
             st.history.clear();
+        } else if chorded_shortcut {
+            // Shortcut that may have changed the text (paste, select, undo...).
+            // Clear the buffer and suppress the next correction.
+            if !st.is_replacing {
+                st.keys.clear();
+            }
+            st.no_fix = true;
         } else if P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some() {
             st.push_key(Typed { key, shift });
         }
@@ -595,6 +646,25 @@ impl<P: Platform> Engine<P> {
             return;
         }
 
+        // If no_fix is set, the buffer is unreliable (cursor movement,
+        // chorded shortcut, or post-fix edit). Skip auto-correction but still
+        // record the word to personal frequency for learning.
+        if st.no_fix {
+            let typed = crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
+            crate::personal::record_word(&typed);
+            // If the user was editing a just-fixed word, record the rejection
+            // so we learn not to correct it again.
+            if st.editing_fixed_word {
+                if let Some(crate::platform::engine::LastAction::Fixed(fix)) = &st.last_action {
+                    crate::complete::learn(&fix.suppress.clone().unwrap_or_default());
+                }
+            }
+            st.keys.clear();
+            st.no_fix = false;
+            st.editing_fixed_word = false;
+            return;
+        }
+
         let outcome = self.check(&st.keys, st.history.run());
         // Record what this word turned out to be before anything else happens
         // to it: the next word is decided with this one behind it. A word whose
@@ -609,6 +679,8 @@ impl<P: Platform> Engine<P> {
         if let Some(rep) = replacement::<P>(&st.keys, result) {
             if let Some((from, to, kind)) = &note {
                 self.control.record_fix(from, to, *kind);
+                // Record confusion pair for personal learning.
+                crate::personal::record_confusion(from, to);
             }
             let undo = undo_of::<P>(&st.keys, &rep, Some(key));
             // +1 for the terminator the user physically typed, which is erased
@@ -627,6 +699,10 @@ impl<P: Platform> Engine<P> {
             );
             return;
         }
+
+        // No fix applied - record the word to personal frequency.
+        let typed = crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
+        crate::personal::record_word(&typed);
 
         if let Some(word) = declined_by_list(
             &st.keys,
@@ -661,6 +737,13 @@ impl<P: Platform> Engine<P> {
     /// unaffected; only a press and release with nothing in between counts.
     pub fn key_release(self: &Arc<Self>, key: P::Key) {
         let mut st = self.lock();
+
+        // Record dwell time for typing pattern analysis.
+        if let Some(press_time) = st.key_press_times.remove(&key) {
+            let key_name = format!("{:?}", key);
+            crate::personal::record_key_release(&key_name, press_time);
+        }
+
         st.held_keys.remove(&key);
 
         // A layout hotkey has been let go of. Drop the cached layout rather than

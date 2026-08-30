@@ -168,8 +168,13 @@ const PRIOR_SMOOTHING: f32 = 10.0;
 /// Posterior score of a candidate: the channel cost of the slip plus the
 /// improbability of the word, both as negative log probabilities, so lower is
 /// better and `argmax P(c)·P(t|c)` becomes a plain sum.
-fn score(cost: u32, rank: u32) -> f32 {
-    cost as f32 + PRIOR_WEIGHT * (rank as f32 + PRIOR_SMOOTHING).ln()
+///
+/// Personal frequency reduces the score (makes the candidate more likely) for
+/// words the user actually types.
+fn score(cost: u32, rank: u32, word: &str) -> f32 {
+    let base = cost as f32 + PRIOR_WEIGHT * (rank as f32 + PRIOR_SMOOTHING).ln();
+    let boost = crate::personal::personal_boost(word);
+    base - (boost - 1.0) * 50.0 // Personal boost reduces score by up to 50 points
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -428,7 +433,7 @@ impl Search<'_> {
         if cost == 0 || rank > rank_budget(cost, self.max_rank, self.typed.len()) {
             return;
         }
-        let candidate = score(cost, rank);
+        let candidate = score(cost, rank, cand);
         let better = self
             .best
             .as_ref()
@@ -1315,18 +1320,18 @@ mod tests {
     #[test]
     fn the_prior_is_a_factor_not_a_tie_break() {
         // Ten times more common is worth about a third of a plain edit …
-        let decade = score(0, 990) - score(0, 90);
+        let decade = score(0, 990, "") - score(0, 90, "");
         assert!(
             (15.0..25.0).contains(&decade),
             "a decade of rank is worth {decade} cost units"
         );
         // … so it can overturn a small channel difference but never a whole
         // extra edit.
-        assert!(score(COST_DOUBLE, 40_000) > score(COST_ADJACENT_ROW, 5));
+        assert!(score(COST_DOUBLE, 40_000, "") > score(COST_ADJACENT_ROW, 5, ""));
         // And a whole extra plain edit is never bought by frequency: the
         // cheapest candidate at the very bottom of the 50k list still beats a
         // one-edit-dearer candidate at the very top.
-        assert!(score(COST_EDIT, 0) > score(0, 50_000));
+        assert!(score(COST_EDIT, 0, "") > score(0, 50_000, ""));
     }
 
     #[test]

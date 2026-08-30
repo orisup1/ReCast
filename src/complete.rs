@@ -43,11 +43,11 @@ const MAX_PREFIX_LEN: usize = 20;
 /// word than the one before it.
 pub const MAX_CANDIDATES: usize = 4;
 
-/// Fixed-point scale for [`value`], so the ranking can be done in integers.
-const VALUE_SCALE: u64 = 1 << 20;
+/// Scale for [`value`], kept as f64 to allow personal frequency boost.
+const VALUE_SCALE: f64 = (1 << 20) as f64;
 
 /// How good a completion is: the keystrokes it would save, weighted by how
-/// likely it is to be the word meant.
+/// likely it is to be the word meant, boosted by personal frequency.
 ///
 /// Ranking candidates by raw frequency — the obvious thing, and what this did
 /// at first — quietly optimises the wrong quantity. The user pressed a key to
@@ -59,8 +59,13 @@ const VALUE_SCALE: u64 = 1 << 20;
 /// It only reorders candidates that are already close in frequency: a word ten
 /// times commoner than its neighbour still wins on frequency alone, which is
 /// why `hel` still completes to `help` rather than to a longer, rarer word.
-fn value(saved: usize, rank: u32) -> u64 {
-    saved as u64 * VALUE_SCALE / (rank as u64 + 1)
+///
+/// Personal frequency boosts candidates the user actually types, making their
+/// vocabulary win over generic corpus rankings.
+fn value(saved: usize, rank: u32, word: &str) -> f64 {
+    let base = saved as f64 * VALUE_SCALE / (rank as f64 + 1.0);
+    let boost = crate::personal::personal_boost(word) as f64;
+    base * boost
 }
 
 /// Completions to offer for the partial word `prefix`, best first.
@@ -112,12 +117,12 @@ pub fn completions_with(
     // Kept sorted by descending `value`, truncated to length as it goes, so the
     // scan never holds more than a handful of candidates however long the
     // prefix run is.
-    let mut best: Vec<(u64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
+    let mut best: Vec<(f64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
     en_freq.for_each_with_prefix(prefix, |word, rank| {
         if rank > max_rank || word.len() <= prefix.len() {
             return;
         }
-        let value = value(word.len() - prefix.len(), rank);
+        let value = value(word.len() - prefix.len(), rank, word);
         // Cheap rejection before the dictionary lookup: if the list is already
         // full of better candidates this one can't get in.
         if best.len() == MAX_CANDIDATES && best[MAX_CANDIDATES - 1].0 >= value {

@@ -206,6 +206,37 @@ pub fn language_of_keymap(keymap: &str) -> Option<Language> {
     }
 }
 
+/// Track consecutive layout query failures. When the layout backend cannot
+/// determine the current layout (returns None), we increment a counter. After
+/// a threshold, we warn the user once that they may need to set
+/// RECAST_LAYOUT_BACKEND.
+const LAYOUT_FAILURE_THRESHOLD: u32 = 50;
+
+static LAYOUT_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LAYOUT_WARNING_EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record a layout query failure. If failures exceed the threshold and no
+/// warning has been emitted yet, print a hint to stderr.
+pub fn record_layout_failure() {
+    let failures = LAYOUT_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if failures >= LAYOUT_FAILURE_THRESHOLD
+        && !LAYOUT_WARNING_EMITTED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        LAYOUT_WARNING_EMITTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "recast: layout query failed {} times — cannot determine current keyboard layout.\n\
+             If you are on Linux, try setting RECAST_LAYOUT_BACKEND=hyprland|sway|kde|gnome|x11\n\
+             (run `recast --status` to see what backend was detected).",
+            failures
+        );
+    }
+}
+
+/// Reset the layout failure counter on a successful query.
+pub fn reset_layout_failures() {
+    LAYOUT_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

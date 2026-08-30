@@ -24,6 +24,7 @@ mod notify;
 mod platform;
 mod prefs;
 mod settings;
+mod personal;
 mod spell;
 mod timing;
 mod types;
@@ -217,7 +218,7 @@ fn main() {
     // ReCast could not use. Printed here rather than only under `--status`,
     // because a daemon launched at login is one nobody runs `--status` on until
     // they have already spent a while wondering why their setting did nothing.
-    for complaint in settings::complaints(&config::NUMERIC_KEYS, &config::ALL_KEYS) {
+    for complaint in settings::complaints(config::NUMERIC_KEYS, config::ALL_KEYS) {
         eprintln!("Warning: {complaint}");
     }
 
@@ -236,6 +237,8 @@ fn main() {
     // …and layout changes made by hand, as they happen rather than within the
     // cache's 300 ms.
     layout::spawn_watcher();
+    // Personal intelligence: frequency, confusions, typing patterns.
+    personal::init();
 
     #[cfg(not(target_os = "linux"))]
     if with_window {
@@ -376,7 +379,7 @@ fn print_status() {
         cfg.complete_max_rank,
     );
 
-    for complaint in settings::complaints(&config::NUMERIC_KEYS, &config::ALL_KEYS) {
+    for complaint in settings::complaints(config::NUMERIC_KEYS, config::ALL_KEYS) {
         eprintln!("\n  ! {complaint}");
     }
 }

@@ -541,6 +541,13 @@ fn decide_known(
     let cur_text = if current == Language::English { text_en } else { text_he };
     let oth_text = if other == Language::English { text_en } else { text_he };
 
+    // Single-character inputs are only corrected if they are real dictionary
+    // words (e.g. "i", "a" in English). This prevents stray single keystrokes
+    // like "r" on Hebrew layout from triggering a layout switch.
+    if oth_text.chars().count() == 1 && !valid_strict(oth_text, other, en_dict, he_dict) {
+        return None;
+    }
+
     let oth_strict = valid_strict(oth_text, other, en_dict, he_dict);
     // Short-word gate: short words are dictionary-collision-prone; when disabled
     // (RECAST_SHORT=0) an other-layout reading of that length never triggers a
@@ -609,6 +616,16 @@ fn decide_unknown(
     en_freq: Freq,
     he_freq: Freq,
 ) -> Option<Language> {
+    // Single-character inputs are only corrected if they are real dictionary
+    // words (e.g. "i", "a" in English). This prevents stray single keystrokes
+    // from triggering a layout switch when the layout is unknown.
+    if text_en.chars().count() == 1 && !valid_strict(text_en, Language::English, en_dict, he_dict) {
+        return None;
+    }
+    if text_he.chars().count() == 1 && !valid_strict(text_he, Language::Hebrew, en_dict, he_dict) {
+        return None;
+    }
+
     // Short-word gate: when disabled, a short uncommon reading never counts as a
     // trigger — the same collision guard as in `decide_known`.
     let enabled = Config::global().short_enabled;
@@ -620,9 +637,9 @@ fn decide_unknown(
         && valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
     // If exactly one layout has a strict match, switch to that layout.
     if en_strict && !he_strict {
-        Some(Language::English)
+        return Some(Language::English);
     } else if he_strict && !en_strict {
-        Some(Language::Hebrew)
+        return Some(Language::Hebrew);
     } else if en_strict && he_strict {
         // Both layouts read as words: break the tie by frequency (and by the
         // run, which is usually the stronger of the two), else leave it alone.
@@ -630,17 +647,14 @@ fn decide_unknown(
         if other_decisively_more_common(
             text_he, Language::Hebrew, text_en, Language::English, run, en_freq, he_freq,
         ) {
-            Some(Language::English)
+            return Some(Language::English);
         } else if other_decisively_more_common(
             text_en, Language::English, text_he, Language::Hebrew, run, en_freq, he_freq,
         ) {
-            Some(Language::Hebrew)
-        } else {
-            None
+            return Some(Language::Hebrew);
         }
-    } else {
-        None
     }
+    None
 }
 
 /// The capitalization the user typed, recovered from the shift/caps-lock state
@@ -905,6 +919,13 @@ fn plan(
         return None;
     }
 
+    // Personal confusion pair: the user has explicitly corrected this word
+    // before (via undo or post-fix edit). This outranks everything — it's
+    // their deliberate choice.
+    if let Some(correction) = crate::personal::personal_correction(typed) {
+        return Some(Plan::Spell { text: correction });
+    }
+
     // An expansion the user configured by hand outranks everything we infer.
     if current == Some(Language::English) {
         if let Some(text) = crate::complete::expand(word_en) {
@@ -1140,6 +1161,12 @@ pub fn check_and_correct<K: Copy>(
     let he = Reading::new(&full_he, word_end_he);
 
     let current = crate::layout::current_layout();
+    // Track layout query failures for dead-backend detection.
+    if current.is_none() {
+        crate::layout::record_layout_failure();
+    } else {
+        crate::layout::reset_layout_failures();
+    }
     // What the word says about the language being written, independent of
     // whatever is about to be done to it. A layout switch overrides this below
     // — that decision is the better answer — but for every word the pipelines
