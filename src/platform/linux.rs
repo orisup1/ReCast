@@ -438,6 +438,7 @@ fn handle_key(
     }
     st.last_event_time = now;
     st.last_keycode = Some(key);
+    crate::personal::record_key_press(&format!("{key:?}"));
     st.held_keys.insert(key);
     if key == KC::KEY_CAPSLOCK {
         st.caps_lock = !st.caps_lock;
@@ -480,6 +481,7 @@ fn handle_key(
                     en_dict,
                     he_dict,
                 );
+                let observed = result.lang.map(|lang| reading(&st.keys, lang));
 
                 // Describe the fix for the history before `replacement`
                 // consumes it.
@@ -487,6 +489,8 @@ fn handle_key(
                 if let Some(rep) = replacement(&st.keys, result.fix) {
                     if let Some((from, to, kind)) = &note {
                         control.record_fix(from, to, *kind);
+                        crate::personal::record_confusion(from, to);
+                        crate::personal::record_word(to);
                     }
                     st.is_replacing = true;
                     let undo = undo_of(&st.keys, &rep, Some(key));
@@ -521,6 +525,8 @@ fn handle_key(
                         word,
                     };
                     st.last_action = Some(LastAction::Skipped(skip));
+                } else if let Some(word) = observed {
+                    crate::personal::record_word(&word);
                 }
                 st.keys.clear();
             }
@@ -588,6 +594,7 @@ fn handle_release(
     injector: &Arc<Mutex<VirtualDevice>>,
     control: &Arc<AppControl>,
 ) {
+    crate::personal::record_key_release(&format!("{key:?}"));
     use evdev::KeyCode as KC;
 
     let mut st = lock_forgiving(state_mutex);
@@ -877,15 +884,20 @@ fn non_empty(s: String) -> Option<String> {
 /// pipeline produced it.
 ///
 /// The "before" side is what was on screen, which is not the same reading in
-/// both cases: a layout fix has already switched to `lang`, so what the user
-/// was looking at is the *other* layout's reading, while a spelling fix or an
-/// expansion never left English.
+/// each case: layout-based fixes have already switched to `lang`, so what the
+/// user was looking at is the *other* layout's reading, while a spelling fix or
+/// an expansion never left English.
 fn note_of(keys: &[Typed], fix: &Fix) -> (String, String, FixKind) {
     match fix {
         Fix::Layout { start, text, lang } => (
             reading(&keys[*start..], lang.other()),
             text.clone(),
             FixKind::Layout,
+        ),
+        Fix::LayoutSpelling { text, lang } => (
+            reading(keys, lang.other()),
+            text.clone(),
+            FixKind::LayoutSpelling,
         ),
         Fix::Spelling { text } => (
             reading(keys, Language::English),
@@ -943,6 +955,13 @@ fn replacement(keys: &[Typed], fix: Option<Fix>) -> Option<Replacement> {
                 previous_layout: Some(lang.other()),
             })
         }
+        // The layout changed, but the original keys still spell a typo in the
+        // target layout. Type the speller's result instead of replaying them.
+        Fix::LayoutSpelling { text, lang } => Some(Replacement {
+            erase: keys.len(),
+            retype: typeable(&text)?,
+            previous_layout: Some(lang.other()),
+        }),
         // Same layout, different letters: erase the whole word and type the
         // corrected spelling instead. If any character turns out not to be
         // typeable, drop the fix rather than inject half a word.

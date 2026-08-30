@@ -31,6 +31,7 @@ impl Config {
     /// spelling autocorrect on).
     pub fn global() -> &'static Config {
         GLOBAL_CONFIG.get_or_init(|| Config {
+            personal_enabled: false,
             short_enabled: true,
             split_enabled: false,
             freq_enabled: true,
@@ -249,6 +250,8 @@ pub enum FixKind {
     Layout,
     /// The English speller rewrote it, or an abbreviation expanded.
     Spelling,
+    /// The layout changed and the alternate reading was spell-corrected.
+    LayoutSpelling,
     /// The completion key finished a partial word.
     Complete,
 }
@@ -259,6 +262,7 @@ impl FixKind {
         match self {
             FixKind::Layout => "layout",
             FixKind::Spelling => "spell",
+            FixKind::LayoutSpelling => "layout+spell",
             FixKind::Complete => "complete",
         }
     }
@@ -320,6 +324,7 @@ impl AppControl {
     #[cfg(test)]
     pub fn new_for_test() -> Self {
         Self::new_with_config(Config {
+            personal_enabled: false,
             short_enabled: true,
             split_enabled: false,
             freq_enabled: true,

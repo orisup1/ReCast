@@ -71,7 +71,13 @@
 //! Everything here is pure and dictionary-driven, so it is unit testable and
 //! never touches the OS.
 
+mod rules;
+
 use std::sync::OnceLock;
+
+use rules::{rules_by_last_byte, LOOKBACK, RULES};
+#[cfg(test)]
+use rules::{COST_HOMOPHONE, COST_SPELLING, MAX_RULE_LEN};
 
 use crate::config::Config;
 use crate::dictionary::{Dict, Freq};
@@ -175,149 +181,6 @@ fn score(cost: u32, rank: u32, word: &str) -> f32 {
     let base = cost as f32 + PRIOR_WEIGHT * (rank as f32 + PRIOR_SMOOTHING).ln();
     let boost = crate::personal::personal_boost(word);
     base - (boost - 1.0) * 50.0 // Personal boost reduces score by up to 50 points
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The Brill–Moore rule table.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A generic string-to-string edit: the user typed `from` where `to` was meant,
-/// and that whole exchange costs `cost` — one event, not one per letter.
-struct Rule {
-    /// What appears in the typed word.
-    from: &'static str,
-    /// What appears in the intended word.
-    to: &'static str,
-    cost: u32,
-}
-
-const fn rule(from: &'static str, to: &'static str, cost: u32) -> Rule {
-    Rule { from, to, cost }
-}
-
-/// Longest side any rule may have. The matrix look-back is bounded by this, and
-/// so is the letter-bag lower bound that prunes the scan.
-const MAX_RULE_LEN: usize = 4;
-
-/// How many rows back an alignment can reach: `MAX_RULE_LEN` for a block edit,
-/// two for a transposition. The matrix's early bail-out is only sound over a
-/// window this deep.
-const LOOKBACK: usize = MAX_RULE_LEN;
-
-/// Cost of a systematic spelling confusion — a rule the writer applied
-/// consistently because they believe that is how the word is spelled. Cheaper
-/// than a plain edit (it is one decision, not several slips) but dearer than a
-/// finger slip, because it rewrites more of the word.
-const COST_SPELLING: u32 = 70;
-/// Cost of the strongest confusions — the ones that are pure orthography, where
-/// the two spellings sound identical and the writer had no phonetic cue at all
-/// (`ph`/`f`, `kn`/`n`, silent letters).
-const COST_HOMOPHONE: u32 = 55;
-
-/// String-to-string edits, `typed` → `intended`.
-///
-/// Brill and Moore derive this table and its probabilities from a corpus of
-/// misspelling/correction pairs. We have no such corpus, so these are the
-/// standard English confusions written out by hand and priced by how systematic
-/// each one is. Both directions are listed where both directions happen.
-///
-/// Two constraints the code depends on: neither side may exceed
-/// [`MAX_RULE_LEN`], and `from` must not be empty (the matrix looks the rule up
-/// by the typed letter it ends on). A third is a matter of judgement: a rule
-/// that moves many letters at once for a single cost drags down the rate the
-/// scan's letter-bag pruning is derived from, blunting it for every other word.
-/// That is why wholesale phonetic respellings (`shun` → `tion`) are not here:
-/// they are past what this corrector is for, and they are not free.
-static RULES: &[Rule] = &[
-    // Silent and phonetic consonant clusters. These are what make a phonetic
-    // spelling reachable at all: "fone" and "phone" differ by two letters and
-    // one sound.
-    rule("f", "ph", COST_HOMOPHONE),
-    rule("ph", "f", COST_HOMOPHONE),
-    rule("f", "gh", COST_HOMOPHONE),
-    rule("gh", "f", COST_HOMOPHONE),
-    rule("n", "kn", COST_HOMOPHONE),
-    rule("kn", "n", COST_HOMOPHONE),
-    rule("n", "gn", COST_HOMOPHONE),
-    rule("r", "wr", COST_HOMOPHONE),
-    rule("wr", "r", COST_HOMOPHONE),
-    rule("m", "mb", COST_HOMOPHONE),
-    rule("w", "wh", COST_HOMOPHONE),
-    rule("wh", "w", COST_HOMOPHONE),
-    rule("k", "ck", COST_HOMOPHONE),
-    rule("ck", "k", COST_HOMOPHONE),
-    rule("k", "c", COST_HOMOPHONE),
-    rule("c", "k", COST_HOMOPHONE),
-    rule("s", "c", COST_HOMOPHONE),
-    rule("c", "s", COST_HOMOPHONE),
-    rule("s", "z", COST_HOMOPHONE),
-    rule("z", "s", COST_HOMOPHONE),
-    rule("x", "ks", COST_HOMOPHONE),
-    rule("ks", "x", COST_HOMOPHONE),
-    rule("j", "g", COST_SPELLING),
-    rule("g", "j", COST_SPELLING),
-    // Vowel digraphs — the sound is one, the spelling is a coin flip.
-    rule("ie", "ei", COST_SPELLING),
-    rule("ei", "ie", COST_SPELLING),
-    rule("ee", "ea", COST_SPELLING),
-    rule("ea", "ee", COST_SPELLING),
-    rule("ee", "ie", COST_SPELLING),
-    rule("ie", "ee", COST_SPELLING),
-    rule("oo", "u", COST_SPELLING),
-    rule("u", "oo", COST_SPELLING),
-    rule("o", "ou", COST_SPELLING),
-    rule("ou", "o", COST_SPELLING),
-    rule("i", "y", COST_SPELLING),
-    rule("y", "i", COST_SPELLING),
-    // Suffixes people genuinely do not know the spelling of. These are the
-    // rules that pay for themselves: "dependant", "existance", "seperatly" are
-    // one decision away from right, not two or three slips.
-    rule("ant", "ent", COST_SPELLING),
-    rule("ent", "ant", COST_SPELLING),
-    rule("ance", "ence", COST_SPELLING),
-    rule("ence", "ance", COST_SPELLING),
-    rule("ancy", "ency", COST_SPELLING),
-    rule("ency", "ancy", COST_SPELLING),
-    rule("able", "ible", COST_SPELLING),
-    rule("ible", "able", COST_SPELLING),
-    rule("cion", "tion", COST_SPELLING),
-    rule("sion", "tion", COST_SPELLING),
-    rule("tion", "sion", COST_SPELLING),
-    rule("us", "ous", COST_SPELLING),
-    rule("ous", "us", COST_SPELLING),
-    rule("aly", "ally", COST_SPELLING),
-    rule("ly", "lly", COST_SPELLING),
-    rule("cal", "cle", COST_SPELLING),
-    rule("cle", "cal", COST_SPELLING),
-    rule("er", "re", COST_SPELLING),
-    rule("re", "er", COST_SPELLING),
-    rule("ar", "er", COST_SPELLING),
-    rule("er", "ar", COST_SPELLING),
-    rule("or", "er", COST_SPELLING),
-    rule("er", "or", COST_SPELLING),
-    rule("ur", "er", COST_SPELLING),
-];
-
-/// The rules that could apply at a given typed cell, indexed by the letter the
-/// typed side ends on.
-///
-/// Without this the matrix would test all ~60 rules in every cell, which costs
-/// more than the rest of the scan put together. With it, a cell looks at the
-/// two or three rules that could possibly match there.
-fn rules_by_last_byte() -> &'static [Vec<&'static Rule>; 26] {
-    static INDEX: OnceLock<[Vec<&'static Rule>; 26]> = OnceLock::new();
-    INDEX.get_or_init(|| {
-        let mut index: [Vec<&'static Rule>; 26] = std::array::from_fn(|_| Vec::new());
-        for rule in RULES {
-            let last = *rule
-                .from
-                .as_bytes()
-                .last()
-                .expect("a rule needs a typed side");
-            index[(last - b'a') as usize].push(rule);
-        }
-        index
-    })
 }
 
 /// Best English correction for `word`, or `None` to leave it alone.
@@ -1718,12 +1581,13 @@ mod real_data {
 
     #[test]
     fn leaves_names_and_shorthand_alone() {
-        // Names, handles and chat shorthand are the things a user would most
-        // resent having rewritten.
-        for word in [
-            "sami", "ori", "supino", "claude", "github", "async", "struct", "asap", "idk", "brb",
-            "nvm", "yeh",
-        ] {
+        // A file makes real-world false-positive reports easy to add without
+        // turning this test into a source-code edit.
+        for word in include_str!("../tests/data/false_positives.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
             assert_eq!(fix(word), None, "{word}");
         }
     }
@@ -1735,6 +1599,29 @@ mod real_data {
         // speller must not have an opinion about them.
         for word in ["akuo", "ykrbo", "nauscl"] {
             assert_eq!(fix(word), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn punctuation_and_unicode_tokens_are_never_spelling_candidates() {
+        // Property-style coverage over every ASCII punctuation byte, plus
+        // representative non-ASCII scripts and combining characters.
+        for byte in 0u8..=127 {
+            if !byte.is_ascii_lowercase() {
+                let token = format!("hell{}o", char::from(byte));
+                assert_eq!(fix(&token), None, "byte {byte:#04x}");
+            }
+        }
+        for token in [
+            "héllo",
+            "hello🙂",
+            "שלום",
+            "привет",
+            "hello\u{301}",
+            "don't",
+            "hello-world",
+        ] {
+            assert_eq!(fix(token), None, "{token:?}");
         }
     }
 }

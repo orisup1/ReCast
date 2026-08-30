@@ -1,0 +1,17 @@
+# Unknown names, handles, technical terms, and shorthand that must stay intact.
+# One lowercase token per line; comments and blank lines are ignored.
+sami
+ori
+supino
+claude
+github
+async
+struct
+asap
+idk
+brb
+nvm
+yeh
+akuo
+ykrbo
+nauscl

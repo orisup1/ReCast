@@ -313,6 +313,7 @@ fn learned_text(counts: &HashMap<String, u32>) -> String {
 /// Written through to disk immediately, as `ignore.txt` is: an undo is a
 /// deliberate gesture that happens a handful of times an hour, and the file is a
 /// few hundred bytes. Nothing here is on the path a keystroke takes.
+#[allow(dead_code)]
 pub fn learn(word: &str) {
     let word = word.trim().to_lowercase();
     if word.is_empty() {

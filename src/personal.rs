@@ -2,15 +2,18 @@
 //!
 //! All three are built by watching what the user actually does — accepted fixes,
 //! undo gestures, completions taken, and raw timing — and written to files in
-//! the config directory so they survive restarts. No settings, no opt-in; the
-//! data is local, small, and only ever improves the user's own experience.
+//! the config directory so they survive restarts. This is deliberately opt-in:
+//! word-frequency and confusion files can contain sensitive text even though
+//! they never leave the machine.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::complete::config_dir;
+use crate::config::Config;
 
 /// Where personal data lives.
 const PERSONAL_DIR: &str = "personal";
@@ -49,7 +52,9 @@ fn personal_freq_map() -> &'static Mutex<HashMap<String, u64>> {
 
 /// Load the personal frequency file, or return empty map.
 fn load_personal_freq() -> HashMap<String, u64> {
-    let path = personal_path(PERSONAL_FREQ_FILE);
+    let Some(path) = personal_path(PERSONAL_FREQ_FILE) else {
+        return HashMap::new();
+    };
     std::fs::read_to_string(&path)
         .ok()
         .as_deref()
@@ -80,6 +85,9 @@ fn parse_freq_file(text: &str) -> HashMap<String, u64> {
 /// Record that `word` was typed/accepted. Call for every finished word that
 /// passes basic sanity (length, ascii/hebrew). The map is flushed periodically.
 pub fn record_word(word: &str) {
+    if !enabled() {
+        return;
+    }
     if word.chars().count() < MIN_WORD_LEN {
         return;
     }
@@ -93,9 +101,11 @@ pub fn record_word(word: &str) {
     }
 }
 
-/// Get personal rank for `word`. Lower = more common personally. Returns
-/// `None` if not in personal list.
-pub fn personal_rank(word: &str) -> Option<u64> {
+/// Get how many times `word` has been observed locally.
+pub fn personal_count(word: &str) -> Option<u64> {
+    if !enabled() {
+        return None;
+    }
     let word = word.trim().to_lowercase();
     personal_freq_map().lock().ok()?.get(&word).copied()
 }
@@ -103,13 +113,16 @@ pub fn personal_rank(word: &str) -> Option<u64> {
 /// Boost a candidate's score in completions/spelling based on personal frequency.
 /// Returns a multiplier (>= 1.0) applied to the candidate's value.
 pub fn personal_boost(word: &str) -> f32 {
-    let rank = match personal_rank(word) {
-        Some(r) => r,
+    let count = match personal_count(word) {
+        Some(count) => count,
         None => return 1.0,
     };
-    // Heuristic: top 10 personal words get 2x, decaying to 1.0 by rank 1000.
-    let boost = 2.0_f32 * (1.0 - (rank as f32).min(1000.0) / 1000.0).max(0.0);
-    1.0 + boost
+    boost_for_count(count)
+}
+
+/// A bounded, monotonic boost: one observation is a hint; ten are the cap.
+fn boost_for_count(count: u64) -> f32 {
+    1.0 + (count as f32 / 10.0).min(1.0)
 }
 
 /// Periodically flush personal frequency to disk.
@@ -124,10 +137,12 @@ fn maybe_flush_freq(len: usize) {
 
 /// Write personal frequency to disk atomically.
 fn flush_personal_freq() {
-    let path = personal_path(PERSONAL_FREQ_FILE);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if !enabled() {
+        return;
     }
+    let Some(path) = personal_path(PERSONAL_FREQ_FILE) else {
+        return;
+    };
     let map = match personal_freq_map().lock() {
         Ok(m) => m,
         Err(_) => return,
@@ -143,7 +158,7 @@ fn flush_personal_freq() {
         out.push('\n');
     }
     let tmp = path.with_extension("txt.tmp");
-    if std::fs::write(&tmp, out).is_ok() {
+    if write_private(&tmp, &out).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
@@ -160,7 +175,9 @@ fn confusions_map() -> &'static Mutex<HashMap<String, HashMap<String, u64>>> {
 
 /// Load confusions file.
 fn load_confusions() -> HashMap<String, HashMap<String, u64>> {
-    let path = personal_path(CONFUSIONS_FILE);
+    let Some(path) = personal_path(CONFUSIONS_FILE) else {
+        return HashMap::new();
+    };
     std::fs::read_to_string(&path)
         .ok()
         .as_deref()
@@ -192,6 +209,9 @@ fn parse_confusions_file(text: &str) -> HashMap<String, HashMap<String, u64>> {
 
 /// Record a confusion pair: the user typed `typed` and it was corrected to `corrected`.
 pub fn record_confusion(typed: &str, corrected: &str) {
+    if !enabled() {
+        return;
+    }
     if typed.is_empty() || corrected.is_empty() || typed == corrected {
         return;
     }
@@ -206,6 +226,9 @@ pub fn record_confusion(typed: &str, corrected: &str) {
 /// Look up the most common correction for `typed` from personal confusions.
 /// Returns the corrected word if there's a strong enough signal (count >= 2).
 pub fn personal_correction(typed: &str) -> Option<String> {
+    if !enabled() {
+        return None;
+    }
     let typed = typed.trim().to_lowercase();
     let map = confusions_map().lock().ok()?;
     let inner = map.get(&typed)?;
@@ -215,21 +238,6 @@ pub fn personal_correction(typed: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Get all corrections for `typed` sorted by count (for potential future use).
-pub fn all_personal_corrections(typed: &str) -> Vec<(String, u64)> {
-    let typed = typed.trim().to_lowercase();
-    confusions_map()
-        .lock()
-        .ok()
-        .and_then(|map| map.get(&typed).cloned())
-        .map(|inner| {
-            let mut v: Vec<_> = inner.into_iter().collect();
-            v.sort_by(|a, b| b.1.cmp(&a.1));
-            v
-        })
-        .unwrap_or_default()
 }
 
 /// Periodically flush confusions to disk.
@@ -245,10 +253,12 @@ fn maybe_flush_confusions(_map: &HashMap<String, HashMap<String, u64>>) {
 
 /// Write confusions to disk atomically.
 fn flush_confusions() {
-    let path = personal_path(CONFUSIONS_FILE);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if !enabled() {
+        return;
     }
+    let Some(path) = personal_path(CONFUSIONS_FILE) else {
+        return;
+    };
     // Clone the map while holding the lock, then release it before writing.
     let map: HashMap<String, HashMap<String, u64>> = match confusions_map().lock() {
         Ok(m) => m.clone(),
@@ -276,7 +286,7 @@ fn flush_confusions() {
         }
     }
     let tmp = path.with_extension("txt.tmp");
-    if std::fs::write(&tmp, out).is_ok() {
+    if write_private(&tmp, &out).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
 }
@@ -296,6 +306,8 @@ struct TypingProfile {
     total_keys: u64,
     /// Last key press time for digraph calculation.
     last_press: Option<(String, Instant)>,
+    /// Press time by held key, for dwell calculation on release.
+    presses: HashMap<String, Instant>,
     /// Whether profile has unsaved changes.
     dirty: bool,
 }
@@ -307,6 +319,9 @@ fn typing_profile() -> &'static Mutex<TypingProfile> {
 
 /// Record a key press for digraph timing.
 pub fn record_key_press(key_name: &str) {
+    if !enabled() {
+        return;
+    }
     let now = Instant::now();
     let key = key_name.to_lowercase();
     if let Ok(mut profile) = typing_profile().lock() {
@@ -329,21 +344,28 @@ pub fn record_key_press(key_name: &str) {
             }
         }
         profile.last_press = Some((key.clone(), now));
+        profile.presses.insert(key, now);
         profile.total_keys += 1;
         profile.dirty = true;
     }
 }
 
 /// Record a key release for dwell time.
-pub fn record_key_release(key_name: &str, press_time: Instant) {
-    let dwell = Instant::now()
-        .saturating_duration_since(press_time)
-        .as_micros() as u64;
-    if dwell > 1_000_000 {
-        return; // Filter stuck keys
+pub fn record_key_release(key_name: &str) {
+    if !enabled() {
+        return;
     }
     let key = key_name.to_lowercase();
     if let Ok(mut profile) = typing_profile().lock() {
+        let Some(press_time) = profile.presses.remove(&key) else {
+            return;
+        };
+        let dwell = Instant::now()
+            .saturating_duration_since(press_time)
+            .as_micros() as u64;
+        if dwell > 1_000_000 {
+            return;
+        }
         profile
             .dwells
             .entry(key.clone())
@@ -358,55 +380,15 @@ pub fn record_key_release(key_name: &str, press_time: Instant) {
     }
 }
 
-/// Get median dwell time for a key (microseconds), or None.
-pub fn median_dwell(key_name: &str) -> Option<u64> {
-    let key = key_name.to_lowercase();
-    let profile = typing_profile().lock().ok()?;
-    let dwells = profile.dwells.get(&key)?;
-    if dwells.is_empty() {
-        return None;
-    }
-    let mut v: Vec<u64> = dwells.iter().copied().collect();
-    v.sort_unstable();
-    Some(v[v.len() / 2])
-}
-
-/// Get median digraph interval for a pair (microseconds), or None.
-pub fn median_digraph(prev_key: &str, key: &str) -> Option<u64> {
-    let profile = typing_profile().lock().ok()?;
-    let dwells = profile
-        .digraphs
-        .get(&(prev_key.to_lowercase(), key.to_lowercase()))?;
-    if dwells.is_empty() {
-        return None;
-    }
-    let mut v: Vec<u64> = dwells.iter().copied().collect();
-    v.sort_unstable();
-    Some(v[v.len() / 2])
-}
-
-/// Global median inter-key interval across all digraphs (microseconds).
-/// Used to adapt injection timing for slow/fast typists.
-pub fn global_median_interval() -> Option<u64> {
-    let profile = typing_profile().lock().ok()?;
-    let mut all: Vec<u64> = Vec::new();
-    for dq in profile.digraphs.values() {
-        all.extend(dq.iter().copied());
-    }
-    if all.is_empty() {
-        return None;
-    }
-    all.sort_unstable();
-    Some(all[all.len() / 2])
-}
-
 /// Flush typing profile to disk (JSON-ish text).
 fn flush_profile() {
-    let path = personal_path(PROFILE_FILE);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if !enabled() {
+        return;
     }
-    let profile = match typing_profile().lock() {
+    let Some(path) = personal_path(PROFILE_FILE) else {
+        return;
+    };
+    let mut profile = match typing_profile().lock() {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -415,7 +397,13 @@ fn flush_profile() {
     }
     let mut out = String::from("# Typing profile — written by ReCast\n");
     out.push_str(&format!("total_keys: {}\n", profile.total_keys));
-    if let Some(global) = global_median_interval() {
+    let mut intervals: Vec<u64> = profile
+        .digraphs
+        .values()
+        .flat_map(|values| values.iter().copied())
+        .collect();
+    intervals.sort_unstable();
+    if let Some(global) = intervals.get(intervals.len() / 2) {
         out.push_str(&format!("global_median_interval_us: {}\n", global));
     }
     out.push_str("\n# Per-key median dwell (us)\n");
@@ -435,11 +423,9 @@ fn flush_profile() {
         }
     }
     let tmp = path.with_extension("txt.tmp");
-    if std::fs::write(&tmp, out).is_ok() {
+    if write_private(&tmp, &out).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
-        if let Ok(mut p) = typing_profile().lock() {
-            p.dirty = false;
-        }
+        profile.dirty = false;
     }
 }
 
@@ -458,15 +444,165 @@ fn spawn_periodic_flusher() {
 
 /// Initialize personal data directory and start background flusher.
 pub fn init() {
-    if let Some(dir) = config_dir().map(|d| d.join(PERSONAL_DIR)) {
-        let _ = std::fs::create_dir_all(&dir);
+    if !enabled() {
+        return;
+    }
+    let Some(dir) = data_dir() else {
+        return;
+    };
+    if create_private_dir(&dir).is_err() {
+        return;
     }
     spawn_periodic_flusher();
 }
 
-/// Build the path for a personal file.
-fn personal_path(name: &str) -> PathBuf {
-    config_dir()
-        .map(|d| d.join(PERSONAL_DIR).join(name))
-        .unwrap_or_else(|| PathBuf::from(name))
+fn enabled() -> bool {
+    Config::global().personal_enabled
+}
+
+/// Directory containing opt-in personal data, if this OS provides one.
+pub fn data_dir() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join(PERSONAL_DIR))
+}
+
+/// Delete only the three files ReCast owns. The directory removal is
+/// non-recursive, so an unexpected user file can never be erased with them.
+pub fn clear_data() -> Result<Option<PathBuf>, String> {
+    let Some(dir) = data_dir() else {
+        return Ok(None);
+    };
+    clear_dir(&dir)?;
+    Ok(Some(dir))
+}
+
+fn clear_dir(dir: &std::path::Path) -> Result<(), String> {
+    for name in [PERSONAL_FREQ_FILE, CONFUSIONS_FILE, PROFILE_FILE] {
+        let path = dir.join(name);
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("{}: {error}", path.display()));
+            }
+        }
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => return Err(format!("{}: {error}", dir.display())),
+    }
+    Ok(())
+}
+
+fn personal_path(name: &str) -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join(name))
+}
+
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        create_private_dir(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(content.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frequent_words_receive_a_larger_bounded_boost() {
+        assert_eq!(boost_for_count(0), 1.0);
+        assert!(boost_for_count(2) > boost_for_count(1));
+        assert_eq!(boost_for_count(10), 2.0);
+        assert_eq!(boost_for_count(10_000), 2.0);
+    }
+
+    #[test]
+    fn personal_data_is_off_in_the_shipped_test_config() {
+        assert!(!enabled());
+        assert_eq!(personal_boost("privateword"), 1.0);
+        assert_eq!(personal_correction("privateword"), None);
+    }
+
+    #[test]
+    fn clearing_removes_only_files_owned_by_recast() {
+        let unique = format!(
+            "recast-personal-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        create_private_dir(&dir).expect("create private test directory");
+        for name in [PERSONAL_FREQ_FILE, CONFUSIONS_FILE, PROFILE_FILE] {
+            write_private(&dir.join(name), "sensitive\n").expect("write owned file");
+        }
+        let keep = dir.join("keep.txt");
+        std::fs::write(&keep, "user-owned\n").expect("write unexpected file");
+
+        clear_dir(&dir).expect("clear personal data");
+        assert!(keep.exists(), "an unexpected file must be preserved");
+        for name in [PERSONAL_FREQ_FILE, CONFUSIONS_FILE, PROFILE_FILE] {
+            assert!(!dir.join(name).exists(), "{name} was not removed");
+        }
+
+        std::fs::remove_file(keep).expect("remove test file");
+        std::fs::remove_dir(dir).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn personal_files_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "recast-private-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        create_private_dir(&dir).expect("create private test directory");
+        let path = dir.join("data.txt");
+        std::fs::write(&path, "old data\n").expect("write old personal file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make old file non-private");
+        write_private(&path, "private\n").expect("write private file");
+        let mode = std::fs::metadata(&path)
+            .expect("private file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_file(path).expect("remove private test file");
+        std::fs::remove_dir(dir).expect("remove private test directory");
+    }
 }

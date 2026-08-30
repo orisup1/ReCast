@@ -304,6 +304,7 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
         let mut st = state_cb.lock().unwrap();
         match event.event_type {
             EventType::KeyPress(key) => {
+                crate::personal::record_key_press(&format!("{key:?}"));
                 st.held_keys.insert(key);
                 if key == Key::CapsLock {
                     st.caps_lock = !st.caps_lock;
@@ -348,6 +349,7 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                                 en_dict,
                                 he_dict,
                             );
+                            let observed = result.lang.map(|lang| reading(&st.keys, lang));
 
                             // Describe the fix for the history before
                             // `replacement` consumes it.
@@ -355,6 +357,8 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                             if let Some(rep) = replacement(&st.keys, result.fix) {
                                 if let Some((from, to, kind)) = &note {
                                     control_cb.record_fix(from, to, *kind);
+                                    crate::personal::record_confusion(from, to);
+                                    crate::personal::record_word(to);
                                 }
                                 st.is_replacing = true;
                                 let terminator = Some(key);
@@ -392,6 +396,8 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                                     word,
                                 };
                                 st.last_action = Some(LastAction::Skipped(skip));
+                            } else if let Some(word) = observed {
+                                crate::personal::record_word(&word);
                             }
 
                             st.keys.clear();
@@ -448,6 +454,7 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
             // capital, for a shortcut) is unaffected; only a press and release
             // with nothing in between counts.
             EventType::KeyRelease(key) => {
+                crate::personal::record_key_release(&format!("{key:?}"));
                 st.held_keys.remove(&key);
                 if key == Key::ControlLeft || key == Key::ControlRight {
                     handle_ctrl_tap(st, &state_cb, &injecting, &control_cb, en_dict, he_dict);
@@ -748,15 +755,20 @@ fn reading(keys: &[Typed], lang: Language) -> String {
 /// pipeline produced it.
 ///
 /// The "before" side is what was on screen, which is not the same reading in
-/// both cases: a layout fix has already switched to `lang`, so what the user
-/// was looking at is the *other* layout's reading, while a spelling fix or an
-/// expansion never left English.
+/// each case: layout-based fixes have already switched to `lang`, so what the
+/// user was looking at is the *other* layout's reading, while a spelling fix or
+/// an expansion never left English.
 fn note_of(keys: &[Typed], fix: &Fix) -> (String, String, FixKind) {
     match fix {
         Fix::Layout { start, text, lang } => (
             reading(&keys[*start..], lang.other()),
             text.clone(),
             FixKind::Layout,
+        ),
+        Fix::LayoutSpelling { text, lang } => (
+            reading(keys, lang.other()),
+            text.clone(),
+            FixKind::LayoutSpelling,
         ),
         Fix::Spelling { text } => (
             reading(keys, Language::English),
@@ -808,6 +820,11 @@ fn replacement(keys: &[Typed], fix: Option<Fix>) -> Option<Replacement> {
         // rather than key positions means there is no shift to replay.
         Fix::Layout { start, text, lang } => Some(Replacement {
             erase: keys.len() - start,
+            text,
+            previous_layout: Some(lang.other()),
+        }),
+        Fix::LayoutSpelling { text, lang } => Some(Replacement {
+            erase: keys.len(),
             text,
             previous_layout: Some(lang.other()),
         }),

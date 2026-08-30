@@ -10,6 +10,8 @@
 // Startup ASCII-art banner: shown when launched from a terminal (tty), not
 // when started by a background service / LaunchAgent whose stdout has no TTY.
 mod banner;
+#[cfg(test)]
+mod benchmarks;
 mod complete;
 mod config;
 mod daemon;
@@ -56,6 +58,8 @@ Options:
       --status      Print what is running and what is configured, then exit
       --write-config  Write a commented config.toml with every setting in it
                     (never overwrites an existing one), then exit
+      --clear-personal-data  Delete locally learned word, correction, and
+                    typing-timing files, then exit (stop ReCast first)
   -v, --version     Print the version and exit
   -h, --help        Show this help
 
@@ -81,6 +85,8 @@ Settings:
   RECAST_COMPLETE=0   Disable auto-complete (word completion + abbreviations)
   RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)
   RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
+  RECAST_PERSONAL=1   Opt in to local word/correction/timing personalization;
+                      off by default because its files can contain typed words
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.
@@ -122,6 +128,7 @@ Your files (<config dir>/recast/):
   config.toml `key = value` per line, everything under Settings above
   abbrev.txt  `abbr = expansion` per line
   ignore.txt  one word per line, never corrected
+  personal/   created only with RECAST_PERSONAL=1; may contain typed words
   The two lists are re-read within a couple of seconds of being edited;
   config.toml is read once, so a change to it takes a restart.";
 
@@ -151,6 +158,17 @@ fn main() {
                     }
                     Err(why) => {
                         eprintln!("{why}");
+                        process::exit(1);
+                    }
+                }
+                return;
+            }
+            "--clear-personal-data" => {
+                match personal::clear_data() {
+                    Ok(Some(path)) => println!("Cleared personal data from {}.", path.display()),
+                    Ok(None) => println!("No personal data directory is available on this OS."),
+                    Err(why) => {
+                        eprintln!("Failed to clear personal data: {why}");
                         process::exit(1);
                     }
                 }
@@ -386,6 +404,13 @@ fn print_status() {
         on_off(cfg.complete_enabled),
         cfg.complete_min_len,
         cfg.complete_max_rank,
+    );
+    println!(
+        "    personalization      {}{}",
+        on_off(cfg.personal_enabled),
+        personal::data_dir()
+            .map(|path| format!("  ({})", path.display()))
+            .unwrap_or_default(),
     );
 
     for complaint in settings::complaints(config::NUMERIC_KEYS, config::ALL_KEYS) {

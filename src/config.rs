@@ -1,5 +1,8 @@
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Persist local word-frequency, correction-pair, and typing-timing data.
+    /// Off by default because the word files may contain sensitive text.
+    pub personal_enabled: bool,
     /// Allow auto-switching on short words (≤3 chars). Short key sequences are
     /// dictionary-collision-prone, so this can be turned off for a stricter,
     /// never-wrongly-switch behaviour.
@@ -69,26 +72,19 @@ impl Config {
     /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 3).
     /// RECAST_COMPLETE_RANK – worst frequency rank a completion may have
     ///                        (default: 30000).
+    /// RECAST_PERSONAL – set to `1` to persist local personalization data
+    ///                   (default: disabled).
     pub fn from_env() -> Self {
         Self {
-            short_enabled: std::env::var("RECAST_SHORT")
-                .map(|v| v != "0")
-                .unwrap_or(true),
-            split_enabled: std::env::var("RECAST_SPLIT")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(false),
-            freq_enabled: std::env::var("RECAST_FREQ")
-                .map(|v| v != "0")
-                .unwrap_or(true),
-            spell_enabled: std::env::var("RECAST_SPELL")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
+            short_enabled: crate::settings::flag("RECAST_SHORT", true),
+            split_enabled: crate::settings::flag("RECAST_SPLIT", false),
+            freq_enabled: crate::settings::flag("RECAST_FREQ", true),
+            spell_enabled: crate::settings::flag("RECAST_SPELL", true),
             spell_min_len: env_num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),
             spell_max_rank: env_num("RECAST_SPELL_RANK", DEFAULT_SPELL_MAX_RANK),
             spell_max_dist: env_num("RECAST_SPELL_DIST", DEFAULT_SPELL_MAX_DIST),
-            complete_enabled: std::env::var("RECAST_COMPLETE")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            complete_enabled: crate::settings::flag("RECAST_COMPLETE", true),
             complete_min_len: env_num("RECAST_COMPLETE_MIN", DEFAULT_COMPLETE_MIN_LEN),
             complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
         }
@@ -97,8 +93,7 @@ impl Config {
 
 /// Numeric env override, falling back to `default` when unset or unparsable.
 fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
+    crate::settings::get(key)
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
@@ -127,6 +122,7 @@ pub const NUMERIC_KEYS: &[&str] = &[
 
 /// All known settings, for validating the config file.
 pub const ALL_KEYS: &[&str] = &[
+    "RECAST_PERSONAL",
     "RECAST_SHORT",
     "RECAST_SPLIT",
     "RECAST_FREQ",
@@ -152,28 +148,6 @@ pub const ALL_KEYS: &[&str] = &[
     // Linux-only setting (not in Config struct)
     "RECAST_LAYOUT_BACKEND",
 ];
-
-/// Settings that were set but could not be understood, described for the user.
-///
-/// [`env_num`] falls back to the shipped default on anything it cannot parse,
-/// which is the right behaviour — a bad value should not stop the program —
-/// but doing it *silently* inverts the user's intent in the one case that
-/// matters. `RECAST_SPELL_DIST=l` (an el for a one) reads as the default 3,
-/// the loosest setting there is, from someone who was plainly trying to
-/// tighten it. Nothing said so. This is what `--status` reads out.
-pub fn env_complaints() -> Vec<String> {
-    let mut out = Vec::new();
-    for key in NUMERIC_KEYS {
-        if let Ok(raw) = std::env::var(key) {
-            if raw.trim().parse::<u64>().is_err() {
-                out.push(format!(
-                    "{key}={raw:?} is not a number — using the default instead."
-                ));
-            }
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {

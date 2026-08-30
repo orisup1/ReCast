@@ -499,6 +499,7 @@ fn device_flag(key: Key) -> Option<u64> {
 }
 
 fn handle_key_press(ctx: &TapContext, key: Key) {
+    crate::personal::record_key_press(&format!("{key:?}"));
     let mut st = lock_forgiving(&ctx.state);
     st.held_keys.insert(key);
     // Any key other than Right Shift itself means the shift is being *held* for
@@ -538,12 +539,15 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                     ctx.en_dict,
                     ctx.he_dict,
                 );
+                let observed = result.lang.map(|lang| reading(&st.keys, lang));
                 // Describe the fix for the history before `replacement`
                 // consumes it.
                 let note = result.fix.as_ref().map(|fix| note_of(&st.keys, fix));
                 if let Some(rep) = replacement(&st.keys, result.fix) {
                     if let Some((from, to, kind)) = &note {
                         ctx.control.record_fix(from, to, *kind);
+                        crate::personal::record_confusion(from, to);
+                        crate::personal::record_word(to);
                     }
                     st.is_replacing = true;
                     let state_clone = Arc::clone(&ctx.state);
@@ -580,6 +584,8 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                         word,
                     };
                     st.last_action = Some(LastAction::Skipped(skip));
+                } else if let Some(word) = observed {
+                    crate::personal::record_word(&word);
                 }
                 st.keys.clear();
             }
@@ -638,6 +644,7 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
 /// (for a capital, for a shortcut) is unaffected; only a press and release with
 /// nothing in between counts.
 fn handle_key_release(ctx: &TapContext, key: Key) {
+    crate::personal::record_key_release(&format!("{key:?}"));
     let mut st = lock_forgiving(&ctx.state);
     st.held_keys.remove(&key);
 
@@ -884,15 +891,20 @@ fn reading(keys: &[Typed], lang: Language) -> String {
 /// pipeline produced it.
 ///
 /// The "before" side is what was on screen, which is not the same reading in
-/// both cases: a layout fix has already switched to `lang`, so what the user
-/// was looking at is the *other* layout's reading, while a spelling fix or an
-/// expansion never left English.
+/// each case: layout-based fixes have already switched to `lang`, so what the
+/// user was looking at is the *other* layout's reading, while a spelling fix or
+/// an expansion never left English.
 fn note_of(keys: &[Typed], fix: &Fix) -> (String, String, FixKind) {
     match fix {
         Fix::Layout { start, text, lang } => (
             reading(&keys[*start..], lang.other()),
             text.clone(),
             FixKind::Layout,
+        ),
+        Fix::LayoutSpelling { text, lang } => (
+            reading(keys, lang.other()),
+            text.clone(),
+            FixKind::LayoutSpelling,
         ),
         Fix::Spelling { text } => (
             reading(keys, Language::English),
@@ -949,6 +961,9 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
     // a main-thread TUI can't coexist with it — the tray is the UI here.
     if with_gui {
         eprintln!("--gui is not supported on macOS; running with the menubar tray instead.");
+    }
+    if let Err(error) = crate::daemon::write_pidfile() {
+        eprintln!("Failed to write pidfile: {error}");
     }
     // Bind the tap to a named local so it stays alive for the whole session;
     // dropping it would disable and release the tap.
@@ -1038,6 +1053,11 @@ fn replacement(keys: &[Typed], fix: Option<Fix>) -> Option<Replacement> {
         // rather than key positions means there is no shift to replay.
         Fix::Layout { start, text, lang } => Some(Replacement {
             erase: keys.len() - start,
+            text,
+            previous_layout: Some(lang.other()),
+        }),
+        Fix::LayoutSpelling { text, lang } => Some(Replacement {
+            erase: keys.len(),
             text,
             previous_layout: Some(lang.other()),
         }),

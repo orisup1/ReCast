@@ -12,182 +12,12 @@
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
+mod blob;
+pub use blob::{en_dict, en_freq, he_dict, he_freq, Dict, Freq};
+
 use crate::config::Config;
 use crate::layout::switch_layout_to;
 use crate::types::Language;
-
-/// A sorted, `\n`-separated word list living in the binary's read-only data.
-///
-/// `Copy` and pointer-sized: it is passed around by value, and cloning it costs
-/// nothing because there is nothing to clone — the words are never copied out
-/// of the executable image.
-#[derive(Clone, Copy)]
-pub struct Dict {
-    blob: &'static str,
-}
-
-/// A sorted `word\trank` list (rank 0-based; lower = more common). Used only to
-/// break homograph ties and to gate spelling suggestions, never as a membership
-/// trigger.
-#[derive(Clone, Copy)]
-pub struct Freq {
-    blob: &'static str,
-}
-
-impl Dict {
-    pub const fn new(blob: &'static str) -> Self {
-        Self { blob }
-    }
-
-    /// Exact membership test: a binary search over the sorted lines.
-    pub fn contains(self, word: &str) -> bool {
-        lookup(self.blob.as_bytes(), word.as_bytes()).is_some()
-    }
-}
-
-impl Freq {
-    pub const fn new(blob: &'static str) -> Self {
-        Self { blob }
-    }
-
-    /// Rank of `word`, if it is common enough to appear in the list.
-    pub fn rank(self, word: &str) -> Option<u32> {
-        let line = lookup(self.blob.as_bytes(), word.as_bytes())?;
-        let tab = line.iter().position(|&b| b == b'\t')?;
-        parse_rank(&line[tab + 1..])
-    }
-
-    /// Call `f(word, rank)` for every entry starting with `prefix`, in list
-    /// order.
-    ///
-    /// Because the blob is sorted, those entries are one contiguous run: a
-    /// binary search finds where it starts and the walk stops at the first line
-    /// that no longer matches. This is what lets the speller and the completer
-    /// consider "every common word beginning with h" without paying for the
-    /// other 96% of the list.
-    pub fn for_each_with_prefix(self, prefix: &str, mut f: impl FnMut(&str, u32)) {
-        let blob = self.blob.as_bytes();
-        let mut pos = lower_bound(blob, prefix.as_bytes());
-        while pos < blob.len() {
-            let end = pos
-                + blob[pos..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .unwrap_or(blob.len() - pos);
-            let line = &blob[pos..end];
-            let key = key_of(line);
-            if !key.starts_with(prefix.as_bytes()) {
-                return;
-            }
-            if let (Ok(word), Some(rank)) = (
-                std::str::from_utf8(key),
-                line.get(key.len() + 1..).and_then(parse_rank),
-            ) {
-                f(word, rank);
-            }
-            pos = end + 1;
-        }
-    }
-}
-
-/// The key of a blob line: everything before the first tab (a `Freq` line), or
-/// the whole line when there is none (a `Dict` line).
-fn key_of(line: &[u8]) -> &[u8] {
-    match line.iter().position(|&b| b == b'\t') {
-        Some(i) => &line[..i],
-        None => line,
-    }
-}
-
-fn parse_rank(bytes: &[u8]) -> Option<u32> {
-    let mut rank: u32 = 0;
-    for &b in bytes {
-        rank = rank
-            .checked_mul(10)?
-            .checked_add(b.checked_sub(b'0')? as u32)?;
-    }
-    Some(rank)
-}
-
-/// Binary search for the line whose key equals `needle`, over a blob whose
-/// lines are sorted by byte order.
-///
-/// The blob carries no index — a probe lands on an arbitrary byte and walks
-/// back to the start of the line it fell inside, which is what keeps the whole
-/// structure to "just the sorted text" with nothing else resident. `lo` is
-/// always the start of a line and `hi` is always a line start or the end of the
-/// blob, so each step either moves `lo` past the probed line or pulls `hi` down
-/// to it, and the window always shrinks.
-fn lookup<'a>(blob: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
-    let (mut lo, mut hi) = (0usize, blob.len());
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        // Start of the line containing `mid` (never before `lo`, which is
-        // itself a line start).
-        let start = match blob[lo..mid].iter().rposition(|&b| b == b'\n') {
-            Some(i) => lo + i + 1,
-            None => lo,
-        };
-        let end = start
-            + blob[start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(blob.len() - start);
-        let line = &blob[start..end];
-        match key_of(line).cmp(needle) {
-            std::cmp::Ordering::Less => lo = end + 1,
-            std::cmp::Ordering::Greater => hi = start,
-            std::cmp::Ordering::Equal => return Some(line),
-        }
-    }
-    None
-}
-
-/// Byte offset of the first line whose key is `>= needle`, or the end of the
-/// blob when there is none. The mirror of [`lookup`] for range queries: the
-/// same walk-back-to-a-line-start probe, keeping the answer on a line boundary
-/// so the caller can read forward from it.
-fn lower_bound(blob: &[u8], needle: &[u8]) -> usize {
-    let (mut lo, mut hi) = (0usize, blob.len());
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let start = match blob[lo..mid].iter().rposition(|&b| b == b'\n') {
-            Some(i) => lo + i + 1,
-            None => lo,
-        };
-        let end = start
-            + blob[start..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(blob.len() - start);
-        if key_of(&blob[start..end]) < needle {
-            lo = end + 1;
-        } else {
-            hi = start;
-        }
-    }
-    lo.min(blob.len())
-}
-
-/// The English dictionary (sorted blob, prepared by `build.rs`).
-pub const fn en_dict() -> Dict {
-    Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_dict.blob")))
-}
-
-/// The Hebrew dictionary (sorted blob, prepared by `build.rs`).
-pub const fn he_dict() -> Dict {
-    Dict::new(include_str!(concat!(env!("OUT_DIR"), "/he_dict.blob")))
-}
-
-/// The English frequency list (sorted blob, prepared by `build.rs`).
-pub const fn en_freq() -> Freq {
-    Freq::new(include_str!(concat!(env!("OUT_DIR"), "/en_freq.blob")))
-}
-
-/// The Hebrew frequency list (sorted blob, prepared by `build.rs`).
-pub const fn he_freq() -> Freq {
-    Freq::new(include_str!(concat!(env!("OUT_DIR"), "/he_freq.blob")))
-}
 
 /// Whether to log every word check and switch decision.
 ///
@@ -278,10 +108,12 @@ const RUN_MIN: u8 = 2;
 /// is not evidence about the language being written, and pushing a guess for it
 /// would turn the run into noise.
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct History {
     recent: VecDeque<Language>,
 }
 
+#[allow(dead_code)]
 impl History {
     /// Note the language a finished word turned out to be.
     pub fn push(&mut self, lang: Language) {
@@ -742,9 +574,9 @@ impl Case {
 
 /// What the correction pipelines decided to do with a finished word.
 ///
-/// Exactly one of these ever comes back for a given word: the pipelines are
-/// mutually exclusive by construction (see [`plan`]), so a word that gets
-/// spell-corrected is never also layout-switched, and vice versa.
+/// A correction may be produced by one pipeline or by a composition of them
+/// (see [`plan`]). In particular, a misspelled English word typed while the
+/// Hebrew layout is active needs both a layout switch and a spelling rewrite.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fix {
     /// Wrong-layout mistype: the layout has already been switched, so the
@@ -766,6 +598,11 @@ pub enum Fix {
         text: String,
         lang: Language,
     },
+    /// The same keystrokes are a plausible English misspelling under the other
+    /// layout. The layout has already been switched to `lang`; unlike a plain
+    /// layout fix, callers must type `text` rather than replaying the original
+    /// keys because those keys still spell the uncorrected word.
+    LayoutSpelling { text: String, lang: Language },
     /// Rewrite in the current (English) layout, from the speller or from an
     /// abbreviation expansion: the layout is untouched and the caller should
     /// erase the whole word and type `text` instead. `text` is ASCII and
@@ -872,6 +709,10 @@ enum Plan {
     Spell {
         text: String,
     },
+    SwitchAndSpell {
+        lang: Language,
+        text: String,
+    },
     /// A user-configured abbreviation was typed out in full.
     Expand {
         text: String,
@@ -889,6 +730,17 @@ fn respelled(fixed: &str, case: Case, tail: &str) -> String {
     let mut out = case.apply(fixed);
     out.push_str(tail);
     out
+}
+
+/// Whether a learned replacement is English text (ignoring spaces and
+/// punctuation). This lets a remembered composed correction keep switching to
+/// English on later occurrences instead of replaying English letters through
+/// the still-active Hebrew layout.
+fn is_english_text(text: &str) -> bool {
+    let mut letters = text.chars().filter(|c| c.is_alphabetic());
+    letters.next().is_some_and(|first| {
+        first.is_ascii_alphabetic() && letters.all(|c| c.is_ascii_alphabetic())
+    })
 }
 
 fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: bool) {
@@ -921,19 +773,17 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
 /// of any I/O so it is unit testable; the actual layout switch happens in the
 /// caller.
 ///
-/// The pipelines run in a fixed order and the first one to produce a plan wins
-/// — a word is only ever corrected once:
+/// The pipelines run in a fixed order, but may compose into one atomic plan:
 ///
 ///   0. **Abbreviation expansion** (English only). The user wrote this rule
 ///      down themselves, so nothing gets to overrule it.
 ///   1. **Layout** (whole buffer, then the opt-in missing-space split). It goes
 ///      ahead of the speller because it is the *exact* signal: the keystrokes
 ///      literally spell a real word in the other language, no guessing involved.
-///   2. **Spelling** (English only). Reached only when the layout pipeline
-///      declined, i.e. the keystrokes are not a word in either language. The
-///      resulting word is typed as-is and never re-examined by the layout
-///      pipeline, so a spell-corrected word whose keys happen to also read as a
-///      Hebrew word is *not* subsequently flipped.
+///   2. **Spelling**. In an English layout it rewrites the current reading. In
+///      a Hebrew layout it checks the alternate English reading; a confident
+///      correction becomes one switch-and-spell operation. The current Hebrew
+///      reading must still be unknown, so a real Hebrew word always wins.
 #[allow(clippy::too_many_arguments)]
 fn plan(
     en: Reading,
@@ -970,6 +820,12 @@ fn plan(
     // before (via undo or post-fix edit). This outranks everything — it's
     // their deliberate choice.
     if let Some(correction) = crate::personal::personal_correction(typed) {
+        if current == Some(Language::Hebrew) && is_english_text(&correction) {
+            return Some(Plan::SwitchAndSpell {
+                lang: Language::English,
+                text: correction,
+            });
+        }
         return Some(Plan::Spell { text: correction });
     }
 
@@ -1011,14 +867,13 @@ fn plan(
     plan_spelling(word_en, word_he, current, case, en_dict, he_dict, en_freq)
 }
 
-/// Second pipeline: the word is not a mistype of the other layout, but it may
-/// be a mistype of an English word.
+/// Second pipeline: neither exact layout reading matched, but the English
+/// reading may be a misspelling.
 ///
-/// Only runs when we *know* the layout is English, for two reasons. It is a
-/// correctness requirement — the correction is injected as keystrokes, which
-/// only produce the intended letters under an English layout — and a safety one:
-/// under an unknown or Hebrew layout the English reading of the keys is not what
-/// the user is looking at, so "fixing" it would be nonsense.
+/// With a known English layout this is an ordinary spelling rewrite. With a
+/// known Hebrew layout, a confident English correction composes with a switch
+/// to English. An unknown live layout remains hands-off because we cannot know
+/// whether a switch is required.
 ///
 /// The Hebrew reading is also required to be nothing at all, loose match
 /// included. A key sequence that reads as a prefixed Hebrew word is the layout
@@ -1037,9 +892,7 @@ fn plan_spelling(
     he_dict: Dict,
     en_freq: Freq,
 ) -> Option<Plan> {
-    if current != Some(Language::English) {
-        return None;
-    }
+    let current = current?;
     if case == Case::Upper {
         return None;
     }
@@ -1053,7 +906,21 @@ fn plan_spelling(
         return None;
     }
     let text = crate::spell::correct(full_en, en_dict, en_freq)?;
-    Some(Plan::Spell { text })
+    Some(compose_spelling(current, text))
+}
+
+/// Turn any accepted English spelling result into the action required by the
+/// live layout. This step deliberately has no access to the typed word: once
+/// the speller accepts a candidate, composition is a rule of layout context and
+/// cannot grow per-word exceptions.
+fn compose_spelling(current: Language, text: String) -> Plan {
+    match current {
+        Language::English => Plan::Spell { text },
+        Language::Hebrew => Plan::SwitchAndSpell {
+            lang: Language::English,
+            text,
+        },
+    }
 }
 
 /// Missing-space split: opt-in, and only meaningful when we know the layout.
@@ -1144,17 +1011,19 @@ fn plan_split(
 ///
 /// The layout pipeline anchors on the live keyboard layout: a sequence that
 /// already reads as a real word in the current layout is never touched, and we
-/// only switch when the *other* layout yields a confident dictionary word. A
-/// missing-space split fallback exists but is opt-in (`RECAST_SPLIT=1`) because
-/// it cannot be made reliably safe. Only if none of that fires does the English
-/// spelling autocorrect get a look at the word.
+/// switch when the *other* layout yields a confident dictionary word. If that
+/// other reading is instead a confident English misspelling, layout switching
+/// and spelling correction are applied together. A missing-space split fallback
+/// exists but is opt-in (`RECAST_SPLIT=1`) because it cannot be made reliably
+/// safe.
 ///
 /// Returns the single [`Fix`] to apply — or `None` to leave the word alone —
 /// alongside the language the word turned out to be, which the caller records
 /// so the *next* word can be decided with a run behind it. For `Fix::Layout` the
 /// layout switch has already happened by the time this returns (and no fix is
-/// returned if the OS refused it); for `Fix::Spelling` no layout call is made at
-/// all.
+/// returned if the OS refused it); [`Fix::LayoutSpelling`] likewise switches
+/// first but replaces the word with corrected text rather than replayed keys.
+/// For `Fix::Spelling` no layout call is made at all.
 ///
 /// `run` is the language of the words immediately before this one — see
 /// [`History`].
@@ -1318,6 +1187,18 @@ pub fn check_and_correct<K: Copy>(
                     text: respelled(&text, case, en.tail),
                 }),
                 Some(Language::English),
+            )
+        }
+        Plan::SwitchAndSpell { lang, text } => {
+            let switched = switch_layout_to(lang).changed();
+            debug_log(&full_en, &full_he, Some(lang), switched);
+            let text = respelled(&text, case, en.tail);
+            if debug_enabled() {
+                println!("layout+spell: {} -> {}", full_he, text);
+            }
+            (
+                switched.then_some(Fix::LayoutSpelling { text, lang }),
+                Some(lang),
             )
         }
     };
@@ -2070,17 +1951,71 @@ mod tests {
     }
 
     #[test]
-    fn spelling_only_runs_in_a_known_english_layout() {
-        // Corrections are injected as keystrokes, so they only produce the
-        // intended letters under an English layout — anywhere else, hands off.
-        let en = dict(&["hello"]);
-        let he = dict(&[]);
-        let en_f = freq(&[("hello", 500)]);
-        assert_eq!(
-            plan_for("helo", "יקךם", Some(Language::Hebrew), en, he, en_f),
-            None
-        );
-        assert_eq!(plan_for("helo", "יקךם", None, en, he, en_f), None);
+    fn wrong_layout_misspellings_stack_for_every_letter_shape() {
+        // Generate a family of unrelated candidates. Every typo drops half of
+        // a doubled letter, which is one generic channel rule. The planner must
+        // compose every accepted result with a layout switch; no named word is
+        // granted special behavior.
+        for letter in b'a'..=b'z' {
+            let letter = char::from(letter);
+            let corrected = format!("ba{letter}{letter}er");
+            let typed = format!("ba{letter}er");
+            let en = dict(&[&corrected]);
+            let he = dict(&[]);
+            let en_f = freq(&[(&corrected, 100)]);
+            assert_eq!(
+                plan_for(&typed, "טקסט", Some(Language::Hebrew), en, he, en_f),
+                Some(Plan::SwitchAndSpell {
+                    lang: Language::English,
+                    text: corrected.clone(),
+                }),
+                "{typed} should pass through both pipelines"
+            );
+        }
+    }
+
+    #[test]
+    fn spelling_composition_depends_only_on_layout() {
+        for len in 1..=64 {
+            let candidate: String = (0..len)
+                .map(|index| char::from(b'a' + (index % 26) as u8))
+                .collect();
+            assert_eq!(
+                compose_spelling(Language::English, candidate.clone()),
+                Plan::Spell {
+                    text: candidate.clone(),
+                }
+            );
+            assert_eq!(
+                compose_spelling(Language::Hebrew, candidate.clone()),
+                Plan::SwitchAndSpell {
+                    lang: Language::English,
+                    text: candidate,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn stacked_spelling_never_overrides_any_real_current_layout_word() {
+        for (index, letter) in (b'a'..=b'z').enumerate() {
+            let letter = char::from(letter);
+            let corrected = format!("ba{letter}{letter}er");
+            let typed = format!("ba{letter}er");
+            let current_word = format!(
+                "מ{}ה",
+                char::from_u32(0x05d0 + index as u32).expect("Hebrew letter")
+            );
+            let en = dict(&[&corrected]);
+            let he = dict(&[&current_word]);
+            let en_f = freq(&[(&corrected, 100)]);
+
+            assert_eq!(
+                plan_for(&typed, &current_word, Some(Language::Hebrew), en, he, en_f,),
+                None,
+                "current-layout dictionary membership must win for {current_word}"
+            );
+        }
     }
 
     #[test]

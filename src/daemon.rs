@@ -84,15 +84,7 @@ pub fn daemonize() {
     }
 }
 
-/// Write the current process ID to a pidfile in the user's cache directory.
-///
-/// Record our PID so `--stop` has something to act on.
-///
-/// Written by the Linux daemon and, since it runs in the foreground with no
-/// fork, by the macOS tray process itself — `process::id()` is the process the
-/// user means either way. Windows is the exception: its instance is ended from
-/// the tray or Task Manager, so nothing there reads a pidfile and gating this
-/// out avoids a dead-code warning.
+/// Write the current process ID so `--status` and `--stop` can find it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn write_pidfile() -> std::io::Result<()> {
     let mut dir = dirs::cache_dir().ok_or_else(|| {
@@ -108,8 +100,7 @@ pub fn write_pidfile() -> std::io::Result<()> {
         .write(true)
         .truncate(true)
         .open(dir.join("pid"))?;
-    let pid = process::id();
-    writeln!(file, "{pid}")?;
+    writeln!(file, "{}", process::id())?;
     Ok(())
 }
 

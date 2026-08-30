@@ -159,6 +159,7 @@ fn set_layout_cache(lang: Language) {
 /// layout-switch hotkey — two modifiers, or a modifier and space — and say so
 /// here. It cannot know whether that combination is bound to anything, and it
 /// does not need to: the cost of being wrong is one extra query.
+#[allow(dead_code)]
 pub fn invalidate() {
     if let Ok(mut guard) = LAYOUT_CACHE.lock() {
         *guard = None;

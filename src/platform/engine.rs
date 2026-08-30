@@ -752,7 +752,8 @@ impl<P: Platform> Engine<P> {
         // Record dwell time for typing pattern analysis.
         if let Some(press_time) = st.key_press_times.remove(&key) {
             let key_name = format!("{:?}", key);
-            crate::personal::record_key_release(&key_name, press_time);
+            let _ = press_time;
+            crate::personal::record_key_release(&key_name);
         }
 
         st.held_keys.remove(&key);
@@ -1105,6 +1106,11 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
             retype: P::retype_layout(&keys[start..], &text, lang)?,
             previous_layout: Some(lang.other()),
         }),
+        Fix::LayoutSpelling { text, lang } => Some(Replacement {
+            erase: keys.len(),
+            retype: P::retype_text(&text)?,
+            previous_layout: Some(lang.other()),
+        }),
         // Same layout, different letters: erase the whole word and type the
         // corrected spelling instead.
         Fix::Spelling { text } => Some(Replacement {
@@ -1166,15 +1172,20 @@ pub fn reading<P: Platform>(keys: &[Typed<P::Key>], lang: Language) -> String {
 /// pipeline produced it.
 ///
 /// The "before" side is what was on screen, which is not the same reading in
-/// both cases: a layout fix has already switched to `lang`, so what the user
-/// was looking at is the *other* layout's reading, while a spelling fix or an
-/// expansion never left English.
+/// each case: layout-based fixes have already switched to `lang`, so what the
+/// user was looking at is the *other* layout's reading, while a spelling fix or
+/// an expansion never left English.
 fn note_of<P: Platform>(keys: &[Typed<P::Key>], fix: &Fix) -> (String, String, FixKind) {
     match fix {
         Fix::Layout { start, text, lang } => (
             reading::<P>(&keys[*start..], lang.other()),
             text.clone(),
             FixKind::Layout,
+        ),
+        Fix::LayoutSpelling { text, lang } => (
+            reading::<P>(keys, lang.other()),
+            text.clone(),
+            FixKind::LayoutSpelling,
         ),
         Fix::Spelling { text } => (
             reading::<P>(keys, Language::English),
