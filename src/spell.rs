@@ -309,7 +309,11 @@ fn rules_by_last_byte() -> &'static [Vec<&'static Rule>; 26] {
     INDEX.get_or_init(|| {
         let mut index: [Vec<&'static Rule>; 26] = std::array::from_fn(|_| Vec::new());
         for rule in RULES {
-            let last = *rule.from.as_bytes().last().expect("a rule needs a typed side");
+            let last = *rule
+                .from
+                .as_bytes()
+                .last()
+                .expect("a rule needs a typed side");
             index[(last - b'a') as usize].push(rule);
         }
         index
@@ -595,9 +599,7 @@ fn budget_for(word: &str, min_len: usize, max_dist: u8) -> Option<u32> {
 
 /// Whether `word` is a token the speller may touch at all.
 fn eligible(word: &str, min_len: usize) -> bool {
-    word.len() >= min_len
-        && word.len() <= MAX_LEN
-        && word.bytes().all(|b| b.is_ascii_lowercase())
+    word.len() >= min_len && word.len() <= MAX_LEN && word.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// Worst frequency rank a suggestion of this channel cost may have. A candidate
@@ -887,7 +889,11 @@ fn extra_cost(w: &[u8], i: usize) -> u32 {
     let after = w.get(i).copied();
     if before == Some(c) || after == Some(c) {
         COST_DOUBLE
-    } else if [before, after].into_iter().flatten().any(|n| adjacent(n, c)) {
+    } else if [before, after]
+        .into_iter()
+        .flatten()
+        .any(|n| adjacent(n, c))
+    {
         COST_STRAY_KEY
     } else {
         COST_EDIT
@@ -982,9 +988,8 @@ impl Dp {
                     // them, so it carries no position penalty — which is what
                     // keeps "hte" → "the" cheap.
                     if i >= 2 && j >= 2 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                        best = best.min(
-                            self.cells[at(i - 2, j - 2)].saturating_add(COST_TRANSPOSE),
-                        );
+                        best =
+                            best.min(self.cells[at(i - 2, j - 2)].saturating_add(COST_TRANSPOSE));
                     }
                     best
                 };
@@ -997,8 +1002,7 @@ impl Dp {
                     if i < fl || j < tl {
                         continue;
                     }
-                    if &a[i - fl..i] == rule.from.as_bytes()
-                        && &b[j - tl..j] == rule.to.as_bytes()
+                    if &a[i - fl..i] == rule.from.as_bytes() && &b[j - tl..j] == rule.to.as_bytes()
                     {
                         best = best.min(self.cells[at(i - fl, j - tl)].saturating_add(rule.cost));
                     }
@@ -1258,9 +1262,8 @@ mod tests {
         // so "dependant" is a single (cheap) edit from "dependent" rather than
         // the two or three a single-character model would charge.
         let mut dp = Dp::default();
-        let cost = |dp: &mut Dp, a: &str, b: &str| {
-            dp.distance(a.as_bytes(), b.as_bytes(), 10 * COST_EDIT)
-        };
+        let cost =
+            |dp: &mut Dp, a: &str, b: &str| dp.distance(a.as_bytes(), b.as_bytes(), 10 * COST_EDIT);
         assert_eq!(cost(&mut dp, "dependant", "dependent"), Some(COST_SPELLING));
         assert_eq!(cost(&mut dp, "existance", "existence"), Some(COST_SPELLING));
         // Word-initial rules carry no position penalty — that is the whole
@@ -1285,14 +1288,21 @@ mod tests {
             Some(COST_EDIT)
         );
         // A transposed opening is exempt: every letter survives, reordered.
-        assert_eq!(dp.distance(b"hte", b"the", 10 * COST_EDIT), Some(COST_TRANSPOSE));
+        assert_eq!(
+            dp.distance(b"hte", b"the", 10 * COST_EDIT),
+            Some(COST_TRANSPOSE)
+        );
     }
 
     #[test]
     fn edit_costs_rank_the_likely_slips_below_a_plain_edit() {
         let mut dp = Dp::default();
         let mut cost = |a: &str, b: &str| dp.distance(a.as_bytes(), b.as_bytes(), 10 * COST_EDIT);
-        assert_eq!(cost("helo", "hello"), Some(COST_DOUBLE), "restores a double");
+        assert_eq!(
+            cost("helo", "hello"),
+            Some(COST_DOUBLE),
+            "restores a double"
+        );
         assert_eq!(cost("hellp", "help"), Some(COST_DOUBLE), "un-doubles");
         assert_eq!(cost("hleo", "helo"), Some(COST_TRANSPOSE), "transposition");
         assert_eq!(
@@ -1418,8 +1428,16 @@ mod tests {
         // A neighbour of the key beside it: two keys caught at once. Checked
         // in both directions, since the hand can catch the extra key on the
         // way in or on the way out.
-        assert_eq!(extra_cost(b"worjk", 4), COST_STRAY_KEY, "next to the letter after");
-        assert_eq!(extra_cost(b"mnake", 2), COST_STRAY_KEY, "next to the letter before");
+        assert_eq!(
+            extra_cost(b"worjk", 4),
+            COST_STRAY_KEY,
+            "next to the letter after"
+        );
+        assert_eq!(
+            extra_cost(b"mnake", 2),
+            COST_STRAY_KEY,
+            "next to the letter before"
+        );
         // A letter from the other side of the keyboard explains nothing about
         // the hand, so it stays a misspelling.
         assert_eq!(extra_cost(b"worqk", 4), COST_EDIT);
@@ -1667,7 +1685,6 @@ mod real_data {
         assert_eq!(fix("restaraunt").as_deref(), Some("restaurant"));
     }
 
-
     #[test]
     fn fixes_a_fat_fingered_first_letter() {
         // The hand was in the right place and landed one key over. These were
@@ -1704,8 +1721,8 @@ mod real_data {
         // Names, handles and chat shorthand are the things a user would most
         // resent having rewritten.
         for word in [
-            "sami", "ori", "supino", "claude", "github", "async", "struct",
-            "asap", "idk", "brb", "nvm", "yeh",
+            "sami", "ori", "supino", "claude", "github", "async", "struct", "asap", "idk", "brb",
+            "nvm", "yeh",
         ] {
             assert_eq!(fix(word), None, "{word}");
         }
@@ -1720,8 +1737,4 @@ mod real_data {
             assert_eq!(fix(word), None, "{word}");
         }
     }
-
 }
-
-
-

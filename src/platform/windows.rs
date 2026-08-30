@@ -12,12 +12,12 @@ use winapi::um::winuser::{
     VK_RETURN, VK_SHIFT, VK_SPACE,
 };
 
-use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix};
+use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix, Run};
 use crate::keymap::{
     english_char_to_key, key_to_english_char, key_to_english_char_shifted, key_to_hebrew_char,
 };
 use crate::types::{
-    lock_forgiving, AppControl, FixKind, Language, Replaceable, ReplaceGuard, WordBuffer,
+    lock_forgiving, AppControl, FixKind, Language, ReplaceGuard, Replaceable, WordBuffer,
 };
 
 /// Longest a Ctrl press may last and still count as a *tap* rather than a hold.
@@ -196,7 +196,10 @@ pub fn attach_parent_console() {
     use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
 
     let wide = |s: &str| -> Vec<u16> {
-        std::ffi::OsStr::new(s).encode_wide().chain(once(0)).collect()
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(once(0))
+            .collect()
     };
 
     unsafe {
@@ -248,12 +251,7 @@ pub fn attach_parent_console() {
 /// `cfg` block: run the keyboard listener on a background thread and hand the
 /// main thread to the tray (or the TUI with `--gui`). Keeping it here means
 /// changes to the Windows launch path can't touch the Linux or macOS paths.
-pub fn start(
-    en: Dict,
-    he: Dict,
-    control: Arc<AppControl>,
-    with_gui: bool,
-) {
+pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
     if with_gui {
         let listener_control = Arc::clone(&control);
         thread::spawn(move || {
@@ -346,14 +344,15 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                                 |t: Typed| key_to_english_char_shifted(t.key, t.shift),
                                 |t: Typed| key_to_hebrew_char(t.key),
                                 |t: Typed| t.shift,
+                                Run::default(),
                                 en_dict,
                                 he_dict,
                             );
 
                             // Describe the fix for the history before
                             // `replacement` consumes it.
-                            let note = result.as_ref().map(|fix| note_of(&st.keys, fix));
-                            if let Some(rep) = replacement(&st.keys, result) {
+                            let note = result.fix.as_ref().map(|fix| note_of(&st.keys, fix));
+                            if let Some(rep) = replacement(&st.keys, result.fix) {
                                 if let Some((from, to, kind)) = &note {
                                     control_cb.record_fix(from, to, *kind);
                                 }
@@ -424,9 +423,7 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                         }
                     }
                     _ => {
-                        if key_to_english_char(key).is_some()
-                            || key_to_hebrew_char(key).is_some()
-                        {
+                        if key_to_english_char(key).is_some() || key_to_hebrew_char(key).is_some() {
                             if st.is_replacing {
                                 st.buffered_keys.push(Typed { key, shift });
                             } else {
@@ -453,9 +450,7 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
             EventType::KeyRelease(key) => {
                 st.held_keys.remove(&key);
                 if key == Key::ControlLeft || key == Key::ControlRight {
-                    handle_ctrl_tap(
-                        st, &state_cb, &injecting, &control_cb, en_dict, he_dict,
-                    );
+                    handle_ctrl_tap(st, &state_cb, &injecting, &control_cb, en_dict, he_dict);
                     return;
                 }
                 if key != Key::ShiftRight || !std::mem::take(&mut st.right_shift_tap) {
@@ -546,7 +541,11 @@ fn handle_completion_tap(
     if back_to_typed {
         control.record_undo();
     } else if index == 0 {
-        control.record_fix(&reading(&typed, Language::English), &text, FixKind::Complete);
+        control.record_fix(
+            &reading(&typed, Language::English),
+            &text,
+            FixKind::Complete,
+        );
     }
 
     // The buffer has to end up holding what is on screen, or the next Space
@@ -694,13 +693,14 @@ fn unlist_and_correct(
         |t: Typed| key_to_english_char_shifted(t.key, t.shift),
         |t: Typed| key_to_hebrew_char(t.key),
         |t: Typed| t.shift,
+        Run::default(),
         en_dict,
         he_dict,
     );
-    let note = result.as_ref().map(|fix| note_of(&skip.keys, fix));
+    let note = result.fix.as_ref().map(|fix| note_of(&skip.keys, fix));
     // Off the list, but the pipelines have nothing to say about it after all —
     // which is a fine outcome, and not one to rewrite the screen over.
-    let Some(rep) = replacement(&skip.keys, result) else {
+    let Some(rep) = replacement(&skip.keys, result.fix) else {
         return;
     };
 
@@ -731,8 +731,13 @@ fn unlist_and_correct(
 fn reading(keys: &[Typed], lang: Language) -> String {
     keys.iter()
         .filter_map(|t| match lang {
-            Language::English => key_to_english_char_shifted(t.key, t.shift)
-                .map(|c| if t.shift { c.to_ascii_uppercase() } else { c }),
+            Language::English => key_to_english_char_shifted(t.key, t.shift).map(|c| {
+                if t.shift {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            }),
             // Hebrew has no case, so the shift the user held says nothing.
             Language::Hebrew => key_to_hebrew_char(t.key),
         })

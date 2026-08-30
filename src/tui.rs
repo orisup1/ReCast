@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -128,7 +128,9 @@ fn ui(f: &mut Frame, app: &App) {
     let history = app.control.history();
 
     // Styles
-    let title_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let border_style = Style::default().fg(Color::Gray);
     let normal = Style::default().fg(Color::White);
     let enabled_col = Style::default().fg(Color::Green);
@@ -138,11 +140,14 @@ fn ui(f: &mut Frame, app: &App) {
     // Layout
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(0),    // body
-            Constraint::Length(3), // footer
-        ].as_ref())
+        .constraints(
+            [
+                Constraint::Length(3), // header
+                Constraint::Min(0),    // body
+                Constraint::Length(3), // footer
+            ]
+            .as_ref(),
+        )
         .split(f.size());
 
     // Header
@@ -151,7 +156,9 @@ fn ui(f: &mut Frame, app: &App) {
             "ReCast v{} — layout correction, autocorrect and completion",
             env!("CARGO_PKG_VERSION")
         ),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     ))
     .block(
         Block::default()
@@ -166,10 +173,7 @@ fn ui(f: &mut Frame, app: &App) {
     // Body: horizontal split
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ].as_ref())
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
         .split(chunks[1]);
 
     // Left: tabs
@@ -185,20 +189,28 @@ fn ui(f: &mut Frame, app: &App) {
         )
         .style(normal)
         .highlight_style(highlight);
-    f.render_widget(tabs, Layout::default()
-        .constraints([Constraint::Length(3)].as_ref())
-        .split(body_chunks[0])[0]);
+    f.render_widget(
+        tabs,
+        Layout::default()
+            .constraints([Constraint::Length(3)].as_ref())
+            .split(body_chunks[0])[0],
+    );
 
     // Tab content
     let tab_area = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ].as_ref())
+        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(body_chunks[0]);
     match app.tab {
-        0 => render_info(f, tab_area[1], app, uptime, &normal, &enabled_col, &disabled_col),
+        0 => render_info(
+            f,
+            tab_area[1],
+            app,
+            uptime,
+            &normal,
+            &enabled_col,
+            &disabled_col,
+        ),
         1 => render_log(f, tab_area[1], &history, &normal),
         2 => render_help(f, tab_area[1], &normal),
         _ => {}
@@ -207,17 +219,10 @@ fn ui(f: &mut Frame, app: &App) {
     // Right: gauge + recent log
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ].as_ref())
+        .constraints([Constraint::Length(5), Constraint::Min(0)].as_ref())
         .split(body_chunks[1]);
     let gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(Color::DarkGray)
-        )
+        .gauge_style(Style::default().fg(Color::Yellow).bg(Color::DarkGray))
         .label(format!("{}%", if enabled { 100 } else { 0 }))
         .ratio(if enabled { 1.0 } else { 0.0 })
         .block(
@@ -263,10 +268,23 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u64, normal: &Style, enabled_col: &Style, disabled_col: &Style) {
+fn render_info(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    app: &App,
+    uptime: u64,
+    normal: &Style,
+    enabled_col: &Style,
+    disabled_col: &Style,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Information", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            "Information",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(Alignment::Center);
     let enabled = app.control.is_enabled();
     let paused = app.control.pause_remaining();
@@ -308,9 +326,7 @@ fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u6
         "ReCast retypes words you typed in the wrong keyboard layout, fixes English \
          typos in place, and finishes words on a tap of Right Shift.",
     ));
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
@@ -321,12 +337,20 @@ fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u6
 fn render_log(f: &mut Frame, area: ratatui::layout::Rect, history: &[Correction], normal: &Style) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Corrections", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            "Corrections",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(Alignment::Center);
     let items: Vec<ListItem> = if history.is_empty() {
         vec![ListItem::new("No corrections yet.")]
     } else {
-        history.iter().map(|c| ListItem::new(correction_line(c))).collect()
+        history
+            .iter()
+            .map(|c| ListItem::new(correction_line(c)))
+            .collect()
     };
     let list = List::new(items)
         .block(block)
@@ -339,7 +363,12 @@ fn render_log(f: &mut Frame, area: ratatui::layout::Rect, history: &[Correction]
 fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Help", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            "Help",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(Alignment::Center);
     // What the user needs from a help tab is the two gestures and where their
     // files live — none of which is visible anywhere else, since ReCast has no

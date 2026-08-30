@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 
 use rdev::{simulate, EventType, Key};
 
-use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix};
+use crate::dictionary::{check_and_correct, complete_candidates, Dict, Fix, Run};
 use crate::keymap::{
     english_char_to_key, key_to_english_char, key_to_english_char_shifted, key_to_hebrew_char,
 };
 use crate::types::{
-    lock_forgiving, AppControl, FixKind, Language, Replaceable, ReplaceGuard, WordBuffer,
+    lock_forgiving, AppControl, FixKind, Language, ReplaceGuard, Replaceable, WordBuffer,
 };
 
 /// Longest a Ctrl press may last and still count as a *tap* rather than a hold.
@@ -443,9 +443,7 @@ unsafe extern "C" fn tap_callback(
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
             handle_flags_changed(ctx, key_from_code(code), CGEventGetFlags(cg_event));
         }
-        KCG_EVENT_LEFT_MOUSE_DOWN
-        | KCG_EVENT_RIGHT_MOUSE_DOWN
-        | KCG_EVENT_OTHER_MOUSE_DOWN => {
+        KCG_EVENT_LEFT_MOUSE_DOWN | KCG_EVENT_RIGHT_MOUSE_DOWN | KCG_EVENT_OTHER_MOUSE_DOWN => {
             let mut st = lock_forgiving(&ctx.state);
             if st.is_replacing {
                 st.buffered_keys.clear();
@@ -536,13 +534,14 @@ fn handle_key_press(ctx: &TapContext, key: Key) {
                     |t: Typed| key_to_english_char_shifted(t.key, t.shift),
                     |t: Typed| key_to_hebrew_char(t.key),
                     |t: Typed| t.shift,
+                    Run::default(),
                     ctx.en_dict,
                     ctx.he_dict,
                 );
                 // Describe the fix for the history before `replacement`
                 // consumes it.
-                let note = result.as_ref().map(|fix| note_of(&st.keys, fix));
-                if let Some(rep) = replacement(&st.keys, result) {
+                let note = result.fix.as_ref().map(|fix| note_of(&st.keys, fix));
+                if let Some(rep) = replacement(&st.keys, result.fix) {
                     if let Some((from, to, kind)) = &note {
                         ctx.control.record_fix(from, to, *kind);
                     }
@@ -698,8 +697,11 @@ fn handle_key_release(ctx: &TapContext, key: Key) {
     if back_to_typed {
         ctx.control.record_undo();
     } else if index == 0 {
-        ctx.control
-            .record_fix(&reading(&typed, Language::English), &text, FixKind::Complete);
+        ctx.control.record_fix(
+            &reading(&typed, Language::English),
+            &text,
+            FixKind::Complete,
+        );
     }
 
     // The buffer has to end up holding what is on screen, or the next Space
@@ -816,20 +818,25 @@ fn undo_fix(ctx: &TapContext, mut st: std::sync::MutexGuard<'_, AppState>, fix: 
 /// terminator on screen is erased with the word and pressed again after it. No
 /// new undo is armed, because taking this one back would put the word straight
 /// onto the list the gesture just took it off.
-fn unlist_and_correct(ctx: &TapContext, mut st: std::sync::MutexGuard<'_, AppState>, skip: LastSkip) {
+fn unlist_and_correct(
+    ctx: &TapContext,
+    mut st: std::sync::MutexGuard<'_, AppState>,
+    skip: LastSkip,
+) {
     crate::complete::unlist(&skip.word);
     let result = check_and_correct(
         &skip.keys,
         |t: Typed| key_to_english_char_shifted(t.key, t.shift),
         |t: Typed| key_to_hebrew_char(t.key),
         |t: Typed| t.shift,
+        Run::default(),
         ctx.en_dict,
         ctx.he_dict,
     );
-    let note = result.as_ref().map(|fix| note_of(&skip.keys, fix));
+    let note = result.fix.as_ref().map(|fix| note_of(&skip.keys, fix));
     // Off the list, but the pipelines have nothing to say about it after all —
     // which is a fine outcome, and not one to rewrite the screen over.
-    let Some(rep) = replacement(&skip.keys, result) else {
+    let Some(rep) = replacement(&skip.keys, result.fix) else {
         return;
     };
 
@@ -860,8 +867,13 @@ fn unlist_and_correct(ctx: &TapContext, mut st: std::sync::MutexGuard<'_, AppSta
 fn reading(keys: &[Typed], lang: Language) -> String {
     keys.iter()
         .filter_map(|t| match lang {
-            Language::English => key_to_english_char_shifted(t.key, t.shift)
-                .map(|c| if t.shift { c.to_ascii_uppercase() } else { c }),
+            Language::English => key_to_english_char_shifted(t.key, t.shift).map(|c| {
+                if t.shift {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            }),
             // Hebrew has no case, so the shift the user held says nothing.
             Language::Hebrew => key_to_hebrew_char(t.key),
         })
@@ -932,12 +944,7 @@ impl Drop for EventTapHandle {
 /// `cfg` block: install the keyboard event tap on the main run loop, then hand
 /// the main thread to the menubar tray. Keeping it here means changes to the
 /// macOS launch path can't touch the Linux or Windows paths.
-pub fn start(
-    en: Dict,
-    he: Dict,
-    control: Arc<AppControl>,
-    with_gui: bool,
-) {
+pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
     // The event tap must live on the main run loop (see `setup_event_tap`), so
     // a main-thread TUI can't coexist with it — the tray is the UI here.
     if with_gui {

@@ -95,13 +95,19 @@ pub fn daemonize() {
 /// out avoids a dead-code warning.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn write_pidfile() -> std::io::Result<()> {
-    let mut dir = dirs::cache_dir().ok_or_else(|| std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "Unable to locate cache directory",
-    ))?;
+    let mut dir = dirs::cache_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Unable to locate cache directory",
+        )
+    })?;
     dir.push("recast");
     fs::create_dir_all(&dir)?;
-    let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(dir.join("pid"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dir.join("pid"))?;
     let pid = process::id();
     writeln!(file, "{pid}")?;
     Ok(())
@@ -189,7 +195,11 @@ fn our_name() -> String {
 /// running", which is what the user means by the question.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn running_pid() -> Option<u32> {
-    let pid: u32 = fs::read_to_string(pidfile_path()?).ok()?.trim().parse().ok()?;
+    let pid: u32 = fs::read_to_string(pidfile_path()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     is_our_process(pid).then_some(pid)
 }
 

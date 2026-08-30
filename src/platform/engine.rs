@@ -41,7 +41,7 @@ use crate::dictionary::{
     check_and_correct, complete_candidates, declined_by_list, Dict, Fix, History, Outcome, Run,
 };
 use crate::types::{
-    lock_forgiving, AppControl, FixKind, Language, Replaceable, ReplaceGuard, WordBuffer,
+    lock_forgiving, AppControl, FixKind, Language, ReplaceGuard, Replaceable, WordBuffer,
 };
 
 /// Longest a Ctrl press may last and still count as a *tap* rather than a hold.
@@ -138,7 +138,8 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// being replaced and `text` is what it spells there — Linux uses the
     /// former (the layout has already changed, so replaying them produces that
     /// text) and macOS and Windows the latter.
-    fn retype_layout(keys: &[Typed<Self::Key>], text: &str, lang: Language) -> Option<Self::Retype>;
+    fn retype_layout(keys: &[Typed<Self::Key>], text: &str, lang: Language)
+        -> Option<Self::Retype>;
 
     /// Arbitrary text — a spelling correction, an expansion, a completion.
     /// `None` when this platform cannot type some character of it, which is a
@@ -559,7 +560,10 @@ impl<P: Platform> Engine<P> {
         // matches what's on screen, so suppress the next correction.
         let is_modifier_key = P::is_modifier(key);
         let is_shift = key == P::SHIFT_LEFT || key == P::SHIFT_RIGHT;
-        let other_modifier_held = st.held_keys.iter().any(|&k| P::is_modifier(k) && k != P::SHIFT_LEFT && k != P::SHIFT_RIGHT);
+        let other_modifier_held = st
+            .held_keys
+            .iter()
+            .any(|&k| P::is_modifier(k) && k != P::SHIFT_LEFT && k != P::SHIFT_RIGHT);
         let chorded_shortcut = !is_modifier_key && !is_shift && other_modifier_held;
 
         st.held_keys.insert(key);
@@ -633,7 +637,12 @@ impl<P: Platform> Engine<P> {
 
     /// A word was ended by Space or Enter: check it, and either correct it or
     /// arm the gesture that would un-list it.
-    fn word_finished(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, key: P::Key, shift: bool) {
+    fn word_finished(
+        self: &Arc<Self>,
+        mut st: MutexGuard<'_, AppState<P>>,
+        key: P::Key,
+        shift: bool,
+    ) {
         if st.is_replacing {
             st.buffered_keys.push(Typed { key, shift });
             return;
@@ -650,7 +659,8 @@ impl<P: Platform> Engine<P> {
         // chorded shortcut, or post-fix edit). Skip auto-correction but still
         // record the word to personal frequency for learning.
         if st.no_fix {
-            let typed = crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
+            let typed =
+                crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
             crate::personal::record_word(&typed);
             // If the user was editing a just-fixed word, record the rejection
             // so we learn not to correct it again.
@@ -701,7 +711,8 @@ impl<P: Platform> Engine<P> {
         }
 
         // No fix applied - record the word to personal frequency.
-        let typed = crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
+        let typed =
+            crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
         crate::personal::record_word(&typed);
 
         if let Some(word) = declined_by_list(
@@ -952,7 +963,11 @@ impl<P: Platform> Engine<P> {
     /// terminator on screen is erased with the word and pressed again after it.
     /// No new undo is armed, because taking this one back would put the word
     /// straight onto the list the gesture just took it off.
-    fn unlist_and_correct(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, skip: LastSkip<P>) {
+    fn unlist_and_correct(
+        self: &Arc<Self>,
+        mut st: MutexGuard<'_, AppState<P>>,
+        skip: LastSkip<P>,
+    ) {
         crate::complete::unlist(&skip.word);
         // The run is read but not added to: this word was already recorded when
         // it was first finished, and the gesture is a second opinion about it
@@ -1134,8 +1149,13 @@ fn undo_of<P: Platform>(
 pub fn reading<P: Platform>(keys: &[Typed<P::Key>], lang: Language) -> String {
     keys.iter()
         .filter_map(|t| match lang {
-            Language::English => P::english_char(t.key, t.shift)
-                .map(|c| if t.shift { c.to_ascii_uppercase() } else { c }),
+            Language::English => P::english_char(t.key, t.shift).map(|c| {
+                if t.shift {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            }),
             // Hebrew has no case, so the shift the user held says nothing.
             Language::Hebrew => P::hebrew_char(t.key),
         })

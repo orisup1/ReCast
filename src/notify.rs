@@ -83,7 +83,10 @@ pub fn notify(title: &str, body: &str) {
         use winapi::um::winuser::{MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND};
 
         let wide = |s: &str| -> Vec<u16> {
-            OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+            OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
         };
         let (body, title) = (wide(body), wide(title));
         // A tray app has no foreground window, so without MB_SETFOREGROUND the

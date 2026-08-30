@@ -182,10 +182,7 @@ fn parse_confusions_file(text: &str) -> HashMap<String, HashMap<String, u64>> {
                 let typed = parts[0].trim().to_lowercase();
                 let corrected = parts[1].trim().to_lowercase();
                 if !typed.is_empty() && !corrected.is_empty() {
-                    outer
-                        .entry(typed)
-                        .or_default()
-                        .insert(corrected, count);
+                    outer.entry(typed).or_default().insert(corrected, count);
                 }
             }
         }
@@ -318,7 +315,11 @@ pub fn record_key_press(key_name: &str) {
             if interval < 1_000_000 {
                 // Cap at 1 second to filter pauses
                 let digraph_key = (prev_key.clone(), key.clone());
-                profile.digraphs.entry(digraph_key.clone()).or_default().push_back(interval);
+                profile
+                    .digraphs
+                    .entry(digraph_key.clone())
+                    .or_default()
+                    .push_back(interval);
                 // Keep only recent N per digraph
                 if let Some(dq) = profile.digraphs.get_mut(&digraph_key) {
                     while dq.len() > 100 {
@@ -335,13 +336,19 @@ pub fn record_key_press(key_name: &str) {
 
 /// Record a key release for dwell time.
 pub fn record_key_release(key_name: &str, press_time: Instant) {
-    let dwell = Instant::now().saturating_duration_since(press_time).as_micros() as u64;
+    let dwell = Instant::now()
+        .saturating_duration_since(press_time)
+        .as_micros() as u64;
     if dwell > 1_000_000 {
         return; // Filter stuck keys
     }
     let key = key_name.to_lowercase();
     if let Ok(mut profile) = typing_profile().lock() {
-        profile.dwells.entry(key.clone()).or_default().push_back(dwell);
+        profile
+            .dwells
+            .entry(key.clone())
+            .or_default()
+            .push_back(dwell);
         if let Some(dq) = profile.dwells.get_mut(&key) {
             while dq.len() > 100 {
                 dq.pop_front();
@@ -367,7 +374,9 @@ pub fn median_dwell(key_name: &str) -> Option<u64> {
 /// Get median digraph interval for a pair (microseconds), or None.
 pub fn median_digraph(prev_key: &str, key: &str) -> Option<u64> {
     let profile = typing_profile().lock().ok()?;
-    let dwells = profile.digraphs.get(&(prev_key.to_lowercase(), key.to_lowercase()))?;
+    let dwells = profile
+        .digraphs
+        .get(&(prev_key.to_lowercase(), key.to_lowercase()))?;
     if dwells.is_empty() {
         return None;
     }

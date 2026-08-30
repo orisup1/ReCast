@@ -134,7 +134,9 @@ pub fn completions_with(
             return;
         }
         // Ties (same value, different words) go to the commoner word.
-        let at = best.partition_point(|(v, r, _)| (*v, std::cmp::Reverse(*r)) > (value, std::cmp::Reverse(rank)));
+        let at = best.partition_point(|(v, r, _)| {
+            (*v, std::cmp::Reverse(*r)) > (value, std::cmp::Reverse(rank))
+        });
         best.insert(at, (value, rank, word.to_string()));
         best.truncate(MAX_CANDIDATES);
     });
@@ -337,9 +339,11 @@ fn unlearn(word: &str) {
 
 /// Whether `word` has been undone often enough to be left alone for good.
 pub fn learned(word: &str) -> bool {
-    learned_words()
-        .lock()
-        .is_ok_and(|counts| counts.get(&word.to_lowercase()).is_some_and(|n| *n >= LEARNED_MIN))
+    learned_words().lock().is_ok_and(|counts| {
+        counts
+            .get(&word.to_lowercase())
+            .is_some_and(|n| *n >= LEARNED_MIN)
+    })
 }
 
 /// Replace `learned.txt` with `counts`, via a temporary file and a rename so an
@@ -537,7 +541,11 @@ pub fn ignore_word(word: &str) {
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = file.write_all(appended_line(&existing, &word).as_bytes());
     }
 }
@@ -551,12 +559,13 @@ pub fn ignore_word(word: &str) {
 ///
 /// Only [`ignore_word`] calls it, so it is dead on the platforms without a
 /// tray — but it is pure, so it is still tested there.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "windows")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn appended_line(existing: &str, word: &str) -> String {
-    let lead = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+    let lead = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
     format!("{lead}{word}\n")
 }
 
@@ -915,7 +924,10 @@ mod tests {
         assert_eq!(after, "# my words\nhostname\n\nkubectl\n");
 
         // Comments are copied through even when they read like the word …
-        assert_eq!(without_word("# postgres\nfoo\n", "postgres"), "# postgres\nfoo\n");
+        assert_eq!(
+            without_word("# postgres\nfoo\n", "postgres"),
+            "# postgres\nfoo\n"
+        );
         // … and a word that is not there leaves the file byte-identical.
         assert_eq!(without_word(before, "redis"), before);
     }
@@ -961,7 +973,6 @@ mod tests {
     }
 }
 
-
 /// Against the real embedded lists, the way `spell::real_data` is: the unit
 /// tests above pin the *rules*, these pin what the rules actually do to the
 /// data we ship. A threshold change that looks harmless in isolation shows up
@@ -984,9 +995,18 @@ mod real_data {
     #[test]
     fn finishes_everyday_words() {
         assert_eq!(offers("tomo").first().map(String::as_str), Some("tomorrow"));
-        assert_eq!(offers("gove").first().map(String::as_str), Some("government"));
-        assert_eq!(offers("unde").first().map(String::as_str), Some("understand"));
-        assert_eq!(offers("recei").first().map(String::as_str), Some("received"));
+        assert_eq!(
+            offers("gove").first().map(String::as_str),
+            Some("government")
+        );
+        assert_eq!(
+            offers("unde").first().map(String::as_str),
+            Some("understand")
+        );
+        assert_eq!(
+            offers("recei").first().map(String::as_str),
+            Some("received")
+        );
     }
 
     #[test]
@@ -996,7 +1016,10 @@ mod real_data {
         let offers = offers("hel");
         assert_eq!(offers.len(), MAX_CANDIDATES);
         for word in ["hello", "help"] {
-            assert!(offers.iter().any(|w| w == word), "{word} missing: {offers:?}");
+            assert!(
+                offers.iter().any(|w| w == word),
+                "{word} missing: {offers:?}"
+            );
         }
     }
 
@@ -1061,7 +1084,9 @@ mod watch_tests {
         //    *file* would miss, because the inode it was watching is gone.
         let tmp = dir.join(".abbrev.txt.swp");
         std::fs::write(&tmp, "btw = by the way\nomw = on my way\n").expect("write tmp");
-        let _ = inotify.read_events().expect("drain the temp file's own events");
+        let _ = inotify
+            .read_events()
+            .expect("drain the temp file's own events");
         std::fs::rename(&tmp, dir.join("abbrev.txt")).expect("rename over");
         let seen = named(inotify.read_events().expect("events"));
         assert!(

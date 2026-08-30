@@ -12,9 +12,9 @@
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
+use crate::config::Config;
 use crate::layout::switch_layout_to;
 use crate::types::Language;
-use crate::config::Config;
 
 /// A sorted, `\n`-separated word list living in the binary's read-only data.
 ///
@@ -69,10 +69,11 @@ impl Freq {
         let blob = self.blob.as_bytes();
         let mut pos = lower_bound(blob, prefix.as_bytes());
         while pos < blob.len() {
-            let end = pos + blob[pos..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(blob.len() - pos);
+            let end = pos
+                + blob[pos..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .unwrap_or(blob.len() - pos);
             let line = &blob[pos..end];
             let key = key_of(line);
             if !key.starts_with(prefix.as_bytes()) {
@@ -101,7 +102,9 @@ fn key_of(line: &[u8]) -> &[u8] {
 fn parse_rank(bytes: &[u8]) -> Option<u32> {
     let mut rank: u32 = 0;
     for &b in bytes {
-        rank = rank.checked_mul(10)?.checked_add(b.checked_sub(b'0')? as u32)?;
+        rank = rank
+            .checked_mul(10)?
+            .checked_add(b.checked_sub(b'0')? as u32)?;
     }
     Some(rank)
 }
@@ -377,6 +380,16 @@ fn other_decisively_more_common(
 /// Longest reading the short-word gate has an opinion about.
 const SHORT_MAX: usize = 3;
 
+/// Automatic corrections need at least two letters of actual word text.
+///
+/// A lone key is too ambiguous to rewrite: it may be an unfinished word, a
+/// shortcut key, or one of the one-letter words that exists only in the other
+/// layout. Dictionary membership alone must never turn a one-character token
+/// into a character from the other layout. User-configured abbreviations remain
+/// allowed because they are explicit instructions rather than an inferred
+/// correction.
+const MIN_AUTOMATIC_WORD_CHARS: usize = 2;
+
 /// A short reading ranked this common is not a collision.
 ///
 /// The top of a frequency list is where the words people actually mistype the
@@ -538,8 +551,16 @@ fn decide_known(
     he_freq: Freq,
 ) -> Option<Language> {
     let other = current.other();
-    let cur_text = if current == Language::English { text_en } else { text_he };
-    let oth_text = if other == Language::English { text_en } else { text_he };
+    let cur_text = if current == Language::English {
+        text_en
+    } else {
+        text_he
+    };
+    let oth_text = if other == Language::English {
+        text_en
+    } else {
+        text_he
+    };
 
     // Single-character inputs are only corrected if they are real dictionary
     // words (e.g. "i", "a" in English). This prevents stray single keystrokes
@@ -629,8 +650,7 @@ fn decide_unknown(
     // Short-word gate: when disabled, a short uncommon reading never counts as a
     // trigger — the same collision guard as in `decide_known`.
     let enabled = Config::global().short_enabled;
-    let short_ok =
-        |text: &str, lang| !too_short_to_trigger(text, lang, enabled, en_freq, he_freq);
+    let short_ok = |text: &str, lang| !too_short_to_trigger(text, lang, enabled, en_freq, he_freq);
     let en_strict = short_ok(text_en, Language::English)
         && valid_strict(text_en, Language::English, en_dict, he_dict);
     let he_strict = short_ok(text_he, Language::Hebrew)
@@ -645,11 +665,23 @@ fn decide_unknown(
         // run, which is usually the stronger of the two), else leave it alone.
         // The winner must be decisively more common than the loser.
         if other_decisively_more_common(
-            text_he, Language::Hebrew, text_en, Language::English, run, en_freq, he_freq,
+            text_he,
+            Language::Hebrew,
+            text_en,
+            Language::English,
+            run,
+            en_freq,
+            he_freq,
         ) {
             return Some(Language::English);
         } else if other_decisively_more_common(
-            text_en, Language::English, text_he, Language::Hebrew, run, en_freq, he_freq,
+            text_en,
+            Language::English,
+            text_he,
+            Language::Hebrew,
+            run,
+            en_freq,
+            he_freq,
         ) {
             return Some(Language::Hebrew);
         }
@@ -833,10 +865,17 @@ impl<'a> Reading<'a> {
 /// the pure planner can be tested without performing the switch.
 #[derive(Clone, Debug, PartialEq)]
 enum Plan {
-    Switch { lang: Language, start: usize },
-    Spell { text: String },
+    Switch {
+        lang: Language,
+        start: usize,
+    },
+    Spell {
+        text: String,
+    },
     /// A user-configured abbreviation was typed out in full.
-    Expand { text: String },
+    Expand {
+        text: String,
+    },
 }
 
 /// What a spelling fix or an expansion puts on screen: the new word in the case
@@ -860,11 +899,19 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
     println!("{}", word_he);
     println!(
         "English: {}",
-        if matches!(target, Some(Language::English)) { "True" } else { "False" }
+        if matches!(target, Some(Language::English)) {
+            "True"
+        } else {
+            "False"
+        }
     );
     println!(
         "Hebrew: {}",
-        if matches!(target, Some(Language::Hebrew)) { "True" } else { "False" }
+        if matches!(target, Some(Language::Hebrew)) {
+            "True"
+        } else {
+            "False"
+        }
     );
     println!("Switch: {}", if switched { "True" } else { "False" });
 }
@@ -933,10 +980,21 @@ fn plan(
         }
     }
 
+    // Do not infer a layout or spelling correction from a single typed letter.
+    // Check the word portions, rather than `keys_len`, so trailing punctuation
+    // cannot make a one-letter word look long enough.
+    if word_en.chars().count() < MIN_AUTOMATIC_WORD_CHARS
+        || word_he.chars().count() < MIN_AUTOMATIC_WORD_CHARS
+    {
+        return None;
+    }
+
     // Whole-buffer decision first — this is what fires for virtually every real
     // correction.
     let whole = match current {
-        Some(cur) => decide_known(word_en, word_he, cur, run, en_dict, he_dict, en_freq, he_freq),
+        Some(cur) => decide_known(
+            word_en, word_he, cur, run, en_dict, he_dict, en_freq, he_freq,
+        ),
         None => decide_unknown(word_en, word_he, run, en_dict, he_dict, en_freq, he_freq),
     };
     if let Some(lang) = whole {
@@ -944,7 +1002,8 @@ fn plan(
     }
 
     if let Some(split) = plan_split(
-        en.full, he.full, offsets_en, offsets_he, keys_len, current, en_dict, he_dict,
+        en.full, he.full, offsets_en, offsets_he, keys_len, current, run, en_dict, he_dict,
+        en_freq, he_freq,
     ) {
         return Some(split);
     }
@@ -1009,8 +1068,11 @@ fn plan_split(
     offsets_he: &[usize],
     keys_len: usize,
     current: Option<Language>,
+    run: Run,
     en_dict: Dict,
     he_dict: Dict,
+    freq_en: Freq,
+    freq_he: Freq,
 ) -> Option<Plan> {
     if !split_enabled() {
         return None;
@@ -1037,14 +1099,8 @@ fn plan_split(
     // is NOT itself a real word in the current layout.
     for split in (1..keys_len).rev() {
         let (cur_prefix, cur_suffix) = match current {
-            Language::English => (
-                &full_en[..offsets_en[split]],
-                &full_en[offsets_en[split]..],
-            ),
-            Language::Hebrew => (
-                &full_he[..offsets_he[split]],
-                &full_he[offsets_he[split]..],
-            ),
+            Language::English => (&full_en[..offsets_en[split]], &full_en[offsets_en[split]..]),
+            Language::Hebrew => (&full_he[..offsets_he[split]], &full_he[offsets_he[split]..]),
         };
         if !valid_strict(cur_prefix, current, en_dict, he_dict) {
             continue;
@@ -1056,9 +1112,24 @@ fn plan_split(
         if oth_suffix.chars().count() < 2 {
             continue;
         }
+        let enabled = Config::global().short_enabled;
+        if too_short_to_trigger(oth_suffix, other, enabled, freq_en, freq_he) {
+            continue;
+        }
         if valid_strict(oth_suffix, other, en_dict, he_dict)
             && !valid_loose(cur_suffix, current, en_dict, he_dict)
         {
+            // Confirm split only when the other suffix is decisively the common
+            // reading (frequency tie-break), matching the main pipeline.
+            let full_cur = match current {
+                Language::English => full_en,
+                Language::Hebrew => full_he,
+            };
+            if !other_decisively_more_common(
+                full_cur, current, oth_suffix, other, run, freq_en, freq_he,
+            ) {
+                continue;
+            }
             return Some(Plan::Switch {
                 lang: other,
                 start: split,
@@ -1098,7 +1169,10 @@ pub fn check_and_correct<K: Copy>(
     he_dict: Dict,
 ) -> Outcome {
     if keys.is_empty() {
-        return Outcome { fix: None, lang: None };
+        return Outcome {
+            fix: None,
+            lang: None,
+        };
     }
 
     // Build the full English/Hebrew folds once and record where each key's
@@ -1187,7 +1261,10 @@ pub fn check_and_correct<K: Copy>(
         he_freq(),
     ) else {
         debug_log(&full_en, &full_he, None, false);
-        return Outcome { fix: None, lang: seen };
+        return Outcome {
+            fix: None,
+            lang: seen,
+        };
     };
 
     let (fix, lang) = match plan {
@@ -1397,7 +1474,9 @@ mod tests {
     fn binary_search_finds_every_entry_and_nothing_else() {
         // The lookup walks back from an arbitrary probe byte to a line start,
         // so exercise it against a list long enough to need several probes.
-        let words = ["a", "aa", "ab", "abc", "b", "hello", "helot", "zebra", "שלום"];
+        let words = [
+            "a", "aa", "ab", "abc", "b", "hello", "helot", "zebra", "שלום",
+        ];
         let d = dict(&words);
         for w in words {
             assert!(d.contains(w), "{w}");
@@ -1485,9 +1564,33 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
         // Typing "hello" while in English layout: do nothing.
-        assert_eq!(decide_known("hello", "ימךךם", Language::English, Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(
+            decide_known(
+                "hello",
+                "ימךךם",
+                Language::English,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            None
+        );
         // Typing "שלום" while in Hebrew layout: do nothing.
-        assert_eq!(decide_known("akuo", "שלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(
+            decide_known(
+                "akuo",
+                "שלום",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1496,12 +1599,30 @@ mod tests {
         let he = dict(&["שלום"]);
         // In Hebrew layout but the keys spell "hello" in English -> switch EN.
         assert_eq!(
-            decide_known("hello", "ימךךם", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()),
+            decide_known(
+                "hello",
+                "ימךךם",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
             Some(Language::English)
         );
         // In English layout but the keys spell "שלום" in Hebrew -> switch HE.
         assert_eq!(
-            decide_known("akuo", "שלום", Language::English, Run::default(), en, he, nofreq(), nofreq()),
+            decide_known(
+                "akuo",
+                "שלום",
+                Language::English,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
             Some(Language::Hebrew)
         );
     }
@@ -1511,7 +1632,19 @@ mod tests {
         // "שלום" is in the dict; "ושלום" not, but matches via one‑letter prefix.
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
-        assert_eq!(decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(
+            decide_known(
+                "uakuo",
+                "ושלום",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1519,7 +1652,19 @@ mod tests {
         let en = dict(&["fun"]);
         let he = dict(&[]);
         // Hebrew reading = "כום"
-        assert_eq!(decide_known("fun", "כום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), Some(Language::English));
+        assert_eq!(
+            decide_known(
+                "fun",
+                "כום",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            Some(Language::English)
+        );
     }
 
     #[test]
@@ -1527,7 +1672,19 @@ mod tests {
         let en = dict(&["very"]);
         let he = dict(&[]);
         // Hebrew reading = "הקרט"
-        assert_eq!(decide_known("very", "הקרט", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), Some(Language::English));
+        assert_eq!(
+            decide_known(
+                "very",
+                "הקרט",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            Some(Language::English)
+        );
     }
 
     #[test]
@@ -1541,36 +1698,93 @@ mod tests {
         let he = dict(&["שלום"]);
         // Nothing known about how common the English word is: leave it alone.
         assert_eq!(
-            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()),
+            decide_known(
+                "uakuo",
+                "ושלום",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
             None
         );
         // A genuinely common English word does win.
         let en_f = freq(&[("uakuo", 300)]);
         assert_eq!(
-            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, en_f, nofreq()),
+            decide_known(
+                "uakuo",
+                "ושלום",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                en_f,
+                nofreq()
+            ),
             Some(Language::English)
         );
         // And a rare one does not, however real it is.
         let rare = freq(&[("uakuo", 30_000)]);
         assert_eq!(
-            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, rare, nofreq()),
+            decide_known(
+                "uakuo",
+                "ושלום",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                rare,
+                nofreq()
+            ),
             None
         );
         // A run of English words is the other way to pay for it: the same rare
         // word, arriving in the middle of English text.
-        let run = Run { lang: Some(Language::English), len: 3 };
+        let run = Run {
+            lang: Some(Language::English),
+            len: 3,
+        };
         assert_eq!(
-            decide_known("uakuo", "ושלום", Language::Hebrew, run, en, he, rare, nofreq()),
+            decide_known(
+                "uakuo",
+                "ושלום",
+                Language::Hebrew,
+                run,
+                en,
+                he,
+                rare,
+                nofreq()
+            ),
             None,
             "30000 is past even the run-relaxed FREQ_COMMON_MAX_RUN"
         );
         let middling = freq(&[("uakuo", 9_000)]);
         assert_eq!(
-            decide_known("uakuo", "ושלום", Language::Hebrew, run, en, he, middling, nofreq()),
+            decide_known(
+                "uakuo",
+                "ושלום",
+                Language::Hebrew,
+                run,
+                en,
+                he,
+                middling,
+                nofreq()
+            ),
             Some(Language::English)
         );
         assert_eq!(
-            decide_known("uakuo", "ושלום", Language::Hebrew, Run::default(), en, he, middling, nofreq()),
+            decide_known(
+                "uakuo",
+                "ושלום",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                middling,
+                nofreq()
+            ),
             None,
             "the same word without the run behind it is not enough"
         );
@@ -1584,11 +1798,19 @@ mod tests {
         let en = dict(&["uakuo"]);
         let he = dict(&["שלום"]);
         assert_eq!(
-            decide_known("uakuo", "זזזזז", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()),
+            decide_known(
+                "uakuo",
+                "זזזזז",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
             Some(Language::English)
         );
     }
-
 
     #[test]
     fn short_gibberish_never_switches() {
@@ -1596,8 +1818,52 @@ mod tests {
         // switch, regardless of the short-word config.
         let en = dict(&[]);
         let he = dict(&[]);
-        assert_eq!(decide_known("xkc", "סלב", Language::English, Run::default(), en, he, nofreq(), nofreq()), None);
-        assert_eq!(decide_unknown("xkc", "סלב", Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(
+            decide_known(
+                "xkc",
+                "סלב",
+                Language::English,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            None
+        );
+        assert_eq!(
+            decide_unknown("xkc", "סלב", Run::default(), en, he, nofreq(), nofreq()),
+            None
+        );
+    }
+
+    #[test]
+    fn every_one_character_token_skips_automatic_correction() {
+        // A one-character token can have a dictionary reading in the other
+        // layout, but it is too ambiguous to rewrite. Exercise each direction
+        // of the layout decision without giving either character special status.
+        assert_eq!(
+            plan_for(
+                "r",
+                "ה",
+                Some(Language::Hebrew),
+                dict(&["r"]),
+                dict(&[]),
+                nofreq(),
+            ),
+            None
+        );
+        assert_eq!(
+            plan_for(
+                "r",
+                "ה",
+                Some(Language::English),
+                dict(&[]),
+                dict(&["ה"]),
+                nofreq(),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1613,7 +1879,10 @@ mod tests {
             Some(Language::Hebrew)
         );
         // In neither dict → no switch.
-        assert_eq!(decide_unknown("qqqq", "ננננ", Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(
+            decide_unknown("qqqq", "ננננ", Run::default(), en, he, nofreq(), nofreq()),
+            None
+        );
     }
 
     #[test]
@@ -1621,8 +1890,32 @@ mod tests {
         // Keys valid as a word in BOTH layouts: do not switch, preserve user intent.
         let en = dict(&["go"]);
         let he = dict(&["עט"]); // whatever the keys read as in Hebrew
-        assert_eq!(decide_known("go", "עט", Language::English, Run::default(), en, he, nofreq(), nofreq()), None);
-        assert_eq!(decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, nofreq(), nofreq()), None);
+        assert_eq!(
+            decide_known(
+                "go",
+                "עט",
+                Language::English,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            None
+        );
+        assert_eq!(
+            decide_known(
+                "go",
+                "עט",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1635,7 +1928,16 @@ mod tests {
         let en_f = freq(&[("go", 30)]); // very common
         let he_f = nofreq(); // "עט" absent from the top-N list
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
+            decide_known(
+                "go",
+                "עט",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                en_f,
+                he_f
+            ),
             Some(Language::English)
         );
     }
@@ -1648,7 +1950,16 @@ mod tests {
         let en_f = freq(&[("go", 30)]);
         let he_f = freq(&[("עט", 40)]); // comparably common, within the factor
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
+            decide_known(
+                "go",
+                "עט",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                en_f,
+                he_f
+            ),
             None
         );
     }
@@ -1701,7 +2012,9 @@ mod tests {
         // so the layout pipeline declines — and the speller takes over.
         assert_eq!(
             plan_for("helo", "יקךם", Some(Language::English), en, he, en_f),
-            Some(Plan::Spell { text: "hello".to_string() })
+            Some(Plan::Spell {
+                text: "hello".to_string()
+            })
         );
     }
 
@@ -1715,7 +2028,10 @@ mod tests {
         let en_f = freq(&[("hello", 500)]);
         assert_eq!(
             plan_for("helo", "שלום", Some(Language::English), en, he, en_f),
-            Some(Plan::Switch { lang: Language::Hebrew, start: 0 })
+            Some(Plan::Switch {
+                lang: Language::Hebrew,
+                start: 0
+            })
         );
     }
 
@@ -1731,7 +2047,12 @@ mod tests {
         let he = dict(&["ימךךם", "שלום"]);
         let en_f = freq(&[("hello", 500)]);
         let plan = plan_for("helo", "יקךם", Some(Language::English), en, he, en_f);
-        assert_eq!(plan, Some(Plan::Spell { text: "hello".to_string() }));
+        assert_eq!(
+            plan,
+            Some(Plan::Spell {
+                text: "hello".to_string()
+            })
+        );
         assert!(!matches!(plan, Some(Plan::Switch { .. })));
     }
 
@@ -1755,7 +2076,10 @@ mod tests {
         let en = dict(&["hello"]);
         let he = dict(&[]);
         let en_f = freq(&[("hello", 500)]);
-        assert_eq!(plan_for("helo", "יקךם", Some(Language::Hebrew), en, he, en_f), None);
+        assert_eq!(
+            plan_for("helo", "יקךם", Some(Language::Hebrew), en, he, en_f),
+            None
+        );
         assert_eq!(plan_for("helo", "יקךם", None, en, he, en_f), None);
     }
 
@@ -1766,7 +2090,10 @@ mod tests {
         let en = dict(&["form", "from"]);
         let he = dict(&[]);
         let en_f = freq(&[("from", 10), ("form", 900)]);
-        assert_eq!(plan_for("form", "בםרצ", Some(Language::English), en, he, en_f), None);
+        assert_eq!(
+            plan_for("form", "בםרצ", Some(Language::English), en, he, en_f),
+            None
+        );
     }
 
     #[test]
@@ -1797,13 +2124,31 @@ mod tests {
         let he = dict(&[]);
         let en_f = freq(&[("nada", 500)]);
         assert_eq!(
-            plan_cased("nasa", "מקק", Some(Language::English), Case::Upper, en, he, en_f),
+            plan_cased(
+                "nasa",
+                "מקק",
+                Some(Language::English),
+                Case::Upper,
+                en,
+                he,
+                en_f
+            ),
             None
         );
         // The same letters typed normally are still fair game.
         assert_eq!(
-            plan_cased("nasa", "מקק", Some(Language::English), Case::Lower, en, he, en_f),
-            Some(Plan::Spell { text: "nada".to_string() })
+            plan_cased(
+                "nasa",
+                "מקק",
+                Some(Language::English),
+                Case::Lower,
+                en,
+                he,
+                en_f
+            ),
+            Some(Plan::Spell {
+                text: "nada".to_string()
+            })
         );
     }
 
@@ -1814,8 +2159,19 @@ mod tests {
         let en = dict(&[]);
         let he = dict(&["שלום"]);
         assert_eq!(
-            plan_cased("akuo", "שלום", Some(Language::English), Case::Upper, en, he, nofreq()),
-            Some(Plan::Switch { lang: Language::Hebrew, start: 0 })
+            plan_cased(
+                "akuo",
+                "שלום",
+                Some(Language::English),
+                Case::Upper,
+                en,
+                he,
+                nofreq()
+            ),
+            Some(Plan::Switch {
+                lang: Language::Hebrew,
+                start: 0
+            })
         );
     }
 
@@ -1877,7 +2233,13 @@ mod tests {
             nofreq(),
             nofreq(),
         );
-        assert_eq!(plan, Some(Plan::Switch { lang: Language::Hebrew, start: 0 }));
+        assert_eq!(
+            plan,
+            Some(Plan::Switch {
+                lang: Language::Hebrew,
+                start: 0
+            })
+        );
     }
 
     #[test]
@@ -1911,7 +2273,9 @@ mod tests {
                 en_f,
                 nofreq(),
             ),
-            Some(Plan::Spell { text: "hello".to_string() })
+            Some(Plan::Spell {
+                text: "hello".to_string()
+            })
         );
     }
 
@@ -1922,11 +2286,23 @@ mod tests {
         h.push(Language::Hebrew);
         h.push(Language::Hebrew);
         h.push(Language::Hebrew);
-        assert_eq!(h.run(), Run { lang: Some(Language::Hebrew), len: 3 });
+        assert_eq!(
+            h.run(),
+            Run {
+                lang: Some(Language::Hebrew),
+                len: 3
+            }
+        );
         // One English word breaks the run rather than being outvoted by the
         // three Hebrew ones behind it.
         h.push(Language::English);
-        assert_eq!(h.run(), Run { lang: Some(Language::English), len: 1 });
+        assert_eq!(
+            h.run(),
+            Run {
+                lang: Some(Language::English),
+                len: 1
+            }
+        );
     }
 
     #[test]
@@ -1970,18 +2346,33 @@ mod tests {
         // Typing in Hebrew with no history: the user's own layout wins, which
         // is the behaviour every other test here pins.
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
+            decide_known(
+                "go",
+                "עט",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                en_f,
+                he_f
+            ),
             None
         );
         // The same word after two English words is not ambiguous any more.
-        let run = Run { lang: Some(Language::English), len: 2 };
+        let run = Run {
+            lang: Some(Language::English),
+            len: 2,
+        };
         assert_eq!(
             decide_known("go", "עט", Language::Hebrew, run, en, he, en_f, he_f),
             Some(Language::English)
         );
         // A run in the layout the user is already in argues for nothing — it
         // agrees with the guard, which was going to keep the word anyway.
-        let same = Run { lang: Some(Language::Hebrew), len: 5 };
+        let same = Run {
+            lang: Some(Language::Hebrew),
+            len: 5,
+        };
         assert_eq!(
             decide_known("go", "עט", Language::Hebrew, same, en, he, en_f, he_f),
             None
@@ -1997,7 +2388,10 @@ mod tests {
         let he = dict(&["עט"]);
         let en_f = freq(&[("go", 6_000)]);
         let he_f = freq(&[("עט", 18_000)]);
-        let one = Run { lang: Some(Language::English), len: 1 };
+        let one = Run {
+            lang: Some(Language::English),
+            len: 1,
+        };
         assert_eq!(
             decide_known("go", "עט", Language::Hebrew, one, en, he, en_f, he_f),
             None
@@ -2011,9 +2405,21 @@ mod tests {
         // what would turn a name typed mid-sentence into gibberish.
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
-        let run = Run { lang: Some(Language::Hebrew), len: 5 };
+        let run = Run {
+            lang: Some(Language::Hebrew),
+            len: 5,
+        };
         assert_eq!(
-            decide_known("qqqq", "ננננ", Language::English, run, en, he, nofreq(), nofreq()),
+            decide_known(
+                "qqqq",
+                "ננננ",
+                Language::English,
+                run,
+                en,
+                he,
+                nofreq(),
+                nofreq()
+            ),
             None
         );
     }
@@ -2046,21 +2452,63 @@ mod tests {
     fn the_short_word_gate_asks_how_common_a_word_is_not_only_how_long() {
         let common = freq(&[("של", 40), ("go", 120)]);
         // With the gate switched on (the shipped default) it never fires.
-        assert!(!too_short_to_trigger("של", Language::Hebrew, true, nofreq(), common));
+        assert!(!too_short_to_trigger(
+            "של",
+            Language::Hebrew,
+            true,
+            nofreq(),
+            common
+        ));
         // Switched off, a short reading nobody types is the collision it is for…
-        assert!(too_short_to_trigger("סלב", Language::Hebrew, false, nofreq(), common));
-        assert!(too_short_to_trigger("xkc", Language::English, false, nofreq(), common));
+        assert!(too_short_to_trigger(
+            "סלב",
+            Language::Hebrew,
+            false,
+            nofreq(),
+            common
+        ));
+        assert!(too_short_to_trigger(
+            "xkc",
+            Language::English,
+            false,
+            nofreq(),
+            common
+        ));
         // …and a short reading everybody types is the opposite of one. This is
         // what the bare length cutoff could not tell apart: "של" and "סלב" are
         // both three characters.
-        assert!(!too_short_to_trigger("של", Language::Hebrew, false, nofreq(), common));
-        assert!(!too_short_to_trigger("go", Language::English, false, common, nofreq()));
+        assert!(!too_short_to_trigger(
+            "של",
+            Language::Hebrew,
+            false,
+            nofreq(),
+            common
+        ));
+        assert!(!too_short_to_trigger(
+            "go",
+            Language::English,
+            false,
+            common,
+            nofreq()
+        ));
         // A short word that is merely *in* the list is not enough — it has to be
         // near the top of it.
         let rare = freq(&[("עט", 9_000)]);
-        assert!(too_short_to_trigger("עט", Language::Hebrew, false, nofreq(), rare));
+        assert!(too_short_to_trigger(
+            "עט",
+            Language::Hebrew,
+            false,
+            nofreq(),
+            rare
+        ));
         // Long readings are none of the gate's business either way.
-        assert!(!too_short_to_trigger("שלום", Language::Hebrew, false, nofreq(), nofreq()));
+        assert!(!too_short_to_trigger(
+            "שלום",
+            Language::Hebrew,
+            false,
+            nofreq(),
+            nofreq()
+        ));
     }
 
     #[test]
@@ -2072,7 +2520,16 @@ mod tests {
         let en_f = freq(&[("go", 9000)]); // real word, but rare
         let he_f = nofreq();
         assert_eq!(
-            decide_known("go", "עט", Language::Hebrew, Run::default(), en, he, en_f, he_f),
+            decide_known(
+                "go",
+                "עט",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                en_f,
+                he_f
+            ),
             None
         );
     }

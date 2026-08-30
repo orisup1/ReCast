@@ -309,7 +309,11 @@ pub fn run(control: Arc<AppControl>) {
 }
 
 fn toggle_label(enabled: bool) -> &'static str {
-    if enabled { "Disable" } else { "Enable" }
+    if enabled {
+        "Disable"
+    } else {
+        "Enable"
+    }
 }
 
 /// The counter row: what stuck, what was taken back, and — once enough has
@@ -371,16 +375,18 @@ fn tooltip(control: &AppControl) -> String {
 // (Windows uses a hover tooltip), so gating it avoids a dead-code warning there.
 #[cfg(target_os = "macos")]
 fn menubar_banner() -> String {
-  if std::env::var_os("NO_COLOR").is_some() {
-    format!("ReCast v{}", env!("CARGO_PKG_VERSION"))
-  } else {
-    let depth = banner::ColorDepth::True;
-    let mut row = banner::logo_rows_compact(depth);
-    if !row.is_empty() { row.push(' '); }
-    row.push_str("\x1b[38;5;39mReCast\x1b[0m ");
-    row.push_str(&format!("\x1b[2mv{}\x1b[0m", env!("CARGO_PKG_VERSION")));
-    row
-  }
+    if std::env::var_os("NO_COLOR").is_some() {
+        format!("ReCast v{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        let depth = banner::ColorDepth::True;
+        let mut row = banner::logo_rows_compact(depth);
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str("\x1b[38;5;39mReCast\x1b[0m ");
+        row.push_str(&format!("\x1b[2mv{}\x1b[0m", env!("CARGO_PKG_VERSION")));
+        row
+    }
 }
 
 const ICON_RGBA: &[u8] = include_bytes!("../../assets/tray-icon.rgba");

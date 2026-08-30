@@ -213,7 +213,8 @@ pub fn language_of_keymap(keymap: &str) -> Option<Language> {
 const LAYOUT_FAILURE_THRESHOLD: u32 = 50;
 
 static LAYOUT_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static LAYOUT_WARNING_EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAYOUT_WARNING_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Record a layout query failure. If failures exceed the threshold and no
 /// warning has been emitted yet, print a hint to stderr.

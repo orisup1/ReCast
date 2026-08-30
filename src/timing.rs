@@ -214,10 +214,7 @@ pub fn injection() -> &'static Injection {
         press_gap: micros("RECAST_INJECT_PRESS_GAP", DEFAULTS.press_gap),
         inter_key_gap: micros("RECAST_INJECT_KEY_GAP", DEFAULTS.inter_key_gap),
         settle: micros("RECAST_INJECT_SETTLE", DEFAULTS.settle),
-        held_release_timeout: micros(
-            "RECAST_INJECT_HELD_TIMEOUT",
-            DEFAULTS.held_release_timeout,
-        ),
+        held_release_timeout: micros("RECAST_INJECT_HELD_TIMEOUT", DEFAULTS.held_release_timeout),
         terminator_release_timeout: micros(
             "RECAST_INJECT_TERM_TIMEOUT",
             DEFAULTS.terminator_release_timeout,

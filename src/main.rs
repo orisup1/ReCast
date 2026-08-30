@@ -21,10 +21,10 @@ mod instance;
 mod keymap;
 mod layout;
 mod notify;
+mod personal;
 mod platform;
 mod prefs;
 mod settings;
-mod personal;
 mod spell;
 mod timing;
 mod types;
@@ -34,9 +34,9 @@ mod types;
 #[cfg(not(target_os = "macos"))]
 mod tui;
 
-use std::sync::Arc;
-use std::process;
 use crate::dictionary::{en_dict, he_dict};
+use std::process;
+use std::sync::Arc;
 
 const HELP: &str = "\
 recast — automatic English/Hebrew layout correction + English autocorrect
@@ -229,7 +229,9 @@ fn main() {
     // off should not have it turned back on for them by a reboot.
     let enabled = prefs::load_enabled();
     if !enabled {
-        println!("Correction is switched off from last time — turn it back on from the tray or TUI.");
+        println!(
+            "Correction is switched off from last time — turn it back on from the tray or TUI."
+        );
     }
     let control = Arc::new(types::AppControl::new_with_config_and_state(cfg, enabled));
     // Pick up edits to abbrev.txt / ignore.txt without a restart.
@@ -321,7 +323,11 @@ fn print_status() {
 
     println!(
         "  correction:     {}",
-        if prefs::load_enabled() { "enabled" } else { "disabled" }
+        if prefs::load_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     // The layout pipeline is the headline feature and the one that can be
     // silently unavailable: on a Linux session ReCast cannot drive, mistyped
@@ -340,7 +346,10 @@ fn print_status() {
     // did nothing, and the most likely answer is that it is somewhere else.
     match settings::file_path() {
         Some(path) if path.exists() => println!("  config.toml:    {}", path.display()),
-        Some(path) => println!("  config.toml:    none ({} — --write-config makes one)", path.display()),
+        Some(path) => println!(
+            "  config.toml:    none ({} — --write-config makes one)",
+            path.display()
+        ),
         None => println!("  config.toml:    (none — no OS config directory)"),
     }
     let (abbrevs, ignored, learned) = complete::list_counts();
@@ -411,10 +420,10 @@ mod tests {
         let quoted: Vec<&str> = readme
             .match_indices("recast ")
             .filter_map(|(at, matched)| {
-                let token = readme[at + matched.len()..]
-                    .split_whitespace()
-                    .next()?;
-                token.starts_with(|c: char| c.is_ascii_digit()).then_some(token)
+                let token = readme[at + matched.len()..].split_whitespace().next()?;
+                token
+                    .starts_with(|c: char| c.is_ascii_digit())
+                    .then_some(token)
             })
             .collect();
         assert!(

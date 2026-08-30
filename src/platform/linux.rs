@@ -21,7 +21,7 @@ use crate::keymap::{
     evkey_to_hebrew_char,
 };
 use crate::types::{
-    lock_forgiving, AppControl, FixKind, Language, Replaceable, ReplaceGuard, WordBuffer,
+    lock_forgiving, AppControl, FixKind, Language, ReplaceGuard, Replaceable, WordBuffer,
 };
 
 /// One key of the word being typed, with the shift state it was typed under.
@@ -280,11 +280,7 @@ pub fn start(
     std::process::exit(1);
 }
 
-pub fn run(
-    en_dict: Dict,
-    he_dict: Dict,
-    control: Arc<AppControl>,
-) {
+pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
     // Persistent virtual device strictly for injecting backspaces and
     // corrected words.  Created once so Wayland has time to recognise it.
     let mut all_keys = AttributeSet::<KeyCode>::new();
@@ -402,9 +398,7 @@ pub fn run(
                 for event in events {
                     if let EventSummary::Key(_, keycode, value) = event.destructure() {
                         match value {
-                            1 => handle_key(
-                                keycode, &state, en_dict, he_dict, &injector, &control,
-                            ),
+                            1 => handle_key(keycode, &state, en_dict, he_dict, &injector, &control),
                             0 => handle_release(
                                 keycode, &state, en_dict, he_dict, &injector, &control,
                             ),
@@ -701,7 +695,15 @@ fn handle_release(
     thread::spawn(move || {
         // The completion key types nothing, so only what is on screen for the
         // partial word is erased and there is no terminator to press again.
-        replace_word(erase, retype, None, keep, undo, &injector_clone, &state_clone);
+        replace_word(
+            erase,
+            retype,
+            None,
+            keep,
+            undo,
+            &injector_clone,
+            &state_clone,
+        );
     });
 }
 

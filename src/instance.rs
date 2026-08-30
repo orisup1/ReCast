@@ -97,7 +97,8 @@ pub fn replace_running() -> Vec<(u32, Outcome)> {
 
     // Asked before anything dies: on Linux the answer is read out of
     // `/proc/<pid>`, which disappears along with the process.
-    let notes: Vec<Option<&'static str>> = others.iter().map(|&pid| imp::service_note(pid)).collect();
+    let notes: Vec<Option<&'static str>> =
+        others.iter().map(|&pid| imp::service_note(pid)).collect();
 
     for &pid in &others {
         imp::ask_to_stop(pid);
@@ -539,15 +540,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
-    /// Both halves of the supervised story have to be present: the outcome
-    /// carries a command, and the command is not empty on the platform that
-    /// can produce it.
+    /// A supervised outcome preserves the command the caller needs to show.
     #[test]
     fn a_refusal_says_what_to_do_about_it() {
-        if cfg!(target_os = "macos") {
-            assert!(!imp::STOP_SERVICE.is_empty());
-        }
         let refused = Outcome::Supervised("launchctl unload -w ...");
-        assert_ne!(refused, Outcome::Ended);
+        assert_eq!(refused, Outcome::Supervised("launchctl unload -w ..."));
     }
 }

@@ -61,7 +61,9 @@ impl Config {
 /// time, while the process stays up and looks healthy. That is the failure this
 /// avoids — see [`ReplaceGuard`], which handles the other half of it.
 pub fn lock_forgiving<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The part of a platform's listener state that a replacement has to put back.
@@ -501,7 +503,10 @@ mod tests {
         // returned early, and the listener discarded every key as its own.
         let st = lock_forgiving(&state);
         assert!(!st.replacing, "is_replacing left set — corrections wedged");
-        assert_eq!(st.buffered, 0, "keys typed during a failed replacement kept");
+        assert_eq!(
+            st.buffered, 0,
+            "keys typed during a failed replacement kept"
+        );
         assert!(
             !injecting.load(Ordering::Relaxed),
             "injecting left set — the keyboard would stop working entirely"
@@ -602,7 +607,10 @@ mod tests {
             c.record_fix("x", "y", FixKind::Spelling);
             c.record_undo();
         }
-        assert!(c.tighten_hint().is_none(), "four undos is not a pattern yet");
+        assert!(
+            c.tighten_hint().is_none(),
+            "four undos is not a pattern yet"
+        );
 
         c.record_fix("x", "y", FixKind::Spelling);
         c.record_undo();

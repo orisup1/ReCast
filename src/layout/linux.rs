@@ -448,7 +448,9 @@ fn json_str_array(block: &str, key: &str) -> Option<Vec<String>> {
             .split(',')
             .filter_map(|item| {
                 let item = item.trim();
-                item.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
+                item.strip_prefix('"')?
+                    .strip_suffix('"')
+                    .map(str::to_string)
             })
             .collect(),
     )
@@ -914,7 +916,11 @@ mod kde {
                 }
             }
             Style::Qdbus => {
-                cmd.args(["org.kde.keyboard", "/Layouts", &format!("org.kde.KeyboardLayouts.{method}")]);
+                cmd.args([
+                    "org.kde.keyboard",
+                    "/Layouts",
+                    &format!("org.kde.KeyboardLayouts.{method}"),
+                ]);
                 if let Some(n) = arg {
                     cmd.arg(n.to_string());
                 }
@@ -1360,13 +1366,18 @@ mod tests {
         // English was unnecessary and the correction would be typed out in
         // Hebrew — the intermittent garbage this was reported as.
         let only_injector_is_main = DEVICES
-            .replace(r#""name": "recast-injector"#, r#""name": "recast-injector-x"#)
-            .replace(r#""name": "hl-virtual-keyboard-fcitx5", "rules": "",
+            .replace(
+                r#""name": "recast-injector"#,
+                r#""name": "recast-injector-x"#,
+            )
+            .replace(
+                r#""name": "hl-virtual-keyboard-fcitx5", "rules": "",
          "model": "", "layout": "us,il", "variant": "", "options": "",
          "active_keymap": "Hebrew", "capsLock": false, "numLock": false, "main": true"#,
-                     r#""name": "recast-injector", "rules": "",
+                r#""name": "recast-injector", "rules": "",
          "model": "", "layout": "us", "variant": "", "options": "",
-         "active_keymap": "English (US)", "capsLock": false, "numLock": false, "main": true"#);
+         "active_keymap": "English (US)", "capsLock": false, "numLock": false, "main": true"#,
+            );
         // With our injector as `main` and claiming English, the answer must
         // still come from the physical keyboard.
         assert_eq!(
@@ -1461,7 +1472,10 @@ mod tests {
 
     #[test]
     fn kde_reports_the_live_layout_as_an_index() {
-        assert_eq!(kde::parse_index("(uint32 1,)".replace("uint32", " ").as_str()), Some(1));
+        assert_eq!(
+            kde::parse_index("(uint32 1,)".replace("uint32", " ").as_str()),
+            Some(1)
+        );
         assert_eq!(kde::parse_index("0"), Some(0));
     }
 

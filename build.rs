@@ -87,7 +87,11 @@ fn prepare_dictionaries() {
             if word.is_empty() {
                 continue;
             }
-            let word = if fold { word.to_ascii_lowercase() } else { word.to_string() };
+            let word = if fold {
+                word.to_ascii_lowercase()
+            } else {
+                word.to_string()
+            };
             if let Some(stripped) = strip_quotes(&word) {
                 best.entry(stripped).or_insert(rank);
             }
@@ -138,7 +142,10 @@ fn embed_windows_resources() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon("assets/recast.ico");
     res.set("ProductName", "ReCast");
-    res.set("FileDescription", "ReCast — automatic English/Hebrew keyboard-layout correction");
+    res.set(
+        "FileDescription",
+        "ReCast — automatic English/Hebrew keyboard-layout correction",
+    );
     res.set("OriginalFilename", "ReCast.exe");
     res.set("LegalCopyright", "© 2026 ReCast");
     // FileVersion / ProductVersion default to CARGO_PKG_VERSION, filled in by

@@ -269,7 +269,10 @@ pub fn sample() -> String {
 pub fn write_sample() -> Result<PathBuf, String> {
     let path = file_path().ok_or_else(|| "no OS config directory to write to".to_string())?;
     if path.exists() {
-        return Err(format!("{} already exists — leaving it alone.", path.display()));
+        return Err(format!(
+            "{} already exists — leaving it alone.",
+            path.display()
+        ));
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -281,10 +284,7 @@ pub fn write_sample() -> Result<PathBuf, String> {
 /// Get a boolean setting from the environment, falling back to `default` when
 /// unset or unparsable. Accepts "0" for false and anything else for true.
 pub fn flag(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| v != "0")
-        .unwrap_or(default)
+    std::env::var(key).ok().map(|v| v != "0").unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -352,7 +352,10 @@ spell_min = 5
     #[test]
     fn every_key_in_the_sample_is_a_real_setting() {
         let sample = sample();
-        let known: Vec<String> = crate::config::ALL_KEYS.iter().map(|k| file_key(k)).collect();
+        let known: Vec<String> = crate::config::ALL_KEYS
+            .iter()
+            .map(|k| file_key(k))
+            .collect();
         let mut found = 0;
         for line in sample.lines() {
             let Some(line) = line.strip_prefix('#') else {

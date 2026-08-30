@@ -199,7 +199,10 @@ mod tests {
             assert!(doc.contains(key), "{key} listed but not used");
         }
         for key in ["RECAST_SPELL_MIN", "RECAST_COMPLETE_RANK"] {
-            assert!(NUMERIC_KEYS.contains(&key), "{key} is numeric but unchecked");
+            assert!(
+                NUMERIC_KEYS.contains(&key),
+                "{key} is numeric but unchecked"
+            );
         }
     }
 
@@ -226,7 +229,11 @@ mod tests {
             })
             .filter(|key| !key.contains("NOTHING_SETS_THIS"))
             .collect();
-        assert!(read.len() >= 10, "found only {} timings: {read:?}", read.len());
+        assert!(
+            read.len() >= 10,
+            "found only {} timings: {read:?}",
+            read.len()
+        );
 
         for key in read {
             assert!(
@@ -234,7 +241,10 @@ mod tests {
                 "{key} is read by timing::injection but not in NUMERIC_KEYS, \
                  so a typoed value would fall back to the default in silence"
             );
-            assert!(help.contains(key), "{key} is a real setting but not in --help");
+            assert!(
+                help.contains(key),
+                "{key} is a real setting but not in --help"
+            );
         }
     }
 }

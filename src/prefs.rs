@@ -160,7 +160,11 @@ mod macos_autostart {
             return false;
         };
         if !enable {
-            let _ = Command::new("launchctl").arg("unload").arg("-w").arg(&path).status();
+            let _ = Command::new("launchctl")
+                .arg("unload")
+                .arg("-w")
+                .arg(&path)
+                .status();
             return std::fs::remove_file(&path).is_ok();
         }
         let Ok(exe) = std::env::current_exe() else {
@@ -248,7 +252,10 @@ mod windows_autostart {
     const VALUE_NAME: &str = "ReCast";
 
     fn wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     pub fn is_enabled() -> bool {
@@ -256,8 +263,13 @@ mod windows_autostart {
         let name = wide(VALUE_NAME);
         unsafe {
             let mut hkey = ptr::null_mut();
-            if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey)
-                != ERROR_SUCCESS as i32
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut hkey,
+            ) != ERROR_SUCCESS as i32
             {
                 return false;
             }

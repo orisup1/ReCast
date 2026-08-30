@@ -102,9 +102,5 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
             .with_icon(icon_data),
         ..Default::default()
     };
-    eframe::run_native(
-        "ReCast",
-        opts,
-        Box::new(|_cc| Box::new(App { control })),
-    )
+    eframe::run_native("ReCast", opts, Box::new(|_cc| Box::new(App { control })))
 }
