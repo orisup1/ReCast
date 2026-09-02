@@ -236,7 +236,11 @@ fn main() {
     // ReCast could not use. Printed here rather than only under `--status`,
     // because a daemon launched at login is one nobody runs `--status` on until
     // they have already spent a while wondering why their setting did nothing.
-    for complaint in settings::complaints(config::NUMERIC_KEYS, config::ALL_KEYS) {
+    for complaint in settings::complaints(
+        config::NUMERIC_KEYS,
+        config::BOOLEAN_KEYS,
+        config::ALL_KEYS,
+    ) {
         eprintln!("Warning: {complaint}");
     }
 
@@ -413,7 +417,11 @@ fn print_status() {
             .unwrap_or_default(),
     );
 
-    for complaint in settings::complaints(config::NUMERIC_KEYS, config::ALL_KEYS) {
+    for complaint in settings::complaints(
+        config::NUMERIC_KEYS,
+        config::BOOLEAN_KEYS,
+        config::ALL_KEYS,
+    ) {
         eprintln!("\n  ! {complaint}");
     }
 }

@@ -103,7 +103,9 @@ fn parse(text: &str) -> Parsed {
             out.malformed.push(n + 1);
             continue;
         };
-        let value = value.trim();
+        // Values are scalars, so `#` can only begin the inline explanation
+        // used by the generated sample file.
+        let value = value.split_once('#').map_or(value, |(value, _)| value).trim();
         // Quotes are stripped so `spell = "0"` and `spell = 0` mean the same
         // thing. A TOML string is what an editor's autocomplete will offer, and
         // the difference between the two is not one worth having an opinion
@@ -164,7 +166,11 @@ pub fn get(env_key: &str) -> Option<String> {
 /// key in the file that is not a setting at all (a typo, or a name from an
 /// older version), and a line in the file with no `=` on it. `--status` reads
 /// these out.
-pub fn complaints(numeric_keys: &[&str], all_keys: &[&str]) -> Vec<String> {
+pub fn complaints(
+    numeric_keys: &[&str],
+    boolean_keys: &[&str],
+    all_keys: &[&str],
+) -> Vec<String> {
     let mut out = Vec::new();
 
     for key in numeric_keys {
@@ -172,6 +178,17 @@ pub fn complaints(numeric_keys: &[&str], all_keys: &[&str]) -> Vec<String> {
             if raw.trim().parse::<u64>().is_err() {
                 out.push(format!(
                     "{}={raw:?} is not a number — using the default instead.",
+                    source.describe(key)
+                ));
+            }
+        }
+    }
+
+    for key in boolean_keys {
+        if let Some((raw, source)) = lookup(key) {
+            if parse_flag(&raw).is_none() {
+                out.push(format!(
+                    "{}={raw:?} is not true/false or 1/0 — using the default instead.",
                     source.describe(key)
                 ));
             }
@@ -283,11 +300,17 @@ pub fn write_sample() -> Result<PathBuf, String> {
 }
 
 /// Get a boolean setting from the environment, falling back to `default` when
-/// unset or unparsable. Accepts "0" for false and anything else for true.
+/// unset or unparsable.
 pub fn flag(key: &str, default: bool) -> bool {
-    get(key)
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(default)
+    get(key).and_then(|v| parse_flag(&v)).unwrap_or(default)
+}
+
+fn parse_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +351,21 @@ spell_min = 5
         // setting they asked for.
         assert_eq!(t.settings.get("spell").map(String::as_str), Some("0"));
         assert_eq!(t.settings.get("split").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn uncommented_sample_values_parse_as_written() {
+        let t = parse(
+            "personal = false # privacy-sensitive\nspell_min = 4 # shortest word\n",
+        );
+        assert_eq!(
+            t.settings.get("personal").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(t.settings.get("spell_min").map(String::as_str), Some("4"));
+        assert_eq!(parse_flag(t.settings["personal"].as_str()), Some(false));
+        assert_eq!(parse_flag("TRUE"), Some(true));
+        assert_eq!(parse_flag("yes"), None);
     }
 
     #[test]

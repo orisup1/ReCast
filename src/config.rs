@@ -120,6 +120,18 @@ pub const NUMERIC_KEYS: &[&str] = &[
     "RECAST_INJECT_BATCH_GAP",
 ];
 
+/// Every boolean setting, so a typo falls back with a warning instead of
+/// quietly inverting the user's intent.
+pub const BOOLEAN_KEYS: &[&str] = &[
+    "RECAST_PERSONAL",
+    "RECAST_SHORT",
+    "RECAST_SPLIT",
+    "RECAST_FREQ",
+    "RECAST_SPELL",
+    "RECAST_COMPLETE",
+    "RECAST_DEBUG",
+];
+
 /// All known settings, for validating the config file.
 pub const ALL_KEYS: &[&str] = &[
     "RECAST_PERSONAL",

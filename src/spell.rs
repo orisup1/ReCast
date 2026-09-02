@@ -570,8 +570,8 @@ fn min_cost_per_letter_x100() -> u32 {
             // What the rule actually moves, not how long it is: `ance` → `ence`
             // is four letters wide but only exchanges one of them.
             let moved = bag_difference(rule.from.as_bytes(), rule.to.as_bytes());
-            if moved > 0 {
-                min = min.min(rule.cost * 100 / moved);
+            if let Some(cost) = (rule.cost * 100).checked_div(moved) {
+                min = min.min(cost);
             }
         }
         min

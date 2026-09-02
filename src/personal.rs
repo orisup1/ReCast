@@ -40,6 +40,10 @@ const MIN_WORD_LEN: usize = 3;
 /// How many new words before a forced flush.
 const FLUSH_AFTER_WORDS: u64 = 20;
 
+fn increment(count: &mut u64) {
+    *count = count.saturating_add(1);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Personal frequency
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +77,9 @@ fn parse_freq_file(text: &str) -> HashMap<String, u64> {
         if let Some((word, count)) = line.split_once('\t') {
             if let Ok(count) = count.trim().parse::<u64>() {
                 let word = word.trim().to_lowercase();
-                if !word.is_empty() {
+                if !word.is_empty()
+                    && (map.len() < MAX_PERSONAL_ENTRIES || map.contains_key(&word))
+                {
                     map.insert(word, count);
                 }
             }
@@ -88,16 +94,19 @@ pub fn record_word(word: &str) {
     if !enabled() {
         return;
     }
+    let word = word.trim().to_lowercase();
     if word.chars().count() < MIN_WORD_LEN {
         return;
     }
-    let word = word.trim().to_lowercase();
-    if word.is_empty() {
-        return;
-    }
     if let Ok(mut map) = personal_freq_map().lock() {
-        *map.entry(word).or_insert(0) += 1;
-        maybe_flush_freq(map.len());
+        // ponytail: keep the first 5,000 unique words; evict the least common
+        // only if tail learning proves more useful than a hard memory bound.
+        if map.len() >= MAX_PERSONAL_ENTRIES && !map.contains_key(&word) {
+            return;
+        }
+        increment(map.entry(word).or_insert(0));
+        drop(map);
+        maybe_flush_freq();
     }
 }
 
@@ -126,10 +135,10 @@ fn boost_for_count(count: u64) -> f32 {
 }
 
 /// Periodically flush personal frequency to disk.
-fn maybe_flush_freq(len: usize) {
+fn maybe_flush_freq() {
     static WORDS_SINCE_FLUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = WORDS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count >= FLUSH_AFTER_WORDS || len.is_multiple_of(MAX_PERSONAL_ENTRIES) {
+    let count = WORDS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if count >= FLUSH_AFTER_WORDS {
         flush_personal_freq();
         WORDS_SINCE_FLUSH.store(0, std::sync::atomic::Ordering::Relaxed);
     }
@@ -144,7 +153,7 @@ fn flush_personal_freq() {
         return;
     };
     let map = match personal_freq_map().lock() {
-        Ok(m) => m,
+        Ok(m) => m.clone(),
         Err(_) => return,
     };
     let mut entries: Vec<_> = map.iter().collect();
@@ -188,6 +197,7 @@ fn load_confusions() -> HashMap<String, HashMap<String, u64>> {
 /// Parse `typed<TAB>corrected<TAB>count` lines.
 fn parse_confusions_file(text: &str) -> HashMap<String, HashMap<String, u64>> {
     let mut outer: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    let mut entries = 0;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -199,7 +209,15 @@ fn parse_confusions_file(text: &str) -> HashMap<String, HashMap<String, u64>> {
                 let typed = parts[0].trim().to_lowercase();
                 let corrected = parts[1].trim().to_lowercase();
                 if !typed.is_empty() && !corrected.is_empty() {
-                    outer.entry(typed).or_default().insert(corrected, count);
+                    let known = outer
+                        .get(&typed)
+                        .is_some_and(|corrections| corrections.contains_key(&corrected));
+                    if known || entries < MAX_PERSONAL_ENTRIES {
+                        let corrections = outer.entry(typed).or_default();
+                        if corrections.insert(corrected, count).is_none() {
+                            entries += 1;
+                        }
+                    }
                 }
             }
         }
@@ -212,14 +230,30 @@ pub fn record_confusion(typed: &str, corrected: &str) {
     if !enabled() {
         return;
     }
+    let typed = typed.trim().to_lowercase();
+    let corrected = corrected.trim().to_lowercase();
     if typed.is_empty() || corrected.is_empty() || typed == corrected {
         return;
     }
-    let typed = typed.trim().to_lowercase();
-    let corrected = corrected.trim().to_lowercase();
     if let Ok(mut map) = confusions_map().lock() {
-        *map.entry(typed).or_default().entry(corrected).or_insert(0) += 1;
-        maybe_flush_confusions(&map);
+        let known = map
+            .get(&typed)
+            .is_some_and(|corrections| corrections.contains_key(&corrected));
+        // ponytail: this O(n) count runs only for a new correction pair; keep a
+        // separate counter if adding pairs at the 5,000-entry ceiling is hot.
+        if !known
+            && map.values().map(HashMap::len).sum::<usize>() >= MAX_PERSONAL_ENTRIES
+        {
+            return;
+        }
+        increment(
+            map.entry(typed)
+                .or_default()
+                .entry(corrected)
+                .or_insert(0),
+        );
+        drop(map);
+        maybe_flush_confusions();
     }
 }
 
@@ -241,10 +275,11 @@ pub fn personal_correction(typed: &str) -> Option<String> {
 }
 
 /// Periodically flush confusions to disk.
-fn maybe_flush_confusions(_map: &HashMap<String, HashMap<String, u64>>) {
+fn maybe_flush_confusions() {
     static CONFUSIONS_SINCE_FLUSH: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
-    let count = CONFUSIONS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let count =
+        CONFUSIONS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count >= FLUSH_AFTER_WORDS {
         flush_confusions();
         CONFUSIONS_SINCE_FLUSH.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -540,6 +575,27 @@ mod tests {
         assert!(boost_for_count(2) > boost_for_count(1));
         assert_eq!(boost_for_count(10), 2.0);
         assert_eq!(boost_for_count(10_000), 2.0);
+    }
+
+    #[test]
+    fn personal_maps_stop_at_their_documented_limit() {
+        let freq: String = (0..=MAX_PERSONAL_ENTRIES)
+            .map(|i| format!("word{i}\t1\n"))
+            .collect();
+        assert_eq!(parse_freq_file(&freq).len(), MAX_PERSONAL_ENTRIES);
+
+        let confusions: String = (0..=MAX_PERSONAL_ENTRIES)
+            .map(|i| format!("typed{i}\tcorrected{i}\t1\n"))
+            .collect();
+        let parsed = parse_confusions_file(&confusions);
+        assert_eq!(
+            parsed.values().map(HashMap::len).sum::<usize>(),
+            MAX_PERSONAL_ENTRIES
+        );
+
+        let mut count = u64::MAX;
+        increment(&mut count);
+        assert_eq!(count, u64::MAX, "hand-edited counters must not wrap");
     }
 
     #[test]
