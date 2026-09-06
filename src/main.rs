@@ -133,6 +133,12 @@ Your files (<config dir>/recast/):
   config.toml is read once, so a change to it takes a restart.";
 
 fn main() {
+    // Windows release builds run as a GUI-subsystem app with no console, so
+    // reattach the launching terminal's console first — otherwise stdout is not
+    // a TTY and the banner never prints. No-op without a parent console.
+    #[cfg(target_os = "windows")]
+    platform::windows::attach_parent_console();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut with_gui = false;
     let mut with_window = false;
@@ -215,12 +221,6 @@ fn main() {
         return;
     }
 
-    // Windows release builds run as a GUI-subsystem app with no console, so
-    // reattach the launching terminal's console first — otherwise stdout is not
-    // a TTY and the banner never prints. No-op without a parent console.
-    #[cfg(target_os = "windows")]
-    platform::windows::attach_parent_console();
-
     if banner::ran_from_terminal() {
         banner::print_logo();
     }
@@ -236,11 +236,9 @@ fn main() {
     // ReCast could not use. Printed here rather than only under `--status`,
     // because a daemon launched at login is one nobody runs `--status` on until
     // they have already spent a while wondering why their setting did nothing.
-    for complaint in settings::complaints(
-        config::NUMERIC_KEYS,
-        config::BOOLEAN_KEYS,
-        config::ALL_KEYS,
-    ) {
+    for complaint in
+        settings::complaints(config::NUMERIC_KEYS, config::BOOLEAN_KEYS, config::ALL_KEYS)
+    {
         eprintln!("Warning: {complaint}");
     }
 
@@ -256,13 +254,6 @@ fn main() {
         );
     }
     let control = Arc::new(types::AppControl::new_with_config_and_state(cfg, enabled));
-    // Pick up edits to abbrev.txt / ignore.txt without a restart.
-    complete::spawn_watcher();
-    // …and layout changes made by hand, as they happen rather than within the
-    // cache's 300 ms.
-    layout::spawn_watcher();
-    // Personal intelligence: frequency, confusions, typing patterns.
-    personal::init();
 
     #[cfg(not(target_os = "linux"))]
     if with_window {
@@ -417,11 +408,9 @@ fn print_status() {
             .unwrap_or_default(),
     );
 
-    for complaint in settings::complaints(
-        config::NUMERIC_KEYS,
-        config::BOOLEAN_KEYS,
-        config::ALL_KEYS,
-    ) {
+    for complaint in
+        settings::complaints(config::NUMERIC_KEYS, config::BOOLEAN_KEYS, config::ALL_KEYS)
+    {
         eprintln!("\n  ! {complaint}");
     }
 }

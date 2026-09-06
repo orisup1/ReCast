@@ -77,8 +77,7 @@ fn parse_freq_file(text: &str) -> HashMap<String, u64> {
         if let Some((word, count)) = line.split_once('\t') {
             if let Ok(count) = count.trim().parse::<u64>() {
                 let word = word.trim().to_lowercase();
-                if !word.is_empty()
-                    && (map.len() < MAX_PERSONAL_ENTRIES || map.contains_key(&word))
+                if !word.is_empty() && (map.len() < MAX_PERSONAL_ENTRIES || map.contains_key(&word))
                 {
                     map.insert(word, count);
                 }
@@ -241,17 +240,10 @@ pub fn record_confusion(typed: &str, corrected: &str) {
             .is_some_and(|corrections| corrections.contains_key(&corrected));
         // ponytail: this O(n) count runs only for a new correction pair; keep a
         // separate counter if adding pairs at the 5,000-entry ceiling is hot.
-        if !known
-            && map.values().map(HashMap::len).sum::<usize>() >= MAX_PERSONAL_ENTRIES
-        {
+        if !known && map.values().map(HashMap::len).sum::<usize>() >= MAX_PERSONAL_ENTRIES {
             return;
         }
-        increment(
-            map.entry(typed)
-                .or_default()
-                .entry(corrected)
-                .or_insert(0),
-        );
+        increment(map.entry(typed).or_default().entry(corrected).or_insert(0));
         drop(map);
         maybe_flush_confusions();
     }
@@ -278,8 +270,7 @@ pub fn personal_correction(typed: &str) -> Option<String> {
 fn maybe_flush_confusions() {
     static CONFUSIONS_SINCE_FLUSH: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
-    let count =
-        CONFUSIONS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let count = CONFUSIONS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if count >= FLUSH_AFTER_WORDS {
         flush_confusions();
         CONFUSIONS_SINCE_FLUSH.store(0, std::sync::atomic::Ordering::Relaxed);

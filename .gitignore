@@ -1,11 +1,8 @@
 # Rust build artifacts
 /target
 
-# macOS distributables built from exec/ReCast.app. The bundle itself is a
-# tracked artifact (see the Binaries workflow); the .dmg and .zip wrapped
-# around it are ~16 MB of packaging that git would keep forever, per refresh.
-/exec/*.dmg
-/exec/*.zip
+# Legacy binary output (bundles now live under target/bundle).
+/exec/
 
 # Local notes / scratch
 /info.md

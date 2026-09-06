@@ -12,6 +12,13 @@
 
 pub mod engine;
 
+/// Start workers only after Linux has forked: other threads do not survive fork.
+fn start_background_tasks() {
+    crate::complete::spawn_watcher();
+    crate::layout::spawn_watcher();
+    crate::personal::init();
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod textkeys;
 

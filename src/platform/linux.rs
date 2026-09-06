@@ -188,6 +188,15 @@ pub fn start(
         std::process::exit(1);
     }
 
+    // Under systemd (Type=simple), keep the PID the service manager tracks.
+    // Fork before starting workers; otherwise their threads disappear and
+    // their locks may remain held forever in the child.
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    if !with_window && !with_gui && !with_foreground && !under_systemd {
+        crate::daemon::daemonize();
+    }
+    super::start_background_tasks();
+
     if with_window {
         // Control window: eframe owns the main thread, listener runs in the
         // background.
@@ -209,14 +218,6 @@ pub fn start(
             eprintln!("TUI error: {e}");
         }
         return;
-    }
-    // Daemonize (fork, setsid, detach stdio) unless asked to stay in the
-    // foreground. Under systemd (Type=simple) the service manager tracks our
-    // PID, so forking would make the unit see the service as dead —
-    // INVOCATION_ID is set by systemd and disables the fork automatically.
-    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
-    if !with_foreground && !under_systemd {
-        crate::daemon::daemonize();
     }
     if let Err(e) = crate::daemon::write_pidfile() {
         eprintln!("Failed to write pidfile: {e}");
@@ -351,21 +352,22 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
     }
 }
 
-fn emit_paced(injector: &Arc<Mutex<VirtualDevice>>, evs: &[evdev::InputEvent], gap: Duration) {
-    let Ok(mut dev) = injector.lock() else {
-        return;
-    };
+fn emit_paced(
+    injector: &Arc<Mutex<VirtualDevice>>,
+    evs: &[evdev::InputEvent],
+    gap: Duration,
+) -> Option<()> {
+    let mut dev = injector.lock().ok()?;
     let mut chunks = evs.chunks(crate::timing::EVENTS_PER_WRITE).peekable();
     while let Some(chunk) = chunks.next() {
-        if dev.emit(chunk).is_err() {
-            return;
-        }
+        dev.emit(chunk).ok()?;
         // Only *between* writes. A gap after the last one would delay nothing
         // but the release of the injector lock.
         if chunks.peek().is_some() {
             crate::timing::pause(gap);
         }
     }
+    Some(())
 }
 
 fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<Vec<Typed>> {
@@ -481,7 +483,7 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     if !engine.replacement_valid(generation) {
         return None;
     }
-    emit_paced(&engine.injector, &evs, gaps.batch_gap);
+    emit_paced(&engine.injector, &evs, gaps.batch_gap)?;
 
     Some(buffered)
 }

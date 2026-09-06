@@ -1,6 +1,6 @@
 # Build the downloadable binaries and attach them to a GitHub Release.
 #
-# These used to be committed into `exec/`, which meant every refresh added
+# These used to be committed into Git, which meant every refresh added
 # ~45 MB to the repository *permanently* — git history cannot be made smaller
 # after the fact, so a download nobody keeps forever was being kept forever.
 # Release assets live outside the object database and can be replaced or
@@ -33,14 +33,19 @@ env:
 
 jobs:
   quality:
-    name: Tests and lints
-    runs-on: ubuntu-latest
+    name: Tests and lints (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -49,8 +54,8 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libgl1-mesa-dev
       - run: cargo fmt --check
-      - run: cargo test
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   # ───────────────────────────────────────────────────────────────────────────
   # Build each artifact on its own OS. No cache: what ships should come from a
@@ -74,7 +79,7 @@ jobs:
             libgl1-mesa-dev
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - uses: actions/upload-artifact@v4
         with:
@@ -119,8 +124,8 @@ jobs:
       # Intel Mac. Both slices cost one extra compile and one `lipo`.
       - name: Build both architectures
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
 
       - name: Merge into a universal binary
         run: |
@@ -142,7 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           make bundle
-          install -m 755 recastMac exec/ReCast.app/Contents/MacOS/recast
+          install -m 755 recastMac target/bundle/ReCast.app/Contents/MacOS/recast
           # Signing has to happen *after* the universal binary replaces the one
           # `make bundle` staged and signed, and before the zip: a signature
           # covers the bundle's contents, so swapping the executable under it
@@ -163,14 +168,14 @@ jobs:
           # arrives as a folder and loses the executable bit. `ditto` keeps the
           # macOS metadata that makes it launchable — and the _CodeSignature
           # directory the signature lives in.
-          ditto -c -k --sequesterRsrc --keepParent exec/ReCast.app ReCast.app.zip
+          ditto -c -k --sequesterRsrc --keepParent target/bundle/ReCast.app ReCast.app.zip
           if [[ -n "$MACOS_SIGNING_IDENTITY" && -n "$APPLE_ID" && \
                 -n "$APPLE_TEAM_ID" && -n "$APPLE_APP_PASSWORD" ]]; then
             xcrun notarytool submit ReCast.app.zip --apple-id "$APPLE_ID" \
               --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
-            xcrun stapler staple exec/ReCast.app
+            xcrun stapler staple target/bundle/ReCast.app
             ditto -c -k --sequesterRsrc --keepParent \
-              exec/ReCast.app ReCast.app.notarized.zip
+              target/bundle/ReCast.app ReCast.app.notarized.zip
             mv ReCast.app.notarized.zip ReCast.app.zip
           else
             echo "Notarization secrets are incomplete; publishing the signed/ad-hoc build."
@@ -202,7 +207,10 @@ jobs:
       - name: Build
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release
+        run: |
+          cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --test cli
 
       - name: Authenticode sign
         shell: pwsh
@@ -283,6 +291,13 @@ jobs:
           set -euo pipefail
           draft_flag=""
           if [ "$DRAFT" = "true" ]; then draft_flag="--draft"; fi
+          git fetch --tags origin
+          if tagged_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}" 2>/dev/null); then
+            if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+              echo "Tag $TAG points to $tagged_commit, but these assets were built from $GITHUB_SHA." >&2
+              exit 1
+            fi
+          fi
           # `create` fails if the tag already has a release, so an existing one
           # is updated in place instead — re-running after a failed build
           # replaces the assets rather than erroring out.
@@ -292,6 +307,7 @@ jobs:
             gh release create "$TAG" dist/* \
               $draft_flag \
               --title "$TAG" \
+              --target "$GITHUB_SHA" \
               --notes "Built by the Binaries workflow from ${GITHUB_SHA}.
           macOS assets are universal (arm64 + x86_64)."
           fi

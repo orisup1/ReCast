@@ -2,7 +2,7 @@
 #
 # Build ReCast and install it into /Applications as a .app bundle.
 #
-# The bundle in exec/ is scratch space, not a committed artifact: `make bundle`
+# The bundle in target/bundle/ is scratch space, not a committed artifact: `make bundle`
 # assembles it from the release binary, an Info.plist generated from Cargo.toml
 # and assets/recast.icns. This script builds it and puts the result where macOS
 # expects to find it.
@@ -34,12 +34,12 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SRC_BUNDLE="$REPO_ROOT/exec/$APP_NAME"
+SRC_BUNDLE="$REPO_ROOT/target/bundle/$APP_NAME"
 BINARY="$REPO_ROOT/target/release/recast"
 
 # ─── 2. Build the bundle ─────────────────────────────────────────────────────
 # `make bundle` builds the release binary and assembles the whole .app around
-# it — executable, Info.plist, icon. Nothing here assumes exec/ already holds
+# it — executable, Info.plist, icon. Nothing here assumes target/bundle/ already holds
 # anything, because since the binaries were untracked it usually does not.
 echo "==> Building (release) and assembling the bundle"
 make -C "$REPO_ROOT" bundle

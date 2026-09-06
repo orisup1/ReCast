@@ -457,6 +457,7 @@ impl Drop for EventTapHandle {
 /// the main thread to the menubar tray. Keeping it here means changes to the
 /// macOS launch path can't touch the Linux or Windows paths.
 pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
+    super::start_background_tasks();
     // The event tap must live on the main run loop (see `setup_event_tap`), so
     // a main-thread TUI can't coexist with it — the tray is the UI here.
     if with_gui {

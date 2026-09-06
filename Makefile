@@ -60,11 +60,11 @@ INSTALL ?= install
 # [package] table can't match.
 VERSION := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
 
-# macOS .app bundle: a committed artifact, but its Info.plist is generated so
+# macOS .app bundle: generated build output; its Info.plist is generated so
 # the version in it tracks the crate.
-APP_BUNDLE := exec/ReCast.app
+APP_BUNDLE := target/bundle/ReCast.app
 APP_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
-APP_ZIP    := exec/ReCast.app.zip
+APP_ZIP    := target/bundle/ReCast.app.zip
 CODESIGN_ID ?= -
 NOTARY_PROFILE ?= recast-notary
 
@@ -241,7 +241,7 @@ sign:
 
 # `ditto` preserves the signature, executable bit, and macOS metadata.
 dist: bundle
-	@mkdir -p exec
+	@mkdir -p target/bundle
 	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(APP_ZIP)
 
 # Store credentials first with:
@@ -255,7 +255,7 @@ notarize: dist
 	ditto -c -k --sequesterRsrc --keepParent $(APP_BUNDLE) $(APP_ZIP).notarized
 	mv $(APP_ZIP).notarized $(APP_ZIP)
 
-# macOS .app: build, restage the bundle in exec/, install it to /Applications
+# macOS .app: build, restage the bundle in target/bundle/, install it to /Applications
 # and reset the TCC grants (macOS keys Input Monitoring and Accessibility to a
 # bundle's signature, so a replaced executable keeps a ticked box and receives
 # nothing). The script refuses to run anywhere but Darwin.
@@ -263,7 +263,7 @@ app:
 	@src/platform/deploy-macos.sh
 
 # Rewrite the .app bundle's Info.plist from Cargo.toml. Run it after a version
-# bump — or before refreshing the committed macOS artifact — so the bundle
+# bump — or before assembling the macOS artifact — so the bundle
 # reports the version the binary inside it was built from.
 bundle-plist:
 	@mkdir -p $(dir $(APP_PLIST))
@@ -304,7 +304,7 @@ help:
 	@echo "  bench              run ignored correction/completion microbenchmarks"
 	@echo "  version            print the version from Cargo.toml"
 	@echo "  bundle-plist       regenerate the .app Info.plist from that version"
-	@echo "  bundle             assemble and sign exec/ReCast.app"
+	@echo "  bundle             assemble and sign target/bundle/ReCast.app"
 	@echo "  sign               sign the assembled app (CODESIGN_ID=- by default)"
 	@echo "  dist               package the app with ditto"
 	@echo "  notarize           notarize and staple dist (requires real signing)"

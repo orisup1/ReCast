@@ -78,7 +78,7 @@ pub fn attach_parent_console() {
     use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
     use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-    use winapi::um::processenv::SetStdHandle;
+    use winapi::um::processenv::{GetStdHandle, SetStdHandle};
     use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
     use winapi::um::wincon::{
         AttachConsole, ATTACH_PARENT_PROCESS, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
@@ -93,6 +93,10 @@ pub fn attach_parent_console() {
     };
 
     unsafe {
+        // Preserve pipes/files supplied by a CLI caller before attaching.
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        let stderr = GetStdHandle(STD_ERROR_HANDLE);
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             // No parent console to attach to (Explorer / Scheduled Task launch),
             // or one is already attached (debug build): leave stdio as-is.
@@ -112,8 +116,16 @@ pub fn attach_parent_console() {
             ptr::null_mut(),
         );
         if conout != INVALID_HANDLE_VALUE {
-            SetStdHandle(STD_OUTPUT_HANDLE, conout);
-            SetStdHandle(STD_ERROR_HANDLE, conout);
+            for (kind, original) in [(STD_OUTPUT_HANDLE, stdout), (STD_ERROR_HANDLE, stderr)] {
+                SetStdHandle(
+                    kind,
+                    if original.is_null() || original == INVALID_HANDLE_VALUE {
+                        conout
+                    } else {
+                        original
+                    },
+                );
+            }
             // Turn on ANSI escape interpretation so the banner's colors show as
             // colors rather than raw `\x1b[` gibberish.
             let mut mode = 0u32;
@@ -132,7 +144,14 @@ pub fn attach_parent_console() {
             ptr::null_mut(),
         );
         if conin != INVALID_HANDLE_VALUE {
-            SetStdHandle(STD_INPUT_HANDLE, conin);
+            SetStdHandle(
+                STD_INPUT_HANDLE,
+                if stdin.is_null() || stdin == INVALID_HANDLE_VALUE {
+                    conin
+                } else {
+                    stdin
+                },
+            );
         }
     }
 }
@@ -142,6 +161,7 @@ pub fn attach_parent_console() {
 /// main thread to the tray (or the TUI with `--gui`). Keeping it here means
 /// changes to the Windows launch path can't touch the Linux or macOS paths.
 pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
+    super::start_background_tasks();
     if with_gui {
         let listener_control = Arc::clone(&control);
         thread::spawn(move || {
@@ -290,10 +310,28 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
     Some(buf)
 }
 fn vk_of(key: Key) -> Option<u16> {
+    use winapi::um::winuser::{
+        VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
+        VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS,
+    };
     match key {
         Key::Space => Some(VK_SPACE as u16),
         Key::Return => Some(VK_RETURN as u16),
-        other => textkeys::english_char_plain(other).map(|c| c.to_ascii_uppercase() as u16),
+        other => Some(match textkeys::english_char_plain(other)? {
+            ';' => VK_OEM_1 as u16,
+            '/' => VK_OEM_2 as u16,
+            '`' => VK_OEM_3 as u16,
+            '[' => VK_OEM_4 as u16,
+            '\\' => VK_OEM_5 as u16,
+            ']' => VK_OEM_6 as u16,
+            '\'' => VK_OEM_7 as u16,
+            ',' => VK_OEM_COMMA as u16,
+            '-' => VK_OEM_MINUS as u16,
+            '.' => VK_OEM_PERIOD as u16,
+            '=' => VK_OEM_PLUS as u16,
+            c if c.is_ascii_alphanumeric() => c.to_ascii_uppercase() as u16,
+            _ => return None,
+        }),
     }
 }
 
@@ -306,5 +344,30 @@ fn focused_target() -> Option<Focus> {
         // Thread zero asks about the foreground queue, not our tray thread.
         (GetGUIThreadInfo(0, &mut info) != 0 && !info.hwndFocus.is_null())
             .then_some(info.hwndFocus as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn buffered_punctuation_uses_virtual_keys_not_ascii_control_codes() {
+        for (text, expected) in [
+            (';', 0xba),
+            ('=', 0xbb),
+            (',', 0xbc),
+            ('-', 0xbd),
+            ('.', 0xbe),
+            ('/', 0xbf),
+            ('`', 0xc0),
+            ('[', 0xdb),
+            ('\\', 0xdc),
+            (']', 0xdd),
+            ('\'', 0xde),
+            ('a', 0x41),
+            ('1', 0x31),
+        ] {
+            let (key, _) = crate::keymap::english_char_to_key(text).unwrap();
+            assert_eq!(super::vk_of(key), Some(expected), "{text}");
+        }
     }
 }

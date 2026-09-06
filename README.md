@@ -78,7 +78,7 @@ and creates a `uinput` virtual device named `recast-injector` to replay correcte
 
 1. Install Rust (`rustup`, `cargo`).
 2. Make sure both English and Hebrew layouts are installed in your OS keyboard settings.
-   On Linux/Hyprland the xkb config must list English as layout 0 and Hebrew as layout 1.
+   Layout order does not matter; ReCast looks up English and Hebrew by name.
 
 ### Prebuilt binaries
 
@@ -171,7 +171,7 @@ Writes a launchd LaunchAgent at `~/Library/LaunchAgents/org.recast.plist` and st
 make app       # ReCast.app in /Applications
 ```
 
-Builds, restages `exec/ReCast.app` around the fresh binary, installs it to
+Builds, restages `target/bundle/ReCast.app` around the fresh binary, installs it to
 `/Applications` and resets the app's privacy grants (`src/platform/deploy-macos.sh`
 does the work). Use this one if you want ReCast to look like an application rather
 than a background job — "Start at login" in the menubar menu then registers it.
@@ -250,7 +250,7 @@ correction off is a decision about the machine, not about one run of the
 process — and `--status` reports it whether or not anything is running:
 
 ```
-recast 0.7.0
+recast 0.8.0
   running:        yes (pid 4821)
   correction:     enabled
   start at login: yes
@@ -696,22 +696,24 @@ Both cross-targets compile from Linux, and are worth checking before a release s
 neither is exercised by `cargo test`:
 
 ```bash
-cargo check --target x86_64-pc-windows-gnu
-cargo check --target x86_64-apple-darwin
+cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+cargo clippy --target x86_64-apple-darwin --all-targets -- -D warnings
 ```
 
 CI (`.github/workflows/ci.yml`) runs `cargo test`, `cargo clippy -- -D warnings` and a
 release build on Linux, macOS and Windows runners. The shared engine is exercised by
 typing-sequence tests; native builds check each platform’s capture and injection adapter.
 
-It is **started by hand**, from the Actions tab ("Run workflow"): the `push` and
-`pull_request` triggers are commented out at the top of the file, so nothing fires
-automatically. Uncomment those two blocks to turn it back on.
+CI runs automatically on pushes and pull requests, and can also be started from
+the Actions tab. Release CLI smoke tests also exercise Windows GUI-subsystem builds.
+
+For v0.8.0 changes and the remaining native release checks, see [RELEASE.md](RELEASE.md).
 
 ### Release signing
 
 The Binaries workflow always publishes `SHA256SUMS` and refuses a tag that differs from
-`Cargo.toml`. Real signing is enabled by repository secrets. macOS uses
+`Cargo.toml` or an existing tag pointing to a different commit. New tags point to the
+commit that built the assets. Real signing is enabled by repository secrets. macOS uses
 `MACOS_CERTIFICATE` (base64 PKCS#12), `MACOS_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`,
 `MACOS_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD`. Windows
 uses `WINDOWS_CERTIFICATE` (base64 PFX) and `WINDOWS_CERTIFICATE_PASSWORD`. Missing

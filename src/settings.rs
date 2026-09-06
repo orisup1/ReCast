@@ -31,6 +31,7 @@
 //! takes a restart — unlike `abbrev.txt`/`ignore.txt`, which are watched.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -105,7 +106,10 @@ fn parse(text: &str) -> Parsed {
         };
         // Values are scalars, so `#` can only begin the inline explanation
         // used by the generated sample file.
-        let value = value.split_once('#').map_or(value, |(value, _)| value).trim();
+        let value = value
+            .split_once('#')
+            .map_or(value, |(value, _)| value)
+            .trim();
         // Quotes are stripped so `spell = "0"` and `spell = 0` mean the same
         // thing. A TOML string is what an editor's autocomplete will offer, and
         // the difference between the two is not one worth having an opinion
@@ -166,11 +170,7 @@ pub fn get(env_key: &str) -> Option<String> {
 /// key in the file that is not a setting at all (a typo, or a name from an
 /// older version), and a line in the file with no `=` on it. `--status` reads
 /// these out.
-pub fn complaints(
-    numeric_keys: &[&str],
-    boolean_keys: &[&str],
-    all_keys: &[&str],
-) -> Vec<String> {
+pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
 
     for key in numeric_keys {
@@ -295,7 +295,12 @@ pub fn write_sample() -> Result<PathBuf, String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    std::fs::write(&path, sample()).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(sample().as_bytes()))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -355,9 +360,7 @@ spell_min = 5
 
     #[test]
     fn uncommented_sample_values_parse_as_written() {
-        let t = parse(
-            "personal = false # privacy-sensitive\nspell_min = 4 # shortest word\n",
-        );
+        let t = parse("personal = false # privacy-sensitive\nspell_min = 4 # shortest word\n");
         assert_eq!(
             t.settings.get("personal").map(String::as_str),
             Some("false")
