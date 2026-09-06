@@ -15,3 +15,12 @@ yeh
 akuo
 ykrbo
 nauscl
+# Identifiers, paths, scripts and mixed-language tokens.
+user_id
+config.toml
+https://example.com
+helloעולם
+שלוםworld
+שלום
+ועולם
+בבית

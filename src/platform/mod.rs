@@ -10,14 +10,9 @@
 //! engine are single-sourced even though the two remain separate platforms with
 //! separate injection.
 
-// The generic replacement for the three legacy listeners is kept compiling
-// while each OS is migrated independently. It is intentionally dormant until
-// all three startup paths implement its `Platform` contract.
-#[allow(dead_code)]
 pub mod engine;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-#[allow(dead_code)]
 pub mod textkeys;
 
 #[cfg(target_os = "linux")]

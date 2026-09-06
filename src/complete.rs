@@ -456,8 +456,25 @@ pub fn user_path(name: &str) -> Option<std::path::PathBuf> {
 
 /// Where ReCast keeps the user's files — `~/.config/recast` and its
 /// per-OS equivalents.
+#[cfg(not(test))]
 pub fn config_dir() -> Option<std::path::PathBuf> {
     Some(dirs::config_dir()?.join("recast"))
+}
+
+// Tests exercise undo's persistence too; never read or modify the real lists.
+#[cfg(test)]
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    Some(
+        DIR.get_or_init(|| {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!("recast-tests-{}-{unique}", std::process::id()))
+        })
+        .clone(),
+    )
 }
 
 /// The ignore list, read from disk on first use. Behind a `Mutex` rather than

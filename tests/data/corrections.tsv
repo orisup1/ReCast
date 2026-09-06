@@ -1,0 +1,29 @@
+# layout<TAB>English reading<TAB>Hebrew reading<TAB>expected visible text
+# Same physical keys read in both layouts, except explicitly mixed-script tokens.
+# Unchanged expectations protect text; changed expectations measure useful fixes.
+en	hello	יקךךם	hello
+en	github	עןאיונ	github
+en	async	שדטמב	async
+en	user_id	ודקר_ןג	user_id
+en	config.toml	בםמכןעץאםצך	config.toml
+en	https://example.com	יאאפד:..קסשצפךקץבםצ	https://example.com
+en	NASA	משדש	NASA
+en	helloעולם	helloעולם	helloעולם
+he	שלוםworld	שלוםworld	שלוםworld
+he	akuo	שלום	שלום
+he	uguko	ועולם	ועולם
+he	cch,	בבית	בבית
+he	,usv	תודה	תודה
+he	khkv	לילה	לילה
+en	akuo	שלום	שלום
+en	,usv	תודה	תודה
+he	hello	יקךךם	hello
+he	keyboard	לקטנםשרג	keyboard
+en	recieve	רקבןקהק	receive
+en	adress	שגרקדד	address
+en	seperate	דקפקרשאק	separate
+en	becuase	נקבושדק	because
+en	goverment	עםהקרצקמא	government
+en	recieve,	רקבןקהקת	receive,
+en	Recieve!	רקבןקהק!	Receive!
+he	recieve	רקבןקהק	receive

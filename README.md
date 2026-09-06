@@ -17,6 +17,11 @@ merely misspelled gets fixed in place instead — and completes words you are st
   each one so a correction comes back capitalized the way you typed it; resets the buffer on
   cursor / focus-shifting keys (Tab, Escape, arrows, Home/End, PgUp/PgDn, Insert, Delete)
   and on mouse clicks (macOS / Windows).
+- **Backspace does not suspend correction.** Partial deletion, full deletion,
+  repeated Backspaces, and word-delete shortcuts leave correction enabled. A pending
+  rewrite is canceled if deletion makes its erase count stale. Navigation, forward
+  Delete, and other shortcuts still pause correction until Space or Enter (or until
+  macOS confirms an empty input field).
 - When you press Space or Enter, it interprets the typed key sequence as both an English
   and a Hebrew word and looks each up in the matching dictionary.
 - **Punctuation is not part of the word.** A word you finished with `.`, `,`, `?`, `)` or
@@ -48,6 +53,15 @@ merely misspelled gets fixed in place instead — and completes words you are st
 - Missing-space splitting (carving `helloעולם` into two words) is **opt-in** via
   `RECAST_SPLIT=1`; it is off by default because it cannot reliably tell a word we simply
   don't have in the dictionary from two run-together words.
+
+Pending corrections are canceled when a shortcut, navigation key, backspace or mouse
+click makes their erase count unreliable. ReCast also compares the focused target before
+rewriting: the accessibility element on macOS, focused control on Windows, and window
+identity on Hyprland, Sway and X11. macOS/Windows decline the rewrite if focus cannot be
+queried. GNOME/KDE Wayland currently use input-event cancellation only. These checks
+cannot make global input injection atomic with focus changes; a change during an OS
+write can still interrupt a replacement. Canceled replacements do not arm undo or learn
+an accepted correction.
 
 ## Supported platforms
 
@@ -222,6 +236,11 @@ corrections themselves as they happen; `e`/`Space` toggles correction on and
 off, `p` pauses it for half an hour, `r` re-reads your files, `q` quits. The
 control window (`-w`) offers the toggle and counters in a tiny GUI window. On
 macOS use the menubar menu instead.
+
+The macOS/Windows tray offers **Open settings** and **Open ignored words**. These
+open `config.toml` and `ignore.txt` in the default text editor, creating a missing file
+without overwriting edits. Windows falls back to Notepad if the file has no association.
+Settings changes take a restart; ignored-word edits are picked up automatically.
 
 Both are **foreground** modes: quitting the dashboard or closing the window ends
 ReCast with it. Install the service if you want it to outlive the window.
@@ -644,7 +663,8 @@ makes sure of it.
 
 ```bash
 cargo build --release     # or `make` — release is the meaningful profile (LTO + strip)
-cargo test                # pure suite: dictionaries, speller, completer, keymaps, counters
+cargo test                # dictionaries, typing sequences, speller, completer, keymaps
+cargo test correction_accuracy_corpus -- --nocapture  # unwanted/missed/wrong corrections
 cargo clippy --all-targets -- -D warnings
 make bench                # opt-in correction/completion microbenchmarks
 RECAST_DEBUG=1 cargo run  # log every word check and switch decision
@@ -656,10 +676,21 @@ speller, with its confusion table in `src/spell/rules.rs`) and `src/complete.rs`
 abbreviations, the ignore and undo lists, and the watcher that reloads them).
 `src/types.rs` holds the shared counters and the corrections history the UIs read,
 `src/prefs.rs` the state kept between runs, and `src/notify.rs` the one-time hint.
+`src/platform/engine.rs` owns the live typing buffer, shortcuts, language history,
+completion cycling and undo on all three platforms. Tests drive it against a simulated
+screen and hold pending injection until a click, shortcut, backspace or focus change
+has had a chance to cancel it. Test lists live in a temporary directory.
 Only capture and injection are per-OS, in
 `src/platform/{linux,macos,windows}.rs`, and each of those owns its entire startup path.
 The word lists are preprocessed by `build.rs` into sorted blobs the binary embeds, so
 there is nothing to install alongside the executable.
+
+`tests/data/corrections.tsv` lists the live layout, both keyboard readings, and the
+expected visible result. It covers Hebrew, mixed-script tokens, identifiers, spelling,
+layout fixes and punctuation. Its test reports unwanted changes separately from missed
+and wrong corrections. Add real reports to this file; the small corpus is a regression
+check, not an estimate of accuracy for all typing. `false_positives.txt` adds protection
+cases for the speller alone.
 
 Both cross-targets compile from Linux, and are worth checking before a release since
 neither is exercised by `cargo test`:
@@ -670,10 +701,8 @@ cargo check --target x86_64-apple-darwin
 ```
 
 CI (`.github/workflows/ci.yml`) runs `cargo test`, `cargo clippy -- -D warnings` and a
-release build on Linux, macOS and Windows runners. The three platform modules are
-near-identical copies that nothing keeps in step, so a change made in one and forgotten in
-the other two is the most likely regression here — building each on its own OS is what
-catches it.
+release build on Linux, macOS and Windows runners. The shared engine is exercised by
+typing-sequence tests; native builds check each platform’s capture and injection adapter.
 
 It is **started by hand**, from the Actions tab ("Run workflow"): the `push` and
 `pull_request` triggers are commented out at the top of the file, so nothing fires

@@ -31,7 +31,7 @@
 //!   than left implicit: [`Platform::DEDUP_WINDOW`] and
 //!   [`Platform::ABORT_UNDO_IF_LAYOUT_REFUSED`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -79,6 +79,25 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// Whatever injection needs a handle to: the `uinput` device on Linux, the
     /// re-entry gate on macOS and Windows.
     type Injector: Send + Sync + 'static;
+    type Focus: PartialEq + Send + Sync + 'static;
+
+    /// Stable identity of the focused target, without reading its text.
+    /// None where the desktop cannot expose focus; input events still cancel.
+    fn focus() -> Option<Self::Focus>;
+    fn current_layout() -> Option<Language> {
+        crate::layout::current_layout()
+    }
+    fn switch_layout_to(lang: Language) -> crate::layout::LayoutSwitch {
+        crate::layout::switch_layout_to(lang)
+    }
+    const REQUIRES_FOCUS: bool = false;
+    fn input_allowed() -> bool {
+        true
+    }
+    /// Confirm an empty text field; unavailable context must remain suppressed.
+    fn input_empty(_: &Self::Injector) -> bool {
+        false
+    }
 
     // ── the keys the state machine names ────────────────────────────────────
 
@@ -165,7 +184,11 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// Returns those replayed keys, which the shared caller needs: keys typed
     /// during a replacement have moved the cursor on, and undo erases backwards
     /// from the cursor.
-    fn inject(engine: &Engine<Self>, plan: Plan<Self>) -> Vec<Typed<Self::Key>>;
+    fn inject(
+        engine: &Engine<Self>,
+        plan: Plan<Self>,
+        generation: u64,
+    ) -> Option<Vec<Typed<Self::Key>>>;
 
     /// The re-entry gate, when this platform has one. macOS and Windows filter
     /// their own injected events with an atomic flag; Linux filters by device
@@ -326,15 +349,10 @@ pub struct AppState<P: Platform> {
     /// read where [`Platform::DEDUP_WINDOW`] is set, which is Linux.
     last_key: Option<P::Key>,
     last_key_at: Instant,
-    /// Per-key press times for dwell time recording.
-    key_press_times: HashMap<P::Key, Instant>,
-    /// Whether the next finished word should skip auto-correction. Set when
-    /// cursor movement happens mid-word, a chorded shortcut fires, or the user
-    /// backspaces into a just-fixed word. Cleared after the next terminator.
+    /// Incremented whenever the cursor or text can no longer be trusted.
+    generation: u64,
+    focus: Option<P::Focus>,
     no_fix: bool,
-    /// True when the user is editing a word that was just fixed (backspace with
-    /// empty buffer right after a fix). Used to record a rejection for learning.
-    editing_fixed_word: bool,
 }
 
 impl<P: Platform> AppState<P> {
@@ -354,9 +372,9 @@ impl<P: Platform> AppState<P> {
             history: History::default(),
             last_key: None,
             last_key_at: Instant::now(),
-            key_press_times: HashMap::new(),
+            generation: 0,
+            focus: None,
             no_fix: false,
-            editing_fixed_word: false,
         }
     }
 
@@ -408,7 +426,14 @@ impl<P: Platform> AppState<P> {
         self.last_action = None;
         self.cycle = None;
         self.last_ctrl_tap = None;
-        self.editing_fixed_word = false;
+    }
+    fn invalidate_text(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.keys.clear();
+        self.buffered_keys.clear();
+        self.forget_gestures();
+        self.history.clear();
+        self.no_fix = true;
     }
 }
 
@@ -498,40 +523,34 @@ impl<P: Platform> Engine<P> {
         self.lock().buffered_keys.to_vec()
     }
 
-    /// Drop everything: the word in progress and both gestures.
-    ///
-    /// macOS calls this when a password field takes focus. Clearing rather than
-    /// merely skipping matters — the buffer may hold the start of a word typed
-    /// a moment before the field took focus, and that half-word must not be
-    /// joined to what is typed into it, nor still be sitting there to be
-    /// corrected when focus comes back.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Cancel pending work and discard text whose cursor is no longer known.
     pub fn forget_everything(&self) {
-        let mut st = self.lock();
-        st.keys.clear();
-        st.last_action = None;
-        st.cycle = None;
-        st.history.clear();
+        self.lock().invalidate_text();
     }
 
-    /// A mouse button went down. The cursor can now be anywhere, so the word in
-    /// progress is over and neither gesture is describing the text in front of
-    /// it any more — and undo erases backwards from wherever the cursor now is.
-    ///
-    /// Linux reaches this through [`Platform::is_reset`] instead, because there
-    /// the buttons arrive as ordinary keys on the same evdev stream.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn mouse_click(&self) {
+        self.forget_everything();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn caps_lock_changed(&self, on: bool) {
         let mut st = self.lock();
+        st.caps_lock = on;
         if st.is_replacing {
-            st.buffered_keys.clear();
-        } else {
-            st.keys.clear();
+            st.invalidate_text();
         }
-        st.forget_gestures();
-        // The language run is a claim about the text being written here, and
-        // after a click "here" is somewhere else.
-        st.history.clear();
+        crate::layout::invalidate();
+    }
+
+    /// Called after waits and immediately before destructive injection.
+    pub fn replacement_valid(&self, generation: u64) -> bool {
+        if !self.control.is_enabled() || !P::input_allowed() {
+            return false;
+        }
+        let focus = P::focus();
+        let st = self.lock();
+        st.generation == generation && st.focus == focus && (!P::REQUIRES_FOCUS || focus.is_some())
     }
 
     // ── capture ─────────────────────────────────────────────────────────────
@@ -550,9 +569,6 @@ impl<P: Platform> Engine<P> {
         st.last_key_at = Instant::now();
         st.last_key = Some(key);
 
-        // Record press time for dwell time calculation on release.
-        st.key_press_times.insert(key, Instant::now());
-
         // Check for chorded shortcut BEFORE inserting the key into held_keys:
         // if a non-modifier key is pressed while a modifier (Ctrl/Alt/Super,
         // not Shift) is already held, the user is invoking a shortcut that may
@@ -560,10 +576,9 @@ impl<P: Platform> Engine<P> {
         // matches what's on screen, so suppress the next correction.
         let is_modifier_key = P::is_modifier(key);
         let is_shift = key == P::SHIFT_LEFT || key == P::SHIFT_RIGHT;
-        let other_modifier_held = st
-            .held_keys
-            .iter()
-            .any(|&k| P::is_modifier(k) && k != P::SHIFT_LEFT && k != P::SHIFT_RIGHT);
+        let other_modifier_held = st.held_keys.iter().any(|&k| {
+            P::is_modifier(k) && k != P::SHIFT_LEFT && k != P::SHIFT_RIGHT && k != P::CAPS_LOCK
+        });
         let chorded_shortcut = !is_modifier_key && !is_shift && other_modifier_held;
 
         st.held_keys.insert(key);
@@ -576,12 +591,12 @@ impl<P: Platform> Engine<P> {
         }
         // Any key other than Right Shift itself means the shift is being *held*
         // for something, not tapped, so it is no longer a completion request.
-        st.right_shift_tap = key == P::SHIFT_RIGHT;
+        st.right_shift_tap = key == P::SHIFT_RIGHT && st.held_keys.len() == 1;
         // Same idea for Ctrl, which is the undo gesture: a Ctrl with another
         // key on top of it is a shortcut, and only a bare press/release pair is
         // a tap.
         let is_ctrl = key == P::CTRL_LEFT || key == P::CTRL_RIGHT;
-        st.ctrl_down = is_ctrl.then(Instant::now);
+        st.ctrl_down = (is_ctrl && st.held_keys.len() == 1).then(Instant::now);
         if !is_ctrl && key != P::SHIFT_RIGHT {
             st.forget_gestures();
         }
@@ -592,46 +607,35 @@ impl<P: Platform> Engine<P> {
         let key_name = format!("{:?}", key);
         crate::personal::record_key_press(&key_name);
 
-        if P::is_terminator(key) {
-            self.word_finished(st, key, shift);
-        } else if key == P::BACKSPACE {
-            // Post-fix edit detection: if buffer is empty and the last action
-            // was a fix, the user is backspacing into the corrected word.
-            if !st.is_replacing && st.keys.is_empty() {
-                if let Some(crate::platform::engine::LastAction::Fixed(_)) = &st.last_action {
-                    st.editing_fixed_word = true;
-                    st.no_fix = true;
-                }
-            }
-            if st.is_replacing {
-                st.buffered_keys.pop();
+        // On backends that identify their own events, a real key arriving
+        // during injection invalidates the snapshot already being erased.
+        let during_injection = P::injecting_flag(&self.injector)
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        if key == P::BACKSPACE {
+            // Deletion cancels a stale rewrite, but never starts suppression.
+            if during_injection || st.is_replacing || chorded_shortcut || st.focus != P::focus() {
+                let no_fix = st.no_fix;
+                st.invalidate_text();
+                st.no_fix = no_fix;
             } else {
                 st.keys.pop();
             }
-        } else if P::is_reset(key) {
-            // Cursor movement mid-word: the buffer no longer reflects what's on
-            // screen, so suppress correction for the next word.
-            if !st.is_replacing && !st.keys.is_empty() {
+        } else if during_injection || chorded_shortcut || P::is_reset(key) {
+            st.invalidate_text();
+        } else if P::is_terminator(key) {
+            self.word_finished(st, key, shift);
+        } else if P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some() {
+            if st.keys.is_empty() && !st.is_replacing {
+                st.focus = P::focus();
+                if st.no_fix && P::input_empty(&self.injector) {
+                    st.no_fix = false;
+                }
+            }
+            st.push_key(Typed { key, shift });
+            if !st.is_replacing && st.keys.is_empty() {
+                // The word buffer gave up on an overlong token.
                 st.no_fix = true;
             }
-            if st.is_replacing {
-                st.buffered_keys.clear();
-            } else {
-                st.keys.clear();
-            }
-            // These are the keys that move the cursor or the focus — the same
-            // reason the word buffer is dropped is the reason the run is: what
-            // comes next is not a continuation of what came before.
-            st.history.clear();
-        } else if chorded_shortcut {
-            // Shortcut that may have changed the text (paste, select, undo...).
-            // Clear the buffer and suppress the next correction.
-            if !st.is_replacing {
-                st.keys.clear();
-            }
-            st.no_fix = true;
-        } else if P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some() {
-            st.push_key(Typed { key, shift });
         }
     }
 
@@ -647,31 +651,20 @@ impl<P: Platform> Engine<P> {
             st.buffered_keys.push(Typed { key, shift });
             return;
         }
+        if std::mem::take(&mut st.no_fix) || !self.control.is_enabled() {
+            st.keys.clear();
+            return;
+        }
         if st.keys.is_empty() {
             return;
         }
-        if !self.control.is_enabled() {
-            st.keys.clear();
-            return;
-        }
-
-        // If no_fix is set, the buffer is unreliable (cursor movement,
-        // chorded shortcut, or post-fix edit). Skip auto-correction but still
-        // record the word to personal frequency for learning.
-        if st.no_fix {
-            let typed =
-                crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
-            crate::personal::record_word(&typed);
-            // If the user was editing a just-fixed word, record the rejection
-            // so we learn not to correct it again.
-            if st.editing_fixed_word {
-                if let Some(crate::platform::engine::LastAction::Fixed(fix)) = &st.last_action {
-                    crate::complete::learn(&fix.suppress.clone().unwrap_or_default());
-                }
-            }
-            st.keys.clear();
+        if !P::input_allowed()
+            || (P::REQUIRES_FOCUS && st.focus.is_none())
+            || st.focus != P::focus()
+        {
+            st.invalidate_text();
+            // This terminator already ended the untrusted word.
             st.no_fix = false;
-            st.editing_fixed_word = false;
             return;
         }
 
@@ -687,11 +680,6 @@ impl<P: Platform> Engine<P> {
         // Describe the fix for the history before `replacement` consumes it.
         let note = result.as_ref().map(|fix| note_of::<P>(&st.keys, fix));
         if let Some(rep) = replacement::<P>(&st.keys, result) {
-            if let Some((from, to, kind)) = &note {
-                self.control.record_fix(from, to, *kind);
-                // Record confusion pair for personal learning.
-                crate::personal::record_confusion(from, to);
-            }
             let undo = undo_of::<P>(&st.keys, &rep, Some(key));
             // +1 for the terminator the user physically typed, which is erased
             // along with the word and pressed again afterwards.
@@ -706,20 +694,21 @@ impl<P: Platform> Engine<P> {
                 },
                 Vec::new(),
                 Some(undo),
+                note.map(|(from, to, kind)| Commit::Fix { from, to, kind }),
             );
             return;
         }
 
-        // No fix applied - record the word to personal frequency.
-        let typed =
-            crate::platform::engine::reading::<P>(&st.keys, crate::types::Language::English);
-        crate::personal::record_word(&typed);
+        if let Some(lang) = outcome.lang {
+            crate::personal::record_word(&reading::<P>(&st.keys, lang));
+        }
 
         if let Some(word) = declined_by_list(
             &st.keys,
             |t: Typed<P::Key>| P::english_char(t.key, t.shift),
             |t: Typed<P::Key>| P::hebrew_char(t.key),
             |t: Typed<P::Key>| t.shift,
+            P::current_layout(),
         ) {
             // Nothing happened to this word, and the only reason is that the
             // user has it listed. Arm the gesture to change their mind about it.
@@ -749,12 +738,7 @@ impl<P: Platform> Engine<P> {
     pub fn key_release(self: &Arc<Self>, key: P::Key) {
         let mut st = self.lock();
 
-        // Record dwell time for typing pattern analysis.
-        if let Some(press_time) = st.key_press_times.remove(&key) {
-            let key_name = format!("{:?}", key);
-            let _ = press_time;
-            crate::personal::record_key_release(&key_name);
-        }
+        crate::personal::record_key_release(&format!("{key:?}"));
 
         st.held_keys.remove(&key);
 
@@ -774,7 +758,14 @@ impl<P: Platform> Engine<P> {
         if key != P::SHIFT_RIGHT || !std::mem::take(&mut st.right_shift_tap) {
             return;
         }
-        if st.is_replacing || !self.control.is_enabled() {
+        if st.is_replacing || st.no_fix || !self.control.is_enabled() {
+            return;
+        }
+        if (P::REQUIRES_FOCUS && st.focus.is_none())
+            || st.focus != P::focus()
+            || !P::input_allowed()
+        {
+            st.invalidate_text();
             return;
         }
         self.completion_tap(st);
@@ -801,6 +792,7 @@ impl<P: Platform> Engine<P> {
                     |t: Typed<P::Key>| P::english_char(t.key, t.shift),
                     |t: Typed<P::Key>| t.shift,
                     self.en_dict,
+                    P::current_layout(),
                 );
                 if candidates.is_empty() {
                     return;
@@ -828,12 +820,17 @@ impl<P: Platform> Engine<P> {
         // the next is still the one fix, and landing back on what the user
         // typed is none at all.
         let was = reading::<P>(&typed, Language::English);
-        if back_to_typed {
-            self.control.record_undo();
+        let commit = if back_to_typed {
+            Some(Commit::Undo { suppress: None })
         } else if index == 0 {
-            self.control
-                .record_fix(&was, &candidates[index], FixKind::Complete);
-        }
+            Some(Commit::Fix {
+                from: was.clone(),
+                to: candidates[index].clone(),
+                kind: FixKind::Complete,
+            })
+        } else {
+            None
+        };
 
         // The buffer has to end up holding what is on screen, or the next Space
         // would check a word the user is no longer looking at.
@@ -871,6 +868,7 @@ impl<P: Platform> Engine<P> {
             },
             keep,
             undo,
+            commit,
         );
     }
 
@@ -907,6 +905,13 @@ impl<P: Platform> Engine<P> {
         if st.is_replacing || !self.control.is_enabled() {
             return;
         }
+        if (P::REQUIRES_FOCUS && st.focus.is_none())
+            || st.focus != P::focus()
+            || !P::input_allowed()
+        {
+            st.invalidate_text();
+            return;
+        }
         match st.last_action.take() {
             Some(LastAction::Fixed(fix)) => self.undo_fix(st, fix),
             Some(LastAction::Skipped(skip)) => self.unlist_and_correct(st, skip),
@@ -923,7 +928,7 @@ impl<P: Platform> Engine<P> {
         // correction. `.ready()`, not a bare bool: "already on that layout" is
         // a reason to carry on, not to abandon the undo.
         if let Some(lang) = fix.layout {
-            let outcome = crate::layout::switch_layout_to(lang);
+            let outcome = P::switch_layout_to(lang);
             if P::ABORT_UNDO_IF_LAYOUT_REFUSED && !outcome.ready() {
                 // Leave the text alone rather than churn it, and leave the word
                 // correctable rather than retire it on the strength of an undo
@@ -931,17 +936,6 @@ impl<P: Platform> Engine<P> {
                 return;
             }
         }
-        // Retire the word before putting it back: a correction is a function of
-        // what was typed, so without this the very next repetition would be
-        // corrected again and undo would be a treadmill.
-        if let Some(word) = &fix.suppress {
-            crate::complete::suppress(word);
-            // …and remember that it happened. Retiring the word for the session
-            // is right for a reflex; doing this twice is a decision, and the
-            // second time it sticks for good (see `complete::learn`).
-            crate::complete::learn(word);
-        }
-        self.control.record_undo();
         st.cycle = None;
         self.start_replacement(
             st,
@@ -953,6 +947,9 @@ impl<P: Platform> Engine<P> {
             fix.keep,
             // Undoing an undo would be a redo, which is a different gesture.
             None,
+            Some(Commit::Undo {
+                suppress: fix.suppress,
+            }),
         );
     }
 
@@ -980,9 +977,6 @@ impl<P: Platform> Engine<P> {
         let Some(rep) = replacement::<P>(&skip.keys, result) else {
             return;
         };
-        if let Some((from, to, kind)) = &note {
-            self.control.record_fix(from, to, *kind);
-        }
         st.cycle = None;
         let erase = rep.erase + usize::from(skip.terminator.is_some());
         self.start_replacement(
@@ -994,6 +988,7 @@ impl<P: Platform> Engine<P> {
             },
             Vec::new(),
             None,
+            note.map(|(from, to, kind)| Commit::Fix { from, to, kind }),
         );
     }
 
@@ -1009,6 +1004,8 @@ impl<P: Platform> Engine<P> {
             run,
             self.en_dict,
             self.he_dict,
+            P::current_layout(),
+            P::switch_layout_to,
         )
     }
 
@@ -1024,11 +1021,13 @@ impl<P: Platform> Engine<P> {
         plan: Plan<P>,
         keep: Vec<Typed<P::Key>>,
         undo: Option<LastFix<P>>,
+        commit: Option<Commit>,
     ) {
+        let generation = st.generation;
         st.is_replacing = true;
         drop(st);
         let engine = Arc::clone(self);
-        thread::spawn(move || engine.replace_word(plan, keep, undo));
+        thread::spawn(move || engine.replace_word(plan, keep, undo, generation, commit));
     }
 
     /// Erase what the user typed and put the replacement in its place.
@@ -1038,15 +1037,53 @@ impl<P: Platform> Engine<P> {
     /// is checked as the word they can see rather than as the tail they added.
     /// `undo` is the payload the Ctrl double-tap would put back, kept only if
     /// the user typed nothing while this was landing.
-    fn replace_word(&self, plan: Plan<P>, keep: Vec<Typed<P::Key>>, undo: Option<LastFix<P>>) {
+    fn replace_word(
+        &self,
+        plan: Plan<P>,
+        keep: Vec<Typed<P::Key>>,
+        undo: Option<LastFix<P>>,
+        generation: u64,
+        commit: Option<Commit>,
+    ) {
         // Armed for the whole replacement: whatever happens below — including a
         // panic — `is_replacing` and the injecting gate are cleared, rather than
         // leaving the listener shut for the rest of the session.
         let _gate = ReplaceGuard::new(&self.state, P::injecting_flag(&self.injector));
 
-        let buffered = P::inject(self, plan);
+        if !self.replacement_valid(generation) {
+            let mut st = self.lock();
+            if st.generation == generation {
+                st.invalidate_text();
+            }
+            return;
+        }
+        let Some(buffered) = P::inject(self, plan, generation) else {
+            let mut st = self.lock();
+            if st.generation == generation {
+                st.invalidate_text();
+            }
+            return;
+        };
+        match commit {
+            Some(Commit::Fix { from, to, kind }) => {
+                self.control.record_fix(&from, &to, kind);
+                crate::personal::record_confusion(&from, &to);
+                crate::personal::record_word(&to);
+            }
+            Some(Commit::Undo { suppress }) => {
+                if let Some(word) = suppress {
+                    crate::complete::suppress(&word);
+                    crate::complete::learn(&word);
+                }
+                self.control.record_undo();
+            }
+            None => {}
+        }
 
         let mut st = self.lock();
+        if st.generation != generation {
+            return;
+        }
         st.keys.replace_with(keep);
         st.keys.extend(buffered.iter().copied());
         // Undo erases backwards from the cursor, so it is only valid while the
@@ -1065,6 +1102,17 @@ impl<P: Platform> Engine<P> {
         // after this lock is dropped — on this path and on a panicking one
         // alike.
     }
+}
+
+enum Commit {
+    Fix {
+        from: String,
+        to: String,
+        kind: FixKind,
+    },
+    Undo {
+        suppress: Option<String>,
+    },
 }
 
 /// What injection is being asked to do.
@@ -1197,4 +1245,396 @@ fn note_of<P: Platform>(keys: &[Typed<P::Key>], fix: &Fix) -> (String, String, F
 
 fn non_empty(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    static FOCUS: AtomicUsize = AtomicUsize::new(1);
+    struct Simulated;
+    struct Screen {
+        text: Mutex<String>,
+        injecting: std::sync::atomic::AtomicBool,
+        ready: mpsc::SyncSender<()>,
+        proceed: Mutex<mpsc::Receiver<()>>,
+    }
+    impl Platform for Simulated {
+        type Key = char;
+        type Retype = String;
+        type Injector = Screen;
+        type Focus = usize;
+        const SHIFT_LEFT: char = '\x01';
+        const SHIFT_RIGHT: char = '\x02';
+        const CTRL_LEFT: char = '\x03';
+        const CTRL_RIGHT: char = '\x04';
+        const CAPS_LOCK: char = '\x05';
+        const BACKSPACE: char = '\x08';
+        fn is_terminator(key: char) -> bool {
+            key == ' ' || key == '\n'
+        }
+        fn is_reset(key: char) -> bool {
+            matches!(key, '\x1b' | '\x10'..='\x14')
+        }
+        fn is_modifier(key: char) -> bool {
+            ('\x01'..='\x05').contains(&key)
+        }
+        fn english_char(key: char, _: bool) -> Option<char> {
+            Self::english_char_plain(key)
+        }
+        fn english_char_plain(key: char) -> Option<char> {
+            (!key.is_control()).then_some(key)
+        }
+        fn hebrew_char(key: char) -> Option<char> {
+            #[cfg(target_os = "linux")]
+            return crate::keymap::english_char_to_evkey_shifted(key)
+                .and_then(|(k, _)| crate::keymap::evkey_to_hebrew_char(k));
+            #[cfg(not(target_os = "linux"))]
+            return crate::keymap::english_char_to_key(key)
+                .and_then(|(k, _)| crate::keymap::key_to_hebrew_char(k));
+        }
+        fn retype_original(keys: &[Typed<char>], lang: Language) -> String {
+            reading::<Self>(keys, lang)
+        }
+        fn retype_layout(_: &[Typed<char>], text: &str, _: Language) -> Option<String> {
+            Some(text.to_string())
+        }
+        fn retype_text(text: &str) -> Option<String> {
+            Some(text.to_string())
+        }
+        fn retype_len(text: &String) -> usize {
+            text.chars().count()
+        }
+        fn buffer_after(text: &String) -> Vec<Typed<char>> {
+            text.chars()
+                .map(|key| Typed { key, shift: false })
+                .collect()
+        }
+        fn injecting_flag(screen: &Screen) -> Option<&std::sync::atomic::AtomicBool> {
+            Some(&screen.injecting)
+        }
+        fn focus() -> Option<usize> {
+            Some(FOCUS.load(Ordering::SeqCst))
+        }
+        fn input_empty(screen: &Screen) -> bool {
+            screen.text.lock().unwrap().is_empty()
+        }
+        fn current_layout() -> Option<Language> {
+            Some(Language::English)
+        }
+        fn switch_layout_to(_: Language) -> crate::layout::LayoutSwitch {
+            panic!("English spelling and undo must not switch layouts");
+        }
+        fn inject(
+            engine: &Engine<Self>,
+            plan: Plan<Self>,
+            generation: u64,
+        ) -> Option<Vec<Typed<char>>> {
+            engine.injector.ready.send(()).unwrap();
+            engine
+                .injector
+                .proceed
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            if !engine.replacement_valid(generation) {
+                return None;
+            }
+            let buffered = engine.buffered();
+            let mut screen = engine.injector.text.lock().unwrap();
+            for _ in 0..plan.erase + buffered.len() {
+                assert!(
+                    screen.pop().is_some(),
+                    "replacement erased beyond the typed text"
+                );
+            }
+            screen.push_str(&plan.retype);
+            if let Some(key) = plan.terminator {
+                screen.push(key);
+            }
+            screen.extend(buffered.iter().map(|t| t.key));
+            Some(buffered)
+        }
+    }
+
+    struct Session {
+        engine: Arc<Engine<Simulated>>,
+        ready: mpsc::Receiver<()>,
+        proceed: mpsc::SyncSender<()>,
+    }
+    impl Session {
+        fn new() -> Self {
+            let (ready_tx, ready) = mpsc::sync_channel(1);
+            let (proceed, proceed_rx) = mpsc::sync_channel(1);
+            let engine = Engine::new(
+                crate::dictionary::en_dict(),
+                crate::dictionary::he_dict(),
+                Arc::new(AppControl::new_for_test()),
+                Screen {
+                    text: Mutex::new(String::new()),
+                    injecting: std::sync::atomic::AtomicBool::new(false),
+                    ready: ready_tx,
+                    proceed: Mutex::new(proceed_rx),
+                },
+            );
+            Self {
+                engine,
+                ready,
+                proceed,
+            }
+        }
+        fn type_text(&self, text: &str) {
+            for key in text.chars() {
+                // Capture runs before the application receives the character.
+                self.engine.key_press(key);
+                self.engine.injector.text.lock().unwrap().push(key);
+                self.engine.key_release(key);
+            }
+        }
+        fn tap(&self, key: char) {
+            self.engine.key_press(key);
+            self.engine.key_release(key);
+        }
+        fn backspace(&self) {
+            self.engine.injector.text.lock().unwrap().pop();
+            self.tap(Simulated::BACKSPACE);
+        }
+        fn pending(&self) {
+            self.ready
+                .recv_timeout(Duration::from_secs(3))
+                .expect("no correction scheduled");
+        }
+        fn finish(&self) {
+            self.proceed.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while self.engine.lock().is_replacing {
+                assert!(Instant::now() < deadline, "replacement did not finish");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn text(&self) -> String {
+            self.engine.injector.text.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn typing_correction_undo_and_interrupted_replacements() {
+        let s = Session::new();
+        s.type_text("keyboad ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyboard ");
+        assert_eq!(s.engine.control.fixed_count(), 1);
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyboad ");
+        assert_eq!(s.engine.control.undo_count(), 1);
+        assert!(crate::complete::suppressed("keyboad"));
+        assert!(s.engine.lock().last_action.is_none());
+
+        // Pause the worker at injection, then move the cursor, paste, edit, or
+        // change focus. None may erase, learn, count a fix, or re-arm undo.
+        for interrupt in 0..6 {
+            let s = Session::new();
+            s.type_text("recieve ");
+            s.pending();
+            match interrupt {
+                0 => s.engine.mouse_click(),
+                1 => s.tap('\x1b'),
+                2 => {
+                    s.engine.key_press(Simulated::CTRL_LEFT);
+                    s.tap('v');
+                    s.engine.key_release(Simulated::CTRL_LEFT);
+                }
+                3 => s.tap(Simulated::BACKSPACE),
+                4 => {
+                    FOCUS.store(2, Ordering::SeqCst);
+                }
+                _ => {
+                    s.engine.injector.injecting.store(true, Ordering::SeqCst);
+                    s.type_text("x");
+                }
+            }
+            s.finish();
+            assert_eq!(
+                s.text(),
+                if interrupt == 5 {
+                    "recieve x"
+                } else {
+                    "recieve "
+                },
+                "interruption {interrupt}"
+            );
+            assert_eq!(s.engine.control.fixed_count(), 0);
+            assert!(s.engine.lock().last_action.is_none());
+            if interrupt == 3 {
+                assert!(!s.engine.lock().no_fix);
+                s.type_text("recieve ");
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), "recieve receive ");
+            }
+            FOCUS.store(1, Ordering::SeqCst);
+        }
+
+        // Shortcut letters and Ctrl+Space are not text or word terminators.
+        let s = Session::new();
+        s.type_text("recie");
+        s.engine.key_press(Simulated::CTRL_LEFT);
+        s.tap('v');
+        s.tap(' ');
+        s.engine.key_release(Simulated::CTRL_LEFT);
+        s.type_text("ve ");
+        assert!(!s.engine.lock().is_replacing);
+        assert!(s.engine.lock().keys.is_empty());
+        // An empty terminator must clear suppression for the following word.
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve receive ");
+
+        // Fast typing is replayed, and undo cannot eat those later keys.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.type_text("next");
+        s.finish();
+        assert_eq!(s.text(), "receive next");
+        assert!(s.engine.lock().last_action.is_none());
+
+        // A programmatic focus change between typing and the terminator is
+        // caught even without a mouse or navigation-key event.
+        let s = Session::new();
+        s.type_text("recieve");
+        FOCUS.store(2, Ordering::SeqCst);
+        s.type_text(" ");
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.text(), "recieve ");
+        FOCUS.store(1, Ordering::SeqCst);
+
+        // Backspacing within a word must not suspend its correction.
+        let s = Session::new();
+        s.type_text("recievex");
+        s.backspace();
+        s.type_text(" ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive ");
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive receive ");
+
+        // Erasing a fully tracked word restores correction immediately.
+        let s = Session::new();
+        s.type_text("bad");
+        for _ in 0..3 {
+            s.backspace();
+        }
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive ");
+
+        // A finished word remains known through its separator and correction.
+        for original in ["old ", "recieve ", "old  ", "old\n"] {
+            let s = Session::new();
+            s.type_text(original);
+            if original == "recieve " {
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), "receive ");
+            }
+            let count = s.text().chars().count();
+            for _ in 0..count {
+                s.backspace();
+            }
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "receive ", "after erasing {original:?}");
+        }
+
+        // Real deletion often includes repeats after the field is already empty.
+        // A click or a delete shortcut also loses context; an empty field is safe.
+        let s = Session::new();
+        s.engine.mouse_click();
+        for _ in 0..3 {
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "receive ");
+            for _ in 0..12 {
+                s.backspace();
+            }
+        }
+        s.type_text("old");
+        s.engine.key_press(Simulated::CTRL_LEFT);
+        s.tap(Simulated::BACKSPACE);
+        s.engine.injector.text.lock().unwrap().clear();
+        s.engine.key_release(Simulated::CTRL_LEFT);
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive ");
+
+        // Arrows and forward delete lose the cursor context. Deleting the
+        // tracked suffix must not make an unknown word safe to rewrite.
+        for reset in '\x10'..='\x14' {
+            let s = Session::new();
+            s.type_text("old ");
+            s.tap(reset);
+            s.type_text("x");
+            s.backspace();
+            s.type_text("recieve");
+            s.tap(Simulated::SHIFT_RIGHT);
+            assert!(!s.engine.lock().is_replacing);
+            s.type_text(" ");
+            assert!(!s.engine.lock().is_replacing);
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "old recieve receive ");
+        }
+
+        // Backspacing into a finished word does not suspend subsequent typing.
+        let s = Session::new();
+        s.type_text("old ");
+        s.backspace();
+        s.backspace();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "olreceive receive ");
+
+        // Explicit completion still works on a fully tracked, edited prefix.
+        let s = Session::new();
+        s.type_text("helx");
+        s.backspace();
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert!(s.text().starts_with("hel") && s.text().len() > 3);
+        let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
+        for _ in 0..count {
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+        }
+        assert_eq!(
+            s.text(),
+            "hel",
+            "completion cycle restores the exact prefix"
+        );
+    }
 }

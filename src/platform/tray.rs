@@ -70,6 +70,8 @@ pub fn run(control: Arc<AppControl>) {
     // about. Rebuilt with the labels on every refresh.
     let mut recent_words: Vec<String> = vec![String::new(); RECENT_SLOTS];
 
+    let settings_item = MenuItem::new("Open settings", true, None);
+    let ignored_item = MenuItem::new("Open ignored words", true, None);
     let reload_item = MenuItem::new("Reload lists", true, None);
     // Only offered where it is wired up; elsewhere the item would be a
     // checkbox that does nothing.
@@ -83,6 +85,8 @@ pub fn run(control: Arc<AppControl>) {
     menu.append(&pause_item).expect("append pause");
     menu.append(&sep).expect("append separator");
     menu.append(&recent_menu).expect("append recent");
+    menu.append(&settings_item).expect("append settings");
+    menu.append(&ignored_item).expect("append ignored words");
     menu.append(&reload_item).expect("append reload");
     if let Some(item) = &autostart_item {
         menu.append(item).expect("append autostart");
@@ -92,6 +96,8 @@ pub fn run(control: Arc<AppControl>) {
 
     let toggle_id = toggle_item.id().clone();
     let pause_id = pause_item.id().clone();
+    let settings_id = settings_item.id().clone();
+    let ignored_id = ignored_item.id().clone();
     let reload_id = reload_item.id().clone();
     let autostart_id = autostart_item.as_ref().map(|i| i.id().clone());
     let about_id = about_item.id().clone();
@@ -193,6 +199,11 @@ pub fn run(control: Arc<AppControl>) {
                 }
                 pause_item.set_text(pause_label(control.pause_remaining()));
                 let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+            } else if event.id == settings_id || event.id == ignored_id {
+                let name = if event.id == settings_id { "config.toml" } else { "ignore.txt" };
+                if let Err(error) = open_user_file(name) {
+                    crate::notify::notify("Could not open ReCast file", &error.to_string());
+                }
             } else if event.id == reload_id {
                 // The watcher picks edits up on its own within a couple of
                 // seconds; this is for the user who has just saved the file
@@ -394,4 +405,99 @@ const ICON_SIZE: u32 = 32;
 
 fn app_icon() -> Icon {
     Icon::from_rgba(ICON_RGBA.to_vec(), ICON_SIZE, ICON_SIZE).expect("icon build")
+}
+
+/// Create a missing file without truncating an existing user's settings.
+fn prepare_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file.write_all(contents.as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_user_file(name: &str) -> std::io::Result<()> {
+    let path = crate::complete::user_path(name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No config directory available",
+        )
+    })?;
+    let contents = if name == "config.toml" {
+        crate::settings::sample()
+    } else {
+        "# One word per line. Changes are picked up automatically.\n".to_string()
+    };
+    prepare_file(&path, &contents)?;
+    open_text_file(&path)
+}
+
+#[cfg(target_os = "macos")]
+fn open_text_file(path: &std::path::Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("open")
+        .arg("-t")
+        .arg(path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "Text editor exited with {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_text_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::{shellapi::ShellExecuteW, winuser::SW_SHOWNORMAL};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result > 32 {
+        return Ok(());
+    }
+    // A fresh Windows install may have no association for .toml.
+    if result == 31 {
+        let mut child = std::process::Command::new("notepad.exe")
+            .arg(path)
+            .spawn()?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "Windows could not open {} (code {result})",
+        path.display()
+    )))
+}
+
+#[cfg(test)]
+mod file_tests {
+    #[test]
+    fn opening_settings_creates_once_and_preserves_edits() {
+        let dir = std::env::temp_dir().join(format!("recast-editor-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        super::prepare_file(&path, "spell = false\n").unwrap();
+        super::prepare_file(&path, "spell = true\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "spell = false\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -16,7 +16,6 @@ mod blob;
 pub use blob::{en_dict, en_freq, he_dict, he_freq, Dict, Freq};
 
 use crate::config::Config;
-use crate::layout::switch_layout_to;
 use crate::types::Language;
 
 /// Whether to log every word check and switch decision.
@@ -1036,6 +1035,8 @@ pub fn check_and_correct<K: Copy>(
     run: Run,
     en_dict: Dict,
     he_dict: Dict,
+    current: Option<Language>,
+    switch_layout_to: impl Fn(Language) -> crate::layout::LayoutSwitch,
 ) -> Outcome {
     if keys.is_empty() {
         return Outcome {
@@ -1103,7 +1104,6 @@ pub fn check_and_correct<K: Copy>(
     let en = Reading::new(&full_en, word_end_en);
     let he = Reading::new(&full_he, word_end_he);
 
-    let current = crate::layout::current_layout();
     // Track layout query failures for dead-backend detection.
     if current.is_none() {
         crate::layout::record_layout_failure();
@@ -1227,6 +1227,7 @@ pub fn declined_by_list<K: Copy>(
     to_en: impl Fn(K) -> Option<char>,
     to_he: impl Fn(K) -> Option<char>,
     shift_of: impl Fn(K) -> bool,
+    current: Option<Language>,
 ) -> Option<String> {
     if keys.is_empty() {
         return None;
@@ -1252,7 +1253,6 @@ pub fn declined_by_list<K: Copy>(
     }
     // The lists hold words, so they are asked about the word — the same reading
     // `plan` would have checked them against, punctuation set aside.
-    let current = crate::layout::current_layout();
     let typed = match current {
         Some(Language::Hebrew) => &full_he[..word_end_he],
         _ => &full_en[..word_end_en],
@@ -1286,8 +1286,9 @@ pub fn complete_candidates<K: Copy>(
     to_en: impl Fn(K) -> Option<char>,
     shift_of: impl Fn(K) -> bool,
     en_dict: Dict,
+    current: Option<Language>,
 ) -> Vec<String> {
-    if keys.is_empty() || crate::layout::current_layout() != Some(Language::English) {
+    if keys.is_empty() || current != Some(Language::English) {
         return Vec::new();
     }
     let mut prefix = String::with_capacity(keys.len());
@@ -1349,6 +1350,111 @@ mod tests {
     /// Frequency list from `(word, rank)` pairs (rank 0 = most common).
     fn freq(entries: &[(&str, u32)]) -> Freq {
         Freq::of(entries)
+    }
+
+    #[test]
+    fn correction_accuracy_corpus() {
+        // Exercise the planner with explicit layouts: this check never switches
+        // the OS keyboard or depends on whichever layout the developer uses.
+        let mut unchanged = 0;
+        let mut wanted = 0;
+        let mut unwanted = Vec::new();
+        let mut missed = Vec::new();
+        let mut wrong = Vec::new();
+        for (line, row) in include_str!("../tests/data/corrections.tsv")
+            .lines()
+            .enumerate()
+        {
+            if row.is_empty() || row.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<_> = row.split('\t').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "corpus line {} must have four columns",
+                line + 1
+            );
+            let current = match fields[0] {
+                "en" => Language::English,
+                "he" => Language::Hebrew,
+                other => panic!("invalid layout {other}"),
+            };
+            let (en_text, he_text, expected) = (fields[1], fields[2], fields[3]);
+            let before = if current == Language::English {
+                en_text
+            } else {
+                he_text
+            };
+            assert_eq!(
+                en_text.chars().count(),
+                he_text.chars().count(),
+                "corpus line {} has mismatched key counts",
+                line + 1
+            );
+            let keys: Vec<_> = en_text
+                .chars()
+                .zip(he_text.chars())
+                .map(|(en, he)| {
+                    (
+                        en.to_ascii_lowercase(),
+                        he,
+                        en.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(en),
+                    )
+                })
+                .collect();
+            let result = check_and_correct(
+                &keys,
+                |k| Some(k.0),
+                |k| Some(k.1),
+                |k| k.2,
+                Run::default(),
+                en_dict(),
+                he_dict(),
+                Some(current),
+                |_| crate::layout::LayoutSwitch::Switched,
+            );
+            let after = match result.fix {
+                None => before.to_string(),
+                Some(
+                    Fix::Layout { text, start: 0, .. }
+                    | Fix::Spelling { text }
+                    | Fix::LayoutSpelling { text, .. },
+                ) => text,
+                Some(Fix::Layout { start, .. }) => {
+                    panic!("unexpected split at {start}: splitting is disabled")
+                }
+            };
+            let detail = format!(
+                "line {}: {before:?} -> {after:?}; expected {expected:?}",
+                line + 1
+            );
+            if expected == before {
+                unchanged += 1;
+                if after != before {
+                    unwanted.push(detail);
+                }
+            } else {
+                wanted += 1;
+                if after == before {
+                    missed.push(detail);
+                } else if after != expected {
+                    wrong.push(detail);
+                }
+            }
+        }
+        assert!(
+            unchanged > 0 && wanted > 0,
+            "the corpus must test both protection and correction"
+        );
+        eprintln!(
+            "Accuracy: unwanted {}/{unchanged}; missed {}/{wanted}; wrong {}/{wanted}",
+            unwanted.len(),
+            missed.len(),
+            wrong.len()
+        );
+        assert!(unwanted.is_empty() && missed.is_empty() && wrong.is_empty(),
+            "unwanted changes: {unwanted:#?}\nmissed corrections: {missed:#?}\nwrong corrections: {wrong:#?}");
     }
 
     #[test]

@@ -229,6 +229,23 @@ pub fn describe_backend() -> String {
 // The two shared operations
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Focus identity for pending replacements. X11 and the two socket backends
+/// expose it; GNOME/KDE Wayland have no equivalent public query here.
+/// ponytail: those sessions use mouse/shortcut cancellation; add their native
+/// focus protocol when one is available, rather than querying XWayland.
+pub fn focused_target() -> Option<String> {
+    match backend() {
+        Backend::Hyprland => {
+            let reply: serde_json::Value =
+                serde_json::from_str(&hypr::request("j/activewindow")?).ok()?;
+            reply.get("address")?.as_str().map(str::to_string)
+        }
+        Backend::Sway => sway::focused_target(),
+        _ if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland") => x11::focused_target(),
+        _ => None,
+    }
+}
+
 pub fn query_layout() -> Option<Language> {
     backend().current()
 }
@@ -728,6 +745,21 @@ mod sway {
         recv(&mut stream)
     }
 
+    pub fn focused_target() -> Option<String> {
+        fn focused(node: &serde_json::Value) -> Option<u64> {
+            if node.get("focused").and_then(|v| v.as_bool()) == Some(true) {
+                return node.get("id")?.as_u64();
+            }
+            ["nodes", "floating_nodes"]
+                .into_iter()
+                .filter_map(|key| node.get(key)?.as_array())
+                .flatten()
+                .find_map(focused)
+        }
+        let tree = serde_json::from_str(&request(4, "")?).ok()?;
+        focused(&tree).map(|id| id.to_string())
+    }
+
     /// A connection of its own, subscribed to input events.
     ///
     /// It has to be a second connection: this one blocks forever waiting to be
@@ -1173,6 +1205,7 @@ mod x11 {
     type XFreeFn = unsafe extern "C" fn(*mut c_void) -> c_int;
     type XkbGetStateFn = unsafe extern "C" fn(*mut Display, u32, *mut XkbState) -> c_int;
     type XkbLockGroupFn = unsafe extern "C" fn(*mut Display, u32, u32) -> Bool;
+    type XGetInputFocusFn = unsafe extern "C" fn(*mut Display, *mut Window, *mut c_int) -> c_int;
     type XFlushFn = unsafe extern "C" fn(*mut Display) -> c_int;
 
     struct Lib {
@@ -1184,6 +1217,7 @@ mod x11 {
         xkb_get_state: XkbGetStateFn,
         xkb_lock_group: XkbLockGroupFn,
         flush: XFlushFn,
+        get_input_focus: XGetInputFocusFn,
     }
 
     /// The X connection, opened once and kept. `Display*` is not thread-safe,
@@ -1233,6 +1267,7 @@ mod x11 {
                 xkb_get_state: sym!("XkbGetState", XkbGetStateFn),
                 xkb_lock_group: sym!("XkbLockGroup", XkbLockGroupFn),
                 flush: sym!("XFlush", XFlushFn),
+                get_input_focus: sym!("XGetInputFocus", XGetInputFocusFn),
             };
             let display = (lib.open_display)(std::ptr::null());
             if display.is_null() {
@@ -1245,6 +1280,17 @@ mod x11 {
 
     pub fn available() -> bool {
         conn().is_some()
+    }
+
+    pub fn focused_target() -> Option<String> {
+        let c = conn()?.lock().ok()?;
+        let mut window = 0;
+        let mut revert = 0;
+        unsafe {
+            (c.lib.get_input_focus)(c.display, &mut window, &mut revert);
+        }
+        // None and PointerRoot do not identify a text target.
+        (window > 1).then(|| window.to_string())
     }
 
     /// The configured layouts, from `_XKB_RULES_NAMES` on the root window.
