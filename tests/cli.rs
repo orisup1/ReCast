@@ -25,6 +25,35 @@ fn cli_reports_version_help_and_bad_options() {
     }
 }
 
+#[test]
+fn status_reports_numeric_fallbacks() {
+    for value in ["4", "256", "-1", "l"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_recast"))
+            .arg("--status")
+            .env("RECAST_LAYOUT_BACKEND", "none")
+            .env("RECAST_SPELL_DIST", value)
+            .env("RECAST_COMPLETE_RANK", "4294967296")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains("max distance 3)"), "{stdout}");
+        assert!(stdout.contains("max rank 30000)"), "{stdout}");
+        assert!(stderr.contains("RECAST_SPELL_DIST="), "{stderr}");
+        assert!(stderr.contains("RECAST_COMPLETE_RANK="), "{stderr}");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_recast"))
+        .arg("--status")
+        .env("RECAST_LAYOUT_BACKEND", "none")
+        .env("RECAST_SPELL_DIST", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("max distance 0)"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("RECAST_SPELL_DIST="));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn write_config_preserves_existing_files_and_symlink_targets() {

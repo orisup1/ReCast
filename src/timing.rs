@@ -268,7 +268,7 @@ const _: () = {
 /// events it is very likely correct.
 fn micros(key: &str, default: Duration) -> Duration {
     crate::settings::get(key)
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|v| crate::settings::parse_number(key, &v).ok())
         .map(Duration::from_micros)
         .unwrap_or(default)
 }

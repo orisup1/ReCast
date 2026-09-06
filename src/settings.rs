@@ -158,6 +158,24 @@ pub fn get(env_key: &str) -> Option<String> {
     lookup(env_key).map(|(value, _)| value)
 }
 
+/// Loading and diagnostics must accept exactly the same values.
+pub fn parse_number(key: &str, raw: &str) -> Result<u64, String> {
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "is not an unsigned integer".to_string())?;
+    let max = match key {
+        "RECAST_SPELL_DIST" => 3,
+        "RECAST_SPELL_RANK" | "RECAST_COMPLETE_RANK" => u32::MAX as u64,
+        "RECAST_SPELL_MIN" | "RECAST_COMPLETE_MIN" => usize::MAX as u64,
+        _ => u64::MAX,
+    };
+    if value > max {
+        return Err(format!("must be between 0 and {max}"));
+    }
+    Ok(value)
+}
+
 /// Settings that were set but could not be used, described for the user.
 ///
 /// Falling back to the shipped default on a value that cannot be parsed is the
@@ -175,9 +193,9 @@ pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str
 
     for key in numeric_keys {
         if let Some((raw, source)) = lookup(key) {
-            if raw.trim().parse::<u64>().is_err() {
+            if let Err(reason) = parse_number(key, &raw) {
                 out.push(format!(
-                    "{}={raw:?} is not a number — using the default instead.",
+                    "{}={raw:?} {reason} — using the default instead.",
                     source.describe(key)
                 ));
             }
@@ -237,7 +255,7 @@ pub fn sample() -> String {
 #spell = true          # English spelling autocorrect
 #spell_min = {spell_min}           # shortest word the speller may fix
 #spell_rank = {spell_rank}      # worst frequency rank a suggestion may have
-#spell_dist = {spell_dist}          # maximum edit distance, 1 to 3
+#spell_dist = {spell_dist}          # maximum edit distance, 0 to 3 (0 disables)
 #complete = true       # word completion + abbreviation expansion
 #complete_min = {complete_min}        # shortest prefix that will be completed
 #complete_rank = {complete_rank}   # worst frequency rank a completion may have
@@ -388,6 +406,26 @@ spell_min = 5
         // once some future setting takes a string.
         let t = parse("key = a=b\n");
         assert_eq!(t.settings.get("key").map(String::as_str), Some("a=b"));
+    }
+
+    #[test]
+    fn numeric_loading_and_diagnostics_share_type_and_range_limits() {
+        for value in ["4", "256", "-1", "l", "18446744073709551616"] {
+            assert!(parse_number("RECAST_SPELL_DIST", value).is_err(), "{value}");
+        }
+        for value in ["0", "1", " 3 "] {
+            assert!(parse_number("RECAST_SPELL_DIST", value).is_ok());
+        }
+        assert_eq!(
+            parse_number("RECAST_SPELL_RANK", "4294967295"),
+            Ok(u32::MAX as u64)
+        );
+        assert!(parse_number("RECAST_COMPLETE_RANK", "4294967296").is_err());
+        assert_eq!(parse_number("RECAST_INJECT_BATCH_GAP", "0"), Ok(0));
+        assert_eq!(
+            parse_number("RECAST_INJECT_SETTLE", "18446744073709551615"),
+            Ok(u64::MAX)
+        );
     }
 
     /// The sample is the only documentation of the file format that the user

@@ -66,7 +66,7 @@ impl Config {
     /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
     /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
     ///                     (default: 20000).
-    /// RECAST_SPELL_DIST – maximum edit distance, 1 to 3 (default: 3).
+    /// RECAST_SPELL_DIST – maximum edit distance, 0 to 3 (default: 3; 0 disables).
     /// RECAST_COMPLETE   – set to `0` to disable auto-complete (default:
     ///                     enabled).
     /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 3).
@@ -92,9 +92,10 @@ impl Config {
 }
 
 /// Numeric env override, falling back to `default` when unset or unparsable.
-fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
+fn env_num<T: TryFrom<u64>>(key: &str, default: T) -> T {
     crate::settings::get(key)
-        .and_then(|v| v.trim().parse().ok())
+        .and_then(|v| crate::settings::parse_number(key, &v).ok())
+        .and_then(|v| T::try_from(v).ok())
         .unwrap_or(default)
 }
 
