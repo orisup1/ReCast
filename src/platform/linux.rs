@@ -17,7 +17,7 @@ impl Platform for Linux {
     type Key = KeyCode;
     type Retype = Vec<(KeyCode, bool)>;
     type Injector = Arc<Mutex<VirtualDevice>>;
-    type Focus = String;
+    type Focus = crate::layout::Focus;
     const SHIFT_LEFT: KeyCode = KeyCode::KEY_LEFTSHIFT;
     const SHIFT_RIGHT: KeyCode = KeyCode::KEY_RIGHTSHIFT;
     const CTRL_LEFT: KeyCode = KeyCode::KEY_LEFTCTRL;
@@ -103,8 +103,14 @@ impl Platform for Linux {
     fn injecting_flag(_: &Self::Injector) -> Option<&std::sync::atomic::AtomicBool> {
         None
     }
-    fn focus() -> Option<String> {
+    fn focus() -> Option<Self::Focus> {
         crate::layout::focused_target()
+    }
+    fn app_id(focus: &Self::Focus) -> Option<String> {
+        focus.app.clone()
+    }
+    fn requires_focus() -> bool {
+        crate::layout::focus_supported()
     }
     fn inject(engine: &Engine<Self>, plan: Plan<Self>, generation: u64) -> Option<Vec<Typed>> {
         inject(engine, plan, generation)

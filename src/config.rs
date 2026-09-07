@@ -1,5 +1,7 @@
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Exact application IDs in which capture, learning and correction stop.
+    pub excluded_apps: Vec<String>,
     /// Persist local word-frequency, correction-pair, and typing-timing data.
     /// Off by default because the word files may contain sensitive text.
     pub personal_enabled: bool,
@@ -76,6 +78,9 @@ impl Config {
     ///                   (default: disabled).
     pub fn from_env() -> Self {
         Self {
+            excluded_apps: parse_excluded_apps(
+                &crate::settings::get("RECAST_EXCLUDE_APPS").unwrap_or_default(),
+            ),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
             split_enabled: crate::settings::flag("RECAST_SPLIT", false),
@@ -89,6 +94,23 @@ impl Config {
             complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
         }
     }
+}
+
+pub fn parse_excluded_apps(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// An unknown application is not safe when exclusions were explicitly requested.
+pub fn app_allowed(excluded: &[String], app: Option<&str>) -> bool {
+    excluded.is_empty()
+        || app
+            .filter(|s| !s.is_empty())
+            .is_some_and(|app| !excluded.contains(&app.to_lowercase()))
 }
 
 /// Numeric env override, falling back to `default` when unset or unparsable.
@@ -135,6 +157,7 @@ pub const BOOLEAN_KEYS: &[&str] = &[
 
 /// All known settings, for validating the config file.
 pub const ALL_KEYS: &[&str] = &[
+    "RECAST_EXCLUDE_APPS",
     "RECAST_PERSONAL",
     "RECAST_SHORT",
     "RECAST_SPLIT",
@@ -165,6 +188,19 @@ pub const ALL_KEYS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusions_match_whole_app_ids_and_decline_unknown_apps() {
+        let excluded =
+            parse_excluded_apps(" Code.exe, com.apple.Terminal, , org.keepassxc.KeePassXC ");
+        assert_eq!(excluded.len(), 3);
+        for app in [None, Some(""), Some("CODE.EXE"), Some("com.apple.Terminal")] {
+            assert!(!app_allowed(&excluded, app));
+        }
+        assert!(app_allowed(&excluded, Some("code.exe.backup")));
+        assert!(app_allowed(&excluded, Some("firefox")));
+        assert!(app_allowed(&[], None));
+    }
 
     /// The parse is what decides whether a complaint is warranted, so it is
     /// what gets tested — the env itself is process-global and shared with

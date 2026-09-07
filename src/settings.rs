@@ -20,7 +20,7 @@
 //! Flat `key = value` lines, `#` comments, blank lines ignored — a strict
 //! subset of TOML, so an editor's TOML mode does the right thing and nobody has
 //! to learn a format for ten scalars. There are no tables and no arrays: every
-//! setting here is a bool or a number. Keys are the environment names without
+//! setting here is a bool, number, or string. Keys are the environment names without
 //! their `RECAST_` prefix, lowercased, so `RECAST_SPELL_DIST` is `spell_dist`
 //! and the two spellings of a setting can never drift apart — [`file_key`] is
 //! the only place the mapping exists.
@@ -248,6 +248,7 @@ pub fn sample() -> String {
 # Read once at startup, so changes take effect on the next launch.
 
 # Correction pipelines
+#exclude_apps = \"\"    # comma-separated exact app IDs; see README application exclusions
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
 #short = true          # auto-switch on short (<= 3 char) words
 #split = false         # missing-space split fallback (opt-in; can mis-split)
@@ -425,6 +426,11 @@ spell_min = 5
         assert_eq!(
             parse_number("RECAST_INJECT_SETTLE", "18446744073709551615"),
             Ok(u64::MAX)
+        );
+        let parsed = parse("exclude_apps = \"Code.exe, com.apple.Terminal\" # exact IDs\n");
+        assert_eq!(
+            crate::config::parse_excluded_apps(&parsed.settings["exclude_apps"]),
+            ["code.exe", "com.apple.terminal"]
         );
     }
 

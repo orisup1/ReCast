@@ -63,6 +63,39 @@ impl Platform for Mac {
     fn focus() -> Option<Focus> {
         focused_target()
     }
+    fn app_id(focus: &Focus) -> Option<String> {
+        use cocoa::base::{id, nil};
+        use cocoa::foundation::NSAutoreleasePool;
+        use objc::{class, msg_send, sel, sel_impl};
+        unsafe {
+            let mut pid = 0;
+            if AXUIElementGetPid(focus.0, &mut pid) != 0 {
+                return None;
+            }
+            let pool = NSAutoreleasePool::new(nil);
+            let app: id = msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+            let bundle: id = if app == nil {
+                nil
+            } else {
+                msg_send![app, bundleIdentifier]
+            };
+            let result = if bundle == nil {
+                None
+            } else {
+                let text: *const std::os::raw::c_char = msg_send![bundle, UTF8String];
+                if text.is_null() {
+                    None
+                } else {
+                    std::ffi::CStr::from_ptr(text)
+                        .to_str()
+                        .ok()
+                        .map(str::to_string)
+                }
+            };
+            let _: () = msg_send![pool, drain];
+            result
+        }
+    }
     fn input_empty(_: &AtomicBool) -> bool {
         use core_foundation::{base::TCFType, string::CFString};
         use core_foundation_sys::{base::CFGetTypeID, string::*};
@@ -663,6 +696,7 @@ impl Drop for Focus {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXUIElementCreateSystemWide() -> *const c_void;
+    fn AXUIElementGetPid(element: *const c_void, pid: *mut i32) -> i32;
     fn AXUIElementCopyAttributeValue(
         element: *const c_void,
         attribute: core_foundation_sys::string::CFStringRef,

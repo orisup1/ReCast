@@ -87,6 +87,9 @@ Settings:
   RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
   RECAST_PERSONAL=1   Opt in to local word/correction/timing personalization;
                       off by default because its files can contain typed words
+  RECAST_EXCLUDE_APPS=  Comma-separated exact application IDs to leave alone:
+                      Linux app_id/WM_CLASS, macOS bundle ID, Windows exe name.
+                      Case-insensitive; unknown apps are skipped when set.
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.
@@ -384,6 +387,14 @@ fn print_status() {
     // fallen back to the default.
     let cfg = config::Config::from_env();
     println!("\n  settings (config.toml and RECAST_* applied):");
+    println!(
+        "    excluded apps        {}",
+        if cfg.excluded_apps.is_empty() {
+            "none".to_string()
+        } else {
+            cfg.excluded_apps.join(", ")
+        }
+    );
     println!("    short words          {}", on_off(cfg.short_enabled));
     println!("    missing-space split  {}", on_off(cfg.split_enabled));
     println!("    frequency tie-break  {}", on_off(cfg.freq_enabled));

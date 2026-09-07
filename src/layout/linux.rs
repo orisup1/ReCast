@@ -233,12 +233,40 @@ pub fn describe_backend() -> String {
 /// expose it; GNOME/KDE Wayland have no equivalent public query here.
 /// ponytail: those sessions use mouse/shortcut cancellation; add their native
 /// focus protocol when one is available, rather than querying XWayland.
-pub fn focused_target() -> Option<String> {
+#[derive(PartialEq)]
+pub struct Focus {
+    id: String,
+    pub app: Option<String>,
+}
+
+// A busy compositor costs a skipped correction, not a quarter-second capture stall.
+const FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
+
+pub fn focus_supported() -> bool {
+    matches!(backend(), Backend::Hyprland | Backend::Sway)
+        || std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
+}
+
+pub fn focused_target() -> Option<Focus> {
     match backend() {
         Backend::Hyprland => {
-            let reply: serde_json::Value =
-                serde_json::from_str(&hypr::request("j/activewindow")?).ok()?;
-            reply.get("address")?.as_str().map(str::to_string)
+            let reply: serde_json::Value = serde_json::from_str(&hypr::request_with_timeout(
+                "j/activewindow",
+                FOCUS_TIMEOUT,
+            )?)
+            .ok()?;
+            let id = reply.get("address")?.as_str()?;
+            if id.is_empty() || id == "0x0" {
+                return None;
+            }
+            Some(Focus {
+                id: id.to_string(),
+                app: reply
+                    .get("class")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
+            })
         }
         Backend::Sway => sway::focused_target(),
         _ if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland") => x11::focused_target(),
@@ -522,13 +550,37 @@ mod hypr {
     /// Send one command and return the reply, or `None` if this is not a
     /// Hyprland session or the socket would not answer.
     pub fn request(command: &str) -> Option<String> {
-        let mut stream = UnixStream::connect(socket_path()?).ok()?;
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        request_with_timeout(command, IO_TIMEOUT)
+    }
+
+    pub fn request_with_timeout(command: &str, timeout: Duration) -> Option<String> {
+        request_on(UnixStream::connect(socket_path()?).ok()?, command, timeout)
+    }
+
+    fn request_on(mut stream: UnixStream, command: &str, timeout: Duration) -> Option<String> {
+        stream.set_read_timeout(Some(timeout)).ok()?;
+        stream.set_write_timeout(Some(timeout)).ok()?;
         stream.write_all(command.as_bytes()).ok()?;
         let mut reply = String::new();
         stream.read_to_string(&mut reply).ok()?;
         Some(reply)
+    }
+
+    #[test]
+    fn stalled_focus_socket_returns_without_waiting_for_the_layout_timeout() {
+        for timeout in [IO_TIMEOUT, super::FOCUS_TIMEOUT] {
+            let (client, _server) = UnixStream::pair().unwrap();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                let reply = request_on(client, "j/activewindow", timeout);
+                tx.send((reply, start.elapsed())).unwrap();
+            });
+            let (reply, elapsed) = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(reply.is_none());
+            eprintln!("stalled focus socket with {timeout:?} timeout: {elapsed:?}");
+            worker.join().unwrap();
+        }
     }
 
     /// Whether this session is one we can drive at all.
@@ -738,17 +790,29 @@ mod sway {
     }
 
     fn request(kind: u32, payload: &str) -> Option<String> {
+        request_with_timeout(kind, payload, IO_TIMEOUT)
+    }
+
+    fn request_with_timeout(kind: u32, payload: &str, timeout: Duration) -> Option<String> {
         let mut stream = UnixStream::connect(socket_path()?).ok()?;
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        stream.set_read_timeout(Some(timeout)).ok()?;
+        stream.set_write_timeout(Some(timeout)).ok()?;
         send(&mut stream, kind, payload)?;
         recv(&mut stream)
     }
 
-    pub fn focused_target() -> Option<String> {
-        fn focused(node: &serde_json::Value) -> Option<u64> {
+    pub fn focused_target() -> Option<super::Focus> {
+        fn focused(node: &serde_json::Value) -> Option<super::Focus> {
             if node.get("focused").and_then(|v| v.as_bool()) == Some(true) {
-                return node.get("id")?.as_u64();
+                return Some(super::Focus {
+                    id: node.get("id")?.as_u64()?.to_string(),
+                    app: node
+                        .get("app_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| node.get("window_properties")?.get("class")?.as_str())
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string),
+                });
             }
             ["nodes", "floating_nodes"]
                 .into_iter()
@@ -756,8 +820,9 @@ mod sway {
                 .flatten()
                 .find_map(focused)
         }
-        let tree = serde_json::from_str(&request(4, "")?).ok()?;
-        focused(&tree).map(|id| id.to_string())
+        let tree =
+            serde_json::from_str(&request_with_timeout(4, "", super::FOCUS_TIMEOUT)?).ok()?;
+        focused(&tree)
     }
 
     /// A connection of its own, subscribed to input events.
@@ -1206,6 +1271,14 @@ mod x11 {
     type XkbGetStateFn = unsafe extern "C" fn(*mut Display, u32, *mut XkbState) -> c_int;
     type XkbLockGroupFn = unsafe extern "C" fn(*mut Display, u32, u32) -> Bool;
     type XGetInputFocusFn = unsafe extern "C" fn(*mut Display, *mut Window, *mut c_int) -> c_int;
+    type XQueryTreeFn = unsafe extern "C" fn(
+        *mut Display,
+        Window,
+        *mut Window,
+        *mut Window,
+        *mut *mut Window,
+        *mut u32,
+    ) -> c_int;
     type XFlushFn = unsafe extern "C" fn(*mut Display) -> c_int;
 
     struct Lib {
@@ -1218,6 +1291,7 @@ mod x11 {
         xkb_lock_group: XkbLockGroupFn,
         flush: XFlushFn,
         get_input_focus: XGetInputFocusFn,
+        query_tree: XQueryTreeFn,
     }
 
     /// The X connection, opened once and kept. `Display*` is not thread-safe,
@@ -1268,6 +1342,7 @@ mod x11 {
                 xkb_lock_group: sym!("XkbLockGroup", XkbLockGroupFn),
                 flush: sym!("XFlush", XFlushFn),
                 get_input_focus: sym!("XGetInputFocus", XGetInputFocusFn),
+                query_tree: sym!("XQueryTree", XQueryTreeFn),
             };
             let display = (lib.open_display)(std::ptr::null());
             if display.is_null() {
@@ -1282,7 +1357,7 @@ mod x11 {
         conn().is_some()
     }
 
-    pub fn focused_target() -> Option<String> {
+    pub fn focused_target() -> Option<super::Focus> {
         let c = conn()?.lock().ok()?;
         let mut window = 0;
         let mut revert = 0;
@@ -1290,7 +1365,77 @@ mod x11 {
             (c.lib.get_input_focus)(c.display, &mut window, &mut revert);
         }
         // None and PointerRoot do not identify a text target.
-        (window > 1).then(|| window.to_string())
+        (window > 1).then(|| super::Focus {
+            id: window.to_string(),
+            app: if crate::config::Config::global().excluded_apps.is_empty() {
+                None
+            } else {
+                window_class(&c, window)
+            },
+        })
+    }
+
+    /// Child controls often have no WM_CLASS; walk to their owning window.
+    fn window_class(c: &Conn, mut window: Window) -> Option<String> {
+        unsafe {
+            let name = CString::new("WM_CLASS").ok()?;
+            let atom = (c.lib.intern_atom)(c.display, name.as_ptr(), 1);
+            if atom == 0 {
+                return None;
+            }
+            for _ in 0..32 {
+                let (mut actual_type, mut format, mut count, mut remaining) = (0, 0, 0, 0);
+                let mut data = std::ptr::null_mut();
+                let status = (c.lib.get_window_property)(
+                    c.display,
+                    window,
+                    atom,
+                    0,
+                    1024,
+                    0,
+                    0,
+                    &mut actual_type,
+                    &mut format,
+                    &mut count,
+                    &mut remaining,
+                    &mut data,
+                );
+                let class = if status == 0 && format == 8 && !data.is_null() && remaining == 0 {
+                    std::slice::from_raw_parts(data, count as usize)
+                        .split(|b| *b == 0)
+                        .nth(1)
+                        .filter(|v| !v.is_empty())
+                        .and_then(|v| std::str::from_utf8(v).ok())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                if !data.is_null() {
+                    (c.lib.free)(data.cast());
+                }
+                if class.is_some() {
+                    return class;
+                }
+                let (mut root, mut parent, mut count) = (0, 0, 0);
+                let mut children = std::ptr::null_mut();
+                let ok = (c.lib.query_tree)(
+                    c.display,
+                    window,
+                    &mut root,
+                    &mut parent,
+                    &mut children,
+                    &mut count,
+                );
+                if !children.is_null() {
+                    (c.lib.free)(children.cast());
+                }
+                if ok == 0 || parent == 0 || parent == window {
+                    return None;
+                }
+                window = parent;
+            }
+            None
+        }
     }
 
     /// The configured layouts, from `_XKB_RULES_NAMES` on the root window.

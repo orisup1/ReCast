@@ -84,6 +84,8 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// Stable identity of the focused target, without reading its text.
     /// None where the desktop cannot expose focus; input events still cancel.
     fn focus() -> Option<Self::Focus>;
+    /// Application identity associated with this focus, never the window title.
+    fn app_id(focus: &Self::Focus) -> Option<String>;
     fn current_layout() -> Option<Language> {
         crate::layout::current_layout()
     }
@@ -91,6 +93,9 @@ pub trait Platform: Sized + Send + Sync + 'static {
         crate::layout::switch_layout_to(lang)
     }
     const REQUIRES_FOCUS: bool = false;
+    fn requires_focus() -> bool {
+        Self::REQUIRES_FOCUS
+    }
     fn input_allowed() -> bool {
         true
     }
@@ -351,6 +356,8 @@ pub struct AppState<P: Platform> {
     last_key_at: Instant,
     /// Incremented whenever the cursor or text can no longer be trusted.
     generation: u64,
+    /// Every input event, including releases, invalidates an in-flight query.
+    revision: u64,
     focus: Option<P::Focus>,
     no_fix: bool,
 }
@@ -373,6 +380,7 @@ impl<P: Platform> AppState<P> {
             last_key: None,
             last_key_at: Instant::now(),
             generation: 0,
+            revision: 0,
             focus: None,
             no_fix: false,
         }
@@ -428,6 +436,7 @@ impl<P: Platform> AppState<P> {
         self.last_ctrl_tap = None;
     }
     fn invalidate_text(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
         self.keys.clear();
         self.buffered_keys.clear();
@@ -463,7 +472,10 @@ pub struct Engine<P: Platform> {
     pub en_dict: Dict,
     pub he_dict: Dict,
     pub injector: P::Injector,
+    excluded_apps: Vec<String>,
 }
+
+type FocusSnapshot<'a, P> = (MutexGuard<'a, AppState<P>>, Option<<P as Platform>::Focus>);
 
 impl<P: Platform> Engine<P> {
     pub fn new(
@@ -478,11 +490,41 @@ impl<P: Platform> Engine<P> {
             en_dict,
             he_dict,
             injector,
+            excluded_apps: crate::config::Config::global().excluded_apps.clone(),
         })
     }
 
     fn lock(&self) -> MutexGuard<'_, AppState<P>> {
         lock_forgiving(&self.state)
+    }
+
+    fn read_focus(&self) -> (Option<P::Focus>, bool) {
+        let focus = P::focus();
+        let app = if self.excluded_apps.is_empty() {
+            None
+        } else {
+            focus.as_ref().and_then(P::app_id)
+        };
+        let allowed =
+            P::input_allowed() && crate::config::app_allowed(&self.excluded_apps, app.as_deref());
+        (focus, allowed)
+    }
+
+    /// OS queries must not prevent releases or mouse clicks from canceling work.
+    /// If another event arrives meanwhile, abandon the stale event's text state.
+    fn refresh_focus<'a>(
+        &'a self,
+        st: MutexGuard<'a, AppState<P>>,
+    ) -> Option<FocusSnapshot<'a, P>> {
+        let revision = st.revision;
+        drop(st);
+        let (focus, allowed) = self.read_focus();
+        let mut st = self.lock();
+        if st.revision != revision || !allowed {
+            st.invalidate_text();
+            return None;
+        }
+        Some((st, focus))
     }
 
     // ── things the platform's injection asks the engine ─────────────────────
@@ -548,9 +590,12 @@ impl<P: Platform> Engine<P> {
         if !self.control.is_enabled() || !P::input_allowed() {
             return false;
         }
-        let focus = P::focus();
+        let (focus, allowed) = self.read_focus();
         let st = self.lock();
-        st.generation == generation && st.focus == focus && (!P::REQUIRES_FOCUS || focus.is_some())
+        allowed
+            && st.generation == generation
+            && st.focus == focus
+            && (!P::requires_focus() || focus.is_some())
     }
 
     // ── capture ─────────────────────────────────────────────────────────────
@@ -568,6 +613,7 @@ impl<P: Platform> Engine<P> {
         }
         st.last_key_at = Instant::now();
         st.last_key = Some(key);
+        st.revision = st.revision.wrapping_add(1);
 
         // Check for chorded shortcut BEFORE inserting the key into held_keys:
         // if a non-modifier key is pressed while a modifier (Ctrl/Alt/Super,
@@ -602,32 +648,73 @@ impl<P: Platform> Engine<P> {
         }
         let shift = st.shift_active();
 
-        // Record key press for typing pattern analysis (dwell, digraphs).
-        // Use Debug representation as a stable-ish key name.
-        let key_name = format!("{:?}", key);
-        crate::personal::record_key_press(&key_name);
-
-        // On backends that identify their own events, a real key arriving
-        // during injection invalidates the snapshot already being erased.
+        // Cancel before any OS query: the worker must see a shortcut/deletion
+        // immediately, even while the compositor is slow to answer focus.
         let during_injection = P::injecting_flag(&self.injector)
             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        if key == P::BACKSPACE && (during_injection || st.is_replacing || chorded_shortcut) {
+            let no_fix = st.no_fix;
+            st.invalidate_text();
+            st.no_fix = no_fix;
+            return;
+        }
+        if during_injection
+            || chorded_shortcut
+            || P::is_reset(key)
+            || (st.is_replacing && !self.excluded_apps.is_empty())
+        {
+            st.invalidate_text();
+            return;
+        }
+
+        let is_text = P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some();
+        let needs_focus = !self.excluded_apps.is_empty()
+            || key == P::BACKSPACE
+            || (P::is_terminator(key) && !st.keys.is_empty() && !st.is_replacing)
+            || (is_text && st.keys.is_empty() && !st.is_replacing);
+        let focus = if needs_focus {
+            let Some((next, focus)) = self.refresh_focus(st) else {
+                return;
+            };
+            st = next;
+            focus
+        } else {
+            None
+        };
+
+        // Record key press for typing pattern analysis (dwell, digraphs).
+        // Use Debug representation as a stable-ish key name.
+        if crate::config::Config::global().personal_enabled {
+            crate::personal::record_key_press(&format!("{key:?}"));
+        }
+
         if key == P::BACKSPACE {
             // Deletion cancels a stale rewrite, but never starts suppression.
-            if during_injection || st.is_replacing || chorded_shortcut || st.focus != P::focus() {
+            if st.focus != focus {
                 let no_fix = st.no_fix;
                 st.invalidate_text();
                 st.no_fix = no_fix;
             } else {
                 st.keys.pop();
             }
-        } else if during_injection || chorded_shortcut || P::is_reset(key) {
-            st.invalidate_text();
         } else if P::is_terminator(key) {
-            self.word_finished(st, key, shift);
-        } else if P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some() {
+            self.word_finished(st, key, shift, focus);
+        } else if is_text {
             if st.keys.is_empty() && !st.is_replacing {
-                st.focus = P::focus();
-                if st.no_fix && P::input_empty(&self.injector) {
+                st.focus = focus;
+                let revision = st.revision;
+                let suppressed = st.no_fix;
+                drop(st);
+                // With exclusions, resume at a word boundary without asking
+                // a newly focused (possibly excluded) field for its value.
+                let empty =
+                    suppressed && self.excluded_apps.is_empty() && P::input_empty(&self.injector);
+                st = self.lock();
+                if st.revision != revision {
+                    st.invalidate_text();
+                    return;
+                }
+                if empty {
                     st.no_fix = false;
                 }
             }
@@ -646,6 +733,7 @@ impl<P: Platform> Engine<P> {
         mut st: MutexGuard<'_, AppState<P>>,
         key: P::Key,
         shift: bool,
+        focus: Option<P::Focus>,
     ) {
         if st.is_replacing {
             st.buffered_keys.push(Typed { key, shift });
@@ -658,10 +746,7 @@ impl<P: Platform> Engine<P> {
         if st.keys.is_empty() {
             return;
         }
-        if !P::input_allowed()
-            || (P::REQUIRES_FOCUS && st.focus.is_none())
-            || st.focus != P::focus()
-        {
+        if !P::input_allowed() || (P::requires_focus() && st.focus.is_none()) || st.focus != focus {
             st.invalidate_text();
             // This terminator already ended the untrusted word.
             st.no_fix = false;
@@ -737,9 +822,7 @@ impl<P: Platform> Engine<P> {
     /// unaffected; only a press and release with nothing in between counts.
     pub fn key_release(self: &Arc<Self>, key: P::Key) {
         let mut st = self.lock();
-
-        crate::personal::record_key_release(&format!("{key:?}"));
-
+        st.revision = st.revision.wrapping_add(1);
         st.held_keys.remove(&key);
 
         // A layout hotkey has been let go of. Drop the cached layout rather than
@@ -749,6 +832,16 @@ impl<P: Platform> Engine<P> {
         if st.layout_hotkey && P::is_modifier(key) {
             st.layout_hotkey = false;
             crate::layout::invalidate();
+        }
+
+        if !self.excluded_apps.is_empty() {
+            let Some((next, _)) = self.refresh_focus(st) else {
+                return;
+            };
+            st = next;
+        }
+        if crate::config::Config::global().personal_enabled {
+            crate::personal::record_key_release(&format!("{key:?}"));
         }
 
         if key == P::CTRL_LEFT || key == P::CTRL_RIGHT {
@@ -761,10 +854,10 @@ impl<P: Platform> Engine<P> {
         if st.is_replacing || st.no_fix || !self.control.is_enabled() {
             return;
         }
-        if (P::REQUIRES_FOCUS && st.focus.is_none())
-            || st.focus != P::focus()
-            || !P::input_allowed()
-        {
+        let Some((mut st, focus)) = self.refresh_focus(st) else {
+            return;
+        };
+        if (P::requires_focus() && st.focus.is_none()) || st.focus != focus || !P::input_allowed() {
             st.invalidate_text();
             return;
         }
@@ -905,10 +998,10 @@ impl<P: Platform> Engine<P> {
         if st.is_replacing || !self.control.is_enabled() {
             return;
         }
-        if (P::REQUIRES_FOCUS && st.focus.is_none())
-            || st.focus != P::focus()
-            || !P::input_allowed()
-        {
+        let Some((mut st, focus)) = self.refresh_focus(st) else {
+            return;
+        };
+        if (P::requires_focus() && st.focus.is_none()) || st.focus != focus || !P::input_allowed() {
             st.invalidate_text();
             return;
         }
@@ -1256,6 +1349,11 @@ mod tests {
     };
 
     static FOCUS: AtomicUsize = AtomicUsize::new(1);
+    struct FocusGate {
+        ready: mpsc::SyncSender<()>,
+        proceed: mpsc::Receiver<()>,
+    }
+    static FOCUS_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
     struct Simulated;
     struct Screen {
         text: Mutex<String>,
@@ -1268,6 +1366,7 @@ mod tests {
         type Retype = String;
         type Injector = Screen;
         type Focus = usize;
+        const REQUIRES_FOCUS: bool = true;
         const SHIFT_LEFT: char = '\x01';
         const SHIFT_RIGHT: char = '\x02';
         const CTRL_LEFT: char = '\x03';
@@ -1318,7 +1417,16 @@ mod tests {
             Some(&screen.injecting)
         }
         fn focus() -> Option<usize> {
-            Some(FOCUS.load(Ordering::SeqCst))
+            let gate = FOCUS_GATE.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.ready.send(()).unwrap();
+                gate.proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            let focus = FOCUS.load(Ordering::SeqCst);
+            (focus != 0).then_some(focus)
+        }
+        fn app_id(focus: &usize) -> Option<String> {
+            Some(if *focus == 2 { "secret.exe" } else { "Editor" }.to_string())
         }
         fn input_empty(screen: &Screen) -> bool {
             screen.text.lock().unwrap().is_empty()
@@ -1636,5 +1744,77 @@ mod tests {
             "hel",
             "completion cycle restores the exact prefix"
         );
+
+        // Exclusions stop capture before any planner, debug log or learning call.
+        for focus in [0, 2] {
+            let mut s = Session::new();
+            Arc::get_mut(&mut s.engine).unwrap().excluded_apps = vec!["secret.exe".into()];
+            FOCUS.store(focus, Ordering::SeqCst);
+            s.type_text("recieve hello akuo ");
+            s.type_text("hel");
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            let st = s.engine.lock();
+            assert!(st.keys.is_empty() && st.buffered_keys.is_empty());
+            assert!(!st.is_replacing && st.last_action.is_none());
+            assert!(st.held_keys.is_empty());
+            assert_eq!(s.engine.control.fixed_count(), 0);
+        }
+        FOCUS.store(1, Ordering::SeqCst);
+        let mut s = Session::new();
+        Arc::get_mut(&mut s.engine).unwrap().excluded_apps = vec!["secret.exe".into()];
+        s.type_text("recieve ");
+        s.pending();
+        // A focus change while the injection worker waits still cancels it.
+        FOCUS.store(2, Ordering::SeqCst);
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        FOCUS.store(1, Ordering::SeqCst);
+        s.type_text(" ");
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve  receive ");
+
+        let mut s = Session::new();
+        Arc::get_mut(&mut s.engine).unwrap().excluded_apps = vec!["secret.exe".into()];
+        s.type_text("recieve ");
+        s.pending();
+        // With exclusions active, new typing cancels pending work immediately
+        // instead of delaying buffered-key accounting behind an app query.
+        s.type_text("x");
+        s.finish();
+        assert_eq!(s.text(), "recieve x");
+        assert_eq!(s.engine.control.fixed_count(), 0);
+
+        // Hold the OS reply indefinitely: releases and clicks still run, and
+        // the late reply must not resurrect the canceled word. This used to
+        // hold state.lock() for the entire focus query (up to 250 ms on Linux).
+        let s = Session::new();
+        let (ready, waiting) = mpsc::sync_channel(1);
+        let (proceed, reply) = mpsc::sync_channel(1);
+        *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: reply,
+        });
+        let engine = Arc::clone(&s.engine);
+        let worker = thread::spawn(move || engine.key_press('r'));
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            s.engine.state.try_lock().is_ok(),
+            "OS query holds the typing lock"
+        );
+        let started = Instant::now();
+        s.engine.key_release('r');
+        s.engine.mouse_click();
+        eprintln!(
+            "release + cancellation during stalled focus query: {:?}",
+            started.elapsed()
+        );
+        proceed.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(s.engine.lock().keys.is_empty());
+        assert!(s.engine.lock().held_keys.is_empty());
     }
 }

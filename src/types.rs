@@ -31,6 +31,7 @@ impl Config {
     /// spelling autocorrect on).
     pub fn global() -> &'static Config {
         GLOBAL_CONFIG.get_or_init(|| Config {
+            excluded_apps: Vec::new(),
             personal_enabled: false,
             short_enabled: true,
             split_enabled: false,
@@ -324,6 +325,7 @@ impl AppControl {
     #[cfg(test)]
     pub fn new_for_test() -> Self {
         Self::new_with_config(Config {
+            excluded_apps: Vec::new(),
             personal_enabled: false,
             short_enabled: true,
             split_enabled: false,

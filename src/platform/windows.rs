@@ -66,6 +66,36 @@ impl Platform for Windows {
     fn focus() -> Option<Focus> {
         focused_target()
     }
+    fn app_id(focus: &Focus) -> Option<String> {
+        use winapi::um::{
+            handleapi::CloseHandle, processthreadsapi::OpenProcess,
+            winbase::QueryFullProcessImageNameW, winnt::PROCESS_QUERY_LIMITED_INFORMATION,
+            winuser::GetWindowThreadProcessId,
+        };
+        unsafe {
+            let mut pid = 0;
+            GetWindowThreadProcessId(*focus as _, &mut pid);
+            if pid == 0 {
+                return None;
+            }
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return None;
+            }
+            let mut path = vec![0u16; 32768];
+            let mut len = path.len() as u32;
+            let ok = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut len);
+            CloseHandle(process);
+            if ok == 0 {
+                return None;
+            }
+            let path = String::from_utf16(&path[..len as usize]).ok()?;
+            path.rsplit('\\')
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }
+    }
     fn inject(engine: &Engine<Self>, plan: Plan<Self>, generation: u64) -> Option<Vec<Typed>> {
         inject(engine, plan, generation)
     }

@@ -1,4 +1,4 @@
-//! Stable, ignored microbenchmarks for the pure hot paths.
+//! Ignored microbenchmarks for the pure hot paths and live desktop focus queries.
 //!
 //! Run with `make bench`. They intentionally report measurements without
 //! asserting wall-clock limits, which would be noisy on shared CI runners.
@@ -69,4 +69,30 @@ fn benchmark_completion_candidates() {
         ));
     }
     report("completion candidates", iterations, started);
+}
+
+/// Read-only: queries focus without capturing keys, switching layouts or injecting.
+#[test]
+#[ignore = "requires a desktop session; run with make bench"]
+fn benchmark_focus_queries() {
+    use crate::platform::engine::Platform;
+    #[cfg(target_os = "linux")]
+    use crate::platform::linux::Linux as Native;
+    #[cfg(target_os = "macos")]
+    use crate::platform::macos::Mac as Native;
+    #[cfg(target_os = "windows")]
+    use crate::platform::windows::Windows as Native;
+
+    let mut samples = Vec::with_capacity(100);
+    let mut available = 0;
+    for _ in 0..100 {
+        let started = Instant::now();
+        available += usize::from(black_box(Native::focus()).is_some());
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    eprintln!(
+        "focus queries: {available}/100 available; p50 {:?}, p95 {:?}, max {:?}",
+        samples[49], samples[94], samples[99]
+    );
 }

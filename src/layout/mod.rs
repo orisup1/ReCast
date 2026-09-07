@@ -40,7 +40,7 @@ pub use windows::switch_layout_to;
 /// only half working: the speller still fixes typos, and layout mistypes go
 /// through untouched.
 #[cfg(target_os = "linux")]
-pub use linux::{describe_backend, focused_target};
+pub use linux::{describe_backend, focus_supported, focused_target, Focus};
 
 /// Follow the session's layout-change notifications, where it has any.
 ///

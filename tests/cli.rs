@@ -26,13 +26,14 @@ fn cli_reports_version_help_and_bad_options() {
 }
 
 #[test]
-fn status_reports_numeric_fallbacks() {
+fn status_reports_numeric_fallbacks_and_application_exclusions() {
     for value in ["4", "256", "-1", "l"] {
         let output = Command::new(env!("CARGO_BIN_EXE_recast"))
             .arg("--status")
             .env("RECAST_LAYOUT_BACKEND", "none")
             .env("RECAST_SPELL_DIST", value)
             .env("RECAST_COMPLETE_RANK", "4294967296")
+            .env("RECAST_EXCLUDE_APPS", " Code.exe, com.apple.Terminal ")
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -40,6 +41,7 @@ fn status_reports_numeric_fallbacks() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stdout.contains("max distance 3)"), "{stdout}");
         assert!(stdout.contains("max rank 30000)"), "{stdout}");
+        assert!(stdout.contains("code.exe, com.apple.terminal"), "{stdout}");
         assert!(stderr.contains("RECAST_SPELL_DIST="), "{stderr}");
         assert!(stderr.contains("RECAST_COMPLETE_RANK="), "{stderr}");
     }
