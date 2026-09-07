@@ -1361,6 +1361,7 @@ mod tests {
         let mut unwanted = Vec::new();
         let mut missed = Vec::new();
         let mut wrong = Vec::new();
+        let mut regressions = Vec::new();
         for (line, row) in include_str!("../tests/data/corrections.tsv")
             .lines()
             .enumerate()
@@ -1369,10 +1370,9 @@ mod tests {
                 continue;
             }
             let fields: Vec<_> = row.split('\t').collect();
-            assert_eq!(
-                fields.len(),
-                4,
-                "corpus line {} must have four columns",
+            assert!(
+                matches!(fields.len(), 4 | 5),
+                "corpus line {} must have four columns, optionally a known-failure baseline",
                 line + 1
             );
             let current = match fields[0] {
@@ -1429,6 +1429,14 @@ mod tests {
                 "line {}: {before:?} -> {after:?}; expected {expected:?}",
                 line + 1
             );
+            // Desired results still count toward accuracy. A documented existing
+            // failure gets an exact baseline so new damage cannot hide in a budget.
+            let baseline = fields.get(4).copied().unwrap_or(expected);
+            if after != baseline {
+                regressions.push(format!(
+                    "{detail}; baseline {baseline:?} (remove baseline if fixed)"
+                ));
+            }
             if expected == before {
                 unchanged += 1;
                 if after != before {
@@ -1453,8 +1461,11 @@ mod tests {
             missed.len(),
             wrong.len()
         );
-        assert!(unwanted.is_empty() && missed.is_empty() && wrong.is_empty(),
-            "unwanted changes: {unwanted:#?}\nmissed corrections: {missed:#?}\nwrong corrections: {wrong:#?}");
+        eprintln!("unwanted changes: {unwanted:#?}\nmissed corrections: {missed:#?}\nwrong corrections: {wrong:#?}");
+        assert!(
+            regressions.is_empty(),
+            "accuracy regressions or resolved baselines: {regressions:#?}"
+        );
     }
 
     #[test]

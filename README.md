@@ -63,6 +63,12 @@ cannot make global input injection atomic with focus changes; a change during an
 write can still interrupt a replacement. Canceled replacements do not arm undo or learn
 an accepted correction.
 
+Focus queries release the typing-state lock while waiting for the OS, so another
+input thread can process releases and cancel stale work. Hyprland/Sway focus socket
+reads and writes time out after 10 ms; an unavailable focus on a supported backend
+skips correction. The injector still queries focus afresh immediately before rewriting.
+These limits do not cover Xlib calls or the separate layout-switch operation.
+
 ## Supported platforms
 
 | OS      | Capture         | Injection                        | Layout switch                                       |
@@ -260,6 +266,7 @@ recast 0.8.0
   memory (this):  8.9 MB
 
   settings (with any RECAST_* override applied):
+    excluded apps        none
     short words          on
     missing-space split  off
     frequency tie-break  on
@@ -268,8 +275,8 @@ recast 0.8.0
     personalization      off  (/home/you/.config/recast/personal)
 ```
 
-Two of those rows are platform-specific and only one platform ever shows both:
-`running:` is Linux (nothing else daemonizes, so there is no pid to report), and
+Two of those rows are platform-specific:
+`running:` is Linux/macOS (both write a pidfile), and
 `start at login:` appears only where the autostart registration is wired up —
 launchd on macOS, the per-user `Run` key on Windows.
 
@@ -280,8 +287,13 @@ to fall back silently to the default 3, the *loosest* setting, from someone
 plainly trying to tighten it:
 
 ```
-  ! RECAST_SPELL_DIST="l" is not a number — using the default instead.
+  ! RECAST_SPELL_DIST="l" is not an unsigned integer — using the default instead.
 ```
+
+Numeric validation uses the same limits as configuration loading. `spell_dist`
+accepts 0–3 (0 disables spelling); larger values, including 256, produce a warning
+and use the default. Rank settings must fit a 32-bit unsigned integer, minimum
+lengths must fit the platform's `usize`, and timings are unsigned 64-bit microseconds.
 
 Environment variables:
 
@@ -302,9 +314,42 @@ RECAST_COMPLETE_RANK=10000 recast  # how common a completion must be (default 30
 RECAST_PERSONAL=1 recast  # persist local word/correction/timing data (off by default)
 ```
 
-`RECAST_DEBUG=1` prints **every word you type** — under a service that means into your
-system log, password fields included, since ReCast cannot tell one text field from
-another. Use it while diagnosing something, not as a standing setting.
+`RECAST_DEBUG=1` prints **every word it checks** — under a service that means into your
+system log, potentially including password text on Linux/Windows. Excluded applications
+and macOS secure input are skipped before checking or logging. Use debug while
+diagnosing something, not as a standing setting.
+
+### Application exclusions
+
+Set `exclude_apps` in `config.toml` to a comma-separated string of exact application
+IDs, then restart ReCast. Matching ignores case; there are no wildcards or title matches.
+The equivalent environment variable is `RECAST_EXCLUDE_APPS` and overrides the file.
+
+```toml
+# Linux example: compositor app_id / window class
+exclude_apps = "Alacritty, org.keepassxc.KeePassXC"
+# macOS example: bundle identifiers
+#exclude_apps = "com.apple.Terminal, com.agilebits.onepassword7"
+# Windows example: executable filenames, including .exe
+#exclude_apps = "WindowsTerminal.exe, Code.exe, KeePassXC.exe"
+```
+
+Use the identifier reported by your application: Hyprland's active-window `class`,
+Sway's `app_id` (or XWayland `window_properties.class`), X11's `WM_CLASS` class,
+the macOS bundle identifier, or the Windows focused control owner's executable name.
+The examples are illustrative; installed versions and terminal hosts can use different IDs.
+`recast --status` lists the configured exclusions.
+
+Excluded applications receive no automatic corrections, expansions, completions or
+undo rewrites. ReCast discards its word buffer before logging or learning there;
+it still receives global events to track key releases. A nonempty exclusion list
+also suspends processing whenever the active application cannot be identified.
+GNOME/KDE on native Wayland currently cannot supply that identity, so configuring
+exclusions there suspends correction throughout the session. An empty list (the
+default) preserves normal operation. On returning to an allowed application, finish
+the current word with Space/Enter before correction resumes.
+With exclusions enabled, additional typing cancels a pending rewrite immediately,
+so application lookup cannot delay accounting for those new keys.
 
 When a key sequence spells a real word in **both** layouts (a homograph
 collision), ReCast normally keeps whatever layout you are in. The frequency
@@ -570,14 +615,15 @@ reporting, no update check, no remote dictionary. The word lists are compiled
 into the executable by `build.rs`, so even the lookups are local — there is
 nothing to fetch and nothing to ask.
 
-**Nothing you type is written to disk, except the words you ask it to keep.**
+**By default, typed text stays in memory except words you explicitly save through undo
+or the ignored-word controls.** Debug logging and opt-in personalization can persist
+typed text; their scope and cleanup instructions are below.
 The word being typed lives in memory and is dropped at every word boundary, on
 Tab / Escape / an arrow key, and on a mouse click. The recent-corrections list
 the tray and TUI show is the last 20, held in RAM and gone when the process
-exits — it is a glance, not a log, and it is never persisted. The one exception
-is `ignore.txt`, which gains a word only when you put it there yourself, by
-double-tapping Ctrl on a correction or clicking one in `Recent`. That is your
-file, in plain text, and you can read or edit it (see
+exits — it is a glance, not a log, and it is never persisted. Undo remembers declined
+words in `learned.txt`; explicitly ignored words are kept in `ignore.txt`, including
+those selected in `Recent`. These files are plain text, and you can read or edit them (see
 [Your files](#your-files)).
 
 **Your clipboard is never touched.** A corrected word is injected as synthetic
@@ -624,8 +670,10 @@ macOS withholds those characters from it in any case — but not being in the
 loop is a stronger promise than not having been given the data, and it also
 stops a correction from firing *inside* the field.
 
-There is no equivalent signal on Linux or Windows, so the same guarantee cannot
-be made there.
+ReCast has no equivalent secure-input check on Linux or Windows, so the same guarantee
+cannot be made there. Application exclusions can keep a whole password manager out of
+the correction and learning paths; they do not identify individual password fields in
+an otherwise allowed browser or application.
 
 ## Your files
 
@@ -645,10 +693,11 @@ OS config directory:
 | `abbrev.txt` | `abbr = expansion` per line, `#` comments. Expands when you finish the word, and is offered by the first Right Shift tap. |
 | `ignore.txt` | One word per line, `#` comments. Words the autocorrect must never touch.                                                  |
 | `state.txt`  | Written by ReCast: the Enable/Disable switch, so it survives a restart.                                                   |
+| `learned.txt` | Words declined through undo, with counts; loaded at startup and rewritten on undo. |
 | `welcomed`   | Written by ReCast: a marker saying the one-time hint below has been shown. Delete it to see it again.                     |
 | `personal/`  | Opt-in word counts, correction pairs, and timing aggregates; may contain sensitive text.                               |
 
-`ignore.txt` is the only file of *yours* that ReCast writes. Double-tapping Ctrl on a
+ReCast preserves unrelated content when editing your lists. Double-tapping Ctrl on a
 word that was skipped *because* it is listed takes that line back out — comments,
 spacing and every other entry copied through untouched, and the file replaced by
 rename — and clicking a correction in the tray's `Recent` list appends one.
@@ -669,6 +718,18 @@ cargo clippy --all-targets -- -D warnings
 make bench                # opt-in correction/completion microbenchmarks
 RECAST_DEBUG=1 cargo run  # log every word check and switch decision
 ```
+
+`cargo test correction_accuracy_corpus -- --nocapture` reports unwanted changes,
+missed fixes and wrong replacements separately. The corpus includes names, developer
+tokens, Hebrew prefixes, layout collisions, punctuation and case. Documented fifth-column
+baselines retain existing failures in the accuracy totals: `nvm` can switch to Hebrew,
+and dictionary membership prevents correcting `wierd`. A changed baseline fails the
+test, including when a fix makes the exception removable.
+
+`cargo test benchmark_focus_queries -- --ignored --nocapture` measures live focus
+query p50/p95/max latency without capturing keys or injecting text. `make bench`
+also runs it with release optimizations. The stalled-socket and engine-interruption
+tests exercise timeout and cancellation behavior without relying on desktop load.
 
 The correction pipeline is platform-agnostic and lives in `src/dictionary.rs` (the
 decision core, with blob lookup in `src/dictionary/blob.rs`), `src/spell.rs` (the English

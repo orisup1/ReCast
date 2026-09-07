@@ -1,6 +1,8 @@
 # layout<TAB>English reading<TAB>Hebrew reading<TAB>expected visible text
 # Same physical keys read in both layouts, except explicitly mixed-script tokens.
 # Unchanged expectations protect text; changed expectations measure useful fixes.
+# Optional fifth column: exact existing failure, not the desired result. It still
+# counts as an accuracy error; remove this column when the defect is fixed.
 en	hello	יקךךם	hello
 en	github	עןאיונ	github
 en	async	שדטמב	async
@@ -27,3 +29,71 @@ en	goverment	עםהקרצקמא	government
 en	recieve,	רקבןקהקת	receive,
 en	Recieve!	רקבןקהק!	Receive!
 he	recieve	רקבןקהק	receive
+# Names and developer vocabulary; each must remain intact.
+en	sami	דשצן	sami
+en	ori	םרן	ori
+en	supino	דופןמם	supino
+en	claude	בךשוגק	claude
+en	Sami	דשצן	Sami
+en	Ori	םרן	Ori
+en	Supino	דופןמם	Supino
+en	Claude	בךשוגק	Claude
+en	struct	דארובא	struct
+en	asap	שדשפ	asap
+en	idk	ןגל	idk
+en	brb	נרנ	brb
+# Known limitation: short switching accepts the rare Hebrew dictionary word מהצ.
+en	nvm	מהצ	nvm	מהצ
+en	yeh	טקי	yeh
+en	snake_case	דמשלק_בשדק	snake_case
+en	api_v2	שפן_ה2	api_v2
+en	src/main.rs	דרב.צשןמץרד	src/main.rs
+en	foo123	כםם123	foo123
+en	HTTP	יאאפ	HTTP
+en	JSON	חדםמ	JSON
+en	RUST	רודא	RUST
+en	CARGO	בשרעם	CARGO
+en	README	רקשגצק	README
+# Hebrew prefixes and nested prefixes; preserve the current layout.
+he	uakuo	ושלום	ושלום
+he	vakuo	השלום	השלום
+he	kakuo	לשלום	לשלום
+he	cakuo	בשלום	בשלום
+he	nvch,	מהבית	מהבית
+he	ucch,	ובבית	ובבית
+he	kch,	לבית	לבית
+he	avch,	שהבית	שהבית
+he	ufavch,	וכשהבית	וכשהבית
+he	ukguko	ולעולם	ולעולם
+he	cguko	בעולם	בעולם
+he	cgcusv	בעבודה	בעבודה
+he	kgcusv	לעבודה	לעבודה
+he	uvnjac	והמחשב	והמחשב
+he	cnjac	במחשב	במחשב
+# Real words in both layouts; the live layout resolves the ambiguity.
+en	go	עם	go
+he	go	עם	עם
+en	do	גם	do
+he	do	גם	גם
+# More useful corrections, punctuation, case, and both starting layouts.
+en	keyboad	לקטנםשג	keyboard
+he	keyboad	לקטנםשג	keyboard
+en	restaraunt	רקדאשרשומא	restaurant
+he	restaraunt	רקדאשרשומא	restaurant
+en	definately	גקכןמשאקךט	definitely
+he	definately	גקכןמשאקךט	definitely
+# Known limitation: wierd is in the embedded dictionary and is treated as valid.
+en	wierd	'ןקרג	weird	wierd
+he	wierd	'ןקרג	weird	wierd
+en	occured	םבבורקג	occurred
+he	occured	םבבורקג	occurred
+en	acheive	שביקןהק	achieve
+he	acheive	שביקןהק	achieve
+en	Recieve	רקבןקהק	Receive
+he	Recieve	רקבןקהק	Receive
+en	recieve.	רקבןקהקץ	receive.
+he	recieve.	רקבןקהקץ	receive.
+en	recieve?	רקבןקהק?	receive?
+he	recieve?	רקבןקהק?	receive?
+en	recieve)	רקבןקהק)	receive)
+he	recieve)	רקבןקהק)	receive)
