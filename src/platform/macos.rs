@@ -185,6 +185,7 @@ const RECAST_EVENT: i64 = 0x5245_4341_5354;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    fn CGRequestListenEventAccess() -> bool;
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -501,7 +502,9 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
     }
     // Bind the tap to a named local so it stays alive for the whole session;
     // dropping it would disable and release the tap.
-    let _tap = setup_event_tap(en, he, Arc::clone(&control));
+    let Some(_tap) = setup_event_tap(en, he, Arc::clone(&control)) else {
+        std::process::exit(1);
+    };
     crate::platform::tray::run(control);
 }
 
@@ -515,6 +518,24 @@ pub fn setup_event_tap(
     he_dict: Dict,
     control: Arc<AppControl>,
 ) -> Option<EventTapHandle> {
+    use core_foundation::{
+        base::TCFType, boolean::CFBoolean, dictionary::CFDictionary, string::CFString,
+    };
+
+    // A listen-only tap can succeed without Accessibility, but focus checks
+    // then fail and every correction is discarded. Ask before starting capture.
+    let options = CFDictionary::from_CFType_pairs(&[(
+        unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) },
+        CFBoolean::true_value(),
+    )]);
+    if unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) } == 0 {
+        eprintln!(
+            "ReCast needs Accessibility access to correct words. Enable ReCast in \
+             System Settings > Privacy & Security > Accessibility, then relaunch."
+        );
+        return None;
+    }
+
     // Silent on the way up, like Linux and Windows: the banner has already
     // greeted a terminal launch, and under the LaunchAgent this would only
     // ever land in /tmp/recast.out.log.
@@ -535,6 +556,7 @@ pub fn setup_event_tap(
             std::ptr::null_mut(),
         );
         if tap.is_null() {
+            CGRequestListenEventAccess();
             eprintln!(
                 "Could not create event tap. Grant 'Input Monitoring' permission \
                  in System Settings > Privacy & Security, then relaunch."
@@ -544,6 +566,9 @@ pub fn setup_event_tap(
         let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
         if source.is_null() {
             CFRelease(tap as _);
+            eprintln!(
+                "Could not attach ReCast's keyboard capture to the run loop. Relaunch ReCast."
+            );
             return None;
         }
         // Remember the tap so the callback can re-enable it if macOS disables
@@ -695,6 +720,10 @@ impl Drop for Focus {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    static kAXTrustedCheckOptionPrompt: core_foundation_sys::string::CFStringRef;
+    fn AXIsProcessTrustedWithOptions(
+        options: core_foundation_sys::dictionary::CFDictionaryRef,
+    ) -> u8;
     fn AXUIElementCreateSystemWide() -> *const c_void;
     fn AXUIElementGetPid(element: *const c_void, pid: *mut i32) -> i32;
     fn AXUIElementCopyAttributeValue(
