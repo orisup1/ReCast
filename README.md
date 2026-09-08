@@ -12,67 +12,18 @@ merely misspelled gets fixed in place instead — and completes words you are st
 
 ## How it works
 
-- Captures global key events on every supported platform.
-- Builds up the current word from key presses, remembering the Shift / Caps Lock state of
-  each one so a correction comes back capitalized the way you typed it; resets the buffer on
-  cursor / focus-shifting keys (Tab, Escape, arrows, Home/End, PgUp/PgDn, Insert, Delete)
-  and on mouse clicks (macOS / Windows).
-- **Backspace does not suspend correction.** Partial deletion, full deletion,
-  repeated Backspaces, and word-delete shortcuts leave correction enabled. A pending
-  rewrite is canceled if deletion makes its erase count stale. Navigation, forward
-  Delete, and other shortcuts still pause correction until Space or Enter (or until
-  macOS confirms an empty input field).
-- When you press Space or Enter, it interprets the typed key sequence as both an English
-  and a Hebrew word and looks each up in the matching dictionary.
-- **Punctuation is not part of the word.** A word you finished with `.`, `,`, `?`, `)` or
-  a quote is looked up without it — the end of a clause or a sentence is where words most
-  often end, and a correction that only fired before a bare space missed most of them.
-  Whatever you typed comes back with the correction (`recieve,` → `receive,`), and
-  punctuation *inside* a word stays part of it (`don't`).
-- It **anchors on your live keyboard layout** (queried from the OS, with any English or
-  Hebrew regional variant recognised). A sequence that already reads as a real word in your
-  current layout is left untouched — including prefixed Hebrew forms (ו/ה/ל/ב/כ/מ/ש) and
-  words whose other-layout reading happens to also be a dictionary word. It only switches
-  when the *other* layout yields a confident word and the current one yields nothing real.
-  This is what stops valid (and nested/prefixed) words from being mangled.
-- On a switch it erases the mistyped word and puts the corrected one back **in one shot**,
-  the way a paste lands rather than the way typing does — followed by the original
-  Space/Enter. On macOS and Windows the word is inserted as text in a single event, so it
-  appears at once and does not depend on the layout change having propagated; on Linux the
-  whole erase + retype sequence goes to the virtual keyboard as one batch.
-- If an English reading is a near-miss rather than an exact dictionary word, the spelling
-  pipeline can follow the layout pipeline. For example, an English typo entered while the
-  Hebrew layout is active is switched to English and spell-corrected as one atomic rewrite.
-  Ordinary English-layout typos are still corrected without changing layouts (see
-  [English autocorrect](#english-autocorrect)).
-- Tapping **Right Shift** mid-word completes it — tap again to cycle through the other
-  guesses — and abbreviations you define expand when the word is finished (see
-  [Auto-complete](#auto-complete)).
-- Tapping **Ctrl twice** right after a correction puts back what you typed and stops that
-  word being corrected again (see [Undo](#undo)).
-- Missing-space splitting (carving `helloעולם` into two words) is **opt-in** via
-  `RECAST_SPLIT=1`; it is off by default because it cannot reliably tell a word we simply
-  don't have in the dictionary from two run-together words.
+- Captures global key events, builds the current word, and remembers capitalization.
+- On Space, Enter, or punctuation, checks the word against English and Hebrew dictionaries.
+- Uses the live OS layout as the anchor. A valid word in the current layout stays untouched.
+- Replaces corrections in one batch, preserving punctuation and the original terminator.
+- Runs English spelling correction after layout detection when the word is a safe near-match.
+- Right Shift completes words; Ctrl twice undoes the latest correction.
+- Backspace keeps correction active; navigation, focus changes, and mouse clicks cancel stale work.
+- Missing-space splitting is opt-in with `RECAST_SPLIT=1`.
 
-Pending corrections are canceled when a shortcut, navigation key, backspace or mouse
-click makes their erase count unreliable. ReCast also compares the focused target before
-rewriting: the accessibility element on macOS, focused control on Windows, and window
-identity on Hyprland, Sway and X11. macOS/Windows decline the rewrite if focus cannot be
-queried. GNOME/KDE Wayland currently use input-event cancellation only. These checks
-cannot make global input injection atomic with focus changes; a change during an OS
-write can still interrupt a replacement. Canceled replacements do not arm undo or learn
-an accepted correction.
-
-Focus queries release the typing-state lock while waiting for the OS, so another
-input thread can process releases and cancel stale work. Hyprland/Sway focus socket
-reads and writes time out after 10 ms; an unavailable focus on a supported backend
-skips correction. The injector still queries focus afresh immediately before rewriting.
-These limits do not cover Xlib calls or the separate layout-switch operation.
-Linux one-shot layout commands (GNOME, KDE, and the Hyprland command fallback)
-have a separate 100 ms deadline and a 1 MiB output limit. Stalled command groups
-are killed and their direct children reaped; failed queries or switches are
-reported to the correction pipeline as unavailable. Long-lived notification
-monitors do not use this deadline.
+Focus is checked before replacement where the platform supports it. A focus change or
+failed layout query cancels the replacement. GNOME/KDE native Wayland cannot currently
+identify the focused application; see [Troubleshooting](#troubleshooting).
 
 ## Supported platforms
 
@@ -114,26 +65,15 @@ native Linux, macOS, and Windows runners. It publishes release assets rather tha
 committing binaries to Git. Signing and notarization are applied when the repository's
 certificate secrets are configured.
 
-The English and Hebrew dictionaries are baked into the binary at compile time, so the
-executable is self-contained and runs identically from any working directory — no data
-files or wrapper scripts to install. They are baked in *sorted*, so a lookup is a binary
-search over the embedded bytes: nothing is parsed at startup and the daemon idles at a
-few MB of memory instead of ~100 MB.
+The English and Hebrew dictionaries are baked into the binary at compile time, sorted for
+binary search. No runtime data files or wrapper scripts are needed.
 
 ### Memory
 
-ReCast is meant to start at login and still be running weeks later, which makes memory
-growth a different kind of bug — there is no end of the run to hide it behind. So nothing
-in it grows with use. The word buffer, the list of words you have undone and the
-corrections history are all bounded at their source; the ~11 MB of dictionaries are
-read-only pages of the executable rather than heap, so they are shared, never copied and
-reclaimable by the OS under pressure.
-
-Measured, not asserted: `cargo test` includes a check that ten times the work adds no
-meaningful memory, and that the total stays under a 50 MB ceiling. On this machine it
-settles at **about 9 MB and grows by hundredths of one** across the tenfold increase. `recast --status`
-prints the status process's own memory use, not the running daemon's. Use your OS
-process monitor to measure the daemon over time.
+Runtime state is bounded: word buffers, undo lists, and correction history cannot grow
+with session length. Dictionaries remain read-only executable data. `recast --status`
+shows the status process's memory, not the daemon's; use your OS process monitor for the
+daemon.
 
 ## Linux: full install + autostart
 
@@ -266,52 +206,11 @@ available to recover.
 Both are **foreground** modes: quitting the dashboard or closing the window ends
 ReCast with it. Install the service if you want it to outlive the window.
 
-The enabled/disabled switch is **remembered across restarts** — turning
-correction off is a decision about the machine, not about one run of the
-process — and `--status` reports it whether or not anything is running:
-
-```
-recast 0.8.0
-Settings, layout backend, and memory below describe this status process, not the running daemon.
-  running:        yes (pid 4821)
-  correction:     enabled
-  start at login: yes
-  config dir:     /home/you/.config/recast
-  abbrev.txt:     3 abbreviation(s)
-  ignore.txt:     7 word(s)
-  memory (this):  8.9 MB
-
-  settings (this process; config.toml and RECAST_* applied):
-    excluded apps        none
-    short words          on
-    missing-space split  off
-    frequency tie-break  on
-    spelling             on  (min length 4, max rank 20000, max distance 3)
-    auto-complete        on  (min prefix 3, max rank 30000)
-    personalization      off  (/home/you/.config/recast/personal)
-```
-
-Two of those rows are platform-specific:
-`running:` is Linux/macOS (both write a pidfile), and
-`start at login:` appears only where the autostart registration is wired up —
-launchd on macOS, the per-user `Run` key on Windows.
-
-The settings block reads the current file and this invocation's environment.
-The daemon may have started with different environment variables or an older
-config file; this output does not query its active settings or layout backend.
-A value this invocation could not parse is reported rather than swallowed —
-`RECAST_SPELL_DIST=l` used
-to fall back silently to the default 3, the *loosest* setting, from someone
-plainly trying to tighten it:
-
-```
-  ! RECAST_SPELL_DIST="l" is not an unsigned integer — using the default instead.
-```
-
-Numeric validation uses the same limits as configuration loading. `spell_dist`
-accepts 0–3 (0 disables spelling); larger values, including 256, produce a warning
-and use the default. Rank settings must fit a 32-bit unsigned integer, minimum
-lengths must fit the platform's `usize`, and timings are unsigned 64-bit microseconds.
+The enabled/disabled switch is remembered across restarts. `recast --status` reports
+whether ReCast is running, the selected layout backend, list counts, and settings for
+that invocation. It does not query the active daemon's environment or memory.
+Invalid values are reported and replaced with defaults; for example,
+`RECAST_SPELL_DIST=l` warns instead of silently selecting distance 3.
 
 Environment variables:
 
@@ -331,6 +230,29 @@ RECAST_COMPLETE_MIN=4 recast    # shortest prefix Right Shift will complete (def
 RECAST_COMPLETE_RANK=10000 recast  # how common a completion must be (default 30000)
 RECAST_PERSONAL=1 recast  # persist local word/correction/timing data (off by default)
 ```
+
+### Troubleshooting
+
+No corrections on Linux:
+
+1. Confirm both layouts are installed.
+2. Check `recast --status` for the selected layout backend.
+3. Under Hyprland, try `RECAST_LAYOUT_BACKEND=hyprland recast`.
+4. Confirm `groups` includes `input`.
+5. Reinstall the service with `make service`, then inspect:
+   `systemctl --user status recast` and `journalctl --user -u recast -f`.
+
+After a reinstall, Hyprland 0.40+ also needs `HYPRLAND_INSTANCE_SIGNATURE` and the
+current `XDG_RUNTIME_DIR`. A missing layout backend can leave spelling correction working
+while layout correction stays disabled.
+
+Corrections stop after changing focus or typing a shortcut: this is deliberate. ReCast
+cancels replacements when it cannot prove that the target is still safe. GNOME/KDE native
+Wayland cannot identify applications, so `exclude_apps` suspends correction there.
+
+macOS sees no keys: grant Input Monitoring and Accessibility. If permissions remain
+broken after replacing an app bundle, run `tccutil reset All com.recast.app`, then grant
+them again. Windows users can run `deploy.ps1 -Target help` for service commands.
 
 `RECAST_DEBUG=1` prints **every word it checks** — under a service that means into your
 system log, potentially including password text on Linux/Windows. Excluded applications
