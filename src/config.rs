@@ -5,9 +5,8 @@ pub struct Config {
     /// Persist local word-frequency, correction-pair, and typing-timing data.
     /// Off by default because the word files may contain sensitive text.
     pub personal_enabled: bool,
-    /// Allow auto-switching on short words (≤3 chars). Short key sequences are
-    /// dictionary-collision-prone, so this can be turned off for a stricter,
-    /// never-wrongly-switch behaviour.
+    /// Allow short (≤3 char) switches up to frequency rank 20,000.
+    /// Turning this off restricts them to very common words (rank ≤500).
     pub short_enabled: bool,
     /// Enable missing‑space split fallback.
     pub split_enabled: bool,
@@ -57,8 +56,8 @@ pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
 
 impl Config {
     /// Load configuration from environment variables.
-    /// RECAST_SHORT – set to `0` to disable switching on short (≤3 char) words
-    ///                (default: enabled).
+    /// RECAST_SHORT – set to `0` to restrict short (≤3 char) switches to very
+    ///                common words (default: enabled).
     /// RECAST_SPLIT – set (to anything but `0`) to enable the missing-space
     ///                split fallback (default: disabled).
     /// RECAST_FREQ  – set to `0` to disable the homograph frequency tie-break

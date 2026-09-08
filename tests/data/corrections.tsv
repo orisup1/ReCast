@@ -42,8 +42,9 @@ en	struct	דארובא	struct
 en	asap	שדשפ	asap
 en	idk	ןגל	idk
 en	brb	נרנ	brb
-# Known limitation: short switching accepts the rare Hebrew dictionary word מהצ.
-en	nvm	מהצ	nvm	מהצ
+en	nvm	מהצ	nvm
+en	Nvm	מהצ	Nvm
+en	NVM	מהצ	NVM
 en	yeh	טקי	yeh
 en	snake_case	דמשלק_בשדק	snake_case
 en	api_v2	שפן_ה2	api_v2
@@ -82,9 +83,11 @@ en	restaraunt	רקדאשרשומא	restaurant
 he	restaraunt	רקדאשרשומא	restaurant
 en	definately	גקכןמשאקךט	definitely
 he	definately	גקכןמשאקךט	definitely
-# Known limitation: wierd is in the embedded dictionary and is treated as valid.
-en	wierd	'ןקרג	weird	wierd
-he	wierd	'ןקרג	weird	wierd
+en	wierd	'ןקרג	weird
+he	wierd	'ןקרג	weird
+en	wierd,	'ןקרגת	weird,
+en	weird	'קןרג	weird
+he	weird	'קןרג	weird
 en	occured	םבבורקג	occurred
 he	occured	םבבורקג	occurred
 en	acheive	שביקןהק	achieve

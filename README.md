@@ -123,7 +123,8 @@ reclaimable by the OS under pressure.
 Measured, not asserted: `cargo test` includes a check that ten times the work adds no
 meaningful memory, and that the total stays under a 50 MB ceiling. On this machine it
 settles at **about 9 MB and grows by hundredths of one** across the tenfold increase. `recast --status`
-prints the figure so you can check a daemon that has been up for a month against it.
+prints the status process's own memory use, not the running daemon's. Use your OS
+process monitor to measure the daemon over time.
 
 ## Linux: full install + autostart
 
@@ -257,6 +258,7 @@ process — and `--status` reports it whether or not anything is running:
 
 ```
 recast 0.8.0
+Settings, layout backend, and memory below describe this status process, not the running daemon.
   running:        yes (pid 4821)
   correction:     enabled
   start at login: yes
@@ -265,7 +267,7 @@ recast 0.8.0
   ignore.txt:     7 word(s)
   memory (this):  8.9 MB
 
-  settings (with any RECAST_* override applied):
+  settings (this process; config.toml and RECAST_* applied):
     excluded apps        none
     short words          on
     missing-space split  off
@@ -280,9 +282,11 @@ Two of those rows are platform-specific:
 `start at login:` appears only where the autostart registration is wired up —
 launchd on macOS, the per-user `Run` key on Windows.
 
-The settings block reads back what the program actually resolved, which is the
-only way to tell an override that was applied from one that was not. A value it
-could not parse is reported rather than swallowed — `RECAST_SPELL_DIST=l` used
+The settings block reads the current file and this invocation's environment.
+The daemon may have started with different environment variables or an older
+config file; this output does not query its active settings or layout backend.
+A value this invocation could not parse is reported rather than swallowed —
+`RECAST_SPELL_DIST=l` used
 to fall back silently to the default 3, the *loosest* setting, from someone
 plainly trying to tighten it:
 
@@ -300,7 +304,7 @@ Environment variables:
 ```bash
 RECAST_DEBUG=1 recast   # print every word check and switch decision
 RECAST_SPLIT=1 recast   # opt-in missing-space splitting (off by default)
-RECAST_SHORT=0 recast   # never auto-switch on short (≤3 char) words
+RECAST_SHORT=0 recast   # restrict short (≤3 char) switches to very common words
 RECAST_FREQ=0  recast   # disable the homograph frequency tie-break (on by default)
 RECAST_SPELL=0 recast   # disable the English spelling autocorrect (on by default)
 
@@ -363,8 +367,9 @@ trigger on their own).
 
 Short words are the most collision-prone (many 2–3 letter abbreviations are
 valid in one dictionary while spelling a real word in the other layout), so
-`RECAST_SHORT=0` is the knob to reach "never wrongly switch" at the cost of
-not fixing short mistyped words.
+short switches require a frequency rank of 20,000 or better, even when enabled.
+`RECAST_SHORT=0` tightens that limit to 500. Unlisted short readings never trigger
+a switch. This reduces false corrections but can miss uncommon intended words.
 
 ## English autocorrect
 
@@ -653,6 +658,11 @@ those word files may include text entered into password fields. The directory an
 are user-only on Unix. Run `recast --clear-personal-data` to delete ReCast's three
 personal files without touching unexpected files in that directory. Stop the running
 ReCast service first so it cannot flush in-memory observations back to disk.
+
+One background thread saves changed personal data every 30 seconds and retries
+failed writes on the next interval. Personal-data recording never writes to disk
+on the input thread. Exiting before the next save can lose observations since
+the last successful save.
 
 **What it needs from the OS**, for the same reason, is the permission to see all
 of this: membership of the `input` group on Linux (plus a `uinput` device to

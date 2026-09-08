@@ -250,7 +250,7 @@ pub fn sample() -> String {
 # Correction pipelines
 #exclude_apps = \"\"    # comma-separated exact app IDs; see README application exclusions
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
-#short = true          # auto-switch on short (<= 3 char) words
+#short = true          # short switches: rank <= 20000; false restricts to <= 500
 #split = false         # missing-space split fallback (opt-in; can mis-split)
 #freq = true           # homograph frequency tie-break
 #spell = true          # English spelling autocorrect

@@ -76,7 +76,7 @@ Settings:
 
   RECAST_DEBUG=1      Print every word check and switch decision
   RECAST_SPLIT=1      Enable the opt-in missing-space split fallback
-  RECAST_SHORT=0      Never auto-switch on short (≤3 char) words
+  RECAST_SHORT=0      Restrict short (≤3 char) switches to very common words
   RECAST_FREQ=0       Disable the homograph frequency tie-break
   RECAST_SPELL=0      Disable the English spelling autocorrect
   RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
@@ -327,6 +327,7 @@ fn clear_the_way() {
 /// disk, which is what the next launch will pick up.
 fn print_status() {
     println!("recast {}", env!("CARGO_PKG_VERSION"));
+    println!("Settings, layout backend, and memory below describe this status process, not the running daemon.");
 
     // Linux and macOS write a pidfile, so both can answer this from disk
     // without attaching to anything. Windows does not: its instance is found
@@ -386,7 +387,7 @@ fn print_status() {
     // had been read — least of all when the value was a typo and had silently
     // fallen back to the default.
     let cfg = config::Config::from_env();
-    println!("\n  settings (config.toml and RECAST_* applied):");
+    println!("\n  settings (this process; config.toml and RECAST_* applied):");
     println!(
         "    excluded apps        {}",
         if cfg.excluded_apps.is_empty() {

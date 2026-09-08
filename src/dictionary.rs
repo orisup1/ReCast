@@ -228,15 +228,15 @@ const MIN_AUTOMATIC_WORD_CHARS: usize = 2;
 /// those is not the accidental dictionary hit the gate exists to suppress.
 const SHORT_COMMON_MAX: u32 = 500;
 
+/// Even with short switching enabled, rare dictionary hits are too ambiguous.
+// ponytail: fixed corpus-rank cutoff can miss uncommon words; tune against an
+// expanded accuracy corpus if short-word recall becomes a problem.
+const SHORT_ENABLED_MAX: u32 = 20_000;
+
 /// Whether `text`, read as `lang`, is too short to be believed as a trigger.
 ///
-/// Only has an opinion when the user has turned short-word switching off
-/// (`short_enabled`, from `RECAST_SHORT=0`), and length is not the whole of the
-/// answer even then. Length was always a proxy for "this is probably an
-/// accidental dictionary collision rather than a word anyone meant", and the
-/// frequency list answers that question directly: a two-letter reading nobody
-/// types is the collision the gate is for, and a two-letter reading everybody
-/// types is not.
+/// Short readings require frequency evidence. RECAST_SHORT=0 tightens the
+/// limit to very common words; enabling it still rejects rare dictionary hits.
 ///
 /// `short_enabled` is passed rather than read from the global config so the
 /// gate can be tested at all — the global is a `OnceLock` holding the shipped
@@ -248,13 +248,15 @@ fn too_short_to_trigger(
     en_freq: Freq,
     he_freq: Freq,
 ) -> bool {
-    if short_enabled {
-        return false;
-    }
     if text.chars().count() > SHORT_MAX {
         return false;
     }
-    freq_rank(text, lang, en_freq, he_freq).is_none_or(|rank| rank > SHORT_COMMON_MAX)
+    let max_rank = if short_enabled {
+        SHORT_ENABLED_MAX
+    } else {
+        SHORT_COMMON_MAX
+    };
+    freq_rank(text, lang, en_freq, he_freq).is_none_or(|rank| rank > max_rank)
 }
 
 /// One-letter inflectional prefixes that Hebrew attaches to nouns/verbs:
@@ -401,10 +403,8 @@ fn decide_known(
     }
 
     let oth_strict = valid_strict(oth_text, other, en_dict, he_dict);
-    // Short-word gate: short words are dictionary-collision-prone; when disabled
-    // (RECAST_SHORT=0) an other-layout reading of that length never triggers a
-    // switch — neither the plain trigger nor the frequency tie-break — unless it
-    // is common enough that the collision reading does not hold up.
+    // Short words need frequency evidence for both plain switches and the
+    // homograph tie-break. RECAST_SHORT=0 tightens that confidence threshold.
     let short_block = too_short_to_trigger(
         oth_text,
         other,
@@ -1658,7 +1658,7 @@ mod tests {
                 Run::default(),
                 en,
                 he,
-                nofreq(),
+                freq(&[("fun", 400)]),
                 nofreq()
             ),
             Some(Language::English)
@@ -2503,7 +2503,7 @@ mod tests {
     #[test]
     fn the_short_word_gate_asks_how_common_a_word_is_not_only_how_long() {
         let common = freq(&[("של", 40), ("go", 120)]);
-        // With the gate switched on (the shipped default) it never fires.
+        // Common short words remain eligible with the shipped default.
         assert!(!too_short_to_trigger(
             "של",
             Language::Hebrew,
@@ -2546,6 +2546,35 @@ mod tests {
         // A short word that is merely *in* the list is not enough — it has to be
         // near the top of it.
         let rare = freq(&[("עט", 9_000)]);
+        assert!(!too_short_to_trigger(
+            "עט",
+            Language::Hebrew,
+            true,
+            nofreq(),
+            rare
+        ));
+        let boundary = freq(&[("עט", SHORT_ENABLED_MAX), ("מהצ", SHORT_ENABLED_MAX + 1)]);
+        assert!(!too_short_to_trigger(
+            "עט",
+            Language::Hebrew,
+            true,
+            nofreq(),
+            boundary
+        ));
+        assert!(too_short_to_trigger(
+            "מהצ",
+            Language::Hebrew,
+            true,
+            nofreq(),
+            boundary
+        ));
+        assert!(too_short_to_trigger(
+            "מהצ",
+            Language::Hebrew,
+            true,
+            nofreq(),
+            nofreq()
+        ));
         assert!(too_short_to_trigger(
             "עט",
             Language::Hebrew,

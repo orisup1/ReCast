@@ -9,6 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,8 +38,9 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// Minimum word length to enter personal frequency (filters single letters, etc.).
 const MIN_WORD_LEN: usize = 3;
 
-/// How many new words before a forced flush.
-const FLUSH_AFTER_WORDS: u64 = 20;
+static FREQ_DIRTY: AtomicBool = AtomicBool::new(false);
+static CONFUSIONS_DIRTY: AtomicBool = AtomicBool::new(false);
+static PROFILE_DIRTY: AtomicBool = AtomicBool::new(false);
 
 fn increment(count: &mut u64) {
     *count = count.saturating_add(1);
@@ -104,8 +106,7 @@ pub fn record_word(word: &str) {
             return;
         }
         increment(map.entry(word).or_insert(0));
-        drop(map);
-        maybe_flush_freq();
+        FREQ_DIRTY.store(true, Ordering::Relaxed);
     }
 }
 
@@ -133,27 +134,14 @@ fn boost_for_count(count: u64) -> f32 {
     1.0 + (count as f32 / 10.0).min(1.0)
 }
 
-/// Periodically flush personal frequency to disk.
-fn maybe_flush_freq() {
-    static WORDS_SINCE_FLUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = WORDS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if count >= FLUSH_AFTER_WORDS {
-        flush_personal_freq();
-        WORDS_SINCE_FLUSH.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// Write personal frequency to disk atomically.
-fn flush_personal_freq() {
-    if !enabled() {
-        return;
-    }
+fn flush_personal_freq() -> std::io::Result<()> {
     let Some(path) = personal_path(PERSONAL_FREQ_FILE) else {
-        return;
+        return Ok(());
     };
     let map = match personal_freq_map().lock() {
         Ok(m) => m.clone(),
-        Err(_) => return,
+        Err(_) => return Err(std::io::Error::other("personal frequency lock poisoned")),
     };
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -166,9 +154,8 @@ fn flush_personal_freq() {
         out.push('\n');
     }
     let tmp = path.with_extension("txt.tmp");
-    if write_private(&tmp, &out).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    write_private(&tmp, &out)?;
+    std::fs::rename(&tmp, &path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -244,8 +231,7 @@ pub fn record_confusion(typed: &str, corrected: &str) {
             return;
         }
         increment(map.entry(typed).or_default().entry(corrected).or_insert(0));
-        drop(map);
-        maybe_flush_confusions();
+        CONFUSIONS_DIRTY.store(true, Ordering::Relaxed);
     }
 }
 
@@ -266,29 +252,15 @@ pub fn personal_correction(typed: &str) -> Option<String> {
     }
 }
 
-/// Periodically flush confusions to disk.
-fn maybe_flush_confusions() {
-    static CONFUSIONS_SINCE_FLUSH: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-    let count = CONFUSIONS_SINCE_FLUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if count >= FLUSH_AFTER_WORDS {
-        flush_confusions();
-        CONFUSIONS_SINCE_FLUSH.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// Write confusions to disk atomically.
-fn flush_confusions() {
-    if !enabled() {
-        return;
-    }
+fn flush_confusions() -> std::io::Result<()> {
     let Some(path) = personal_path(CONFUSIONS_FILE) else {
-        return;
+        return Ok(());
     };
     // Clone the map while holding the lock, then release it before writing.
     let map: HashMap<String, HashMap<String, u64>> = match confusions_map().lock() {
         Ok(m) => m.clone(),
-        Err(_) => return,
+        Err(_) => return Err(std::io::Error::other("personal confusions lock poisoned")),
     };
     let mut total_entries = 0;
     let mut out = String::from("# Personal confusion pairs — written by ReCast, safe to edit\n");
@@ -312,9 +284,8 @@ fn flush_confusions() {
         }
     }
     let tmp = path.with_extension("txt.tmp");
-    if write_private(&tmp, &out).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
+    write_private(&tmp, &out)?;
+    std::fs::rename(&tmp, &path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +293,7 @@ fn flush_confusions() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// In-memory typing profile: aggregated dwell times and digraph intervals.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TypingProfile {
     /// Key -> list of dwell times (press to release) in microseconds.
     dwells: HashMap<String, VecDeque<u64>>,
@@ -334,8 +305,6 @@ struct TypingProfile {
     last_press: Option<(String, Instant)>,
     /// Press time by held key, for dwell calculation on release.
     presses: HashMap<String, Instant>,
-    /// Whether profile has unsaved changes.
-    dirty: bool,
 }
 
 fn typing_profile() -> &'static Mutex<TypingProfile> {
@@ -372,7 +341,7 @@ pub fn record_key_press(key_name: &str) {
         profile.last_press = Some((key.clone(), now));
         profile.presses.insert(key, now);
         profile.total_keys += 1;
-        profile.dirty = true;
+        PROFILE_DIRTY.store(true, Ordering::Relaxed);
     }
 }
 
@@ -402,25 +371,19 @@ pub fn record_key_release(key_name: &str) {
                 dq.pop_front();
             }
         }
-        profile.dirty = true;
+        PROFILE_DIRTY.store(true, Ordering::Relaxed);
     }
 }
 
 /// Flush typing profile to disk (JSON-ish text).
-fn flush_profile() {
-    if !enabled() {
-        return;
-    }
+fn flush_profile() -> std::io::Result<()> {
     let Some(path) = personal_path(PROFILE_FILE) else {
-        return;
+        return Ok(());
     };
-    let mut profile = match typing_profile().lock() {
-        Ok(p) => p,
-        Err(_) => return,
+    let profile = match typing_profile().lock() {
+        Ok(p) => p.clone(),
+        Err(_) => return Err(std::io::Error::other("typing profile lock poisoned")),
     };
-    if !profile.dirty {
-        return;
-    }
     let mut out = String::from("# Typing profile — written by ReCast\n");
     out.push_str(&format!("total_keys: {}\n", profile.total_keys));
     let mut intervals: Vec<u64> = profile
@@ -449,9 +412,15 @@ fn flush_profile() {
         }
     }
     let tmp = path.with_extension("txt.tmp");
-    if write_private(&tmp, &out).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-        profile.dirty = false;
+    write_private(&tmp, &out)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Only the background writer calls this. Clear before snapshotting so changes
+/// arriving during a save remain dirty; failed writes are retried next time.
+fn flush_if_dirty(dirty: &AtomicBool, flush: impl FnOnce() -> std::io::Result<()>) {
+    if dirty.swap(false, Ordering::Relaxed) && flush().is_err() {
+        dirty.store(true, Ordering::Relaxed);
     }
 }
 
@@ -461,9 +430,9 @@ fn spawn_periodic_flusher() {
         .name("recast-personal-flush".into())
         .spawn(|| loop {
             std::thread::sleep(FLUSH_INTERVAL);
-            flush_personal_freq();
-            flush_confusions();
-            flush_profile();
+            flush_if_dirty(&FREQ_DIRTY, flush_personal_freq);
+            flush_if_dirty(&CONFUSIONS_DIRTY, flush_confusions);
+            flush_if_dirty(&PROFILE_DIRTY, flush_profile);
         })
         .ok();
 }
@@ -479,7 +448,12 @@ pub fn init() {
     if create_private_dir(&dir).is_err() {
         return;
     }
-    spawn_periodic_flusher();
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        personal_freq_map();
+        confusions_map();
+        spawn_periodic_flusher();
+    });
 }
 
 fn enabled() -> bool {
@@ -559,6 +533,25 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dirty_flush_skips_clean_data_and_preserves_retries_and_new_changes() {
+        let dirty = AtomicBool::new(false);
+        flush_if_dirty(&dirty, || panic!("clean data must not be written"));
+        dirty.store(true, Ordering::Relaxed);
+        flush_if_dirty(&dirty, || Err(std::io::Error::other("save failed")));
+        assert!(dirty.load(Ordering::Relaxed));
+        flush_if_dirty(&dirty, || {
+            dirty.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        assert!(
+            dirty.load(Ordering::Relaxed),
+            "new changes must survive a save"
+        );
+        flush_if_dirty(&dirty, || Ok(()));
+        assert!(!dirty.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn frequent_words_receive_a_larger_bounded_boost() {
