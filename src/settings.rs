@@ -55,19 +55,33 @@ fn file_key(env_key: &str) -> String {
 
 /// The parsed file, or an empty table if there isn't one.
 ///
-/// A missing, unreadable or malformed file means "no settings from the file" —
-/// never a startup failure. The same bargain the user lists make: these are
-/// conveniences, and a daemon that refuses to start because of a stray line in
-/// an optional file is worse than one that ignores the line and says so in
-/// `--status` (see [`complaints`]).
+/// A missing file is optional. Read errors must stop startup because falling
+/// back could silently discard application exclusions.
 fn parsed() -> &'static Parsed {
     static PARSED: OnceLock<Parsed> = OnceLock::new();
-    PARSED.get_or_init(|| {
-        let text = file_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        parse(&text)
-    })
+    PARSED.get_or_init(|| file_path().map_or_else(Parsed::default, |path| load_file(&path)))
+}
+
+fn load_file(path: &std::path::Path) -> Parsed {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse(&text),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(path)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Parsed::default()
+        }
+        Err(error) => Parsed {
+            read_error: Some(format!("Cannot read {}: {error}", path.display())),
+            ..Parsed::default()
+        },
+    }
+}
+
+/// Check the same cached read used by every setting, before stopping peers.
+pub fn check_readable() -> Result<(), &'static str> {
+    parsed().read_error.as_deref().map_or(Ok(()), Err)
 }
 
 fn table() -> &'static HashMap<String, String> {
@@ -79,6 +93,7 @@ fn table() -> &'static HashMap<String, String> {
 #[derive(Default)]
 struct Parsed {
     settings: HashMap<String, String>,
+    read_error: Option<String>,
     /// 1-based line numbers with no `=` on them, for [`complaints`]. Kept as
     /// numbers rather than as the text: a config file can contain anything, and
     /// echoing a line back is how a diagnostic becomes the longest thing on the
@@ -340,6 +355,29 @@ fn parse_flag(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_config_is_optional_but_unreadable_config_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("recast-config-read-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.toml");
+        assert!(load_file(&path).read_error.is_none());
+        std::fs::write(&path, b"exclude_apps = \"Editor\"\n").unwrap();
+        assert_eq!(load_file(&path).settings["exclude_apps"], "Editor");
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(load_file(&path).read_error.is_some());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_file(&path).read_error.is_some());
+        std::fs::remove_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("missing"), &path).unwrap();
+            assert!(load_file(&path).read_error.is_some());
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn the_file_key_is_the_env_name_without_its_prefix() {

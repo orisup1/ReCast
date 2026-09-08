@@ -68,6 +68,11 @@ input thread can process releases and cancel stale work. Hyprland/Sway focus soc
 reads and writes time out after 10 ms; an unavailable focus on a supported backend
 skips correction. The injector still queries focus afresh immediately before rewriting.
 These limits do not cover Xlib calls or the separate layout-switch operation.
+Linux one-shot layout commands (GNOME, KDE, and the Hyprland command fallback)
+have a separate 100 ms deadline and a 1 MiB output limit. Stalled command groups
+are killed and their direct children reaped; failed queries or switches are
+reported to the correction pipeline as unavailable. Long-lived notification
+monitors do not use this deadline.
 
 ## Supported platforms
 
@@ -79,6 +84,10 @@ These limits do not cover Xlib calls or the separate layout-switch operation.
 
 Linux additionally requires the user to be in the `input` group (for `evdev` read access)
 and creates a `uinput` virtual device named `recast-injector` to replay corrected words.
+It checks for new or reconnected input devices every second and keeps waiting
+when all devices disconnect. Removing a device cancels pending corrections and
+clears its tracked held keys. The first word after a connection change may be
+skipped because its captured text is incomplete.
 
 ## Setup
 
@@ -248,6 +257,11 @@ The macOS/Windows tray offers **Open settings** and **Open ignored words**. Thes
 open `config.toml` and `ignore.txt` in the default text editor, creating a missing file
 without overwriting edits. Windows falls back to Notepad if the file has no association.
 Settings changes take a restart; ignored-word edits are picked up automatically.
+An absent config file uses defaults. An existing file that cannot be read
+(including invalid UTF-8 or a dangling symlink) stops startup and `--status`
+with an error, so application exclusions are not silently discarded. Startup
+checks this before stopping any existing instance; `--help` and `--stop` remain
+available to recover.
 
 Both are **foreground** modes: quitting the dashboard or closing the window ends
 ReCast with it. Install the service if you want it to outlive the window.

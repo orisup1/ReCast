@@ -6,7 +6,8 @@ use crate::keymap::{
 };
 use crate::types::{AppControl, Language};
 use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -231,9 +232,8 @@ pub fn start(
     }
     run(en, he, control);
 
-    // `run` blocks for the life of the daemon — a normal shutdown is a signal,
-    // which never gets here. Returning means it gave up: no injector, or every
-    // device thread ended. Exiting 0 there told systemd the service had
+    // `run` keeps waiting even when all keyboards are disconnected. Returning
+    // means injector setup failed. Exiting 0 there told systemd the service had
     // finished its work, and `Restart=on-failure` (Makefile) left the unit
     // stopped instead of bringing it back.
     std::process::exit(1);
@@ -273,89 +273,118 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
     crate::timing::pause(crate::timing::injection().device_settle);
     let injector = Arc::new(Mutex::new(injector));
 
-    // Normally already checked by `preflight` before we detached from the
-    // terminal; still handled here because a device can be unplugged in
-    // between, and because `run` is also reached from the foreground UIs.
-    let device_paths = input_device_paths();
-    if device_paths.is_empty() {
-        eprintln!("No input devices found. Make sure you are in the 'input' group.");
-        eprintln!("Hint: Run 'sudo usermod -aG input $USER' and log out/in.");
-        return;
-    }
-
     let engine = Engine::<Linux>::new(en_dict, he_dict, control, injector);
-
-    let mut handles = vec![];
-
-    for path in device_paths {
-        let engine = Arc::clone(&engine);
-        let path_clone = path.clone();
-
-        let handle = thread::spawn(move || {
-            let mut dev = match Device::open(&path_clone) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("Could not open {path_clone:?}: {e}");
-                    eprintln!(
-                        "Hint: Are you in the 'input' group? \
-                         Run 'sudo usermod -aG input $USER' and log out/in."
-                    );
-                    return;
-                }
-            };
-
-            // A read error used to be retried forever. Unplugging a keyboard
-            // does not make its node readable again — it makes every read fail
-            // with the same error — so the thread settled into waking twice a
-            // second, for the life of the daemon, to be told the device is
-            // still gone. It also kept `run` from ever returning, because it
-            // joins these handles.
-            //
-            // A handful of retries still covers what retrying is *for*: a
-            // transient EINTR, or a device that drops out for a moment during
-            // suspend/resume.
-            const GIVE_UP_AFTER: u32 = 10;
-            let mut failures = 0u32;
-
-            loop {
-                let events = match dev.fetch_events() {
-                    Ok(ev) => {
-                        failures = 0;
-                        ev.collect::<Vec<_>>()
-                    }
+    let mut readers = HashMap::new();
+    loop {
+        refresh_readers(&mut readers, input_device_paths(), |path_clone| {
+            let engine = Arc::clone(&engine);
+            thread::spawn(move || {
+                let mut dev = match Device::open(&path_clone) {
+                    Ok(d) => d,
                     Err(e) => {
-                        failures += 1;
-                        eprintln!("Error reading {:?}: {}", path_clone, e);
-                        if failures >= GIVE_UP_AFTER {
-                            eprintln!(
-                                "Giving up on {:?} after {} consecutive errors — \
-                                 it is most likely unplugged.",
-                                path_clone, failures
-                            );
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
+                        eprintln!("Could not open {path_clone:?}: {e}");
+                        eprintln!(
+                            "Hint: Are you in the 'input' group? \
+                         Run 'sudo usermod -aG input $USER' and log out/in."
+                        );
+                        return;
                     }
                 };
+                engine.forget_everything();
+                let mut held = HashSet::new();
+                // Retry transient failures, but retire disconnected readers at once.
+                const GIVE_UP_AFTER: u32 = 10;
+                let mut failures = 0u32;
 
-                for event in events {
-                    if let EventSummary::Key(_, keycode, value) = event.destructure() {
-                        match value {
-                            1 => engine.key_press(keycode),
-                            0 => engine.key_release(keycode),
-                            _ => {}
+                loop {
+                    let events = match dev.fetch_events() {
+                        Ok(ev) => {
+                            failures = 0;
+                            ev.collect::<Vec<_>>()
+                        }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            failures += 1;
+                            eprintln!("Error reading {:?}: {}", path_clone, e);
+                            if e.raw_os_error() == Some(nix::libc::ENODEV)
+                                || failures >= GIVE_UP_AFTER
+                            {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                    };
+
+                    for event in events {
+                        if let EventSummary::Key(_, keycode, value) = event.destructure() {
+                            match value {
+                                1 => {
+                                    held.insert(keycode);
+                                    engine.key_press(keycode);
+                                }
+                                0 => {
+                                    held.remove(&keycode);
+                                    engine.key_release(keycode);
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
-            }
+                engine.input_device_removed(&held);
+            })
         });
-        handles.push(handle);
+        // ponytail: one-second discovery polling also retries permission races;
+        // use a udev monitor if idle wakeups or reconnect latency matter.
+        thread::sleep(Duration::from_secs(1));
     }
+}
 
-    for h in handles {
-        let _ = h.join();
+fn refresh_readers(
+    readers: &mut HashMap<PathBuf, thread::JoinHandle<()>>,
+    paths: Vec<PathBuf>,
+    mut start: impl FnMut(PathBuf) -> thread::JoinHandle<()>,
+) {
+    let finished: Vec<_> = readers
+        .iter()
+        .filter(|(_, reader)| reader.is_finished())
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in finished {
+        if let Some(reader) = readers.remove(&path) {
+            let _ = reader.join();
+        }
     }
+    for path in paths {
+        readers.entry(path.clone()).or_insert_with(|| start(path));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn readers_survive_hotplug_without_duplicates() {
+    let path = PathBuf::from("event-test");
+    let mut readers = HashMap::new();
+    refresh_readers(&mut readers, vec![path.clone()], |_| {
+        thread::spawn(|| thread::park_timeout(Duration::from_secs(2)))
+    });
+    refresh_readers(&mut readers, vec![path.clone()], |_| {
+        panic!("duplicate reader")
+    });
+    assert_eq!(readers.len(), 1);
+    readers[&path].thread().unpark();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while !readers[&path].is_finished() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    refresh_readers(&mut readers, vec![], |_| panic!("no device attached"));
+    assert!(readers.is_empty());
+    refresh_readers(&mut readers, vec![path.clone()], |_| thread::spawn(|| {}));
+    readers.remove(&path).unwrap().join().unwrap();
 }
 
 fn emit_paced(

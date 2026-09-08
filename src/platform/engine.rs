@@ -570,6 +570,20 @@ impl<P: Platform> Engine<P> {
         self.lock().invalidate_text();
     }
 
+    /// Unplugged evdev devices cannot deliver releases. Cancel stale work and
+    /// remove their held keys without interpreting a release as an undo tap.
+    #[cfg(target_os = "linux")]
+    pub fn input_device_removed(&self, held: &HashSet<P::Key>) {
+        let mut st = self.lock();
+        st.invalidate_text();
+        st.held_keys.retain(|key| !held.contains(key));
+        st.right_shift_tap = false;
+        st.ctrl_down = None;
+        st.layout_hotkey = false;
+        st.last_key = None;
+        crate::layout::invalidate();
+    }
+
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn mouse_click(&self) {
         self.forget_everything();
@@ -1528,6 +1542,30 @@ mod tests {
         fn text(&self) -> String {
             self.engine.injector.text.lock().unwrap().clone()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unplugging_cancels_pending_work_and_releases_device_keys() {
+        let s = Session::new();
+        let generation = {
+            let mut st = s.engine.lock();
+            st.held_keys.extend([Simulated::CTRL_LEFT, 'x']);
+            st.keys.push(Typed {
+                key: 'a',
+                shift: false,
+            });
+            st.ctrl_down = Some(Instant::now());
+            st.right_shift_tap = true;
+            st.generation
+        };
+        s.engine
+            .input_device_removed(&HashSet::from([Simulated::CTRL_LEFT]));
+        let st = s.engine.lock();
+        assert_ne!(st.generation, generation);
+        assert!(st.keys.is_empty() && st.no_fix);
+        assert_eq!(st.held_keys, HashSet::from(['x']));
+        assert!(st.ctrl_down.is_none() && !st.right_shift_tap);
     }
 
     #[test]

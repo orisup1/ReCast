@@ -59,6 +59,28 @@ fn status_reports_numeric_fallbacks_and_application_exclusions() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn unreadable_config_stops_startup_and_status_but_not_help() {
+    let dir = std::env::temp_dir().join(format!("recast-cli-config-read-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("recast/config.toml")).unwrap();
+    for arg in ["--foreground", "--status", "--help"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_recast"))
+            .env("XDG_CONFIG_HOME", &dir)
+            .arg(arg)
+            .output()
+            .unwrap();
+        if arg == "--help" {
+            assert!(output.status.success());
+        } else {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("refusing to discard configured settings"));
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn write_config_preserves_existing_files_and_symlink_targets() {
     let dir = std::env::temp_dir().join(format!("recast-cli-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();

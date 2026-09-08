@@ -156,6 +156,7 @@ fn main() {
             "-f" | "--foreground" => with_foreground = true,
             "--keep-others" => keep_others = true,
             "--status" => {
+                require_readable_config();
                 print_status();
                 return;
             }
@@ -223,6 +224,8 @@ fn main() {
         }
         return;
     }
+
+    require_readable_config();
 
     if banner::ran_from_terminal() {
         banner::print_logo();
@@ -320,11 +323,14 @@ fn clear_the_way() {
     }
 }
 
-/// Answer the two questions a user asks when something isn't happening: is it
-/// running, and is it configured the way I think it is.
-///
-/// Deliberately readable without a running daemon — it reports the state on
-/// disk, which is what the next launch will pick up.
+fn require_readable_config() {
+    if let Err(error) = settings::check_readable() {
+        eprintln!("{error}; refusing to discard configured settings.");
+        process::exit(1);
+    }
+}
+
+/// Report running state and this invocation's settings, without needing a daemon.
 fn print_status() {
     println!("recast {}", env!("CARGO_PKG_VERSION"));
     println!("Settings, layout backend, and memory below describe this status process, not the running daemon.");

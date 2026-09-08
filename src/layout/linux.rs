@@ -441,6 +441,71 @@ fn watch_command(bin: &str, args: &[&str], interesting: fn(&str) -> bool) -> Opt
     ))
 }
 
+/// Bound one-shot layout queries and switches, including pipe reads. Monitor
+/// processes use watch_command instead because their lifetime is intentional.
+fn command_output(command: &mut std::process::Command) -> Option<String> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_millis(100);
+    const MAX_OUTPUT: usize = 1024 * 1024;
+    let deadline = Instant::now() + TIMEOUT;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let result = (|| {
+        let mut stdout = child.stdout.take()?;
+        fcntl(stdout.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        let mut eof = false;
+        loop {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            match stdout.read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(n) => {
+                    if bytes.len() + n > MAX_OUTPUT {
+                        return None;
+                    }
+                    bytes.extend_from_slice(&buffer[..n]);
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+            if let Some(status) = child.try_wait().ok()? {
+                if !status.success() {
+                    return None;
+                }
+                if eof {
+                    return String::from_utf8(bytes).ok();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    })();
+    if result.is_none() {
+        // Kill the process group too: descendants may keep stdout open.
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+    }
+    result
+}
+
 /// Our own injector, which must never be mistaken for a keyboard the user
 /// types on: it carries a layout list of its own, and reading the layout off it
 /// means reporting the state of a device nobody has touched. A wrong reading
@@ -594,11 +659,7 @@ mod hypr {
             // The socket refused. Fall back to the subprocess so a setup that
             // only has `hyprctl` still works.
             None => {
-                let out = std::process::Command::new("hyprctl")
-                    .args(["devices", "-j"])
-                    .output()
-                    .ok()?;
-                String::from_utf8(out.stdout).ok()
+                super::command_output(std::process::Command::new("hyprctl").args(["devices", "-j"]))
             }
         }
     }
@@ -704,16 +765,12 @@ mod hypr {
             return request(&format!("/switchxkblayout all {index}"))
                 .is_some_and(|reply| reply.trim() == "ok");
         }
-        match std::process::Command::new("hyprctl")
-            .args(["switchxkblayout", "all", &index.to_string()])
-            .status()
-        {
-            Ok(status) => status.success(),
-            Err(e) => {
-                eprintln!("Failed to switch layout using hyprctl: {e}");
-                false
-            }
-        }
+        super::command_output(std::process::Command::new("hyprctl").args([
+            "switchxkblayout",
+            "all",
+            &index.to_string(),
+        ]))
+        .is_some()
     }
 }
 
@@ -952,11 +1009,7 @@ mod kde {
                     ("qdbus6", Style::Qdbus),
                     ("qdbus", Style::Qdbus),
                 ] {
-                    if Command::new(bin)
-                        .arg("--version")
-                        .output()
-                        .is_ok_and(|o| o.status.success())
-                    {
+                    if super::command_output(Command::new(bin).arg("--version")).is_some() {
                         return Some((bin, style));
                     }
                 }
@@ -1023,10 +1076,7 @@ mod kde {
                 }
             }
         }
-        let out = cmd.output().ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        super::command_output(&mut cmd)
     }
 
     /// The display names out of a `getLayoutsList` reply.
@@ -1126,13 +1176,11 @@ mod gnome {
     use std::process::Command;
 
     fn get(key: &str) -> Option<String> {
-        let out = Command::new("gsettings")
-            .args(["get", "org.gnome.desktop.input-sources", key])
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        super::command_output(Command::new("gsettings").args([
+            "get",
+            "org.gnome.desktop.input-sources",
+            key,
+        ]))
     }
 
     /// The xkb codes out of a `sources` reply.
@@ -1180,15 +1228,13 @@ mod gnome {
     }
 
     pub fn set_index(index: usize) -> bool {
-        Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.input-sources",
-                "current",
-                &format!("uint32 {index}"),
-            ])
-            .status()
-            .is_ok_and(|s| s.success())
+        super::command_output(Command::new("gsettings").args([
+            "set",
+            "org.gnome.desktop.input-sources",
+            "current",
+            &format!("uint32 {index}"),
+        ]))
+        .is_some()
     }
 }
 
@@ -1526,6 +1572,42 @@ mod x11 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_commands_capture_output_and_reap_timeouts() {
+        use std::process::Command;
+        assert_eq!(
+            command_output(Command::new("sh").args(["-c", "printf layout"])),
+            Some("layout".into())
+        );
+        assert!(command_output(Command::new("sh").args(["-c", "exit 1"])).is_none());
+        let path = std::env::temp_dir().join(format!("recast-command-pid-{}", std::process::id()));
+        let started = Instant::now();
+        assert!(command_output(
+            Command::new("sh")
+                .args(["-c", "echo $$ > \"$1\"; exec sleep 10", "recast-test"])
+                .arg(&path)
+        )
+        .is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let pid: i32 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(pid),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD),
+            "timed-out child must already be reaped"
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            command_output(Command::new("head").args(["-c", "1048577", "/dev/zero"])).is_none()
+        );
+    }
 
     // ── Hyprland ─────────────────────────────────────────────────────────────
 
