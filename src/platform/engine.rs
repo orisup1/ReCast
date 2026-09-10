@@ -1570,6 +1570,27 @@ mod tests {
 
     #[test]
     fn typing_correction_undo_and_interrupted_replacements() {
+        // Undo changes process-wide suppression and learning state. Run this
+        // scenario alone so it cannot change the parallel corpus test's results.
+        const CHILD: &str = "RECAST_ENGINE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::typing_correction_undo_and_interrupted_replacements",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let s = Session::new();
         s.type_text("keyboad ");
         s.pending();
