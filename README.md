@@ -667,10 +667,13 @@ RECAST_DEBUG=1 cargo run  # log every word check and switch decision
 
 `cargo test correction_accuracy_corpus -- --nocapture` reports unwanted changes,
 missed fixes and wrong replacements separately. The corpus includes names, developer
-tokens, Hebrew prefixes, layout collisions, punctuation and case. Documented fifth-column
-baselines retain existing failures in the accuracy totals: `nvm` can switch to Hebrew,
-and dictionary membership prevents correcting `wierd`. A changed baseline fails the
-test, including when a fix makes the exception removable.
+tokens, Hebrew inflections and prefixes, layout collisions, punctuation and case.
+It protects `nvm` from unwanted changes and checks that `wierd` becomes `weird`.
+Additional cases exercise existing speller examples through the full planner in both
+layouts. All-caps tokens are protected from spelling changes, including apparent typos.
+An optional fifth column records the exact output of a documented existing failure;
+it still counts as an accuracy error. A changed baseline fails the test, including
+when a fix makes the exception removable. The current corpus needs no such exceptions.
 
 `cargo test benchmark_focus_queries -- --ignored --nocapture` measures live focus
 query p50/p95/max latency without capturing keys or injecting text. `make bench`
@@ -696,7 +699,7 @@ there is nothing to install alongside the executable.
 expected visible result. It covers Hebrew, mixed-script tokens, identifiers, spelling,
 layout fixes and punctuation. Its test reports unwanted changes separately from missed
 and wrong corrections. Add real reports to this file; the small corpus is a regression
-check, not an estimate of accuracy for all typing. `false_positives.txt` adds protection
+check, not an estimate of accuracy for all typing. `tests/data/false_positives.txt` adds protection
 cases for the speller alone.
 
 Both cross-targets compile from Linux, and are worth checking before a release since
@@ -713,8 +716,6 @@ typing-sequence tests; native builds check each platform’s capture and injecti
 
 CI runs automatically on pushes and pull requests, and can also be started from
 the Actions tab. Release CLI smoke tests also exercise Windows GUI-subsystem builds.
-
-For v0.8.0 changes and the remaining native release checks, see [RELEASE.md](RELEASE.md).
 
 ### Release signing
 

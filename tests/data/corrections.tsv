@@ -100,3 +100,85 @@ en	recieve?	רקבןקהק?	receive?
 he	recieve?	רקבןקהק?	receive?
 en	recieve)	רקבןקהק)	receive)
 he	recieve)	רקבןקהק)	receive)
+
+# Curated name and shorthand variants, including punctuation after prior regressions.
+en	David	גשהןג	David
+en	Daniel	גשמןקך	Daniel
+en	Sarah	דשרשי	Sarah
+en	Noam	מםשצ	Noam
+en	Maya	צשטש	Maya
+en	sami,	דשצןת	sami,
+en	ori.	םרןץ	ori.
+en	supino!	דופןמם!	supino!
+en	claude?	בךשוגק?	claude?
+en	nvm,	מהצת	nvm,
+en	Nvm.	מהצץ	Nvm.
+en	NVM!	מהצ!	NVM!
+en	idk?	ןגל?	idk?
+en	brb.	נרנץ	brb.
+en	asap!	שדשפ!	asap!
+# Short English words must not become plausible Hebrew readings.
+en	if	ןכ	if
+en	of	םכ	of
+en	or	םר	or
+en	on	םמ	on
+en	no	מם	no
+en	so	דם	so
+en	to	אם	to
+en	we	'ק	we
+en	in	ןמ	in
+en	at	שא	at
+en	by	נט	by
+en	my	צט	my
+# Hebrew inflections: plurals, possessives, and attached prefixes in both layouts.
+he	hksho	ילדים	ילדים
+en	hksho	ילדים	ילדים
+he	vhksho	הילדים	הילדים
+en	vhksho	הילדים	הילדים
+he	khksho	לילדים	לילדים
+en	khksho	לילדים	לילדים
+he	xprho	ספרים	ספרים
+en	xprho	ספרים	ספרים
+he	vxprho	הספרים	הספרים
+en	vxprho	הספרים	הספרים
+he	xpru	ספרו	ספרו
+en	xpru	ספרו	ספרו
+he	xprhv	ספריה	ספריה
+en	xprhv	ספריה	ספריה
+he	c,ho	בתים	בתים
+en	c,ho	בתים	בתים
+he	cc,ho	בבתים	בבתים
+en	cc,ho	בבתים	בבתים
+he	nhkho	מילים	מילים
+en	nhkho	מילים	מילים
+he	vnhkho	המילים	המילים
+en	vnhkho	המילים	המילים
+he	jcrho	חברים	חברים
+en	jcrho	חברים	חברים
+# Existing speller examples now exercise the full planner and layout/spelling composition.
+en	freind	כרקןמג	friend
+he	freind	כרקןמג	friend
+en	tomorow	אםצםרם'	tomorrow
+he	tomorow	אםצםרם'	tomorrow
+en	conmputer	בםמצפואקר	computer
+he	conmputer	בםמצפואקר	computer
+en	differemt	גןככקרקצא	different
+he	differemt	גןככקרקצא	different
+en	begining	נקעןמןמע	beginning
+he	begining	נקעןמןמע	beginning
+en	necesary	מקבקדשרט	necessary
+he	necesary	מקבקדשרט	necessary
+en	existance	קסןדאשמבק	existence
+he	existance	קסןדאשמבק	existence
+en	recieveing	רקבןקהקןמע	receiving
+he	recieveing	רקבןקהקןמע	receiving
+# Preserve capitalization and trailing punctuation when spelling is corrected.
+en	Wierd!	'ןקרג!	Weird!
+he	Wierd!	'ןקרג!	Weird!
+en	Tomorow,	אםצםרם'ת	Tomorrow,
+he	Tomorow,	אםצםרם'ת	Tomorrow,
+# All-caps tokens skip spelling even when they resemble typos, in either layout.
+en	WIERD?	'ןקרג?	WIERD?
+he	WIERD?	'ןקרג?	'ןקרג?
+en	CONMPUTER.	בםמצפואקרץ	CONMPUTER.
+he	CONMPUTER.	בםמצפואקרץ	בםמצפואקרץ
