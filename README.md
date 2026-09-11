@@ -132,8 +132,17 @@ Builds, restages `target/bundle/ReCast.app` around the fresh binary, installs it
 does the work). Use this one if you want ReCast to look like an application rather
 than a background job — "Start at login" in the menubar menu then registers it.
 
-Either way you will need to grant **Input Monitoring** and **Accessibility** in
+Either way you will need to grant **Accessibility** in
 System Settings → Privacy & Security the first time it runs.
+ReCast opens a setup dialog on first launch or when a requirement is missing.
+It checks Accessibility and the English/Hebrew keyboards, opens the relevant
+System Settings panes, and offers **Check again**. If macOS requires a relaunch
+after granting permission, quit and reopen ReCast.
+Accessibility grants both event listening and posting, so setup does not require a
+separate Input Monitoring entry. If ReCast is absent from Accessibility, click **+**,
+press **Cmd+Shift+G**, and enter the exact app path shown in setup. **Show ReCast in
+Finder** reveals that copy. Launch the `.app` from Finder to give it its own app
+identity; terminal-launched executables may be attributed to the terminal instead.
 
 macOS keys those two grants to the bundle's code signature rather than to its path,
 so replacing the executable inside a bundle that already has them leaves the checkbox
@@ -190,13 +199,20 @@ to bring it back afterwards.
 The TUI (`-g`, Linux/Windows) shows the enabled state, the counters and the
 corrections themselves as they happen; `e`/`Space` toggles correction on and
 off, `p` pauses it for half an hour, `r` re-reads your files, `q` quits. The
-control window (`-w`) offers the toggle and counters in a tiny GUI window. On
+control window (`-w`) offers the toggle, counters, settings, application exclusions,
+and shortcut help. On
 macOS use the menubar menu instead.
 
-The macOS/Windows tray offers **Open settings** and **Open ignored words**. These
+The macOS/Windows tray's **Settings** submenu offers spelling, completion/abbreviations,
+and **Conservative spelling** (single-edit fixes; turning it off restores the default
+three-edit ceiling). These controls save to `config.toml` and apply immediately.
+Environment overrides take precedence; a controlled setting reports why it cannot
+be changed from the UI. The Linux control window offers the same settings.
+
+**Advanced settings** and **Open ignored words** in the tray
 open `config.toml` and `ignore.txt` in the default text editor, creating a missing file
 without overwriting edits. Windows falls back to Notepad if the file has no association.
-Settings changes take a restart; ignored-word edits are picked up automatically.
+Manual config-file edits take a restart; ignored-word edits are picked up automatically.
 An absent config file uses defaults. An existing file that cannot be read
 (including invalid UTF-8 or a dangling symlink) stops startup and `--status`
 with an error, so application exclusions are not silently discarded. Startup
@@ -250,7 +266,7 @@ Corrections stop after changing focus or typing a shortcut: this is deliberate. 
 cancels replacements when it cannot prove that the target is still safe. GNOME/KDE native
 Wayland cannot identify applications, so `exclude_apps` suspends correction there.
 
-macOS sees no keys: grant Input Monitoring and Accessibility. If permissions remain
+macOS sees no keys: grant Accessibility. If permissions remain
 broken after replacing an app bundle, run `tccutil reset All com.recast.app`, then grant
 them again. Windows users can run `deploy.ps1 -Target help` for service commands.
 
@@ -260,6 +276,12 @@ and macOS secure input are skipped before checking or logging. Use debug while
 diagnosing something, not as a standing setting.
 
 ### Application exclusions
+
+In the tray's **Excluded applications** submenu (or the Linux control window),
+choose **Exclude [app]** to exclude the last detected active application without
+looking up its identifier. Changes apply immediately and survive restarts. Click
+**Allow [app]** to remove an exclusion. The Linux window explains when application
+detection is unavailable and disables adding exclusions in that session.
 
 Set `exclude_apps` in `config.toml` to a comma-separated string of exact application
 IDs, then restart ReCast. Matching ignores case; there are no wildcards or title matches.
@@ -459,6 +481,9 @@ you typed (`Btw` → `By the way`, `BTW` → `BY THE WAY`).
 
 ## Undo
 
+**Typing shortcuts** in the tray or Linux control window keeps the gesture help
+available at any time. The first-correction hint is nonblocking on Windows.
+
 **Tap Ctrl twice, quickly**, right after a correction and ReCast puts back what
 you actually typed — and switches the layout back too, if that is what the
 correction changed. Ctrl is the second gesture key for the same reason Right
@@ -476,9 +501,10 @@ eating text further back.
 Putting the letters back is only half of it. A correction is a *function* of what
 you typed, so retyping the same word reaches the same conclusion — an undo that
 only rewrote the screen would put you on a treadmill. So undoing a word also
-**retires** it: nothing corrects that word again until ReCast restarts. That is
-the fast path for the `hostname` → `hostage` case, and `ignore.txt` is still how
-you make it permanent.
+**retires** it: nothing corrects that word again until ReCast restarts. Undoing
+the same word on two occasions makes that preference persist in `learned.txt`.
+That is the fast path for the `hostname` → `hostage` case; the Recent menu and
+`ignore.txt` also let you make an exception permanent immediately.
 
 A completion can be taken back the same way, though tapping Right Shift around
 the cycle gets you there without the gesture.
@@ -602,7 +628,7 @@ the last successful save.
 
 **What it needs from the OS**, for the same reason, is the permission to see all
 of this: membership of the `input` group on Linux (plus a `uinput` device to
-type corrections back), Input Monitoring and Accessibility on macOS, and a
+type corrections back), Accessibility on macOS, and a
 low-level keyboard hook on Windows. Those are the real trust you are extending;
 the rest of this section is about what is done with it.
 
@@ -641,6 +667,7 @@ OS config directory:
 | `state.txt`  | Written by ReCast: the Enable/Disable switch, so it survives a restart.                                                   |
 | `learned.txt` | Words declined through undo, with counts; loaded at startup and rewritten on undo. |
 | `welcomed`   | Written by ReCast: a marker saying the one-time hint below has been shown. Delete it to see it again.                     |
+| `setup-complete` | macOS setup marker. Delete it to see setup again; missing requirements always reopen setup. |
 | `personal/`  | Opt-in word counts, correction pairs, and timing aggregates; may contain sensitive text.                               |
 
 ReCast preserves unrelated content when editing your lists. Double-tapping Ctrl on a
