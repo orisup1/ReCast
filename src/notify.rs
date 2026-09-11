@@ -14,6 +14,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub const SHORTCUTS: &str = "Undo: tap Ctrl twice within half a second, immediately after a correction. Typing anything else or moving the cursor ends the undo opportunity.\n\nCompletion: tap Right Shift mid-word. Tap again to cycle suggestions and eventually restore your original prefix. Holding Shift to capitalize is unaffected.\n\nOne undo leaves that word alone for this session. Undoing it on two occasions remembers that preference across restarts.\n\nTo allow a word again: type the ignored word and its space, then double-tap Ctrl immediately. This removes its saved exception and may correct it.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.";
+
 /// Explicitly requested help may use a dialog; typing notifications must not.
 #[cfg(target_os = "macos")]
 pub fn dialog(title: &str, body: &str, buttons: &[&str]) -> usize {
@@ -85,6 +87,24 @@ pub fn dialog_with_destination(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn show_shortcuts() {
+    #[cfg(target_os = "macos")]
+    dialog("Typing shortcuts", SHORTCUTS, &["Done"]);
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use winapi::um::winuser::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+        let title: Vec<u16> = "Typing shortcuts".encode_utf16().chain(Some(0)).collect();
+        let body: Vec<u16> = SHORTCUTS.encode_utf16().chain(Some(0)).collect();
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
 /// Whether this run has already dealt with the hint — checked before the
 /// filesystem is, so the steady state costs one relaxed atomic load per
 /// correction rather than a `stat`.
@@ -117,8 +137,9 @@ pub fn first_correction_hint() {
         crate::prefs::mark_welcomed();
         notify(
             "ReCast just corrected a word",
-            "Double-tap Ctrl right after a correction to put your word back — \
-             and ReCast will leave that word alone from then on.",
+            "Ctrl twice immediately undoes a correction and skips that word this session. \
+             Repeated undos remember it. Right Shift completes; tap again to cycle. \
+             See Typing shortcuts for help.",
         );
     });
 }
@@ -149,26 +170,15 @@ pub fn notify(title: &str, body: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use winapi::um::winuser::{MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND};
-
-        let wide = |s: &str| -> Vec<u16> {
-            OsStr::new(s)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect()
-        };
-        let (body, title) = (wide(body), wide(title));
-        // A tray app has no foreground window, so without MB_SETFOREGROUND the
-        // box can open behind whatever the user is typing into.
-        unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                body.as_ptr(),
-                title.as_ptr(),
-                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
-            );
+        // The tray thread presents these without opening or focusing a window.
+        if let Ok(mut pending) = WINDOWS_NOTICES.lock() {
+            if pending.len() < 8 {
+                pending.push_back((title.to_string(), body.to_string()));
+            }
         }
     }
 }
+
+#[cfg(target_os = "windows")]
+pub static WINDOWS_NOTICES: std::sync::Mutex<std::collections::VecDeque<(String, String)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());

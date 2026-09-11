@@ -389,6 +389,8 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         Line::from("                       and stop correcting that word. On a word that"),
         Line::from("                       was skipped because it is listed, it does the"),
         Line::from("                       opposite: unlists it and corrects it."),
+        Line::from("  Undo immediately: more typing or cursor movement ends the opportunity."),
+        Line::from("  One undo skips a word this session; two occasions remember it."),
         Line::from(""),
         Line::from("Your files (edits are picked up within ~2s, no restart):"),
         Line::from("  abbrev.txt : `btw = by the way`, one per line"),

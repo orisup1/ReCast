@@ -71,6 +71,45 @@ pub fn run(control: Arc<AppControl>) {
     let mut recent_words: Vec<String> = vec![String::new(); RECENT_SLOTS];
 
     let settings_item = MenuItem::new("Open settings", true, None);
+    let settings_menu = Submenu::new("Settings", true);
+    let config = crate::config::Config::global();
+    let spell_item =
+        CheckMenuItem::new("Correct English spelling", true, config.spell_enabled, None);
+    let complete_item = CheckMenuItem::new(
+        "Word completion and abbreviations",
+        true,
+        config.complete_enabled,
+        None,
+    );
+    let conservative_item = CheckMenuItem::new(
+        "Conservative spelling (single-typo fixes)",
+        true,
+        config.spell_max_dist == 1,
+        None,
+    );
+    settings_menu.append(&spell_item).expect("append spelling");
+    settings_menu
+        .append(&complete_item)
+        .expect("append completion");
+    settings_menu
+        .append(&conservative_item)
+        .expect("append conservative");
+    settings_item.set_text("Advanced settings… (file edits need restart)");
+    settings_menu
+        .append(&settings_item)
+        .expect("append advanced settings");
+    let apps_menu = Submenu::new("Excluded applications", true);
+    let exclude_item = MenuItem::new("Switch to an app first", false, None);
+    apps_menu.append(&exclude_item).expect("append exclude app");
+    let apps_hint = MenuItem::new(
+        "Click a saved app below to allow correction again",
+        false,
+        None,
+    );
+    apps_menu.append(&apps_hint).expect("append apps hint");
+    let mut excluded_items: Vec<(MenuItem, String)> = Vec::new();
+    let mut last_app: Option<(String, String)> = None;
+    let shortcuts_item = MenuItem::new("Typing shortcuts…", true, None);
     let ignored_item = MenuItem::new("Open ignored words", true, None);
     let reload_item = MenuItem::new("Reload lists", true, None);
     // Only offered where it is wired up; elsewhere the item would be a
@@ -85,7 +124,9 @@ pub fn run(control: Arc<AppControl>) {
     menu.append(&pause_item).expect("append pause");
     menu.append(&sep).expect("append separator");
     menu.append(&recent_menu).expect("append recent");
-    menu.append(&settings_item).expect("append settings");
+    menu.append(&settings_menu).expect("append settings");
+    menu.append(&apps_menu).expect("append apps");
+    menu.append(&shortcuts_item).expect("append shortcuts");
     menu.append(&ignored_item).expect("append ignored words");
     menu.append(&reload_item).expect("append reload");
     if let Some(item) = &autostart_item {
@@ -95,8 +136,14 @@ pub fn run(control: Arc<AppControl>) {
     menu.append(&quit_item).expect("append quit");
 
     let toggle_id = toggle_item.id().clone();
+    let status_id = status_item.id().clone();
     let pause_id = pause_item.id().clone();
     let settings_id = settings_item.id().clone();
+    let spell_id = spell_item.id().clone();
+    let complete_id = complete_item.id().clone();
+    let conservative_id = conservative_item.id().clone();
+    let exclude_id = exclude_item.id().clone();
+    let shortcuts_id = shortcuts_item.id().clone();
     let ignored_id = ignored_item.id().clone();
     let reload_id = reload_item.id().clone();
     let autostart_id = autostart_item.as_ref().map(|i| i.id().clone());
@@ -117,13 +164,36 @@ pub fn run(control: Arc<AppControl>) {
     // lifetime; we never read it back after construction.
     let mut pending_menu: Option<Menu> = Some(menu);
     let mut _tray: Option<TrayIcon> = None;
+    #[cfg(target_os = "windows")]
+    let mut balloon_until: Option<Instant> = None;
 
     event_loop.run(move |event, _target, control_flow| {
         // Wake periodically to refresh the fixed-word counter; menu/tray
         // events still wake us immediately in between.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + STATUS_REFRESH);
 
+        if let Some(app) = super::active_application() {
+            last_app = Some(app);
+        }
+        let excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
+        if let Some((name, id)) = &last_app {
+            let verb = if excluded.contains(&id.to_lowercase()) { "Allow" } else { "Exclude" };
+            exclude_item.set_text(format!("{verb} {name} ({id})"));
+            exclude_item.set_enabled(true);
+        }
+        if excluded_items.iter().map(|(_, id)| id).ne(excluded.iter()) {
+            for (item, _) in excluded_items.drain(..) {
+                let _ = apps_menu.remove(&item);
+            }
+            for id in &excluded {
+                let item = MenuItem::new(format!("Allow {id}"), true, None);
+                apps_menu.append(&item).expect("append excluded application");
+                excluded_items.push((item, id.clone()));
+            }
+        }
+
         // Keep the counters in sync with the listener's running totals.
+        status_item.set_enabled(control.tighten_hint().is_some() && crate::config::Config::global().spell_max_dist > 1);
         let status = status_label(&control);
         if status != last_status {
             status_item.set_text(&status);
@@ -180,8 +250,28 @@ pub fn run(control: Arc<AppControl>) {
             }
         }
 
+        #[cfg(target_os = "windows")]
+        if let Some(tray) = &_tray {
+            if balloon_until.is_some_and(|until| Instant::now() >= until) {
+                windows_balloon(tray, None);
+                balloon_until = None;
+            }
+            if balloon_until.is_none() {
+                let notice = crate::notify::WINDOWS_NOTICES.lock().ok().and_then(|mut q| q.pop_front());
+                if let Some((title, body)) = notice {
+                    windows_balloon(tray, Some((&title, &body)));
+                    balloon_until = Some(Instant::now() + Duration::from_secs(12));
+                }
+            }
+        }
+
         while let Ok(event) = menu_channel.try_recv() {
-            if event.id == toggle_id {
+            if event.id == status_id {
+                if let Err(error) = crate::settings::set_live(&control, "spell_dist", "1") {
+                    crate::notify::notify("Settings unchanged", &error);
+                }
+                conservative_item.set_checked(crate::config::Config::global().spell_max_dist == 1);
+            } else if event.id == toggle_id {
                 let new_enabled = !control.is_switched_on();
                 control.set_enabled(new_enabled);
                 toggle_item.set_text(toggle_label(new_enabled));
@@ -199,6 +289,34 @@ pub fn run(control: Arc<AppControl>) {
                 }
                 pause_item.set_text(pause_label(control.pause_remaining()));
                 let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+            } else if event.id == shortcuts_id {
+                crate::notify::show_shortcuts();
+            } else if event.id == spell_id || event.id == complete_id || event.id == conservative_id {
+                let (key, value) = if event.id == spell_id {
+                    ("spell", if spell_item.is_checked() { "true" } else { "false" })
+                } else if event.id == complete_id {
+                    ("complete", if complete_item.is_checked() { "true" } else { "false" })
+                } else {
+                    ("spell_dist", if conservative_item.is_checked() { "1" } else { "3" })
+                };
+                if let Err(error) = crate::settings::set_live(&control, key, value) {
+                    crate::notify::notify("Settings unchanged", &error);
+                }
+                let config = crate::config::Config::global();
+                spell_item.set_checked(config.spell_enabled);
+                complete_item.set_checked(config.complete_enabled);
+                conservative_item.set_checked(config.spell_max_dist == 1);
+            } else if event.id == exclude_id || excluded_items.iter().any(|(item, _)| *item.id() == event.id) {
+                let id = if event.id == exclude_id {
+                    last_app.as_ref().map(|(_, id)| id.clone())
+                } else {
+                    excluded_items.iter().find(|(item, _)| *item.id() == event.id).map(|(_, id)| id.clone())
+                };
+                if let Some(id) = id {
+                    if let Err(error) = super::toggle_app_exclusion(&control, &id) {
+                        crate::notify::notify("Application exclusions unchanged", &error);
+                    }
+                }
             } else if event.id == settings_id || event.id == ignored_id {
                 let name = if event.id == settings_id { "config.toml" } else { "ignore.txt" };
                 if let Err(error) = open_user_file(name) {
@@ -308,6 +426,10 @@ pub fn run(control: Arc<AppControl>) {
                     }
                 }
             } else if event.id == quit_id {
+                #[cfg(target_os = "windows")]
+                if let Some(tray) = &_tray {
+                    windows_balloon(tray, None);
+                }
                 // Drop the tray icon first so Windows removes it from the
                 // notification area immediately. process::exit skips destructors,
                 // which would otherwise leave a ghost icon behind until the user
@@ -317,6 +439,44 @@ pub fn run(control: Arc<AppControl>) {
             }
         }
     });
+}
+
+/// Native balloon on the tray's hidden window: no foreground window or focus change.
+#[cfg(target_os = "windows")]
+fn windows_balloon(tray: &TrayIcon, message: Option<(&str, &str)>) {
+    use winapi::um::{
+        shellapi::*,
+        winuser::{LoadIconW, IDI_INFORMATION},
+    };
+    unsafe {
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = tray.window_handle() as _;
+        // A separate, temporary notification icon avoids depending on tray-icon's private ID.
+        data.uID = u32::MAX;
+        if let Some((title, body)) = message {
+            data.uFlags = NIF_INFO | NIF_ICON | NIF_TIP;
+            data.hIcon = LoadIconW(std::ptr::null_mut(), IDI_INFORMATION);
+            data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+            for (dst, src) in data
+                .szInfoTitle
+                .iter_mut()
+                .take(63)
+                .zip(title.encode_utf16())
+            {
+                *dst = src;
+            }
+            for (dst, src) in data.szInfo.iter_mut().take(255).zip(body.encode_utf16()) {
+                *dst = src;
+            }
+            for (dst, src) in data.szTip.iter_mut().zip("ReCast".encode_utf16()) {
+                *dst = src;
+            }
+            Shell_NotifyIconW(NIM_ADD, &mut data);
+        } else {
+            Shell_NotifyIconW(NIM_DELETE, &mut data);
+        }
+    }
 }
 
 fn toggle_label(enabled: bool) -> &'static str {
@@ -340,8 +500,8 @@ fn status_label(control: &AppControl) -> String {
     if undone > 0 {
         label.push_str(&format!(" · {undone} taken back"));
     }
-    if let Some(hint) = control.tighten_hint() {
-        label.push_str(&format!(" — {hint}"));
+    if control.tighten_hint().is_some() && crate::config::Config::global().spell_max_dist > 1 {
+        label.push_str(" — click to use Conservative spelling");
     }
     label
 }

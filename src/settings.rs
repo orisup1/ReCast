@@ -41,6 +41,83 @@ pub fn file_path() -> Option<PathBuf> {
     crate::complete::user_path("config.toml")
 }
 
+/// Save a menu setting before applying it, so a failed save cannot look successful.
+pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> Result<(), String> {
+    if std::env::var_os(format!("RECAST_{}", key.to_uppercase())).is_some() {
+        return Err(format!("{key} is controlled by an environment variable. Remove that override and relaunch to change it here."));
+    }
+    match key {
+        "spell" | "complete" if parse_flag(value).is_some() => (),
+        "spell_dist" if parse_number("RECAST_SPELL_DIST", value).is_ok() => (),
+        "exclude_apps" if !value.contains(['\n', '\r', '"', '#', '\\']) => (),
+        _ => return Err("Invalid setting value".into()),
+    }
+    let path = file_path().ok_or("No config directory available")?;
+    save_value(&path, key, value).map_err(|e| format!("Could not save settings: {e}"))?;
+    crate::config::Config::update_live(|cfg| match key {
+        "spell" => cfg.spell_enabled = parse_flag(value).unwrap(),
+        "complete" => cfg.complete_enabled = parse_flag(value).unwrap(),
+        "spell_dist" => cfg.spell_max_dist = value.trim().parse().unwrap(),
+        "exclude_apps" => cfg.excluded_apps = crate::config::parse_excluded_apps(value),
+        _ => unreachable!(),
+    });
+    if key == "exclude_apps" {
+        *crate::types::lock_forgiving(&control.excluded_apps) =
+            crate::config::parse_excluded_apps(value);
+    }
+    Ok(())
+}
+
+fn save_value(path: &std::path::Path, key: &str, value: &str) -> std::io::Result<()> {
+    // Replacing a symlink would silently disconnect the user's managed config.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other(
+            "Settings is a symlink; edit its target instead",
+        ));
+    }
+    let previous = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut text = String::new();
+    for line in previous.split_inclusive('\n') {
+        if !line
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+        {
+            text.push_str(line);
+        }
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("{key} = \"{value}\"\n"));
+    std::fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("Missing settings directory"))?,
+    )?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    let result = (|| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 /// The file key for an environment name: `RECAST_SPELL_DIST` → `spell_dist`.
 ///
 /// Mechanical on purpose. The alternative — a table pairing the two spellings —
@@ -355,6 +432,96 @@ fn parse_flag(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_menu_changes_apply_and_persist() {
+        // Isolate process-global config from the parallel dictionary tests.
+        if std::env::var_os("RECAST_MENU_TEST_CHILD").is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "settings::tests::live_menu_changes_apply_and_persist",
+                ])
+                .env("RECAST_MENU_TEST_CHILD", "1")
+                .env_remove("RECAST_SPELL")
+                .env_remove("RECAST_COMPLETE")
+                .env_remove("RECAST_SPELL_DIST")
+                .env_remove("RECAST_EXCLUDE_APPS")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let control = crate::types::AppControl::new_for_test();
+        let dict = crate::dictionary::Dict::of(&["hello"]);
+        let freq = crate::dictionary::Freq::of(&[("hello", 1)]);
+        assert_eq!(
+            crate::spell::correct("helo", dict, freq).as_deref(),
+            Some("hello")
+        );
+        set_live(&control, "spell", "false").unwrap();
+        assert!(crate::spell::correct("helo", dict, freq).is_none());
+        set_live(&control, "spell", "true").unwrap();
+        assert_eq!(
+            crate::spell::correct("helo", dict, freq).as_deref(),
+            Some("hello")
+        );
+        set_live(&control, "complete", "false").unwrap();
+        assert!(crate::complete::completions("hel", dict, freq).is_empty());
+        set_live(&control, "complete", "true").unwrap();
+        assert_eq!(crate::complete::completions("hel", dict, freq), ["hello"]);
+        set_live(&control, "spell_dist", "1").unwrap();
+        assert_eq!(crate::config::Config::global().spell_max_dist, 1);
+        assert!(set_live(&control, "spell_dist", "4").is_err());
+        crate::platform::toggle_app_exclusion(&control, "Editor").unwrap();
+        assert_eq!(
+            *crate::types::lock_forgiving(&control.excluded_apps),
+            ["editor"]
+        );
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["exclude_apps"],
+            "editor"
+        );
+        crate::platform::toggle_app_exclusion(&control, "EDITOR").unwrap();
+        assert!(crate::types::lock_forgiving(&control.excluded_apps).is_empty());
+        std::fs::write(file_path().unwrap(), [0xff]).unwrap();
+        assert!(set_live(&control, "spell", "false").is_err());
+        assert!(crate::config::Config::global().spell_enabled);
+        std::fs::remove_file(file_path().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn menu_settings_preserve_other_settings_and_refuse_unreadable_files() {
+        let dir = std::env::temp_dir().join(format!("recast-menu-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# My settings\nspell = true\nSPELL = true\nexclude_apps = \"Code.exe\"",
+        )
+        .unwrap();
+        save_value(&path, "spell", "false").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "# My settings\nexclude_apps = \"Code.exe\"\nspell = \"false\"\n"
+        );
+        save_value(&path, "exclude_apps", "Code.exe, Terminal.exe").unwrap();
+        assert_eq!(
+            load_file(&path).settings["exclude_apps"],
+            "Code.exe, Terminal.exe"
+        );
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(save_value(&path, "spell", "true").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff]);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
 
     #[test]
     fn missing_config_is_optional_but_unreadable_config_is_an_error() {

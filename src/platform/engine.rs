@@ -472,7 +472,6 @@ pub struct Engine<P: Platform> {
     pub en_dict: Dict,
     pub he_dict: Dict,
     pub injector: P::Injector,
-    excluded_apps: Vec<String>,
 }
 
 type FocusSnapshot<'a, P> = (MutexGuard<'a, AppState<P>>, Option<<P as Platform>::Focus>);
@@ -490,7 +489,6 @@ impl<P: Platform> Engine<P> {
             en_dict,
             he_dict,
             injector,
-            excluded_apps: crate::config::Config::global().excluded_apps.clone(),
         })
     }
 
@@ -500,13 +498,14 @@ impl<P: Platform> Engine<P> {
 
     fn read_focus(&self) -> (Option<P::Focus>, bool) {
         let focus = P::focus();
-        let app = if self.excluded_apps.is_empty() {
+        let excluded_apps = lock_forgiving(&self.control.excluded_apps).clone();
+        let app = if excluded_apps.is_empty() {
             None
         } else {
             focus.as_ref().and_then(P::app_id)
         };
         let allowed =
-            P::input_allowed() && crate::config::app_allowed(&self.excluded_apps, app.as_deref());
+            P::input_allowed() && crate::config::app_allowed(&excluded_apps, app.as_deref());
         (focus, allowed)
     }
 
@@ -675,14 +674,14 @@ impl<P: Platform> Engine<P> {
         if during_injection
             || chorded_shortcut
             || P::is_reset(key)
-            || (st.is_replacing && !self.excluded_apps.is_empty())
+            || (st.is_replacing && !lock_forgiving(&self.control.excluded_apps).is_empty())
         {
             st.invalidate_text();
             return;
         }
 
         let is_text = P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some();
-        let needs_focus = !self.excluded_apps.is_empty()
+        let needs_focus = !lock_forgiving(&self.control.excluded_apps).is_empty()
             || key == P::BACKSPACE
             || (P::is_terminator(key) && !st.keys.is_empty() && !st.is_replacing)
             || (is_text && st.keys.is_empty() && !st.is_replacing);
@@ -721,8 +720,9 @@ impl<P: Platform> Engine<P> {
                 drop(st);
                 // With exclusions, resume at a word boundary without asking
                 // a newly focused (possibly excluded) field for its value.
-                let empty =
-                    suppressed && self.excluded_apps.is_empty() && P::input_empty(&self.injector);
+                let empty = suppressed
+                    && lock_forgiving(&self.control.excluded_apps).is_empty()
+                    && P::input_empty(&self.injector);
                 st = self.lock();
                 if st.revision != revision {
                     st.invalidate_text();
@@ -848,7 +848,7 @@ impl<P: Platform> Engine<P> {
             crate::layout::invalidate();
         }
 
-        if !self.excluded_apps.is_empty() {
+        if !lock_forgiving(&self.control.excluded_apps).is_empty() {
             let Some((next, _)) = self.refresh_focus(st) else {
                 return;
             };
@@ -1805,9 +1805,22 @@ mod tests {
         );
 
         // Exclusions stop capture before any planner, debug log or learning call.
+        // A new exclusion also cancels a correction planned before the UI change.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()];
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        lock_forgiving(&s.engine.control.excluded_apps).clear();
+        s.type_text(" recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve  receive ");
+
         for focus in [0, 2] {
-            let mut s = Session::new();
-            Arc::get_mut(&mut s.engine).unwrap().excluded_apps = vec!["secret.exe".into()];
+            let s = Session::new();
+            *lock_forgiving(&s.engine.control.excluded_apps) = vec!["secret.exe".into()];
             FOCUS.store(focus, Ordering::SeqCst);
             s.type_text("recieve hello akuo ");
             s.type_text("hel");
@@ -1821,8 +1834,8 @@ mod tests {
             assert_eq!(s.engine.control.fixed_count(), 0);
         }
         FOCUS.store(1, Ordering::SeqCst);
-        let mut s = Session::new();
-        Arc::get_mut(&mut s.engine).unwrap().excluded_apps = vec!["secret.exe".into()];
+        let s = Session::new();
+        *lock_forgiving(&s.engine.control.excluded_apps) = vec!["secret.exe".into()];
         s.type_text("recieve ");
         s.pending();
         // A focus change while the injection worker waits still cancels it.
@@ -1836,8 +1849,8 @@ mod tests {
         s.finish();
         assert_eq!(s.text(), "recieve  receive ");
 
-        let mut s = Session::new();
-        Arc::get_mut(&mut s.engine).unwrap().excluded_apps = vec!["secret.exe".into()];
+        let s = Session::new();
+        *lock_forgiving(&s.engine.control.excluded_apps) = vec!["secret.exe".into()];
         s.type_text("recieve ");
         s.pending();
         // With exclusions active, new typing cancels pending work immediately

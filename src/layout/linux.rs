@@ -1413,11 +1413,7 @@ mod x11 {
         // None and PointerRoot do not identify a text target.
         (window > 1).then(|| super::Focus {
             id: window.to_string(),
-            app: if crate::config::Config::global().excluded_apps.is_empty() {
-                None
-            } else {
-                window_class(&c, window)
-            },
+            app: window_class(&c, window),
         })
     }
 

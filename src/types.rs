@@ -22,28 +22,37 @@ impl Language {
     }
 }
 
-/// Global runtime configuration, set once at startup.
-static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
+/// Runtime configuration. Menu edits replace values under a short-held lock;
+/// callers take snapshots so dictionary searches never hold up a settings edit.
+static GLOBAL_CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
 
 impl Config {
     /// Access the global config, falling back to defaults if not yet set
     /// (matches the `from_env` defaults: short-word switching on, split off,
     /// spelling autocorrect on).
-    pub fn global() -> &'static Config {
-        GLOBAL_CONFIG.get_or_init(|| Config {
-            excluded_apps: Vec::new(),
-            personal_enabled: false,
-            short_enabled: true,
-            split_enabled: false,
-            freq_enabled: true,
-            spell_enabled: true,
-            spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
-            spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
-            spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
-            complete_enabled: true,
-            complete_min_len: crate::config::DEFAULT_COMPLETE_MIN_LEN,
-            complete_max_rank: crate::config::DEFAULT_COMPLETE_MAX_RANK,
-        })
+    pub fn global() -> Config {
+        lock_forgiving(GLOBAL_CONFIG.get_or_init(|| {
+            Mutex::new(Config {
+                excluded_apps: Vec::new(),
+                personal_enabled: false,
+                short_enabled: true,
+                split_enabled: false,
+                freq_enabled: true,
+                spell_enabled: true,
+                spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
+                spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
+                spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
+                complete_enabled: true,
+                complete_min_len: crate::config::DEFAULT_COMPLETE_MIN_LEN,
+                complete_max_rank: crate::config::DEFAULT_COMPLETE_MAX_RANK,
+            })
+        }))
+        .clone()
+    }
+
+    pub fn update_live(update: impl FnOnce(&mut Config)) {
+        let _ = Self::global();
+        update(&mut lock_forgiving(GLOBAL_CONFIG.get().unwrap()));
     }
 }
 
@@ -292,6 +301,7 @@ const HISTORY_LEN: usize = 20;
 
 /// Shared runtime state between the keyboard listener and the optional GUI.
 pub struct AppControl {
+    pub excluded_apps: Mutex<Vec<String>>,
     enabled: AtomicBool,
     fixed_count: AtomicU64,
     undo_count: AtomicU64,
@@ -306,8 +316,10 @@ pub struct AppControl {
 impl AppControl {
     /// Create a new control and register the provided config globally.
     pub fn new_with_config(cfg: Config) -> Self {
-        let _ = GLOBAL_CONFIG.set(cfg);
+        let excluded_apps = Mutex::new(cfg.excluded_apps.clone());
+        let _ = GLOBAL_CONFIG.set(Mutex::new(cfg));
         Self {
+            excluded_apps,
             enabled: AtomicBool::new(true),
             fixed_count: AtomicU64::new(0),
             undo_count: AtomicU64::new(0),
@@ -460,7 +472,7 @@ impl AppControl {
         let undone = self.undo_count();
         let kept = self.fixed_count();
         (undone >= 5 && undone * 3 >= kept + undone)
-            .then_some("Many corrections taken back — try RECAST_SPELL_DIST=1")
+            .then_some("Many corrections taken back — try Conservative spelling in Settings")
     }
 }
 
