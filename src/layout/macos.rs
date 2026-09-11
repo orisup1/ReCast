@@ -32,7 +32,24 @@ extern "C" {
     ) -> *const std::ffi::c_void;
     // The list of language codes ("en", "he", "iw", …) an input source enters.
     static kTISPropertyInputSourceLanguages: CFStringRef;
+    static kTISPropertyInputSourceIsEnabled: CFStringRef;
     fn CFRelease(cf: CFTypeRef);
+}
+
+pub fn enabled_languages() -> (bool, bool) {
+    let enabled = |code| unsafe {
+        let language = CFString::new(code);
+        let source = TISCopyInputSourceForLanguage(language.as_concrete_TypeRef());
+        if source.is_null() {
+            return false;
+        }
+        let value = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsEnabled);
+        let result =
+            !value.is_null() && core_foundation_sys::number::CFBooleanGetValue(value.cast());
+        CFRelease(source as CFTypeRef);
+        result
+    };
+    (enabled("en"), enabled("he"))
 }
 
 pub fn switch_layout_to(lang: Language) -> LayoutSwitch {

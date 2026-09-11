@@ -14,6 +14,77 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Explicitly requested help may use a dialog; typing notifications must not.
+#[cfg(target_os = "macos")]
+pub fn dialog(title: &str, body: &str, buttons: &[&str]) -> usize {
+    dialog_with_destination(title, body, buttons, None)
+}
+
+#[cfg(target_os = "macos")]
+pub enum DialogDestination<'a> {
+    Settings(&'a str),
+    Reveal(&'a std::path::Path),
+}
+
+/// Hand off focus only after the next setup dialog has appeared. Opening Settings
+/// before runModal would immediately cover it with the new ReCast dialog.
+#[cfg(target_os = "macos")]
+pub fn dialog_with_destination(
+    title: &str,
+    body: &str,
+    buttons: &[&str],
+    destination: Option<DialogDestination<'_>>,
+) -> usize {
+    use cocoa::base::{id, nil, YES};
+    use cocoa::foundation::{NSAutoreleasePool, NSString};
+    use objc::{class, msg_send, sel, sel_impl};
+    unsafe {
+        let pool = NSAutoreleasePool::new(nil);
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: bool = msg_send![app, setActivationPolicy: 1isize];
+        let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+        let alert: id = msg_send![class!(NSAlert), new];
+        let heading = NSString::alloc(nil).init_str(title);
+        let text = NSString::alloc(nil).init_str(body);
+        let _: () = msg_send![alert, setMessageText: heading];
+        let _: () = msg_send![alert, setInformativeText: text];
+        for (index, button) in buttons.iter().enumerate() {
+            let label = NSString::alloc(nil).init_str(button);
+            let button: id = msg_send![alert, addButtonWithTitle: label];
+            let _: () = msg_send![button, setTag: (1000 + index) as isize];
+            let _: () = msg_send![label, release];
+        }
+        if let Some(destination) = destination {
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let (selector, argument) = match destination {
+                DialogDestination::Settings(url) => {
+                    let text = NSString::alloc(nil).init_str(url);
+                    let url: id = msg_send![class!(NSURL), URLWithString: text];
+                    let _: () = msg_send![text, release];
+                    (sel!(openURL:), url)
+                }
+                DialogDestination::Reveal(path) => {
+                    let text = NSString::alloc(nil).init_str(&path.to_string_lossy());
+                    let url: id = msg_send![class!(NSURL), fileURLWithPath: text];
+                    let urls: id = msg_send![class!(NSArray), arrayWithObject: url];
+                    let _: () = msg_send![text, release];
+                    (sel!(activateFileViewerSelectingURLs:), urls)
+                }
+            };
+            let mode = NSString::alloc(nil).init_str("NSModalPanelRunLoopMode");
+            let modes: id = msg_send![class!(NSArray), arrayWithObject: mode];
+            let _: () = msg_send![workspace, performSelector: selector withObject: argument afterDelay: 0.0f64 inModes: modes];
+            let _: () = msg_send![mode, release];
+        }
+        let result: isize = msg_send![alert, runModal];
+        let _: () = msg_send![heading, release];
+        let _: () = msg_send![text, release];
+        let _: () = msg_send![alert, release];
+        let _: () = msg_send![pool, drain];
+        (result - 1000).max(0) as usize
+    }
+}
+
 /// Whether this run has already dealt with the hint — checked before the
 /// filesystem is, so the steady state costs one relaxed atomic load per
 /// correction rather than a `stat`.

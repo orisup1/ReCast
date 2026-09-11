@@ -491,6 +491,9 @@ impl Drop for EventTapHandle {
 /// the main thread to the menubar tray. Keeping it here means changes to the
 /// macOS launch path can't touch the Linux or Windows paths.
 pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
+    if !setup_guidance() {
+        return;
+    }
     super::start_background_tasks();
     // The event tap must live on the main run loop (see `setup_event_tap`), so
     // a main-thread TUI can't coexist with it — the tray is the UI here.
@@ -503,9 +506,143 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
     // Bind the tap to a named local so it stays alive for the whole session;
     // dropping it would disable and release the tap.
     let Some(_tap) = setup_event_tap(en, he, Arc::clone(&control)) else {
+        crate::notify::dialog("ReCast could not start", "Keyboard capture could not start. If you just granted Accessibility access, quit and reopen ReCast. If an older ReCast entry is already enabled, remove that entry and add this copy again in Privacy & Security → Accessibility.", &["Quit"]);
         std::process::exit(1);
     };
     crate::platform::tray::run(control);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SetupAction {
+    Check,
+    Accessibility,
+    Keyboards,
+    Reveal,
+    Quit,
+}
+
+const SETUP_ACTIONS: &[(SetupAction, &str)] = &[
+    (SetupAction::Check, "Check again"),
+    (SetupAction::Accessibility, "Open Accessibility"),
+    (SetupAction::Keyboards, "Keyboard Settings"),
+    (SetupAction::Reveal, "Show ReCast in Finder"),
+    (SetupAction::Quit, "Quit"),
+];
+
+impl SetupAction {
+    fn settings_url(self, modern: bool) -> Option<&'static str> {
+        match (self, modern) {
+            (Self::Accessibility, true) => Some("x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"),
+            (Self::Accessibility, false) => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"),
+            (Self::Keyboards, true) => Some("x-apple.systempreferences:com.apple.Keyboard-Settings.extension?inputSources"),
+            (Self::Keyboards, false) => Some("x-apple.systempreferences:com.apple.preference.keyboard?InputSources"),
+            _ => None,
+        }
+    }
+}
+
+fn application_bundle(executable: &std::path::Path) -> Option<&std::path::Path> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then_some(bundle)
+}
+
+fn request_accessibility() -> bool {
+    use core_foundation::{
+        base::TCFType, boolean::CFBoolean, dictionary::CFDictionary, string::CFString,
+    };
+    let options = CFDictionary::from_CFType_pairs(&[(
+        unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) },
+        CFBoolean::true_value(),
+    )]);
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) != 0 }
+}
+
+/// Native setup stays available while the user switches to System Settings.
+pub fn setup_guidance() -> bool {
+    use crate::notify::DialogDestination;
+    let marker = crate::complete::user_path("setup-complete");
+    let mut first = marker.as_ref().is_none_or(|p| !p.exists());
+    let executable = std::env::current_exe().ok();
+    let bundle = executable.as_deref().and_then(application_bundle);
+    let permission_target = bundle.or(executable.as_deref());
+    let modern = std::path::Path::new("/System/Applications/System Settings.app").exists();
+    let mut destination = None;
+    loop {
+        let accessibility = unsafe { AXIsProcessTrusted() != 0 };
+        let (english, hebrew) = crate::layout::enabled_languages();
+        // Accessibility grants both event posting and listening. Requiring an
+        // additional Input Monitoring entry can strand an already-authorized app.
+        let ready = accessibility && english && hebrew;
+        if ready && !first {
+            return true;
+        }
+        let state = |ok| if ok { "Ready" } else { "Needs setup" };
+        let mut body = format!("ReCast fixes English/Hebrew layout mistakes and English spelling as you type. Processing stays on this Mac.\n\nAccessibility: {}\nEnglish keyboard: {}\nHebrew keyboard: {}\n\n{}", state(accessibility), state(english), state(hebrew), if ready { "You're ready. Double-tap Ctrl immediately after a correction to undo it. Right Shift completes words. These shortcuts are also in the menu." } else { "In System Settings → Privacy & Security → Accessibility, enable ReCast. Accessibility covers both reading keys and typing corrections; a separate Input Monitoring entry is not required.\n\nFor keyboards, open Keyboard → Text Input → Edit and add English and Hebrew. Return here and choose Check again. After granting permission, macOS may require you to quit and reopen ReCast." });
+        if !accessibility {
+            if let Some(path) = permission_target {
+                body.push_str(&format!("\n\nIf ReCast is missing, click + in Accessibility, press Cmd+Shift+G, and enter:\n{}\n\nShow ReCast in Finder reveals this exact copy.", path.display()));
+            }
+            if bundle.is_none() {
+                body.push_str("\n\nThis is a standalone executable. A terminal launch may appear under the terminal's name. For permissions attached to ReCast.app, install the app bundle and open it from Finder.");
+            }
+        }
+        let buttons: Vec<&str> = if ready {
+            vec!["Start ReCast", "Quit"]
+        } else {
+            SETUP_ACTIONS.iter().map(|(_, label)| *label).collect()
+        };
+        let choice = crate::notify::dialog_with_destination(
+            "Set up ReCast",
+            &body,
+            &buttons,
+            destination.take(),
+        );
+        if ready {
+            if choice != 0 {
+                return false;
+            }
+            if let Some(path) = &marker {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                    let _ = std::fs::write(path, "Setup completed\n");
+                }
+            }
+            return true;
+        }
+        let action = SETUP_ACTIONS
+            .get(choice)
+            .map(|(action, _)| *action)
+            .unwrap_or(SetupAction::Quit);
+        match action {
+            SetupAction::Check => {
+                first = true;
+            }
+            SetupAction::Accessibility => {
+                request_accessibility();
+                destination = action.settings_url(modern).map(DialogDestination::Settings);
+            }
+            SetupAction::Keyboards => {
+                destination = action.settings_url(modern).map(DialogDestination::Settings);
+            }
+            SetupAction::Reveal => {
+                if let Some(path) = permission_target {
+                    destination = Some(DialogDestination::Reveal(path));
+                } else {
+                    crate::notify::dialog(
+                        "Cannot locate ReCast",
+                        "Quit and reopen ReCast from Finder, then try again.",
+                        &["OK"],
+                    );
+                }
+            }
+            SetupAction::Quit => return false,
+        }
+    }
 }
 
 /// Register a system-wide keyboard tap with the main run loop. Must be called
@@ -518,17 +655,9 @@ pub fn setup_event_tap(
     he_dict: Dict,
     control: Arc<AppControl>,
 ) -> Option<EventTapHandle> {
-    use core_foundation::{
-        base::TCFType, boolean::CFBoolean, dictionary::CFDictionary, string::CFString,
-    };
-
     // A listen-only tap can succeed without Accessibility, but focus checks
     // then fail and every correction is discarded. Ask before starting capture.
-    let options = CFDictionary::from_CFType_pairs(&[(
-        unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) },
-        CFBoolean::true_value(),
-    )]);
-    if unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) } == 0 {
+    if !request_accessibility() {
         eprintln!(
             "ReCast needs Accessibility access to correct words. Enable ReCast in \
              System Settings > Privacy & Security > Accessibility, then relaunch."
@@ -720,6 +849,7 @@ impl Drop for Focus {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    fn AXIsProcessTrusted() -> u8;
     static kAXTrustedCheckOptionPrompt: core_foundation_sys::string::CFStringRef;
     fn AXIsProcessTrustedWithOptions(
         options: core_foundation_sys::dictionary::CFDictionaryRef,
@@ -755,5 +885,32 @@ fn focused_target() -> Option<Focus> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn permission_target_is_the_running_copy_not_another_installed_bundle() {
+        for path in ["/Applications/ReCast.app", "/tmp/local build/ReCast.app"] {
+            let executable = Path::new(path).join("Contents/MacOS/recast");
+            assert_eq!(application_bundle(&executable), Some(Path::new(path)));
+        }
+        for path in [
+            "/usr/local/bin/recast",
+            "/tmp/ReCast.app/recast",
+            "/tmp/ReCast.app/Contents/Helpers/recast",
+        ] {
+            assert_eq!(application_bundle(Path::new(path)), None);
+        }
+        let accessibility = SetupAction::Accessibility.settings_url(true).unwrap();
+        let keyboards = SetupAction::Keyboards.settings_url(true).unwrap();
+        assert!(accessibility.ends_with("PrivacySecurity.extension?Privacy_Accessibility"));
+        assert!(keyboards.ends_with("Keyboard-Settings.extension?inputSources"));
+        assert!(SetupAction::Reveal.settings_url(true).is_none());
+        assert!(SetupAction::Quit.settings_url(true).is_none());
     }
 }
