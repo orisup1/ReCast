@@ -105,5 +105,5 @@ fi
 
 echo
 echo "Installed: $INSTALL_DIR/$APP_NAME"
-echo "Launch it once and re-grant Input Monitoring and Accessibility when asked;"
-echo "until you do, ReCast sees no keystrokes."
+echo "Launch ReCast and follow setup to grant Accessibility access and enable"
+echo "English and Hebrew keyboards. Quit and reopen if permission changes require it."

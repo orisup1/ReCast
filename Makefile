@@ -28,7 +28,7 @@ else ifeq ($(UNAME_S),Darwin)
     SERVICE_TARGET := service-macos
     SERVICE_UNINSTALL_TARGET := service-uninstall-macos
     PERM_HINT_1 := macOS needs the binary to be granted permissions:
-    PERM_HINT_2 := "  System Settings → Privacy & Security → Input Monitoring + Accessibility"
+    PERM_HINT_2 := "  System Settings → Privacy & Security → Accessibility"
 else
     OS_NAME := $(UNAME_S)
     SERVICE_TARGET := service-unsupported

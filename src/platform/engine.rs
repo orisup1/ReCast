@@ -881,6 +881,10 @@ impl<P: Platform> Engine<P> {
     /// The completion key was tapped: either step to the next guess in the
     /// cycle already running, or start one from the word in the buffer.
     fn completion_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>) {
+        if !crate::config::Config::global().complete_enabled {
+            st.cycle = None;
+            return;
+        }
         let (typed, candidates, index, erase) = match st.cycle.take() {
             Some(cycle) => {
                 let next = if cycle.index >= cycle.candidates.len() {
@@ -1803,6 +1807,24 @@ mod tests {
             "hel",
             "completion cycle restores the exact prefix"
         );
+
+        // Live settings must also stop an already cached completion cycle.
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        let completed = s.text();
+        crate::config::Config::update_live(|cfg| cfg.complete_enabled = false);
+        s.tap(Simulated::SHIFT_RIGHT);
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.text(), completed);
+        assert!(s.engine.lock().cycle.is_none());
+        // Turning completion off must still let the user undo its last offer.
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "hel");
+        crate::config::Config::update_live(|cfg| cfg.complete_enabled = true);
 
         // Exclusions stop capture before any planner, debug log or learning call.
         // A new exclusion also cancels a correction planned before the UI change.
