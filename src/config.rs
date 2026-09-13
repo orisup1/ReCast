@@ -2,6 +2,9 @@
 pub struct Config {
     /// Exact application IDs in which capture, learning and correction stop.
     pub excluded_apps: Vec<String>,
+    pub layout_only_apps: Vec<String>,
+    /// An optional single modifier tap; double-tap Ctrl remains available.
+    pub undo_shortcut: String,
     /// Persist local word-frequency, correction-pair, and typing-timing data.
     /// Off by default because the word files may contain sensitive text.
     pub personal_enabled: bool,
@@ -80,6 +83,12 @@ impl Config {
             excluded_apps: parse_excluded_apps(
                 &crate::settings::get("RECAST_EXCLUDE_APPS").unwrap_or_default(),
             ),
+            layout_only_apps: parse_excluded_apps(
+                &crate::settings::get("RECAST_LAYOUT_ONLY_APPS").unwrap_or_default(),
+            ),
+            undo_shortcut: crate::settings::get("RECAST_UNDO_SHORTCUT")
+                .filter(|value| valid_undo_shortcut(value))
+                .unwrap_or_else(|| "none".into()),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
             split_enabled: crate::settings::flag("RECAST_SPLIT", false),
@@ -93,6 +102,28 @@ impl Config {
             complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppMode {
+    Full,
+    LayoutOnly,
+    Off,
+}
+
+impl AppMode {
+    pub const ALL: [Self; 3] = [Self::Full, Self::LayoutOnly, Self::Off];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full correction",
+            Self::LayoutOnly => "Layout only",
+            Self::Off => "Off",
+        }
+    }
+}
+
+pub fn valid_undo_shortcut(value: &str) -> bool {
+    matches!(value, "none" | "left_ctrl" | "right_ctrl")
 }
 
 pub fn parse_excluded_apps(value: &str) -> Vec<String> {
@@ -157,6 +188,8 @@ pub const BOOLEAN_KEYS: &[&str] = &[
 /// All known settings, for validating the config file.
 pub const ALL_KEYS: &[&str] = &[
     "RECAST_EXCLUDE_APPS",
+    "RECAST_LAYOUT_ONLY_APPS",
+    "RECAST_UNDO_SHORTCUT",
     "RECAST_PERSONAL",
     "RECAST_SHORT",
     "RECAST_SPLIT",

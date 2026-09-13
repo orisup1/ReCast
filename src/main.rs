@@ -16,6 +16,7 @@ mod complete;
 mod config;
 mod daemon;
 mod dictionary;
+mod explain;
 mod footprint;
 #[cfg(target_os = "linux")]
 mod gui;
@@ -25,6 +26,7 @@ mod layout;
 mod notify;
 mod personal;
 mod platform;
+mod practice;
 mod prefs;
 mod settings;
 mod spell;
@@ -56,6 +58,9 @@ Options:
                     new ReCast replaces the old one — two at once correct every
                     word twice)
       --status      Print what is running and what is configured, then exit
+      --explain WORD --layout en|he
+                    Preview one visible word using an explicit layout, then exit
+                    (no keyboard capture, layout changes, or typing)
       --write-config  Write a commented config.toml with every setting in it
                     (never overwrites an existing one), then exit
       --clear-personal-data  Delete locally learned word, correction, and
@@ -90,6 +95,10 @@ Settings:
   RECAST_EXCLUDE_APPS=  Comma-separated exact application IDs to leave alone:
                       Linux app_id/WM_CLASS, macOS bundle ID, Windows exe name.
                       Case-insensitive; unknown apps are skipped when set.
+  RECAST_LAYOUT_ONLY_APPS=  Exact app IDs for layout correction only; spelling,
+                      abbreviations, completion, and personalization are off there.
+  RECAST_UNDO_SHORTCUT=  none (default), left_ctrl, or right_ctrl to add a
+                      single Ctrl tap for undo. Double-tap Ctrl stays available.
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.
@@ -143,6 +152,16 @@ fn main() {
     platform::windows::attach_parent_console();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--explain" | "--layout"))
+    {
+        if let Err(error) = explain::run(&args) {
+            eprintln!("{error}");
+            process::exit(2);
+        }
+        return;
+    }
     let mut with_gui = false;
     let mut with_window = false;
     let mut with_kill = false;
@@ -401,6 +420,18 @@ fn print_status() {
         } else {
             cfg.excluded_apps.join(", ")
         }
+    );
+    println!(
+        "    layout-only apps     {}",
+        if cfg.layout_only_apps.is_empty() {
+            "none".into()
+        } else {
+            cfg.layout_only_apps.join(", ")
+        }
+    );
+    println!(
+        "    extra undo shortcut  {}",
+        crate::practice::shortcut_label(&cfg.undo_shortcut)
     );
     println!("    short words          {}", on_off(cfg.short_enabled));
     println!("    missing-space split  {}", on_off(cfg.split_enabled));

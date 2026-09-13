@@ -66,6 +66,13 @@ impl Platform for Windows {
     fn focus() -> Option<Focus> {
         focused_target()
     }
+    fn is_own_focus(focus: &Focus) -> bool {
+        let mut pid = 0;
+        unsafe {
+            winapi::um::winuser::GetWindowThreadProcessId(*focus as _, &mut pid);
+        }
+        pid == std::process::id()
+    }
     fn app_id(focus: &Focus) -> Option<String> {
         use winapi::um::{
             handleapi::CloseHandle, processthreadsapi::OpenProcess,
@@ -211,7 +218,7 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
 }
 
 pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
-    let engine = Engine::<Windows>::new(en_dict, he_dict, control, AtomicBool::new(false));
+    let engine = Engine::<Windows>::new(en_dict, he_dict, control.clone(), AtomicBool::new(false));
     let callback = move |event: Event| {
         if let EventType::ButtonPress(_) = event.event_type {
             engine.mouse_click();
@@ -226,7 +233,9 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
             _ => {}
         }
     };
+    control.listener_ready.store(true, Ordering::Relaxed);
     if let Err(err) = listen(callback) {
+        control.listener_ready.store(false, Ordering::Relaxed);
         let _ = writeln!(
             std::io::stderr(),
             "Error while listening for keyboard events: {err:?}"

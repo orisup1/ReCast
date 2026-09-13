@@ -1,6 +1,130 @@
 use std::process::Command;
 
 #[test]
+fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
+    let dir = std::env::temp_dir().join(format!("recast-explain-{}", std::process::id()));
+    let config = if cfg!(target_os = "macos") {
+        dir.join("Library/Application Support/recast")
+    } else {
+        dir.join("recast")
+    };
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("abbrev.txt"), "zztest = preview expansion\n").unwrap();
+    std::fs::write(config.join("ignore.txt"), "keyboad\n").unwrap();
+    let preview = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_recast"));
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RECAST_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .args(args)
+            .env("HOME", &dir)
+            .env("XDG_CONFIG_HOME", &dir)
+            .env("APPDATA", &dir)
+            .env("RECAST_LAYOUT_BACKEND", "none")
+            .output()
+            .unwrap()
+    };
+    for (word, layout, expected, reason) in [
+        ("recieve", "en", "receive", "English spelling"),
+        ("Recieve!", "en", "Receive!", "English spelling"),
+        ("akuo", "en", "שלום", "Keyboard-layout correction"),
+        ("יקךךם", "he", "hello", "Keyboard-layout correction"),
+        (
+            "רקבןקהק",
+            "he",
+            "receive",
+            "Keyboard-layout correction with spelling",
+        ),
+        (
+            "שלום",
+            "he",
+            "שלום",
+            "Protected word or no confident correction",
+        ),
+        (
+            "hello",
+            "en",
+            "hello",
+            "Protected word or no confident correction",
+        ),
+        (
+            "keyboad",
+            "en",
+            "keyboad",
+            "Protected word or no confident correction",
+        ),
+        (
+            "zztest",
+            "en",
+            "preview expansion",
+            "Configured abbreviation",
+        ),
+    ] {
+        // Windows resolves config through Known Folders, ignoring APPDATA.
+        // Fixture-dependent checks run where HOME isolates the files.
+        if cfg!(windows) && matches!(word, "keyboad" | "zztest") {
+            continue;
+        }
+        let output = preview(&["--explain", word, "--layout", layout]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(&format!("Replacement: {expected:?}")),
+            "{text}"
+        );
+        assert!(text.contains(reason), "{text}");
+    }
+    for args in [
+        vec!["--explain"],
+        vec!["--explain", "hello"],
+        vec!["--layout", "en"],
+        vec!["--explain", "hello", "--layout", "fr"],
+        vec!["--explain", "", "--layout", "en"],
+        vec!["--explain", "two words", "--layout", "en"],
+        vec!["--explain", "🙂", "--layout", "en"],
+        vec!["--explain", "hello", "--layout", "en", "--stop"],
+        vec!["--explain", "hello", "--layout", "en", "--layout", "he"],
+    ] {
+        assert_eq!(preview(&args).status.code(), Some(2), "{args:?}");
+    }
+    #[cfg(unix)]
+    {
+        std::fs::write(config.join("config.toml"), "spell = false\n").unwrap();
+        for word in ["teh", "recieve"] {
+            let output = preview(&["--explain", word, "--layout", "en"]);
+            assert!(output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(&format!("Replacement: {word:?}"))
+            );
+        }
+        std::fs::remove_file(config.join("config.toml")).unwrap();
+    }
+    assert_eq!(
+        preview(&["--explain", &"a".repeat(65), "--layout", "en"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        std::fs::read_dir(&config).unwrap().count(),
+        2,
+        "preview must not create state or personal data"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.join("ignore.txt")).unwrap(),
+        "keyboad\n"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn cli_reports_version_help_and_bad_options() {
     for (arg, expected, code) in [
         (

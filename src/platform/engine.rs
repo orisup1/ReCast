@@ -86,6 +86,9 @@ pub trait Platform: Sized + Send + Sync + 'static {
     fn focus() -> Option<Self::Focus>;
     /// Application identity associated with this focus, never the window title.
     fn app_id(focus: &Self::Focus) -> Option<String>;
+    fn is_own_focus(_focus: &Self::Focus) -> bool {
+        false
+    }
     fn current_layout() -> Option<Language> {
         crate::layout::current_layout()
     }
@@ -313,6 +316,8 @@ pub struct Cycle<P: Platform> {
 
 /// Listener state, shared by every capture thread of a platform.
 pub struct AppState<P: Platform> {
+    mode: crate::config::AppMode,
+    practice: bool,
     pub keys: WordBuffer<Typed<P::Key>>,
     pub is_replacing: bool,
     pub buffered_keys: WordBuffer<Typed<P::Key>>,
@@ -365,6 +370,8 @@ pub struct AppState<P: Platform> {
 impl<P: Platform> AppState<P> {
     fn new() -> Self {
         Self {
+            mode: crate::config::AppMode::Full,
+            practice: false,
             keys: WordBuffer::new(),
             is_replacing: false,
             buffered_keys: WordBuffer::new(),
@@ -496,17 +503,20 @@ impl<P: Platform> Engine<P> {
         lock_forgiving(&self.state)
     }
 
-    fn read_focus(&self) -> (Option<P::Focus>, bool) {
+    fn read_focus(&self) -> (Option<P::Focus>, Option<crate::config::AppMode>) {
         let focus = P::focus();
-        let excluded_apps = lock_forgiving(&self.control.excluded_apps).clone();
-        let app = if excluded_apps.is_empty() {
+        let app = if !self.control.has_app_rules() {
             None
         } else {
             focus.as_ref().and_then(P::app_id)
         };
-        let allowed =
-            P::input_allowed() && crate::config::app_allowed(&excluded_apps, app.as_deref());
-        (focus, allowed)
+        let mode = P::input_allowed()
+            .then(|| {
+                self.control
+                    .effective_app_mode(app.as_deref(), focus.as_ref().is_some_and(P::is_own_focus))
+            })
+            .flatten();
+        (focus, mode)
     }
 
     /// OS queries must not prevent releases or mouse clicks from canceling work.
@@ -517,12 +527,22 @@ impl<P: Platform> Engine<P> {
     ) -> Option<FocusSnapshot<'a, P>> {
         let revision = st.revision;
         drop(st);
-        let (focus, allowed) = self.read_focus();
+        let (focus, mode) = self.read_focus();
         let mut st = self.lock();
-        if st.revision != revision || !allowed {
+        if st.revision != revision || matches!(mode, None | Some(crate::config::AppMode::Off)) {
             st.invalidate_text();
             return None;
         }
+        let mode = mode.unwrap();
+        if st.mode != mode {
+            st.invalidate_text();
+        }
+        st.mode = mode;
+        st.practice = self
+            .control
+            .practice_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && focus.as_ref().is_some_and(P::is_own_focus);
         Some((st, focus))
     }
 
@@ -603,9 +623,9 @@ impl<P: Platform> Engine<P> {
         if !self.control.is_enabled() || !P::input_allowed() {
             return false;
         }
-        let (focus, allowed) = self.read_focus();
+        let (focus, mode) = self.read_focus();
         let st = self.lock();
-        allowed
+        mode.is_some_and(|mode| mode != crate::config::AppMode::Off && mode == st.mode)
             && st.generation == generation
             && st.focus == focus
             && (!P::requires_focus() || focus.is_some())
@@ -674,14 +694,18 @@ impl<P: Platform> Engine<P> {
         if during_injection
             || chorded_shortcut
             || P::is_reset(key)
-            || (st.is_replacing && !lock_forgiving(&self.control.excluded_apps).is_empty())
+            || (st.is_replacing && self.control.has_app_rules())
         {
             st.invalidate_text();
             return;
         }
 
         let is_text = P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some();
-        let needs_focus = !lock_forgiving(&self.control.excluded_apps).is_empty()
+        let needs_focus = self.control.has_app_rules()
+            || self
+                .control
+                .practice_open
+                .load(std::sync::atomic::Ordering::Relaxed)
             || key == P::BACKSPACE
             || (P::is_terminator(key) && !st.keys.is_empty() && !st.is_replacing)
             || (is_text && st.keys.is_empty() && !st.is_replacing);
@@ -697,7 +721,10 @@ impl<P: Platform> Engine<P> {
 
         // Record key press for typing pattern analysis (dwell, digraphs).
         // Use Debug representation as a stable-ish key name.
-        if crate::config::Config::global().personal_enabled {
+        if !st.practice
+            && st.mode == crate::config::AppMode::Full
+            && crate::config::Config::global().personal_enabled
+        {
             crate::personal::record_key_press(&format!("{key:?}"));
         }
 
@@ -717,11 +744,12 @@ impl<P: Platform> Engine<P> {
                 st.focus = focus;
                 let revision = st.revision;
                 let suppressed = st.no_fix;
+                let practice = st.practice;
                 drop(st);
                 // With exclusions, resume at a word boundary without asking
                 // a newly focused (possibly excluded) field for its value.
                 let empty = suppressed
-                    && lock_forgiving(&self.control.excluded_apps).is_empty()
+                    && (!self.control.has_app_rules() || practice)
                     && P::input_empty(&self.injector);
                 st = self.lock();
                 if st.revision != revision {
@@ -767,7 +795,7 @@ impl<P: Platform> Engine<P> {
             return;
         }
 
-        let outcome = self.check(&st.keys, st.history.run());
+        let outcome = self.check(&st.keys, st.history.run(), st.mode);
         // Record what this word turned out to be before anything else happens
         // to it: the next word is decided with this one behind it. A word whose
         // language could not be told is not recorded at all — see
@@ -798,17 +826,24 @@ impl<P: Platform> Engine<P> {
             return;
         }
 
-        if let Some(lang) = outcome.lang {
-            crate::personal::record_word(&reading::<P>(&st.keys, lang));
+        if !st.practice && st.mode == crate::config::AppMode::Full {
+            if let Some(lang) = outcome.lang {
+                crate::personal::record_word(&reading::<P>(&st.keys, lang));
+            }
         }
 
-        if let Some(word) = declined_by_list(
-            &st.keys,
-            |t: Typed<P::Key>| P::english_char(t.key, t.shift),
-            |t: Typed<P::Key>| P::hebrew_char(t.key),
-            |t: Typed<P::Key>| t.shift,
-            P::current_layout(),
-        ) {
+        if let Some(word) = (!st.practice)
+            .then(|| {
+                declined_by_list(
+                    &st.keys,
+                    |t: Typed<P::Key>| P::english_char(t.key, t.shift),
+                    |t: Typed<P::Key>| P::hebrew_char(t.key),
+                    |t: Typed<P::Key>| t.shift,
+                    P::current_layout(),
+                )
+            })
+            .flatten()
+        {
             // Nothing happened to this word, and the only reason is that the
             // user has it listed. Arm the gesture to change their mind about it.
             st.last_action = Some(LastAction::Skipped(LastSkip {
@@ -848,18 +883,26 @@ impl<P: Platform> Engine<P> {
             crate::layout::invalidate();
         }
 
-        if !lock_forgiving(&self.control.excluded_apps).is_empty() {
+        if self.control.has_app_rules()
+            || self
+                .control
+                .practice_open
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let Some((next, _)) = self.refresh_focus(st) else {
                 return;
             };
             st = next;
         }
-        if crate::config::Config::global().personal_enabled {
+        if !st.practice
+            && st.mode == crate::config::AppMode::Full
+            && crate::config::Config::global().personal_enabled
+        {
             crate::personal::record_key_release(&format!("{key:?}"));
         }
 
         if key == P::CTRL_LEFT || key == P::CTRL_RIGHT {
-            self.ctrl_tap(st);
+            self.ctrl_tap(st, key);
             return;
         }
         if key != P::SHIFT_RIGHT || !std::mem::take(&mut st.right_shift_tap) {
@@ -881,7 +924,9 @@ impl<P: Platform> Engine<P> {
     /// The completion key was tapped: either step to the next guess in the
     /// cycle already running, or start one from the word in the buffer.
     fn completion_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>) {
-        if !crate::config::Config::global().complete_enabled {
+        if st.mode != crate::config::AppMode::Full
+            || !crate::config::Config::global().complete_enabled
+        {
             st.cycle = None;
             return;
         }
@@ -994,7 +1039,7 @@ impl<P: Platform> Engine<P> {
     /// ([`AppState::last_action`], cleared by the next keystroke). That is the
     /// same bargain every in-place autocorrect makes, and it is what keeps a
     /// mistimed double-tap from eating text further back.
-    fn ctrl_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>) {
+    fn ctrl_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, key: P::Key) {
         let Some(down) = st.ctrl_down.take() else {
             return;
         };
@@ -1004,7 +1049,11 @@ impl<P: Platform> Engine<P> {
             return;
         }
         let now = Instant::now();
+        let shortcut = crate::config::Config::global().undo_shortcut;
+        let single = (shortcut == "left_ctrl" && key == P::CTRL_LEFT)
+            || (shortcut == "right_ctrl" && key == P::CTRL_RIGHT);
         match st.last_ctrl_tap.take() {
+            _ if single => {}
             Some(prev) if now.duration_since(prev) <= DOUBLE_TAP_WINDOW => {}
             // First tap of a possible pair: remember it and wait for the second.
             _ => {
@@ -1081,7 +1130,7 @@ impl<P: Platform> Engine<P> {
         // The run is read but not added to: this word was already recorded when
         // it was first finished, and the gesture is a second opinion about it
         // rather than a second word.
-        let result = self.check(&skip.keys, st.history.run()).fix;
+        let result = self.check(&skip.keys, st.history.run(), st.mode).fix;
         let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
         // Off the list, but the pipelines have nothing to say about it after
         // all — which is a fine outcome, and not one to rewrite the screen over.
@@ -1106,7 +1155,7 @@ impl<P: Platform> Engine<P> {
     /// Run the pipelines over a finished word. `run` is the language of the
     /// words before it, which the caller reads off [`AppState::history`] while
     /// it still holds the lock.
-    fn check(&self, keys: &[Typed<P::Key>], run: Run) -> Outcome {
+    fn check(&self, keys: &[Typed<P::Key>], run: Run, mode: crate::config::AppMode) -> Outcome {
         check_and_correct(
             keys,
             |t: Typed<P::Key>| P::english_char(t.key, t.shift),
@@ -1116,6 +1165,7 @@ impl<P: Platform> Engine<P> {
             self.en_dict,
             self.he_dict,
             P::current_layout(),
+            mode == crate::config::AppMode::LayoutOnly,
             P::switch_layout_to,
         )
     }
@@ -1175,18 +1225,39 @@ impl<P: Platform> Engine<P> {
             }
             return;
         };
+        let (practice, mode) = {
+            let st = self.lock();
+            (st.practice, st.mode)
+        };
         match commit {
             Some(Commit::Fix { from, to, kind }) => {
-                self.control.record_fix(&from, &to, kind);
-                crate::personal::record_confusion(&from, &to);
-                crate::personal::record_word(&to);
+                if practice {
+                    crate::practice::fixed(&self.control, &from, &to, kind);
+                }
+                if !practice {
+                    self.control.record_fix(&from, &to, kind);
+                    if mode == crate::config::AppMode::Full {
+                        crate::personal::record_confusion(&from, &to);
+                        crate::personal::record_word(&to);
+                    }
+                }
             }
             Some(Commit::Undo { suppress }) => {
-                if let Some(word) = suppress {
+                if practice && suppress.as_deref() == Some("akuo") {
+                    let _ = self.control.practice_stage.compare_exchange(
+                        1,
+                        2,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                if let Some(word) = suppress.filter(|_| !practice) {
                     crate::complete::suppress(&word);
                     crate::complete::learn(&word);
                 }
-                self.control.record_undo();
+                if !practice {
+                    self.control.record_undo();
+                }
             }
             None => {}
         }
@@ -1367,6 +1438,10 @@ mod tests {
     };
 
     static FOCUS: AtomicUsize = AtomicUsize::new(1);
+    static SIMULATED_LAYOUT: AtomicUsize = AtomicUsize::new(0);
+    static INPUT_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    static ALLOW_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     struct FocusGate {
         ready: mpsc::SyncSender<()>,
         proceed: mpsc::Receiver<()>,
@@ -1446,14 +1521,29 @@ mod tests {
         fn app_id(focus: &usize) -> Option<String> {
             Some(if *focus == 2 { "secret.exe" } else { "Editor" }.to_string())
         }
+        fn is_own_focus(focus: &usize) -> bool {
+            *focus == 3
+        }
+        fn input_allowed() -> bool {
+            INPUT_ALLOWED.load(Ordering::SeqCst)
+        }
         fn input_empty(screen: &Screen) -> bool {
             screen.text.lock().unwrap().is_empty()
         }
         fn current_layout() -> Option<Language> {
-            Some(Language::English)
+            match SIMULATED_LAYOUT.load(Ordering::SeqCst) {
+                0 => Some(Language::English),
+                1 => Some(Language::Hebrew),
+                _ => None,
+            }
         }
-        fn switch_layout_to(_: Language) -> crate::layout::LayoutSwitch {
-            panic!("English spelling and undo must not switch layouts");
+        fn switch_layout_to(lang: Language) -> crate::layout::LayoutSwitch {
+            assert!(
+                ALLOW_LAYOUT_SWITCH.load(Ordering::SeqCst),
+                "English spelling and undo must not switch layouts"
+            );
+            SIMULATED_LAYOUT.store(usize::from(lang == Language::Hebrew), Ordering::SeqCst);
+            crate::layout::LayoutSwitch::Switched
         }
         fn inject(
             engine: &Engine<Self>,
@@ -1680,6 +1770,48 @@ mod tests {
         assert_eq!(s.text(), "receive next");
         assert!(s.engine.lock().last_action.is_none());
 
+        // A complete second word arriving during injection must remain intact;
+        // its terminator must not let undo erase either word afterward.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.type_text("next ");
+        s.finish();
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        assert_eq!(s.text(), "receive next ");
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.engine.control.undo_count(), 0);
+
+        // Pausing or disabling while a worker is waiting cancels that rewrite.
+        for pause in [true, false] {
+            let s = Session::new();
+            s.type_text("recieve ");
+            s.pending();
+            if pause {
+                s.engine.control.pause_for(Duration::from_secs(60));
+            } else {
+                s.engine.control.set_enabled(false);
+            }
+            s.finish();
+            assert_eq!(s.text(), "recieve ");
+            assert_eq!(s.engine.control.fixed_count(), 0);
+            assert!(s.engine.lock().last_action.is_none());
+        }
+
+        // Focus can move after a successful correction, before an undo gesture.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        FOCUS.store(2, Ordering::SeqCst);
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        assert_eq!(s.text(), "receive ");
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.engine.control.undo_count(), 0);
+        FOCUS.store(1, Ordering::SeqCst);
+
         // A programmatic focus change between typing and the terminator is
         // caught even without a mouse or navigation-key event.
         let s = Session::new();
@@ -1881,6 +2013,178 @@ mod tests {
         s.finish();
         assert_eq!(s.text(), "recieve x");
         assert_eq!(s.engine.control.fixed_count(), 0);
+
+        // Temporary app pause cancels pending injection and blocks all capture.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.engine.control.pause_in_app("EDITOR");
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        for focus in [1, 0, 3, 1] {
+            FOCUS.store(focus, Ordering::SeqCst);
+            s.type_text("recieve hel");
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            let st = s.engine.lock();
+            assert!(st.keys.is_empty() && st.buffered_keys.is_empty());
+            assert!(!st.is_replacing && st.last_action.is_none());
+            assert_eq!(s.engine.control.paused_app().as_deref(), Some("editor"));
+        }
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        s.engine
+            .control
+            .listener_ready
+            .store(true, Ordering::Relaxed);
+        assert!(crate::platform::status_for::<Simulated>(&s.engine.control)
+            .starts_with("Paused in editor"));
+        // The existing status poll notices leaving even without a keystroke.
+        FOCUS.store(2, Ordering::SeqCst);
+        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).starts_with("Ready"));
+        assert!(s.engine.control.paused_app().is_none());
+        FOCUS.store(1, Ordering::SeqCst);
+        s.type_text(" recieve ");
+        s.pending();
+        s.finish();
+        assert!(s.text().ends_with(" receive "));
+        // Expiration and manual resume never remove saved restrictions.
+        *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()];
+        s.engine.control.pause_in_app("editor");
+        FOCUS.store(2, Ordering::SeqCst);
+        s.type_text(" ");
+        assert!(s.engine.control.paused_app().is_none());
+        FOCUS.store(1, Ordering::SeqCst);
+        s.engine.control.pause_in_app("editor");
+        s.engine.control.resume_app();
+        s.type_text("recieve ");
+        assert!(!s.engine.lock().is_replacing);
+        assert!(s.text().ends_with("recieve "));
+        assert_eq!(
+            s.engine.control.app_mode(Some("editor")),
+            Some(crate::config::AppMode::Off)
+        );
+
+        // Switching to layout-only cancels an already-planned spelling fix.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        *lock_forgiving(&s.engine.control.layout_only_apps) = vec!["editor".into()];
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        s.type_text(" recieve keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.text(), "recieve  recieve keyb");
+        s.engine
+            .control
+            .listener_ready
+            .store(true, Ordering::Relaxed);
+        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).contains("layout only"));
+        SIMULATED_LAYOUT.store(2, Ordering::SeqCst);
+        assert!(crate::platform::status_for::<Simulated>(&s.engine.control)
+            .starts_with("Keyboard layout unavailable"));
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        FOCUS.store(0, Ordering::SeqCst);
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control).contains("Cannot identify")
+        );
+        FOCUS.store(1, Ordering::SeqCst);
+
+        // Single-tap undo uses the same focus and modifier-chord guards.
+        INPUT_ALLOWED.store(false, Ordering::SeqCst);
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control).contains("Secure Input")
+        );
+        INPUT_ALLOWED.store(true, Ordering::SeqCst);
+        s.engine.control.pause_for(Duration::from_secs(60));
+        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).starts_with("Paused"));
+        s.engine.control.resume();
+        *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()];
+        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).starts_with("Excluded"));
+
+        // Layout-only still fixes the layout, but never expands abbreviations.
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        let s = Session::new();
+        *lock_forgiving(&s.engine.control.layout_only_apps) = vec!["editor".into()];
+        s.type_text(" akuo ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), " שלום ");
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        let abbrev = crate::complete::user_path("abbrev.txt").unwrap();
+        std::fs::create_dir_all(abbrev.parent().unwrap()).unwrap();
+        std::fs::write(&abbrev, "zzpractice = should not expand\n").unwrap();
+        crate::complete::reload_user_files();
+        s.type_text("zzpractice teh ");
+        assert!(!s.engine.lock().is_replacing);
+        assert!(s.text().ends_with("zzpractice teh "));
+        std::fs::remove_file(abbrev).unwrap();
+        crate::complete::reload_user_files();
+
+        crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "right_ctrl".into());
+        let s = Session::new();
+        s.type_text("acheive ");
+        s.pending();
+        s.finish();
+        s.tap(Simulated::CTRL_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "acheive ");
+        assert_eq!(s.engine.control.undo_count(), 1);
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.engine.key_press(Simulated::CTRL_RIGHT);
+        s.tap('v');
+        s.engine.key_release(Simulated::CTRL_RIGHT);
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.engine.control.undo_count(), 0);
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        FOCUS.store(2, Ordering::SeqCst);
+        s.tap(Simulated::CTRL_RIGHT);
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.engine.control.undo_count(), 0);
+        crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "none".into());
+
+        // Practice runs actual layout correction, undo, and completion without learning.
+        FOCUS.store(3, Ordering::SeqCst);
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        let s = Session::new();
+        s.engine
+            .control
+            .practice_open
+            .store(true, Ordering::Relaxed);
+        s.type_text("akuo ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "שלום ");
+        assert_eq!(s.engine.control.practice_stage.load(Ordering::Relaxed), 1);
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "akuo ");
+        assert_eq!(s.engine.control.practice_stage.load(Ordering::Relaxed), 2);
+        assert!(!crate::complete::suppressed("akuo"));
+        assert!(!crate::complete::learned("akuo"));
+        s.engine.mouse_click();
+        s.engine.injector.text.lock().unwrap().clear();
+        s.type_text(" keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), " keyboard");
+        assert_eq!(s.engine.control.practice_stage.load(Ordering::Relaxed), 3);
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        assert_eq!(s.engine.control.undo_count(), 0);
+        ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        FOCUS.store(1, Ordering::SeqCst);
 
         // Hold the OS reply indefinitely: releases and clicks still run, and
         // the late reply must not resurrect the canceled word. This used to

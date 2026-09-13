@@ -34,6 +34,8 @@ impl Config {
         lock_forgiving(GLOBAL_CONFIG.get_or_init(|| {
             Mutex::new(Config {
                 excluded_apps: Vec::new(),
+                layout_only_apps: Vec::new(),
+                undo_shortcut: "none".into(),
                 personal_enabled: false,
                 short_enabled: true,
                 split_enabled: false,
@@ -302,6 +304,10 @@ const HISTORY_LEN: usize = 20;
 /// Shared runtime state between the keyboard listener and the optional GUI.
 pub struct AppControl {
     pub excluded_apps: Mutex<Vec<String>>,
+    pub layout_only_apps: Mutex<Vec<String>>,
+    pub listener_ready: AtomicBool,
+    pub practice_open: AtomicBool,
+    pub practice_stage: std::sync::atomic::AtomicU8,
     enabled: AtomicBool,
     fixed_count: AtomicU64,
     undo_count: AtomicU64,
@@ -310,6 +316,7 @@ pub struct AppControl {
     /// same as being switched off: it expires by itself and it does not change
     /// what the user gets back when it does.
     paused_until: Mutex<Option<Instant>>,
+    paused_app: Mutex<Option<String>>,
     history: Mutex<VecDeque<Correction>>,
 }
 
@@ -317,13 +324,19 @@ impl AppControl {
     /// Create a new control and register the provided config globally.
     pub fn new_with_config(cfg: Config) -> Self {
         let excluded_apps = Mutex::new(cfg.excluded_apps.clone());
+        let layout_only_apps = Mutex::new(cfg.layout_only_apps.clone());
         let _ = GLOBAL_CONFIG.set(Mutex::new(cfg));
         Self {
             excluded_apps,
+            layout_only_apps,
+            listener_ready: AtomicBool::new(false),
+            practice_open: AtomicBool::new(false),
+            practice_stage: std::sync::atomic::AtomicU8::new(0),
             enabled: AtomicBool::new(true),
             fixed_count: AtomicU64::new(0),
             undo_count: AtomicU64::new(0),
             paused_until: Mutex::new(None),
+            paused_app: Mutex::new(None),
             history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
         }
     }
@@ -338,6 +351,8 @@ impl AppControl {
     pub fn new_for_test() -> Self {
         Self::new_with_config(Config {
             excluded_apps: Vec::new(),
+            layout_only_apps: Vec::new(),
+            undo_shortcut: "none".into(),
             personal_enabled: false,
             short_enabled: true,
             split_enabled: false,
@@ -362,6 +377,66 @@ impl AppControl {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed) && self.pause_remaining().is_none()
+    }
+
+    pub fn has_app_rules(&self) -> bool {
+        let excluded = lock_forgiving(&self.excluded_apps);
+        let layout = lock_forgiving(&self.layout_only_apps);
+        !excluded.is_empty() || !layout.is_empty() || self.paused_app().is_some()
+    }
+
+    pub fn paused_app(&self) -> Option<String> {
+        lock_forgiving(&self.paused_app).clone()
+    }
+
+    pub fn pause_in_app(&self, app: &str) {
+        if !app.trim().is_empty() {
+            *lock_forgiving(&self.paused_app) = Some(app.to_lowercase());
+        }
+    }
+
+    pub fn resume_app(&self) {
+        *lock_forgiving(&self.paused_app) = None;
+    }
+
+    /// Only a positively identified external app can end the temporary pause.
+    /// ReCast's controls and missing identity must not accidentally resume it.
+    pub fn effective_app_mode(
+        &self,
+        app: Option<&str>,
+        own_focus: bool,
+    ) -> Option<crate::config::AppMode> {
+        {
+            let mut paused = lock_forgiving(&self.paused_app);
+            if let Some(id) = paused.as_ref() {
+                let app = app.filter(|app| !app.is_empty());
+                if own_focus || app.is_none() {
+                    return None;
+                }
+                if app.unwrap().eq_ignore_ascii_case(id) {
+                    return Some(crate::config::AppMode::Off);
+                }
+                *paused = None;
+            }
+        }
+        self.app_mode(app)
+    }
+
+    pub fn app_mode(&self, app: Option<&str>) -> Option<crate::config::AppMode> {
+        use crate::config::AppMode;
+        let Some(app) = app.filter(|s| !s.is_empty()) else {
+            return (!self.has_app_rules()).then_some(AppMode::Full);
+        };
+        let app = app.to_lowercase();
+        let excluded = lock_forgiving(&self.excluded_apps);
+        let layout = lock_forgiving(&self.layout_only_apps);
+        Some(if !crate::config::app_allowed(&excluded, Some(&app)) {
+            AppMode::Off
+        } else if layout.contains(&app) {
+            AppMode::LayoutOnly
+        } else {
+            AppMode::Full
+        })
     }
 
     /// The enabled switch on its own, ignoring any running pause — what the

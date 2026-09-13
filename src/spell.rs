@@ -215,6 +215,16 @@ pub fn correct_with(
     max_rank: u32,
     max_dist: u8,
 ) -> Option<String> {
+    // A curated transposition, not permission to guess at other three-letter tokens.
+    if word == "teh"
+        && !en_dict.contains(word)
+        && min_len <= crate::config::DEFAULT_SPELL_MIN_LEN
+        && max_dist > 0
+        && en_dict.contains("the")
+        && en_freq.rank("the").is_some_and(|rank| rank <= max_rank)
+    {
+        return Some("the".into());
+    }
     let budget = budget_for(word, min_len, max_dist)?;
     // A word we already know is never a typo. The caller normally checks this
     // too, but it is cheap and this must never "correct" a valid word.

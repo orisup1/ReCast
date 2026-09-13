@@ -60,6 +60,10 @@ impl Platform for Mac {
     fn input_allowed() -> bool {
         !secure_input_active()
     }
+    fn is_own_focus(focus: &Focus) -> bool {
+        let mut pid = 0;
+        unsafe { AXUIElementGetPid(focus.0, &mut pid) == 0 && pid == std::process::id() as i32 }
+    }
     fn focus() -> Option<Focus> {
         focused_target()
     }
@@ -582,7 +586,7 @@ pub fn setup_guidance() -> bool {
             return true;
         }
         let state = |ok| if ok { "Ready" } else { "Needs setup" };
-        let mut body = format!("ReCast fixes English/Hebrew layout mistakes and English spelling as you type. Processing stays on this Mac.\n\nAccessibility: {}\nEnglish keyboard: {}\nHebrew keyboard: {}\n\n{}", state(accessibility), state(english), state(hebrew), if ready { "You're ready. Double-tap Ctrl immediately after a correction to undo it. Right Shift completes words. These shortcuts are also in the menu." } else { "In System Settings → Privacy & Security → Accessibility, enable ReCast. Accessibility covers both reading keys and typing corrections; a separate Input Monitoring entry is not required.\n\nFor keyboards, open Keyboard → Text Input → Edit and add English and Hebrew. Return here and choose Check again. After granting permission, macOS may require you to quit and reopen ReCast." });
+        let mut body = format!("ReCast fixes English/Hebrew layout mistakes and English spelling as you type. Processing stays on this Mac.\n\nAccessibility: {}\nEnglish keyboard: {}\nHebrew keyboard: {}\n\n{}", state(accessibility), state(english), state(hebrew), if ready { "You're ready. Optional practice opens after setup so you can try correction, undo, and completion in a local field. Close it to skip; reopen Practice from the menu anytime." } else { "In System Settings → Privacy & Security → Accessibility, enable ReCast. Accessibility covers both reading keys and typing corrections; a separate Input Monitoring entry is not required.\n\nFor keyboards, open Keyboard → Text Input → Edit and add English and Hebrew. Return here and choose Check again. After granting permission, macOS may require you to quit and reopen ReCast." });
         if !accessibility {
             if let Some(path) = permission_target {
                 body.push_str(&format!("\n\nIf ReCast is missing, click + in Accessibility, press Cmd+Shift+G, and enter:\n{}\n\nShow ReCast in Finder reveals this exact copy.", path.display()));
@@ -705,6 +709,11 @@ pub fn setup_event_tap(
         let _ = TAP_PORT.set(TapPort(tap));
         CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
+        CTX.get()
+            .unwrap()
+            .control
+            .listener_ready
+            .store(true, Ordering::Relaxed);
         Some(EventTapHandle { tap, source })
     }
 }

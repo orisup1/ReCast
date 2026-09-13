@@ -113,6 +113,12 @@ impl Platform for Linux {
     fn requires_focus() -> bool {
         crate::layout::focus_supported()
     }
+    fn is_own_focus(focus: &Self::Focus) -> bool {
+        focus
+            .app
+            .as_deref()
+            .is_some_and(|app| app.eq_ignore_ascii_case("recast"))
+    }
     fn inject(engine: &Engine<Self>, plan: Plan<Self>, generation: u64) -> Option<Vec<Typed>> {
         inject(engine, plan, generation)
     }
@@ -337,6 +343,10 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                 engine.input_device_removed(&held);
             })
         });
+        engine
+            .control
+            .listener_ready
+            .store(!readers.is_empty(), std::sync::atomic::Ordering::Relaxed);
         // ponytail: one-second discovery polling also retries permission races;
         // use a udev monitor if idle wakeups or reconnect latency matter.
         thread::sleep(Duration::from_secs(1));

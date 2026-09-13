@@ -182,3 +182,30 @@ en	WIERD?	'ןקרג?	WIERD?
 he	WIERD?	'ןקרג?	'ןקרג?
 en	CONMPUTER.	בםמצפואקרץ	CONMPUTER.
 he	CONMPUTER.	בםמצפואקרץ	בםמצפואקרץ
+
+# Additional everyday tokens and punctuation boundaries (synthetic regressions).
+en	user@example.com	ודקר@קסשצפךקץבםצ	user@example.com
+en	v0.8.0	ה0ץ8ץ0	v0.8.0
+en	feature/recast	כקשאורק.רקבשדא	feature/recast
+en	foo-bar	כםם-נשר	foo-bar
+en	recieve_v2	רקבןקהק_ה2	recieve_v2
+en	README.md	רקשגצקץצג	README.md
+en	apiKey123	שפןלקט123	apiKey123
+en	שלוםworld	שלום'םרךג	שלוםworld
+en	recieve;	רקבןקהקף	receive;
+he	recieve;	רקבןקהקף	receive;
+en	Recieve:	רקבןקהק:	Receive:
+he	Recieve:	רקבןקהק:	Receive:
+en	acheive!	שביקןהק!	achieve!
+he	acheive!	שביקןהק!	achieve!
+en	definately?	גקכןמשאקךט?	definitely?
+he	definately?	גקכןמשאקךט?	definitely?
+# English teh is a curated typo; its Hebrew reading אקי is valid and stays Hebrew.
+en	teh	אקי	the
+en	Teh	אקי	The
+en	TEH	אקי	TEH
+he	teh	אקי	אקי
+en	accomodate	שבבםצםגשאק	accommodate
+he	accomodate	שבבםצםגשאק	accommodate
+en	untill	ומאןךך	until
+he	untill	ומאןךך	until

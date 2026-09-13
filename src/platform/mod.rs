@@ -101,16 +101,54 @@ pub fn active_application() -> Option<(String, String)> {
     }
 }
 
-pub fn toggle_app_exclusion(control: &crate::types::AppControl, id: &str) -> Result<(), String> {
-    if id.is_empty() || id.contains([',', '\n', '\r', '"', '#', '\\']) {
-        return Err("This application identifier cannot be saved in the exclusions file".into());
+/// Shared status wording for live controls. It never reads the focused text.
+pub fn status(control: &crate::types::AppControl) -> String {
+    #[cfg(target_os = "macos")]
+    return status_for::<macos::Mac>(control);
+    #[cfg(target_os = "windows")]
+    return status_for::<windows::Windows>(control);
+    #[cfg(target_os = "linux")]
+    return status_for::<linux::Linux>(control);
+}
+
+fn status_for<P: engine::Platform>(control: &crate::types::AppControl) -> String {
+    let focus = P::focus();
+    let app = focus.as_ref().and_then(P::app_id);
+    let mode =
+        control.effective_app_mode(app.as_deref(), focus.as_ref().is_some_and(P::is_own_focus));
+    if !control.is_switched_on() {
+        return "Disabled — enable correction to resume.".into();
     }
-    let mut apps = crate::types::lock_forgiving(&control.excluded_apps).clone();
-    let id = id.to_lowercase();
-    if apps.contains(&id) {
-        apps.retain(|app| app != &id);
-    } else {
-        apps.push(id);
+    if let Some(left) = control.pause_remaining() {
+        return format!(
+            "Paused — {} min left. Choose Resume to continue now.",
+            left.as_secs() / 60 + 1
+        );
     }
-    crate::settings::set_live(control, "exclude_apps", &apps.join(", "))
+    if !control
+        .listener_ready
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return "Keyboard listener unavailable — check permissions and connected keyboards, then reopen ReCast if needed.".into();
+    }
+    if !P::input_allowed() {
+        return "Secure Input — correction resumes when secure entry ends.".into();
+    }
+    if let Some(id) = control.paused_app() {
+        return format!("Paused in {id} — switch to another application or choose Resume in {id}.");
+    }
+    if mode.is_none() || (P::requires_focus() && focus.is_none()) {
+        return "Cannot identify this application — switch to a text field and check focus/accessibility support. Configured app restrictions stay enforced.".into();
+    }
+    match mode.unwrap() {
+        crate::config::AppMode::Off => {
+            "Excluded application — choose Full correction or Layout only in Application modes."
+                .into()
+        }
+        _ if P::current_layout().is_none() => "Keyboard layout unavailable — enable English and Hebrew keyboards and check the layout backend.".into(),
+        crate::config::AppMode::LayoutOnly => {
+            "Ready — layout only; spelling, abbreviations, and completion are off.".into()
+        }
+        crate::config::AppMode::Full => "Ready — correction follows your enabled settings.".into(),
+    }
 }

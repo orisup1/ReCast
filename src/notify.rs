@@ -14,7 +14,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const SHORTCUTS: &str = "Undo: tap Ctrl twice within half a second, immediately after a correction. Typing anything else or moving the cursor ends the undo opportunity.\n\nCompletion: tap Right Shift mid-word. Tap again to cycle suggestions and eventually restore your original prefix. Holding Shift to capitalize is unaffected.\n\nOne undo leaves that word alone for this session. Undoing it on two occasions remembers that preference across restarts.\n\nTo allow a word again: type the ignored word and its space, then double-tap Ctrl immediately. This removes its saved exception and may correct it.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.";
+pub const SHORTCUTS: &str = "Undo: tap Ctrl twice within half a second, immediately after a correction. Typing anything else or moving the cursor ends the undo opportunity.\n\nCompletion: tap Right Shift mid-word. Tap again to cycle suggestions and eventually restore your original prefix. Holding Shift to capitalize is unaffected.\n\nSettings can add a single Left Ctrl or Right Ctrl tap for undo; double-tap Ctrl stays available. Try Practice correction and undo from the menu.\n\nOne undo leaves that word alone for this session. Undoing it on two occasions remembers that preference across restarts.\n\nTo allow a word again: type the ignored word and its space, then double-tap Ctrl immediately. This removes its saved exception and may correct it.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.";
 
 /// Explicitly requested help may use a dialog; typing notifications must not.
 #[cfg(target_os = "macos")]

@@ -63,6 +63,15 @@ Use **Start at login** in the menubar menu for autostart. Alternatively,
 `make service-uninstall` removes that service. Terminal-launched binaries may have
 permissions attributed to the terminal rather than ReCast.
 
+After the keyboard listener is ready, **Practice correction and undo** opens once
+in the tray app or Linux control window. Close it to skip, or reopen it from the
+menu/controls. The exercise uses a real local text field: try layout correction,
+undo it, then complete `keyb` with Right Shift. Successful steps are confirmed by
+the keyboard engine. Practice does not train word exceptions or personalization,
+consume the first-correction hint, or change correction counts. Saved word rules
+and your enabled settings still apply. Linux practice requires a desktop that
+can identify the active application; its field is disabled otherwise.
+
 ### Linux
 
 ReCast reads keyboards through `evdev` and writes corrections through `uinput`.
@@ -113,6 +122,10 @@ Use `-Target service-uninstall` to remove the task, or `-Target help` for all ta
 | Review gestures | **Typing shortcuts** in the tray or Linux control window |
 
 Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures.
+**Settings → Extra undo shortcut** can additionally enable a single tap of
+Left Ctrl or Right Ctrl. Double-tap Ctrl remains available. Holding Ctrl or using
+it in a chord never triggers the extra shortcut; the same cursor/focus safeguards
+apply to both gestures.
 Further typing or cursor movement ends the undo opportunity. Undo restores the
 original text and, when changed, the previous layout. One undo suppresses that word
 for the session; undo counts are saved in `learned.txt`, and two occasions make the
@@ -133,9 +146,27 @@ recast -g              # Terminal dashboard (Linux/Windows)
 recast -w              # Control window (Linux only)
 recast --stop          # Linux/macOS; on Windows, quit from the tray
 recast --status        # Running state and configuration diagnostics
+recast --explain "recieve" --layout en  # Preview a correction without typing
+recast --explain "יקךךם" --layout he    # Preview visible Hebrew-layout text
 recast --write-config  # Create a commented config without overwriting one
 recast --help          # All options and environment settings
 ```
+
+The tray and Linux control window also offer **Pause in [application] until I
+switch away** for the last detected external app. Switching to another identified
+app ends this temporary pause automatically; **Resume in [application]** ends it
+early. Unknown focus and ReCast's own controls preserve the pause. Saved app modes
+remain unchanged and apply when correction resumes.
+
+The Linux control window offers **Pause for 30 minutes** / **Resume** and
+**Recent corrections**. Click a recent correction to ignore its original word;
+undone corrections remain visible and marked.
+
+`--explain` accepts one visible word with optional trailing punctuation and requires
+an explicit `en` or `he` layout. It reports the replacement and planner operation,
+using this invocation's settings and saved lists. It never captures keys, changes
+the OS layout, types text, or stops a running instance. It has no prior-word
+history or live application checks; unsupported characters produce an error.
 
 In the terminal dashboard, `e`/Space toggles correction, `p` pauses for 30 minutes,
 `r` reloads lists, and `q` quits. Closing the control window or quitting the dashboard
@@ -188,6 +219,7 @@ an unreadable config stops startup so exclusions are not silently discarded.
 | `state.txt` | Saved enabled/disabled state |
 | `welcomed` | Marker for the one-time correction hint |
 | `setup-complete` | macOS setup marker; missing requirements still reopen setup |
+| `practice-offered` | Marker for the optional first-run practice window |
 | `personal/` | Opt-in word counts, correction pairs, and aggregate typing timings |
 
 `abbrev.txt` and `ignore.txt` reload within about two seconds of edits. The tray's
@@ -208,22 +240,37 @@ disables both abbreviations and word completion.
 
 ### Application exclusions
 
-Use **Excluded applications** in the tray or Linux window to exclude the last
-detected active app, or choose **Allow** to remove an exclusion. Changes save and
-apply immediately. You can also set `exclude_apps` in the config and restart:
+Use **Application modes** in the tray or Linux window for the last detected app:
+
+- **Full correction** follows the global spelling/completion settings.
+- **Layout only** keeps layout correction and undo, with spelling, abbreviations,
+  completion, and personalization disabled in that app.
+- **Off** excludes the app from processing.
+
+Choose a saved entry to restore Full correction. Changes save together and apply
+immediately; an in-flight replacement is canceled if its app mode changes.
+You can also edit these values and restart:
 
 ```toml
 # Exact IDs, comma-separated and case-insensitive; no wildcards.
 exclude_apps = "Alacritty, org.keepassxc.KeePassXC"
+layout_only_apps = "code, org.gnome.TextEditor"
+undo_shortcut = "right_ctrl" # none (default), left_ctrl, right_ctrl
 # macOS uses bundle IDs; Windows uses executable filenames including .exe.
 ```
 
 Excluded apps receive no corrections, expansions, completion, undo rewrites,
-word logging, or learning. Global events still track key releases. With any
-exclusions configured, an unknown active application also suspends processing.
+word logging, or learning. Global events still track key releases. Off takes
+precedence if an app appears in both lists. With any application restrictions
+configured, an unknown active application also suspends processing.
 On **native GNOME/KDE Wayland**, this means correction pauses throughout the session;
-the Linux window disables adding exclusions when detection is unavailable.
+the Linux window disables adding restrictions when detection is unavailable.
 After returning to an allowed app, finish the current word with Space/Enter to resume.
+
+The tray's **Status** submenu and Linux window explain Ready, Disabled, Paused,
+Excluded application, Secure Input, unavailable keyboard capture, and unknown
+application identity, with a suggested recovery action. Routine corrections stay
+silent. `--status` still describes its own invocation rather than live daemon state.
 
 ## Privacy
 

@@ -2,7 +2,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tao::event::{Event, StartCause};
+use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -46,8 +46,14 @@ pub fn run(control: Arc<AppControl>) {
     // Informational row: what it has done, and how much of that was thrown
     // back at it (see `status_label`).
     let status_item = MenuItem::new(status_label(&control), false, None);
+    let health_menu = Submenu::new("Status", true);
+    let health_detail = MenuItem::new("Starting keyboard listener…", false, None);
+    health_menu
+        .append(&health_detail)
+        .expect("append status detail");
     let toggle_item = MenuItem::new(toggle_label(control.is_switched_on()), true, None);
     let pause_item = MenuItem::new(pause_label(None), true, None);
+    let app_pause_item = MenuItem::new("Pause in application (waiting for focus)", false, None);
     let sep = MenuItem::new("", false, None);
 
     // The recent-corrections list. Silent text replacement is the whole
@@ -94,15 +100,37 @@ pub fn run(control: Arc<AppControl>) {
     settings_menu
         .append(&conservative_item)
         .expect("append conservative");
+    let undo_menu = Submenu::new("Extra undo shortcut", true);
+    let undo_items: Vec<_> = [
+        ("none", "Double-tap Ctrl only"),
+        ("left_ctrl", "Also single-tap Left Ctrl"),
+        ("right_ctrl", "Also single-tap Right Ctrl"),
+    ]
+    .into_iter()
+    .map(|(value, label)| {
+        let item = CheckMenuItem::new(label, true, config.undo_shortcut == value, None);
+        undo_menu.append(&item).expect("append undo choice");
+        (item, value)
+    })
+    .collect();
+    settings_menu.append(&undo_menu).expect("append undo menu");
     settings_item.set_text("Advanced settings… (file edits need restart)");
     settings_menu
         .append(&settings_item)
         .expect("append advanced settings");
-    let apps_menu = Submenu::new("Excluded applications", true);
+    let apps_menu = Submenu::new("Application modes", true);
     let exclude_item = MenuItem::new("Switch to an app first", false, None);
     apps_menu.append(&exclude_item).expect("append exclude app");
+    let mode_items: Vec<_> = crate::config::AppMode::ALL
+        .into_iter()
+        .map(|mode| {
+            let item = CheckMenuItem::new(mode.label(), false, false, None);
+            apps_menu.append(&item).expect("append mode");
+            (item, mode)
+        })
+        .collect();
     let apps_hint = MenuItem::new(
-        "Click a saved app below to allow correction again",
+        "Click a saved app below to restore Full correction",
         false,
         None,
     );
@@ -110,6 +138,7 @@ pub fn run(control: Arc<AppControl>) {
     let mut excluded_items: Vec<(MenuItem, String)> = Vec::new();
     let mut last_app: Option<(String, String)> = None;
     let shortcuts_item = MenuItem::new("Typing shortcuts…", true, None);
+    let practice_item = MenuItem::new("Practice correction and undo…", true, None);
     let ignored_item = MenuItem::new("Open ignored words", true, None);
     let reload_item = MenuItem::new("Reload lists", true, None);
     // Only offered where it is wired up; elsewhere the item would be a
@@ -120,13 +149,16 @@ pub fn run(control: Arc<AppControl>) {
     let quit_item = MenuItem::new("Quit", true, None);
 
     menu.append(&status_item).expect("append status");
+    menu.append(&health_menu).expect("append health");
     menu.append(&toggle_item).expect("append toggle");
     menu.append(&pause_item).expect("append pause");
+    menu.append(&app_pause_item).expect("append app pause");
     menu.append(&sep).expect("append separator");
     menu.append(&recent_menu).expect("append recent");
     menu.append(&settings_menu).expect("append settings");
     menu.append(&apps_menu).expect("append apps");
     menu.append(&shortcuts_item).expect("append shortcuts");
+    menu.append(&practice_item).expect("append practice");
     menu.append(&ignored_item).expect("append ignored words");
     menu.append(&reload_item).expect("append reload");
     if let Some(item) = &autostart_item {
@@ -138,12 +170,13 @@ pub fn run(control: Arc<AppControl>) {
     let toggle_id = toggle_item.id().clone();
     let status_id = status_item.id().clone();
     let pause_id = pause_item.id().clone();
+    let app_pause_id = app_pause_item.id().clone();
     let settings_id = settings_item.id().clone();
     let spell_id = spell_item.id().clone();
     let complete_id = complete_item.id().clone();
     let conservative_id = conservative_item.id().clone();
-    let exclude_id = exclude_item.id().clone();
     let shortcuts_id = shortcuts_item.id().clone();
+    let practice_id = practice_item.id().clone();
     let ignored_id = ignored_item.id().clone();
     let reload_id = reload_item.id().clone();
     let autostart_id = autostart_item.as_ref().map(|i| i.id().clone());
@@ -164,10 +197,14 @@ pub fn run(control: Arc<AppControl>) {
     // lifetime; we never read it back after construction.
     let mut pending_menu: Option<Menu> = Some(menu);
     let mut _tray: Option<TrayIcon> = None;
+    let mut health = String::new();
+    let mut last_health_check = Instant::now() - STATUS_REFRESH;
+    let mut practice_window: Option<crate::practice::native::Window> = None;
+    let mut practice_offered = false;
     #[cfg(target_os = "windows")]
     let mut balloon_until: Option<Instant> = None;
 
-    event_loop.run(move |event, _target, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         // Wake periodically to refresh the fixed-word counter; menu/tray
         // events still wake us immediately in between.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + STATUS_REFRESH);
@@ -175,21 +212,51 @@ pub fn run(control: Arc<AppControl>) {
         if let Some(app) = super::active_application() {
             last_app = Some(app);
         }
-        let excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
+        let mut excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
+        excluded.extend(crate::types::lock_forgiving(&control.layout_only_apps).iter().cloned());
+        excluded.sort();
+        excluded.dedup();
+        if last_health_check.elapsed() >= STATUS_REFRESH {
+            health = super::status(&control);
+            let (state, detail) = health.split_once(" — ").unwrap_or((&health, ""));
+            health_menu.set_text(format!("Status: {state}"));
+            health_detail.set_text(detail);
+            if let Some(tray) = &_tray { let _ = tray.set_tooltip(Some(format!("ReCast — {state}"))); }
+            last_health_check = Instant::now();
+        }
+        if let Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } = &event {
+            if practice_window.as_ref().is_some_and(|practice| practice.window.id() == *window_id) {
+                control.practice_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                practice_window = None;
+            }
+        }
+        if let Some(practice) = &mut practice_window { practice.update(&control, &health); }
+        if let Some(id) = control.paused_app() {
+            app_pause_item.set_text(format!("Resume in {id}"));
+            app_pause_item.set_enabled(true);
+        } else if let Some((name, _)) = &last_app {
+            app_pause_item.set_text(format!("Pause in {name} until I switch away"));
+            app_pause_item.set_enabled(true);
+        }
         if let Some((name, id)) = &last_app {
-            let verb = if excluded.contains(&id.to_lowercase()) { "Allow" } else { "Exclude" };
-            exclude_item.set_text(format!("{verb} {name} ({id})"));
-            exclude_item.set_enabled(true);
+            exclude_item.set_text(format!("{name} ({id})"));
+            for (item, mode) in &mode_items {
+                item.set_enabled(true);
+                item.set_checked(control.app_mode(Some(id)) == Some(*mode));
+            }
         }
         if excluded_items.iter().map(|(_, id)| id).ne(excluded.iter()) {
             for (item, _) in excluded_items.drain(..) {
                 let _ = apps_menu.remove(&item);
             }
             for id in &excluded {
-                let item = MenuItem::new(format!("Allow {id}"), true, None);
+                let item = MenuItem::new(id, true, None);
                 apps_menu.append(&item).expect("append excluded application");
                 excluded_items.push((item, id.clone()));
             }
+        }
+        for (item, id) in &excluded_items {
+            item.set_text(format!("{id}: {} — restore Full", control.app_mode(Some(id)).unwrap().label()));
         }
 
         // Keep the counters in sync with the listener's running totals.
@@ -249,6 +316,15 @@ pub fn run(control: Arc<AppControl>) {
                 _tray = Some(tray_builder.build().expect("tray build"));
             }
         }
+        if !practice_offered && pending_menu.is_none() && control.listener_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            practice_offered = true;
+            if crate::practice::first_run() {
+                match crate::practice::native::Window::new(target, &control) {
+                    Ok(window) => practice_window = Some(window),
+                    Err(error) => crate::notify::notify("Could not open practice", &error),
+                }
+            }
+        }
 
         #[cfg(target_os = "windows")]
         if let Some(tray) = &_tray {
@@ -278,6 +354,13 @@ pub fn run(control: Arc<AppControl>) {
                 // The hover text carries the same state as the menu, so it is
                 // refreshed here rather than waiting for the next timer wake.
                 let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+            } else if event.id == app_pause_id {
+                if control.paused_app().is_some() {
+                    control.resume_app();
+                } else if let Some((_, id)) = &last_app {
+                    control.pause_in_app(id);
+                }
+                last_health_check = Instant::now() - STATUS_REFRESH;
             } else if event.id == pause_id {
                 // The same item ends the pause it started: while one is
                 // running the row reads "Resume", so this is one control with
@@ -289,6 +372,15 @@ pub fn run(control: Arc<AppControl>) {
                 }
                 pause_item.set_text(pause_label(control.pause_remaining()));
                 let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+            } else if event.id == practice_id {
+                if let Some(practice) = &practice_window {
+                    practice.focus();
+                } else {
+                    match crate::practice::native::Window::new(target, &control) {
+                        Ok(window) => practice_window = Some(window),
+                        Err(error) => crate::notify::notify("Could not open practice", &error),
+                    }
+                }
             } else if event.id == shortcuts_id {
                 crate::notify::show_shortcuts();
             } else if event.id == spell_id || event.id == complete_id || event.id == conservative_id {
@@ -306,15 +398,23 @@ pub fn run(control: Arc<AppControl>) {
                 spell_item.set_checked(config.spell_enabled);
                 complete_item.set_checked(config.complete_enabled);
                 conservative_item.set_checked(config.spell_max_dist == 1);
-            } else if event.id == exclude_id || excluded_items.iter().any(|(item, _)| *item.id() == event.id) {
-                let id = if event.id == exclude_id {
+            } else if undo_items.iter().any(|(item, _)| *item.id() == event.id) {
+                let value = undo_items.iter().find(|(item, _)| *item.id() == event.id).unwrap().1;
+                if let Err(error) = crate::settings::set_live(&control, "undo_shortcut", value) {
+                    crate::notify::notify("Shortcut unchanged", &error);
+                }
+                for (item, value) in &undo_items { item.set_checked(crate::config::Config::global().undo_shortcut == *value); }
+            } else if mode_items.iter().any(|(item, _)| *item.id() == event.id) || excluded_items.iter().any(|(item, _)| *item.id() == event.id) {
+                let selected = mode_items.iter().find(|(item, _)| *item.id() == event.id);
+                let id = if selected.is_some() {
                     last_app.as_ref().map(|(_, id)| id.clone())
                 } else {
                     excluded_items.iter().find(|(item, _)| *item.id() == event.id).map(|(_, id)| id.clone())
                 };
                 if let Some(id) = id {
-                    if let Err(error) = super::toggle_app_exclusion(&control, &id) {
-                        crate::notify::notify("Application exclusions unchanged", &error);
+                    let mode = selected.map(|(_, mode)| *mode).unwrap_or(crate::config::AppMode::Full);
+                    if let Err(error) = crate::settings::set_app_mode(&control, &id, mode) {
+                        crate::notify::notify("Application mode unchanged", &error);
                     }
                 }
             } else if event.id == settings_id || event.id == ignored_id {

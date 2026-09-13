@@ -618,6 +618,8 @@ pub enum Fix {
 /// genuinely ambiguous key sequence be resolved by what was being written around
 /// it rather than by frequency tables alone.
 pub struct Outcome {
+    /// The selected planner operation, also shown by the offline preview.
+    pub reason: &'static str,
     /// The correction to apply, or `None` to leave the word alone.
     pub fix: Option<Fix>,
     /// The language the word turned out to be, when that is knowable at all.
@@ -797,6 +799,7 @@ fn plan(
     he_dict: Dict,
     en_freq: Freq,
     he_freq: Freq,
+    layout_only: bool,
 ) -> Option<Plan> {
     // Every pipeline below asks about the *word* — the punctuation the user
     // finished it with is set aside by `Reading` and put back by the caller.
@@ -818,7 +821,10 @@ fn plan(
     // Personal confusion pair: the user has explicitly corrected this word
     // before (via undo or post-fix edit). This outranks everything — it's
     // their deliberate choice.
-    if let Some(correction) = crate::personal::personal_correction(typed) {
+    if let Some(correction) = (!layout_only)
+        .then(|| crate::personal::personal_correction(typed))
+        .flatten()
+    {
         if current == Some(Language::Hebrew) && is_english_text(&correction) {
             return Some(Plan::SwitchAndSpell {
                 lang: Language::English,
@@ -830,8 +836,24 @@ fn plan(
 
     // An expansion the user configured by hand outranks everything we infer.
     if current == Some(Language::English) {
-        if let Some(text) = crate::complete::expand(word_en) {
+        if let Some(text) = (!layout_only)
+            .then(|| crate::complete::expand(word_en))
+            .flatten()
+        {
             return Some(Plan::Expand { text });
+        }
+        // In English this exact transposition beats an accidental Hebrew name.
+        // The same keys in Hebrew retain the valid Hebrew reading.
+        if word_en == "teh" {
+            if layout_only
+                || case == Case::Upper
+                || crate::complete::ignored(word_en)
+                || crate::complete::learned(word_en)
+            {
+                return None;
+            }
+            return crate::spell::correct(word_en, en_dict, en_freq)
+                .map(|text| Plan::Spell { text });
         }
     }
 
@@ -863,7 +885,11 @@ fn plan(
         return Some(split);
     }
 
-    plan_spelling(word_en, word_he, current, case, en_dict, he_dict, en_freq)
+    if layout_only {
+        None
+    } else {
+        plan_spelling(word_en, word_he, current, case, en_dict, he_dict, en_freq)
+    }
 }
 
 /// Second pipeline: neither exact layout reading matched, but the English
@@ -1036,10 +1062,12 @@ pub fn check_and_correct<K: Copy>(
     en_dict: Dict,
     he_dict: Dict,
     current: Option<Language>,
+    layout_only: bool,
     switch_layout_to: impl Fn(Language) -> crate::layout::LayoutSwitch,
 ) -> Outcome {
     if keys.is_empty() {
         return Outcome {
+            reason: "Empty input",
             fix: None,
             lang: None,
         };
@@ -1128,14 +1156,25 @@ pub fn check_and_correct<K: Copy>(
         he_dict,
         en_freq(),
         he_freq(),
+        layout_only,
     ) else {
         debug_log(&full_en, &full_he, None, false);
         return Outcome {
+            reason: "Protected word or no confident correction under these settings",
             fix: None,
             lang: seen,
         };
     };
 
+    let reason = match &plan {
+        Plan::Switch { start: 0, .. } => "Keyboard-layout correction",
+        Plan::Switch { .. } => "Missing-space layout correction",
+        Plan::Spell { .. } => "English spelling or learned replacement",
+        Plan::Expand { .. } => "Configured abbreviation",
+        Plan::SwitchAndSpell { .. } => {
+            "Keyboard-layout correction with spelling or learned replacement"
+        }
+    };
     let (fix, lang) = match plan {
         Plan::Switch { lang, start } => {
             let switched = switch_layout_to(lang).changed();
@@ -1203,7 +1242,7 @@ pub fn check_and_correct<K: Copy>(
         }
     };
 
-    Outcome { fix, lang }
+    Outcome { fix, lang, reason }
 }
 
 /// The word `keys` spells, if the pipelines left it alone *only* because the
@@ -1412,6 +1451,7 @@ mod tests {
                 en_dict(),
                 he_dict(),
                 Some(current),
+                false,
                 |_| crate::layout::LayoutSwitch::Switched,
             );
             let after = match result.fix {
@@ -1998,6 +2038,7 @@ mod tests {
             he,
             en_f,
             nofreq(),
+            false,
         )
     }
 
@@ -2284,6 +2325,7 @@ mod tests {
             he,
             nofreq(),
             nofreq(),
+            false,
         );
         assert_eq!(
             plan,
@@ -2324,6 +2366,7 @@ mod tests {
                 he,
                 en_f,
                 nofreq(),
+                false,
             ),
             Some(Plan::Spell {
                 text: "hello".to_string()

@@ -49,7 +49,8 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
     match key {
         "spell" | "complete" if parse_flag(value).is_some() => (),
         "spell_dist" if parse_number("RECAST_SPELL_DIST", value).is_ok() => (),
-        "exclude_apps" if !value.contains(['\n', '\r', '"', '#', '\\']) => (),
+        "exclude_apps" | "layout_only_apps" if !value.contains(['\n', '\r', '"', '#', '\\']) => (),
+        "undo_shortcut" if crate::config::valid_undo_shortcut(value) => (),
         _ => return Err("Invalid setting value".into()),
     }
     let path = file_path().ok_or("No config directory available")?;
@@ -59,16 +60,26 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "complete" => cfg.complete_enabled = parse_flag(value).unwrap(),
         "spell_dist" => cfg.spell_max_dist = value.trim().parse().unwrap(),
         "exclude_apps" => cfg.excluded_apps = crate::config::parse_excluded_apps(value),
+        "layout_only_apps" => cfg.layout_only_apps = crate::config::parse_excluded_apps(value),
+        "undo_shortcut" => cfg.undo_shortcut = value.into(),
         _ => unreachable!(),
     });
     if key == "exclude_apps" {
         *crate::types::lock_forgiving(&control.excluded_apps) =
             crate::config::parse_excluded_apps(value);
     }
+    if key == "layout_only_apps" {
+        *crate::types::lock_forgiving(&control.layout_only_apps) =
+            crate::config::parse_excluded_apps(value);
+    }
     Ok(())
 }
 
 fn save_value(path: &std::path::Path, key: &str, value: &str) -> std::io::Result<()> {
+    save_values(path, &[(key, value)])
+}
+
+fn save_values(path: &std::path::Path, values: &[(&str, &str)]) -> std::io::Result<()> {
     // Replacing a symlink would silently disconnect the user's managed config.
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(std::io::Error::other(
@@ -82,17 +93,20 @@ fn save_value(path: &std::path::Path, key: &str, value: &str) -> std::io::Result
     };
     let mut text = String::new();
     for line in previous.split_inclusive('\n') {
-        if !line
-            .split_once('=')
-            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key))
-        {
+        if !line.split_once('=').is_some_and(|(k, _)| {
+            values
+                .iter()
+                .any(|(key, _)| k.trim().eq_ignore_ascii_case(key))
+        }) {
             text.push_str(line);
         }
     }
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!("{key} = \"{value}\"\n"));
+    for (key, value) in values {
+        text.push_str(&format!("{key} = \"{value}\"\n"));
+    }
     std::fs::create_dir_all(
         path.parent()
             .ok_or_else(|| std::io::Error::other("Missing settings directory"))?,
@@ -116,6 +130,51 @@ fn save_value(path: &std::path::Path, key: &str, value: &str) -> std::io::Result
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Save both lists together so changing modes cannot partially discard an exclusion.
+pub fn set_app_mode(
+    control: &crate::types::AppControl,
+    id: &str,
+    mode: crate::config::AppMode,
+) -> Result<(), String> {
+    use crate::config::AppMode;
+    if id.trim().is_empty() || id.contains([',', '\n', '\r', '"', '#', '\\']) {
+        return Err("This application identifier cannot be saved".into());
+    }
+    for key in ["RECAST_EXCLUDE_APPS", "RECAST_LAYOUT_ONLY_APPS"] {
+        if std::env::var_os(key).is_some() {
+            return Err(format!("{key} controls application modes. Remove the override and relaunch to change them here."));
+        }
+    }
+    let id = id.trim().to_lowercase();
+    let mut excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
+    let mut layout = crate::types::lock_forgiving(&control.layout_only_apps).clone();
+    excluded.retain(|app| app != &id);
+    layout.retain(|app| app != &id);
+    match mode {
+        AppMode::Off => excluded.push(id),
+        AppMode::LayoutOnly => layout.push(id),
+        AppMode::Full => {}
+    }
+    let path = file_path().ok_or("No config directory available")?;
+    save_values(
+        &path,
+        &[
+            ("exclude_apps", &excluded.join(", ")),
+            ("layout_only_apps", &layout.join(", ")),
+        ],
+    )
+    .map_err(|e| format!("Could not save application modes: {e}"))?;
+    crate::config::Config::update_live(|cfg| {
+        cfg.excluded_apps = excluded.clone();
+        cfg.layout_only_apps = layout.clone();
+    });
+    let mut live_excluded = crate::types::lock_forgiving(&control.excluded_apps);
+    let mut live_layout = crate::types::lock_forgiving(&control.layout_only_apps);
+    *live_excluded = excluded;
+    *live_layout = layout;
+    Ok(())
 }
 
 /// The file key for an environment name: `RECAST_SPELL_DIST` → `spell_dist`.
@@ -282,6 +341,11 @@ pub fn parse_number(key: &str, raw: &str) -> Result<u64, String> {
 /// these out.
 pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
+    if let Some(value) = get("RECAST_UNDO_SHORTCUT") {
+        if !crate::config::valid_undo_shortcut(&value) {
+            out.push("undo_shortcut must be none, left_ctrl, or right_ctrl — using none.".into());
+        }
+    }
 
     for key in numeric_keys {
         if let Some((raw, source)) = lookup(key) {
@@ -340,7 +404,9 @@ pub fn sample() -> String {
 # Read once at startup, so changes take effect on the next launch.
 
 # Correction pipelines
-#exclude_apps = \"\"    # comma-separated exact app IDs; see README application exclusions
+#exclude_apps = \"\"    # exact app IDs where correction is Off
+#layout_only_apps = \"\" # exact app IDs where only layout correction is allowed
+#undo_shortcut = \"none\" # none, left_ctrl, or right_ctrl; double-tap Ctrl stays active
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
 #short = true          # short switches: rank <= 20000; false restricts to <= 500
 #split = false         # missing-space split fallback (opt-in; can mis-split)
@@ -478,7 +544,7 @@ mod tests {
         set_live(&control, "spell_dist", "1").unwrap();
         assert_eq!(crate::config::Config::global().spell_max_dist, 1);
         assert!(set_live(&control, "spell_dist", "4").is_err());
-        crate::platform::toggle_app_exclusion(&control, "Editor").unwrap();
+        set_app_mode(&control, "Editor", crate::config::AppMode::Off).unwrap();
         assert_eq!(
             *crate::types::lock_forgiving(&control.excluded_apps),
             ["editor"]
@@ -487,9 +553,29 @@ mod tests {
             load_file(&file_path().unwrap()).settings["exclude_apps"],
             "editor"
         );
-        crate::platform::toggle_app_exclusion(&control, "EDITOR").unwrap();
+        set_app_mode(&control, "EDITOR", crate::config::AppMode::Full).unwrap();
         assert!(crate::types::lock_forgiving(&control.excluded_apps).is_empty());
+        use crate::config::AppMode;
+        set_app_mode(&control, "Editor", AppMode::LayoutOnly).unwrap();
+        assert_eq!(control.app_mode(Some("EDITOR")), Some(AppMode::LayoutOnly));
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["layout_only_apps"],
+            "editor"
+        );
+        assert_eq!(control.app_mode(None), None);
+        assert!(set_app_mode(&control, "bad,id", AppMode::Off).is_err());
+        set_app_mode(&control, "Editor", AppMode::Off).unwrap();
+        assert!(crate::types::lock_forgiving(&control.layout_only_apps).is_empty());
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["exclude_apps"],
+            "editor"
+        );
+        set_live(&control, "undo_shortcut", "right_ctrl").unwrap();
+        assert_eq!(crate::config::Config::global().undo_shortcut, "right_ctrl");
+        assert!(set_live(&control, "undo_shortcut", "ctrl+z").is_err());
         std::fs::write(file_path().unwrap(), [0xff]).unwrap();
+        assert!(set_app_mode(&control, "Editor", AppMode::Full).is_err());
+        assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));
         assert!(set_live(&control, "spell", "false").is_err());
         assert!(crate::config::Config::global().spell_enabled);
         std::fs::remove_file(file_path().unwrap()).unwrap();

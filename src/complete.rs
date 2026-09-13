@@ -533,10 +533,7 @@ pub fn reload_user_files() {
 /// Appends rather than rewrites: the file belongs to the user, and adding a
 /// line is the smallest possible edit to it.
 ///
-/// Only the tray's recent-corrections list calls this, so it is gated to the
-/// platforms that have a tray; on Linux the same job is done by the Ctrl
-/// double-tap and by editing the file.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// Used by the tray and Linux window's recent-corrections lists.
 pub fn ignore_word(word: &str) {
     let word = word.trim().to_lowercase();
     if word.is_empty() {
@@ -575,9 +572,6 @@ pub fn ignore_word(word: &str) {
 /// entry would stop working, which is a strange thing to have happen from
 /// clicking a menu item about a different word.
 ///
-/// Only [`ignore_word`] calls it, so it is dead on the platforms without a
-/// tray — but it is pure, so it is still tested there.
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn appended_line(existing: &str, word: &str) -> String {
     let lead = if existing.is_empty() || existing.ends_with('\n') {
         ""

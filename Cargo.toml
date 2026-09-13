@@ -56,7 +56,7 @@ rdev = "0.5.3"
 tray-icon = "0.24"
 tao = "0.35"
 winapi = { version = "0.3", features = [
-    "winuser", "windef",
+    "winuser", "windef", "wingdi",
     # Reattaching the parent console at startup so the banner can print even
     # though release builds run under `windows_subsystem = "windows"` (see
     # platform::windows::attach_parent_console).
