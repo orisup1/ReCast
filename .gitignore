@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Legacy binary output (bundles now live under target/bundle).
+/exec/
+
 # Local notes / scratch
 /info.md
 /AGENTS.md

@@ -1,0 +1,26 @@
+# Unknown names, handles, technical terms, and shorthand that must stay intact.
+# One lowercase token per line; comments and blank lines are ignored.
+sami
+ori
+supino
+claude
+github
+async
+struct
+asap
+idk
+brb
+nvm
+yeh
+akuo
+ykrbo
+nauscl
+# Identifiers, paths, scripts and mixed-language tokens.
+user_id
+config.toml
+https://example.com
+helloעולם
+שלוםworld
+שלום
+ועולם
+בבית

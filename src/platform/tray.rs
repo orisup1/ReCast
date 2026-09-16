@@ -2,7 +2,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tao::event::{Event, StartCause};
+use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -46,8 +46,14 @@ pub fn run(control: Arc<AppControl>) {
     // Informational row: what it has done, and how much of that was thrown
     // back at it (see `status_label`).
     let status_item = MenuItem::new(status_label(&control), false, None);
+    let health_menu = Submenu::new("Status", true);
+    let health_detail = MenuItem::new("Starting keyboard listener…", false, None);
+    health_menu
+        .append(&health_detail)
+        .expect("append status detail");
     let toggle_item = MenuItem::new(toggle_label(control.is_switched_on()), true, None);
     let pause_item = MenuItem::new(pause_label(None), true, None);
+    let app_pause_item = MenuItem::new("Pause in application (waiting for focus)", false, None);
     let sep = MenuItem::new("", false, None);
 
     // The recent-corrections list. Silent text replacement is the whole
@@ -70,6 +76,70 @@ pub fn run(control: Arc<AppControl>) {
     // about. Rebuilt with the labels on every refresh.
     let mut recent_words: Vec<String> = vec![String::new(); RECENT_SLOTS];
 
+    let settings_item = MenuItem::new("Open settings", true, None);
+    let settings_menu = Submenu::new("Settings", true);
+    let config = crate::config::Config::global();
+    let spell_item =
+        CheckMenuItem::new("Correct English spelling", true, config.spell_enabled, None);
+    let complete_item = CheckMenuItem::new(
+        "Word completion and abbreviations",
+        true,
+        config.complete_enabled,
+        None,
+    );
+    let conservative_item = CheckMenuItem::new(
+        "Conservative spelling (single-typo fixes)",
+        true,
+        config.spell_max_dist == 1,
+        None,
+    );
+    settings_menu.append(&spell_item).expect("append spelling");
+    settings_menu
+        .append(&complete_item)
+        .expect("append completion");
+    settings_menu
+        .append(&conservative_item)
+        .expect("append conservative");
+    let undo_menu = Submenu::new("Extra undo shortcut", true);
+    let undo_items: Vec<_> = [
+        ("none", "Double-tap Ctrl only"),
+        ("left_ctrl", "Also single-tap Left Ctrl"),
+        ("right_ctrl", "Also single-tap Right Ctrl"),
+    ]
+    .into_iter()
+    .map(|(value, label)| {
+        let item = CheckMenuItem::new(label, true, config.undo_shortcut == value, None);
+        undo_menu.append(&item).expect("append undo choice");
+        (item, value)
+    })
+    .collect();
+    settings_menu.append(&undo_menu).expect("append undo menu");
+    settings_item.set_text("Advanced settings… (file edits need restart)");
+    settings_menu
+        .append(&settings_item)
+        .expect("append advanced settings");
+    let apps_menu = Submenu::new("Application modes", true);
+    let exclude_item = MenuItem::new("Switch to an app first", false, None);
+    apps_menu.append(&exclude_item).expect("append exclude app");
+    let mode_items: Vec<_> = crate::config::AppMode::ALL
+        .into_iter()
+        .map(|mode| {
+            let item = CheckMenuItem::new(mode.label(), false, false, None);
+            apps_menu.append(&item).expect("append mode");
+            (item, mode)
+        })
+        .collect();
+    let apps_hint = MenuItem::new(
+        "Click a saved app below to restore Full correction",
+        false,
+        None,
+    );
+    apps_menu.append(&apps_hint).expect("append apps hint");
+    let mut excluded_items: Vec<(MenuItem, String)> = Vec::new();
+    let mut last_app: Option<(String, String)> = None;
+    let shortcuts_item = MenuItem::new("Typing shortcuts…", true, None);
+    let practice_item = MenuItem::new("Practice correction and undo…", true, None);
+    let ignored_item = MenuItem::new("Open ignored words", true, None);
     let reload_item = MenuItem::new("Reload lists", true, None);
     // Only offered where it is wired up; elsewhere the item would be a
     // checkbox that does nothing.
@@ -79,10 +149,17 @@ pub fn run(control: Arc<AppControl>) {
     let quit_item = MenuItem::new("Quit", true, None);
 
     menu.append(&status_item).expect("append status");
+    menu.append(&health_menu).expect("append health");
     menu.append(&toggle_item).expect("append toggle");
     menu.append(&pause_item).expect("append pause");
+    menu.append(&app_pause_item).expect("append app pause");
     menu.append(&sep).expect("append separator");
     menu.append(&recent_menu).expect("append recent");
+    menu.append(&settings_menu).expect("append settings");
+    menu.append(&apps_menu).expect("append apps");
+    menu.append(&shortcuts_item).expect("append shortcuts");
+    menu.append(&practice_item).expect("append practice");
+    menu.append(&ignored_item).expect("append ignored words");
     menu.append(&reload_item).expect("append reload");
     if let Some(item) = &autostart_item {
         menu.append(item).expect("append autostart");
@@ -91,7 +168,16 @@ pub fn run(control: Arc<AppControl>) {
     menu.append(&quit_item).expect("append quit");
 
     let toggle_id = toggle_item.id().clone();
+    let status_id = status_item.id().clone();
     let pause_id = pause_item.id().clone();
+    let app_pause_id = app_pause_item.id().clone();
+    let settings_id = settings_item.id().clone();
+    let spell_id = spell_item.id().clone();
+    let complete_id = complete_item.id().clone();
+    let conservative_id = conservative_item.id().clone();
+    let shortcuts_id = shortcuts_item.id().clone();
+    let practice_id = practice_item.id().clone();
+    let ignored_id = ignored_item.id().clone();
     let reload_id = reload_item.id().clone();
     let autostart_id = autostart_item.as_ref().map(|i| i.id().clone());
     let about_id = about_item.id().clone();
@@ -111,13 +197,70 @@ pub fn run(control: Arc<AppControl>) {
     // lifetime; we never read it back after construction.
     let mut pending_menu: Option<Menu> = Some(menu);
     let mut _tray: Option<TrayIcon> = None;
+    let mut health = String::new();
+    let mut last_health_check = Instant::now() - STATUS_REFRESH;
+    let mut practice_window: Option<crate::practice::native::Window> = None;
+    let mut practice_offered = false;
+    #[cfg(target_os = "windows")]
+    let mut balloon_until: Option<Instant> = None;
 
-    event_loop.run(move |event, _target, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         // Wake periodically to refresh the fixed-word counter; menu/tray
         // events still wake us immediately in between.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + STATUS_REFRESH);
 
+        if let Some(app) = super::active_application() {
+            last_app = Some(app);
+        }
+        let mut excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
+        excluded.extend(crate::types::lock_forgiving(&control.layout_only_apps).iter().cloned());
+        excluded.sort();
+        excluded.dedup();
+        if last_health_check.elapsed() >= STATUS_REFRESH {
+            health = super::status(&control);
+            let (state, detail) = health.split_once(" — ").unwrap_or((&health, ""));
+            health_menu.set_text(format!("Status: {state}"));
+            health_detail.set_text(detail);
+            if let Some(tray) = &_tray { let _ = tray.set_tooltip(Some(format!("ReCast — {state}"))); }
+            last_health_check = Instant::now();
+        }
+        if let Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } = &event {
+            if practice_window.as_ref().is_some_and(|practice| practice.window.id() == *window_id) {
+                control.practice_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                practice_window = None;
+            }
+        }
+        if let Some(practice) = &mut practice_window { practice.update(&control, &health); }
+        if let Some(id) = control.paused_app() {
+            app_pause_item.set_text(format!("Resume in {id}"));
+            app_pause_item.set_enabled(true);
+        } else if let Some((name, _)) = &last_app {
+            app_pause_item.set_text(format!("Pause in {name} until I switch away"));
+            app_pause_item.set_enabled(true);
+        }
+        if let Some((name, id)) = &last_app {
+            exclude_item.set_text(format!("{name} ({id})"));
+            for (item, mode) in &mode_items {
+                item.set_enabled(true);
+                item.set_checked(control.app_mode(Some(id)) == Some(*mode));
+            }
+        }
+        if excluded_items.iter().map(|(_, id)| id).ne(excluded.iter()) {
+            for (item, _) in excluded_items.drain(..) {
+                let _ = apps_menu.remove(&item);
+            }
+            for id in &excluded {
+                let item = MenuItem::new(id, true, None);
+                apps_menu.append(&item).expect("append excluded application");
+                excluded_items.push((item, id.clone()));
+            }
+        }
+        for (item, id) in &excluded_items {
+            item.set_text(format!("{id}: {} — restore Full", control.app_mode(Some(id)).unwrap().label()));
+        }
+
         // Keep the counters in sync with the listener's running totals.
+        status_item.set_enabled(control.tighten_hint().is_some() && crate::config::Config::global().spell_max_dist > 1);
         let status = status_label(&control);
         if status != last_status {
             status_item.set_text(&status);
@@ -173,15 +316,51 @@ pub fn run(control: Arc<AppControl>) {
                 _tray = Some(tray_builder.build().expect("tray build"));
             }
         }
+        if !practice_offered && pending_menu.is_none() && control.listener_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            practice_offered = true;
+            if crate::practice::first_run() {
+                match crate::practice::native::Window::new(target, &control) {
+                    Ok(window) => practice_window = Some(window),
+                    Err(error) => crate::notify::notify("Could not open practice", &error),
+                }
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Some(tray) = &_tray {
+            if balloon_until.is_some_and(|until| Instant::now() >= until) {
+                windows_balloon(tray, None);
+                balloon_until = None;
+            }
+            if balloon_until.is_none() {
+                let notice = crate::notify::WINDOWS_NOTICES.lock().ok().and_then(|mut q| q.pop_front());
+                if let Some((title, body)) = notice {
+                    windows_balloon(tray, Some((&title, &body)));
+                    balloon_until = Some(Instant::now() + Duration::from_secs(12));
+                }
+            }
+        }
 
         while let Ok(event) = menu_channel.try_recv() {
-            if event.id == toggle_id {
+            if event.id == status_id {
+                if let Err(error) = crate::settings::set_live(&control, "spell_dist", "1") {
+                    crate::notify::notify("Settings unchanged", &error);
+                }
+                conservative_item.set_checked(crate::config::Config::global().spell_max_dist == 1);
+            } else if event.id == toggle_id {
                 let new_enabled = !control.is_switched_on();
                 control.set_enabled(new_enabled);
                 toggle_item.set_text(toggle_label(new_enabled));
-                // Update tooltip immediately
-                // Fix: set_tooltip requires Option<S>, so wrap in Some(...)
+                // The hover text carries the same state as the menu, so it is
+                // refreshed here rather than waiting for the next timer wake.
                 let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+            } else if event.id == app_pause_id {
+                if control.paused_app().is_some() {
+                    control.resume_app();
+                } else if let Some((_, id)) = &last_app {
+                    control.pause_in_app(id);
+                }
+                last_health_check = Instant::now() - STATUS_REFRESH;
             } else if event.id == pause_id {
                 // The same item ends the pause it started: while one is
                 // running the row reads "Resume", so this is one control with
@@ -193,12 +372,65 @@ pub fn run(control: Arc<AppControl>) {
                 }
                 pause_item.set_text(pause_label(control.pause_remaining()));
                 let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+            } else if event.id == practice_id {
+                if let Some(practice) = &practice_window {
+                    practice.focus();
+                } else {
+                    match crate::practice::native::Window::new(target, &control) {
+                        Ok(window) => practice_window = Some(window),
+                        Err(error) => crate::notify::notify("Could not open practice", &error),
+                    }
+                }
+            } else if event.id == shortcuts_id {
+                crate::notify::show_shortcuts();
+            } else if event.id == spell_id || event.id == complete_id || event.id == conservative_id {
+                let (key, value) = if event.id == spell_id {
+                    ("spell", if spell_item.is_checked() { "true" } else { "false" })
+                } else if event.id == complete_id {
+                    ("complete", if complete_item.is_checked() { "true" } else { "false" })
+                } else {
+                    ("spell_dist", if conservative_item.is_checked() { "1" } else { "3" })
+                };
+                if let Err(error) = crate::settings::set_live(&control, key, value) {
+                    crate::notify::notify("Settings unchanged", &error);
+                }
+                let config = crate::config::Config::global();
+                spell_item.set_checked(config.spell_enabled);
+                complete_item.set_checked(config.complete_enabled);
+                conservative_item.set_checked(config.spell_max_dist == 1);
+            } else if undo_items.iter().any(|(item, _)| *item.id() == event.id) {
+                let value = undo_items.iter().find(|(item, _)| *item.id() == event.id).unwrap().1;
+                if let Err(error) = crate::settings::set_live(&control, "undo_shortcut", value) {
+                    crate::notify::notify("Shortcut unchanged", &error);
+                }
+                for (item, value) in &undo_items { item.set_checked(crate::config::Config::global().undo_shortcut == *value); }
+            } else if mode_items.iter().any(|(item, _)| *item.id() == event.id) || excluded_items.iter().any(|(item, _)| *item.id() == event.id) {
+                let selected = mode_items.iter().find(|(item, _)| *item.id() == event.id);
+                let id = if selected.is_some() {
+                    last_app.as_ref().map(|(_, id)| id.clone())
+                } else {
+                    excluded_items.iter().find(|(item, _)| *item.id() == event.id).map(|(_, id)| id.clone())
+                };
+                if let Some(id) = id {
+                    let mode = selected.map(|(_, mode)| *mode).unwrap_or(crate::config::AppMode::Full);
+                    if let Err(error) = crate::settings::set_app_mode(&control, &id, mode) {
+                        crate::notify::notify("Application mode unchanged", &error);
+                    }
+                }
+            } else if event.id == settings_id || event.id == ignored_id {
+                let name = if event.id == settings_id { "config.toml" } else { "ignore.txt" };
+                if let Err(error) = open_user_file(name) {
+                    crate::notify::notify("Could not open ReCast file", &error.to_string());
+                }
             } else if event.id == reload_id {
                 // The watcher picks edits up on its own within a couple of
                 // seconds; this is for the user who has just saved the file
                 // and wants to know *now* that it took.
                 crate::complete::reload_user_files();
-                let (abbrevs, ignored) = crate::complete::list_counts();
+                // `learned.txt` is ours rather than the user's, and is not
+                // among the files a reload re-reads — so it is not reported by
+                // the notification about having re-read them.
+                let (abbrevs, ignored, _) = crate::complete::list_counts();
                 crate::notify::notify(
                     "ReCast reloaded your lists",
                     &format!("{abbrevs} abbreviation(s), {ignored} ignored word(s)"),
@@ -226,16 +458,14 @@ pub fn run(control: Arc<AppControl>) {
                     }
                 }
             } else if event.id == about_id {
-                // Show about dialog - platform specific
                 #[cfg(target_os = "macos")]
                 {
-                    // NSAlert is configured via setMessageText:/setInformativeText:
-                    // and shown with runModal. The previous code sent a
-                    // UIAlertController-style `initWithTitle:message:preferredStyle:`
-                    // selector (which NSAlert does not implement) and passed Rust
-                    // &str where NSString* was expected — an unrecognized-selector
-                    // Objective-C exception that aborted the whole process whenever
-                    // About was clicked. Build real NSStrings and use NSAlert's API.
+                    // NSAlert only: configured with setMessageText: /
+                    // setInformativeText: and shown with runModal, and every
+                    // string built as a real NSString. Sending it a selector it
+                    // does not implement, or a Rust &str where NSString* is
+                    // expected, is an Objective-C exception — which aborts the
+                    // whole process rather than failing the click.
                     use cocoa::appkit::NSApp;
                     use cocoa::base::{id, nil, YES};
                     use cocoa::foundation::NSString;
@@ -296,6 +526,10 @@ pub fn run(control: Arc<AppControl>) {
                     }
                 }
             } else if event.id == quit_id {
+                #[cfg(target_os = "windows")]
+                if let Some(tray) = &_tray {
+                    windows_balloon(tray, None);
+                }
                 // Drop the tray icon first so Windows removes it from the
                 // notification area immediately. process::exit skips destructors,
                 // which would otherwise leave a ghost icon behind until the user
@@ -307,8 +541,50 @@ pub fn run(control: Arc<AppControl>) {
     });
 }
 
+/// Native balloon on the tray's hidden window: no foreground window or focus change.
+#[cfg(target_os = "windows")]
+fn windows_balloon(tray: &TrayIcon, message: Option<(&str, &str)>) {
+    use winapi::um::{
+        shellapi::*,
+        winuser::{LoadIconW, IDI_INFORMATION},
+    };
+    unsafe {
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = tray.window_handle() as _;
+        // A separate, temporary notification icon avoids depending on tray-icon's private ID.
+        data.uID = u32::MAX;
+        if let Some((title, body)) = message {
+            data.uFlags = NIF_INFO | NIF_ICON | NIF_TIP;
+            data.hIcon = LoadIconW(std::ptr::null_mut(), IDI_INFORMATION);
+            data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+            for (dst, src) in data
+                .szInfoTitle
+                .iter_mut()
+                .take(63)
+                .zip(title.encode_utf16())
+            {
+                *dst = src;
+            }
+            for (dst, src) in data.szInfo.iter_mut().take(255).zip(body.encode_utf16()) {
+                *dst = src;
+            }
+            for (dst, src) in data.szTip.iter_mut().zip("ReCast".encode_utf16()) {
+                *dst = src;
+            }
+            Shell_NotifyIconW(NIM_ADD, &mut data);
+        } else {
+            Shell_NotifyIconW(NIM_DELETE, &mut data);
+        }
+    }
+}
+
 fn toggle_label(enabled: bool) -> &'static str {
-    if enabled { "Disable" } else { "Enable" }
+    if enabled {
+        "Disable"
+    } else {
+        "Enable"
+    }
 }
 
 /// The counter row: what stuck, what was taken back, and — once enough has
@@ -324,8 +600,8 @@ fn status_label(control: &AppControl) -> String {
     if undone > 0 {
         label.push_str(&format!(" · {undone} taken back"));
     }
-    if let Some(hint) = control.tighten_hint() {
-        label.push_str(&format!(" — {hint}"));
+    if control.tighten_hint().is_some() && crate::config::Config::global().spell_max_dist > 1 {
+        label.push_str(" — click to use Conservative spelling");
     }
     label
 }
@@ -370,16 +646,18 @@ fn tooltip(control: &AppControl) -> String {
 // (Windows uses a hover tooltip), so gating it avoids a dead-code warning there.
 #[cfg(target_os = "macos")]
 fn menubar_banner() -> String {
-  if std::env::var_os("NO_COLOR").is_some() {
-    format!("ReCast v{}", env!("CARGO_PKG_VERSION"))
-  } else {
-    let depth = banner::ColorDepth::True;
-    let mut row = banner::logo_rows_compact(depth);
-    if !row.is_empty() { row.push(' '); }
-    row.push_str("\x1b[38;5;39mReCast\x1b[0m ");
-    row.push_str(&format!("\x1b[2mv{}\x1b[0m", env!("CARGO_PKG_VERSION")));
-    row
-  }
+    if std::env::var_os("NO_COLOR").is_some() {
+        format!("ReCast v{}", env!("CARGO_PKG_VERSION"))
+    } else {
+        let depth = banner::ColorDepth::True;
+        let mut row = banner::logo_rows_compact(depth);
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.push_str("\x1b[38;5;39mReCast\x1b[0m ");
+        row.push_str(&format!("\x1b[2mv{}\x1b[0m", env!("CARGO_PKG_VERSION")));
+        row
+    }
 }
 
 const ICON_RGBA: &[u8] = include_bytes!("../../assets/tray-icon.rgba");
@@ -387,4 +665,99 @@ const ICON_SIZE: u32 = 32;
 
 fn app_icon() -> Icon {
     Icon::from_rgba(ICON_RGBA.to_vec(), ICON_SIZE, ICON_SIZE).expect("icon build")
+}
+
+/// Create a missing file without truncating an existing user's settings.
+fn prepare_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file.write_all(contents.as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_user_file(name: &str) -> std::io::Result<()> {
+    let path = crate::complete::user_path(name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No config directory available",
+        )
+    })?;
+    let contents = if name == "config.toml" {
+        crate::settings::sample()
+    } else {
+        "# One word per line. Changes are picked up automatically.\n".to_string()
+    };
+    prepare_file(&path, &contents)?;
+    open_text_file(&path)
+}
+
+#[cfg(target_os = "macos")]
+fn open_text_file(path: &std::path::Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("open")
+        .arg("-t")
+        .arg(path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "Text editor exited with {status}"
+        )))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_text_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::{shellapi::ShellExecuteW, winuser::SW_SHOWNORMAL};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result > 32 {
+        return Ok(());
+    }
+    // A fresh Windows install may have no association for .toml.
+    if result == 31 {
+        let mut child = std::process::Command::new("notepad.exe")
+            .arg(path)
+            .spawn()?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "Windows could not open {} (code {result})",
+        path.display()
+    )))
+}
+
+#[cfg(test)]
+mod file_tests {
+    #[test]
+    fn opening_settings_creates_once_and_preserves_edits() {
+        let dir = std::env::temp_dir().join(format!("recast-editor-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        super::prepare_file(&path, "spell = false\n").unwrap();
+        super::prepare_file(&path, "spell = true\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "spell = false\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

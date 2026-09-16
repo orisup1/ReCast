@@ -1,24 +1,16 @@
 # CI — the parity guard.
 #
-# The correction pipeline is pure and covered by `cargo test`, but capture and
-# injection live in three near-identical copies (`src/platform/{linux,macos,
-# windows}.rs`) that nothing keeps in step. A change landed in one and forgotten
-# in the other two still *compiles* on the machine it was written on, which is
-# why every job below runs on a real runner for its own OS rather than
-# cross-checking from Linux.
+# Test the shared engine and compile each capture/injection backend on its OS.
 
 name: CI
 
-# PARKED. The automatic triggers are commented out, so this runs only when
-# started by hand from the Actions tab ("Run workflow"). Nothing happens on a
-# push or a pull request.
-#
-# To turn it back on, uncomment the two blocks below:
 on:
-  # push:
-  #   branches: ["**"]
-  # pull_request:
+  push:
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,7 +37,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -65,14 +57,18 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libgl1-mesa-dev
 
+      - name: Formatting
+        run: cargo fmt --check
+
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      # Compiling the release profile is the only thing that exercises each
-      # platform module's injection path at all — there are no tests below
-      # `src/platform/`, so "it builds" is the entire guarantee here.
+      # Also check code compiled only in the release profile.
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --locked --release
+
+      - name: Release CLI smoke test
+        run: cargo test --locked --release --test cli

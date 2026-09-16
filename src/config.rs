@@ -1,8 +1,15 @@
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Allow auto-switching on short words (≤3 chars). Short key sequences are
-    /// dictionary-collision-prone, so this can be turned off for a stricter,
-    /// never-wrongly-switch behaviour.
+    /// Exact application IDs in which capture, learning and correction stop.
+    pub excluded_apps: Vec<String>,
+    pub layout_only_apps: Vec<String>,
+    /// An optional single modifier tap; double-tap Ctrl remains available.
+    pub undo_shortcut: String,
+    /// Persist local word-frequency, correction-pair, and typing-timing data.
+    /// Off by default because the word files may contain sensitive text.
+    pub personal_enabled: bool,
+    /// Allow short (≤3 char) switches up to frequency rank 20,000.
+    /// Turning this off restricts them to very common words (rank ≤500).
     pub short_enabled: bool,
     /// Enable missing‑space split fallback.
     pub split_enabled: bool,
@@ -52,8 +59,8 @@ pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
 
 impl Config {
     /// Load configuration from environment variables.
-    /// RECAST_SHORT – set to `0` to disable switching on short (≤3 char) words
-    ///                (default: enabled).
+    /// RECAST_SHORT – set to `0` to restrict short (≤3 char) switches to very
+    ///                common words (default: enabled).
     /// RECAST_SPLIT – set (to anything but `0`) to enable the missing-space
     ///                split fallback (default: disabled).
     /// RECAST_FREQ  – set to `0` to disable the homograph frequency tie-break
@@ -63,48 +70,89 @@ impl Config {
     /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
     /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
     ///                     (default: 20000).
-    /// RECAST_SPELL_DIST – maximum edit distance, 1 to 3 (default: 3).
+    /// RECAST_SPELL_DIST – maximum edit distance, 0 to 3 (default: 3; 0 disables).
     /// RECAST_COMPLETE   – set to `0` to disable auto-complete (default:
     ///                     enabled).
     /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 3).
     /// RECAST_COMPLETE_RANK – worst frequency rank a completion may have
     ///                        (default: 30000).
+    /// RECAST_PERSONAL – set to `1` to persist local personalization data
+    ///                   (default: disabled).
     pub fn from_env() -> Self {
         Self {
-            short_enabled: std::env::var("RECAST_SHORT")
-                .map(|v| v != "0")
-                .unwrap_or(true),
-            split_enabled: std::env::var("RECAST_SPLIT")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(false),
-            freq_enabled: std::env::var("RECAST_FREQ")
-                .map(|v| v != "0")
-                .unwrap_or(true),
-            spell_enabled: std::env::var("RECAST_SPELL")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            excluded_apps: parse_excluded_apps(
+                &crate::settings::get("RECAST_EXCLUDE_APPS").unwrap_or_default(),
+            ),
+            layout_only_apps: parse_excluded_apps(
+                &crate::settings::get("RECAST_LAYOUT_ONLY_APPS").unwrap_or_default(),
+            ),
+            undo_shortcut: crate::settings::get("RECAST_UNDO_SHORTCUT")
+                .filter(|value| valid_undo_shortcut(value))
+                .unwrap_or_else(|| "none".into()),
+            personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
+            short_enabled: crate::settings::flag("RECAST_SHORT", true),
+            split_enabled: crate::settings::flag("RECAST_SPLIT", false),
+            freq_enabled: crate::settings::flag("RECAST_FREQ", true),
+            spell_enabled: crate::settings::flag("RECAST_SPELL", true),
             spell_min_len: env_num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),
             spell_max_rank: env_num("RECAST_SPELL_RANK", DEFAULT_SPELL_MAX_RANK),
             spell_max_dist: env_num("RECAST_SPELL_DIST", DEFAULT_SPELL_MAX_DIST),
-            complete_enabled: std::env::var("RECAST_COMPLETE")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            complete_enabled: crate::settings::flag("RECAST_COMPLETE", true),
             complete_min_len: env_num("RECAST_COMPLETE_MIN", DEFAULT_COMPLETE_MIN_LEN),
             complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppMode {
+    Full,
+    LayoutOnly,
+    Off,
+}
+
+impl AppMode {
+    pub const ALL: [Self; 3] = [Self::Full, Self::LayoutOnly, Self::Off];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full correction",
+            Self::LayoutOnly => "Layout only",
+            Self::Off => "Off",
+        }
+    }
+}
+
+pub fn valid_undo_shortcut(value: &str) -> bool {
+    matches!(value, "none" | "left_ctrl" | "right_ctrl")
+}
+
+pub fn parse_excluded_apps(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// An unknown application is not safe when exclusions were explicitly requested.
+pub fn app_allowed(excluded: &[String], app: Option<&str>) -> bool {
+    excluded.is_empty()
+        || app
+            .filter(|s| !s.is_empty())
+            .is_some_and(|app| !excluded.contains(&app.to_lowercase()))
+}
+
 /// Numeric env override, falling back to `default` when unset or unparsable.
-fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
+fn env_num<T: TryFrom<u64>>(key: &str, default: T) -> T {
+    crate::settings::get(key)
+        .and_then(|v| crate::settings::parse_number(key, &v).ok())
+        .and_then(|v| T::try_from(v).ok())
         .unwrap_or(default)
 }
 
 /// Every numeric setting, so a value that could not be read can be named.
-const NUMERIC_KEYS: &[&str] = &[
+pub const NUMERIC_KEYS: &[&str] = &[
     "RECAST_SPELL_MIN",
     "RECAST_SPELL_RANK",
     "RECAST_SPELL_DIST",
@@ -117,6 +165,7 @@ const NUMERIC_KEYS: &[&str] = &[
     "RECAST_INJECT_KEY_GAP",
     "RECAST_INJECT_SETTLE",
     "RECAST_INJECT_HELD_TIMEOUT",
+    "RECAST_INJECT_TERM_TIMEOUT",
     "RECAST_INJECT_HELD_POLL",
     "RECAST_INJECT_DEVICE_SETTLE",
     "RECAST_INJECT_LAYOUT_CONFIRM",
@@ -124,31 +173,66 @@ const NUMERIC_KEYS: &[&str] = &[
     "RECAST_INJECT_BATCH_GAP",
 ];
 
-/// Settings that were set but could not be understood, described for the user.
-///
-/// [`env_num`] falls back to the shipped default on anything it cannot parse,
-/// which is the right behaviour — a bad value should not stop the program —
-/// but doing it *silently* inverts the user's intent in the one case that
-/// matters. `RECAST_SPELL_DIST=l` (an el for a one) reads as the default 3,
-/// the loosest setting there is, from someone who was plainly trying to
-/// tighten it. Nothing said so. This is what `--status` reads out.
-pub fn env_complaints() -> Vec<String> {
-    let mut out = Vec::new();
-    for key in NUMERIC_KEYS {
-        if let Ok(raw) = std::env::var(key) {
-            if raw.trim().parse::<u64>().is_err() {
-                out.push(format!(
-                    "{key}={raw:?} is not a number — using the default instead."
-                ));
-            }
-        }
-    }
-    out
-}
+/// Every boolean setting, so a typo falls back with a warning instead of
+/// quietly inverting the user's intent.
+pub const BOOLEAN_KEYS: &[&str] = &[
+    "RECAST_PERSONAL",
+    "RECAST_SHORT",
+    "RECAST_SPLIT",
+    "RECAST_FREQ",
+    "RECAST_SPELL",
+    "RECAST_COMPLETE",
+    "RECAST_DEBUG",
+];
+
+/// All known settings, for validating the config file.
+pub const ALL_KEYS: &[&str] = &[
+    "RECAST_EXCLUDE_APPS",
+    "RECAST_LAYOUT_ONLY_APPS",
+    "RECAST_UNDO_SHORTCUT",
+    "RECAST_PERSONAL",
+    "RECAST_SHORT",
+    "RECAST_SPLIT",
+    "RECAST_FREQ",
+    "RECAST_SPELL",
+    "RECAST_SPELL_MIN",
+    "RECAST_SPELL_RANK",
+    "RECAST_SPELL_DIST",
+    "RECAST_COMPLETE",
+    "RECAST_COMPLETE_MIN",
+    "RECAST_COMPLETE_RANK",
+    "RECAST_INJECT_PRESS_GAP",
+    "RECAST_INJECT_KEY_GAP",
+    "RECAST_INJECT_SETTLE",
+    "RECAST_INJECT_HELD_TIMEOUT",
+    "RECAST_INJECT_TERM_TIMEOUT",
+    "RECAST_INJECT_HELD_POLL",
+    "RECAST_INJECT_DEVICE_SETTLE",
+    "RECAST_INJECT_LAYOUT_CONFIRM",
+    "RECAST_INJECT_LAYOUT_POLL",
+    "RECAST_INJECT_BATCH_GAP",
+    // Debug setting (not in Config struct)
+    "RECAST_DEBUG",
+    // Linux-only setting (not in Config struct)
+    "RECAST_LAYOUT_BACKEND",
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusions_match_whole_app_ids_and_decline_unknown_apps() {
+        let excluded =
+            parse_excluded_apps(" Code.exe, com.apple.Terminal, , org.keepassxc.KeePassXC ");
+        assert_eq!(excluded.len(), 3);
+        for app in [None, Some(""), Some("CODE.EXE"), Some("com.apple.Terminal")] {
+            assert!(!app_allowed(&excluded, app));
+        }
+        assert!(app_allowed(&excluded, Some("code.exe.backup")));
+        assert!(app_allowed(&excluded, Some("firefox")));
+        assert!(app_allowed(&[], None));
+    }
 
     /// The parse is what decides whether a complaint is warranted, so it is
     /// what gets tested — the env itself is process-global and shared with
@@ -170,7 +254,52 @@ mod tests {
             assert!(doc.contains(key), "{key} listed but not used");
         }
         for key in ["RECAST_SPELL_MIN", "RECAST_COMPLETE_RANK"] {
-            assert!(NUMERIC_KEYS.contains(&key), "{key} is numeric but unchecked");
+            assert!(
+                NUMERIC_KEYS.contains(&key),
+                "{key} is numeric but unchecked"
+            );
+        }
+    }
+
+    /// The injection timings are written down in three places — the code that
+    /// reads them (`timing::injection`), the list that complains about a value
+    /// it cannot parse (above), and `--help`. All three had drifted: `--help`
+    /// was missing two of them, the complaint list a third, and `timing`'s own
+    /// doc comment three. A setting nothing complains about and nothing
+    /// documents is a setting that does not exist as far as the user is
+    /// concerned, so the source of truth checks the copies.
+    #[test]
+    fn every_injection_timing_is_listed_and_documented() {
+        let timing = include_str!("timing.rs");
+        let help = include_str!("main.rs");
+
+        // Every `"RECAST_INJECT_…"` string literal in timing.rs — which is
+        // exactly the set `injection()` reads, since the doc comments name them
+        // in backticks rather than quotes.
+        let read: Vec<&str> = timing
+            .match_indices("\"RECAST_INJECT_")
+            .map(|(at, matched)| {
+                let rest = &timing[at + matched.len() - "RECAST_INJECT_".len()..];
+                &rest[..rest.find('"').expect("unterminated key")]
+            })
+            .filter(|key| !key.contains("NOTHING_SETS_THIS"))
+            .collect();
+        assert!(
+            read.len() >= 10,
+            "found only {} timings: {read:?}",
+            read.len()
+        );
+
+        for key in read {
+            assert!(
+                NUMERIC_KEYS.contains(&key),
+                "{key} is read by timing::injection but not in NUMERIC_KEYS, \
+                 so a typoed value would fall back to the default in silence"
+            );
+            assert!(
+                help.contains(key),
+                "{key} is a real setting but not in --help"
+            );
         }
     }
 }

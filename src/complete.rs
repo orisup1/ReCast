@@ -43,11 +43,11 @@ const MAX_PREFIX_LEN: usize = 20;
 /// word than the one before it.
 pub const MAX_CANDIDATES: usize = 4;
 
-/// Fixed-point scale for [`value`], so the ranking can be done in integers.
-const VALUE_SCALE: u64 = 1 << 20;
+/// Scale for [`value`], kept as f64 to allow personal frequency boost.
+const VALUE_SCALE: f64 = (1 << 20) as f64;
 
 /// How good a completion is: the keystrokes it would save, weighted by how
-/// likely it is to be the word meant.
+/// likely it is to be the word meant, boosted by personal frequency.
 ///
 /// Ranking candidates by raw frequency — the obvious thing, and what this did
 /// at first — quietly optimises the wrong quantity. The user pressed a key to
@@ -59,8 +59,13 @@ const VALUE_SCALE: u64 = 1 << 20;
 /// It only reorders candidates that are already close in frequency: a word ten
 /// times commoner than its neighbour still wins on frequency alone, which is
 /// why `hel` still completes to `help` rather than to a longer, rarer word.
-fn value(saved: usize, rank: u32) -> u64 {
-    saved as u64 * VALUE_SCALE / (rank as u64 + 1)
+///
+/// Personal frequency boosts candidates the user actually types, making their
+/// vocabulary win over generic corpus rankings.
+fn value(saved: usize, rank: u32, word: &str) -> f64 {
+    let base = saved as f64 * VALUE_SCALE / (rank as f64 + 1.0);
+    let boost = crate::personal::personal_boost(word) as f64;
+    base * boost
 }
 
 /// Completions to offer for the partial word `prefix`, best first.
@@ -112,12 +117,12 @@ pub fn completions_with(
     // Kept sorted by descending `value`, truncated to length as it goes, so the
     // scan never holds more than a handful of candidates however long the
     // prefix run is.
-    let mut best: Vec<(u64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
+    let mut best: Vec<(f64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
     en_freq.for_each_with_prefix(prefix, |word, rank| {
         if rank > max_rank || word.len() <= prefix.len() {
             return;
         }
-        let value = value(word.len() - prefix.len(), rank);
+        let value = value(word.len() - prefix.len(), rank, word);
         // Cheap rejection before the dictionary lookup: if the list is already
         // full of better candidates this one can't get in.
         if best.len() == MAX_CANDIDATES && best[MAX_CANDIDATES - 1].0 >= value {
@@ -129,7 +134,9 @@ pub fn completions_with(
             return;
         }
         // Ties (same value, different words) go to the commoner word.
-        let at = best.partition_point(|(v, r, _)| (*v, std::cmp::Reverse(*r)) > (value, std::cmp::Reverse(rank)));
+        let at = best.partition_point(|(v, r, _)| {
+            (*v, std::cmp::Reverse(*r)) > (value, std::cmp::Reverse(rank))
+        });
         best.insert(at, (value, rank, word.to_string()));
         best.truncate(MAX_CANDIDATES);
     });
@@ -178,6 +185,10 @@ pub fn unlist(word: &str) {
     if let Ok(mut set) = suppressed_words().lock() {
         set.remove(&word);
     }
+    // Including what earlier undos taught: the gesture is asking for this word
+    // to be corrected after all, and a count from a previous session would
+    // quietly decline.
+    unlearn(&word);
     let was_in_file = ignore_list()
         .lock()
         .map(|mut list| list.remove(&word))
@@ -220,6 +231,147 @@ fn without_word(text: &str, word: &str) -> String {
         kept.push('\n');
     }
     kept
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What the undo gesture teaches, kept past the end of the session
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How many undos of the same word retire it for good.
+///
+/// Two, not one. A single undo already stops the word being corrected for the
+/// rest of the session ([`suppress`]), which is the right answer for a word the
+/// user took back by reflex — and a reflex is not a decision. Doing it twice, on
+/// two separate occasions, is: it means the correction is not a one-off
+/// annoyance but something that will keep happening, and that is exactly what
+/// `ignore.txt` is for. This is the same conclusion reached without asking the
+/// user to go and find a file.
+const LEARNED_MIN: u32 = 2;
+
+/// The undo counts, read from `learned.txt` on first use.
+///
+/// The gap this fills: the session list is forgotten at restart and
+/// `ignore.txt` has to be written by hand, so a name the speller dislikes was
+/// undone once a session, for as long as the user kept using the daemon. Nothing
+/// in between remembered anything. This does — and it remembers the one signal
+/// there is real evidence behind, since an undo is the user saying, about a
+/// specific word, that we were wrong.
+///
+/// Deliberately *not* fed by "a word that was typed and not corrected": the
+/// speller only ever leaves those alone anyway, so counting them would gather
+/// evidence about every word except the ones this exists to protect.
+fn learned_words() -> &'static Mutex<HashMap<String, u32>> {
+    static WORDS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    WORDS.get_or_init(|| Mutex::new(parse_learned(&read_user_file(LEARNED_FILE))))
+}
+
+/// `<config dir>/learned.txt` — beside `ignore.txt`, and the same idea kept by
+/// hand rather than by gesture.
+const LEARNED_FILE: &str = "learned.txt";
+
+/// One `word<TAB>count` per line, `#` starting a comment. A line without a
+/// count, or with one that does not parse, is read as a single undo — the file
+/// is meant to be editable, and "just put the word in" should work.
+fn parse_learned(text: &str) -> HashMap<String, u32> {
+    let mut counts = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (word, count) = match line.split_once('\t') {
+            Some((word, count)) => (word.trim(), count.trim().parse().unwrap_or(1)),
+            None => (line, 1),
+        };
+        if !word.is_empty() {
+            counts.insert(word.to_lowercase(), count);
+        }
+    }
+    counts
+}
+
+/// Serialise the counts, newest-largest first so the file reads as a list of
+/// what the user most disagrees with.
+fn learned_text(counts: &HashMap<String, u32>) -> String {
+    let mut entries: Vec<_> = counts.iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let mut out = String::from(
+        "# Words you have taken back a correction of, and how many times.\n\
+         # Written by ReCast; safe to edit or delete.\n",
+    );
+    for (word, count) in entries {
+        out.push_str(word);
+        out.push('\t');
+        out.push_str(&count.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// Note that the user undid a correction of `word`.
+///
+/// Written through to disk immediately, as `ignore.txt` is: an undo is a
+/// deliberate gesture that happens a handful of times an hour, and the file is a
+/// few hundred bytes. Nothing here is on the path a keystroke takes.
+#[allow(dead_code)]
+pub fn learn(word: &str) {
+    let word = word.trim().to_lowercase();
+    if word.is_empty() {
+        return;
+    }
+    let Ok(mut counts) = learned_words().lock() else {
+        return;
+    };
+    // The engine releases its injection gate before saving. A newer unlist
+    // must win over an undo worker that has not reached persistence yet.
+    // Check under the counts lock so a concurrent unlearn removes our update.
+    if !suppressed(&word) {
+        return;
+    }
+    *counts.entry(word).or_insert(0) += 1;
+    write_learned(&counts);
+}
+
+/// Forget what the undos taught about `word` — the un-ignore gesture's half of
+/// the toggle. A user asking for a word to be corrected after all must not have
+/// it declined by a count from last month.
+fn unlearn(word: &str) {
+    let Ok(mut counts) = learned_words().lock() else {
+        return;
+    };
+    if counts.remove(word).is_some() {
+        write_learned(&counts);
+    }
+}
+
+/// Whether `word` has been undone often enough to be left alone for good.
+pub fn learned(word: &str) -> bool {
+    learned_words().lock().is_ok_and(|counts| {
+        counts
+            .get(&word.to_lowercase())
+            .is_some_and(|n| *n >= LEARNED_MIN)
+    })
+}
+
+/// Replace `learned.txt` with `counts`, via a temporary file and a rename so an
+/// interrupted write cannot leave a truncated list behind.
+///
+/// Unlike `ignore.txt` this file is entirely ours, so it is rewritten wholesale
+/// rather than appended to a line at a time — there is no user formatting to
+/// preserve.
+fn write_learned(counts: &HashMap<String, u32>) {
+    let Some(path) = user_path(LEARNED_FILE) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let tmp = path.with_extension("txt.tmp");
+    if std::fs::write(&tmp, learned_text(counts)).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Words the user has taken back with the undo gesture this session.
@@ -310,8 +462,25 @@ pub fn user_path(name: &str) -> Option<std::path::PathBuf> {
 
 /// Where ReCast keeps the user's files — `~/.config/recast` and its
 /// per-OS equivalents.
+#[cfg(not(test))]
 pub fn config_dir() -> Option<std::path::PathBuf> {
     Some(dirs::config_dir()?.join("recast"))
+}
+
+// Tests exercise undo's persistence too; never read or modify the real lists.
+#[cfg(test)]
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    Some(
+        DIR.get_or_init(|| {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!("recast-tests-{}-{unique}", std::process::id()))
+        })
+        .clone(),
+    )
 }
 
 /// The ignore list, read from disk on first use. Behind a `Mutex` rather than
@@ -370,10 +539,7 @@ pub fn reload_user_files() {
 /// Appends rather than rewrites: the file belongs to the user, and adding a
 /// line is the smallest possible edit to it.
 ///
-/// Only the tray's recent-corrections list calls this, so it is gated to the
-/// platforms that have a tray; on Linux the same job is done by the Ctrl
-/// double-tap and by editing the file.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// Used by the tray and Linux window's recent-corrections lists.
 pub fn ignore_word(word: &str) {
     let word = word.trim().to_lowercase();
     if word.is_empty() {
@@ -396,7 +562,11 @@ pub fn ignore_word(word: &str) {
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = file.write_all(appended_line(&existing, &word).as_bytes());
     }
 }
@@ -408,23 +578,28 @@ pub fn ignore_word(word: &str) {
 /// entry would stop working, which is a strange thing to have happen from
 /// clicking a menu item about a different word.
 ///
-/// Only [`ignore_word`] calls it, so it is dead on the platforms without a
-/// tray — but it is pure, so it is still tested there.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "windows")),
-    allow(dead_code)
-)]
 fn appended_line(existing: &str, word: &str) -> String {
-    let lead = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+    let lead = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
     format!("{lead}{word}\n")
 }
 
 /// How many abbreviations and ignored words are loaded — what `--status`
 /// reports, so a user who has just edited a file can see it took.
-pub fn list_counts() -> (usize, usize) {
+pub fn list_counts() -> (usize, usize, usize) {
     (
         abbreviations().lock().map(|t| t.len()).unwrap_or(0),
         ignore_list().lock().map(|l| l.len()).unwrap_or(0),
+        // Only the words that have actually crossed the threshold: a single
+        // undo is in the file but is not yet doing anything, and reporting it
+        // as a retired word would be a lie about why a correction still fires.
+        learned_words()
+            .lock()
+            .map(|c| c.values().filter(|n| **n >= LEARNED_MIN).count())
+            .unwrap_or(0),
     )
 }
 
@@ -569,6 +744,66 @@ fn parse_abbreviations(text: &str) -> HashMap<String, String> {
 }
 
 #[cfg(test)]
+mod learned_list {
+    use super::*;
+
+    #[test]
+    fn a_count_survives_being_written_and_read_back() {
+        let mut counts = HashMap::new();
+        counts.insert("supino".to_string(), 3);
+        counts.insert("recast".to_string(), 1);
+        assert_eq!(parse_learned(&learned_text(&counts)), counts);
+    }
+
+    #[test]
+    fn the_file_is_editable_by_hand() {
+        // Comments and blanks are skipped, and a bare word with no count is
+        // read as one undo — "just put the word in" has to work, because that
+        // is what a user editing this file will do.
+        let counts = parse_learned(
+            "# mine\n\
+             \n\
+             supino\t4\n\
+             ori\n\
+             Github\t2\n\
+             \tnonsense\n",
+        );
+        assert_eq!(counts.get("supino"), Some(&4));
+        assert_eq!(counts.get("ori"), Some(&1), "a bare word counts once");
+        assert_eq!(counts.get("github"), Some(&2), "folded like every reading");
+        assert_eq!(counts.get("#"), None);
+        assert_eq!(counts.len(), 4, "the empty word is not an entry");
+    }
+
+    #[test]
+    fn one_undo_is_a_reflex_and_two_are_a_decision() {
+        // The threshold is the whole design: undoing once already retires the
+        // word for the session, so this only has to catch the word that keeps
+        // coming back.
+        let mut counts = HashMap::new();
+        counts.insert("sami".to_string(), 1);
+        assert!(counts["sami"] < LEARNED_MIN, "one undo does not stick");
+        counts.insert("sami".to_string(), 2);
+        assert!(counts["sami"] >= LEARNED_MIN);
+    }
+
+    #[test]
+    fn the_file_leads_with_what_is_most_disagreed_with() {
+        let mut counts = HashMap::new();
+        counts.insert("once".to_string(), 1);
+        counts.insert("often".to_string(), 9);
+        counts.insert("twice".to_string(), 2);
+        let text = learned_text(&counts);
+        let listed: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split('\t').next())
+            .collect();
+        assert_eq!(listed, ["often", "twice", "once"]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -707,7 +942,10 @@ mod tests {
         assert_eq!(after, "# my words\nhostname\n\nkubectl\n");
 
         // Comments are copied through even when they read like the word …
-        assert_eq!(without_word("# postgres\nfoo\n", "postgres"), "# postgres\nfoo\n");
+        assert_eq!(
+            without_word("# postgres\nfoo\n", "postgres"),
+            "# postgres\nfoo\n"
+        );
         // … and a word that is not there leaves the file byte-identical.
         assert_eq!(without_word(before, "redis"), before);
     }
@@ -753,7 +991,6 @@ mod tests {
     }
 }
 
-
 /// Against the real embedded lists, the way `spell::real_data` is: the unit
 /// tests above pin the *rules*, these pin what the rules actually do to the
 /// data we ship. A threshold change that looks harmless in isolation shows up
@@ -776,9 +1013,18 @@ mod real_data {
     #[test]
     fn finishes_everyday_words() {
         assert_eq!(offers("tomo").first().map(String::as_str), Some("tomorrow"));
-        assert_eq!(offers("gove").first().map(String::as_str), Some("government"));
-        assert_eq!(offers("unde").first().map(String::as_str), Some("understand"));
-        assert_eq!(offers("recei").first().map(String::as_str), Some("received"));
+        assert_eq!(
+            offers("gove").first().map(String::as_str),
+            Some("government")
+        );
+        assert_eq!(
+            offers("unde").first().map(String::as_str),
+            Some("understand")
+        );
+        assert_eq!(
+            offers("recei").first().map(String::as_str),
+            Some("received")
+        );
     }
 
     #[test]
@@ -788,7 +1034,10 @@ mod real_data {
         let offers = offers("hel");
         assert_eq!(offers.len(), MAX_CANDIDATES);
         for word in ["hello", "help"] {
-            assert!(offers.iter().any(|w| w == word), "{word} missing: {offers:?}");
+            assert!(
+                offers.iter().any(|w| w == word),
+                "{word} missing: {offers:?}"
+            );
         }
     }
 
@@ -853,7 +1102,9 @@ mod watch_tests {
         //    *file* would miss, because the inode it was watching is gone.
         let tmp = dir.join(".abbrev.txt.swp");
         std::fs::write(&tmp, "btw = by the way\nomw = on my way\n").expect("write tmp");
-        let _ = inotify.read_events().expect("drain the temp file's own events");
+        let _ = inotify
+            .read_events()
+            .expect("drain the temp file's own events");
         std::fs::rename(&tmp, dir.join("abbrev.txt")).expect("rename over");
         let seen = named(inotify.read_events().expect("events"));
         assert!(

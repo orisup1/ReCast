@@ -1,15 +1,20 @@
+//! The terminal dashboard behind `-g` / `--gui`.
+//!
+//! Linux and Windows only — `main` gates the module itself, because on macOS
+//! the event tap owns the main run loop and the menubar is the UI there. Every
+//! item below used to repeat that gate as a `cfg(any(linux, macos, windows))`
+//! attribute, which was true on all three and so decided nothing.
+
+use crate::types::{AppControl, Correction};
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::io;
-use crate::types::{AppControl, Correction};
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout},
@@ -22,6 +27,18 @@ use ratatui::{
 /// How long a pause started from the TUI lasts — the same half hour the tray
 /// offers, so the two UIs mean the same thing by the word.
 const PAUSE_LENGTH: Duration = Duration::from_secs(30 * 60);
+
+/// Uptime as something readable at a glance. A raw second count is the one
+/// number here nobody can use: "Uptime: 419213 s" answers the question with
+/// arithmetic homework.
+fn uptime_human(secs: u64) -> String {
+    let (days, hours, mins) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    match (days, hours) {
+        (0, 0) => format!("{}m {}s", mins, secs % 60),
+        (0, _) => format!("{hours}h {mins}m"),
+        _ => format!("{days}d {hours}h {mins}m"),
+    }
+}
 
 /// One line of the corrections log: when it happened, what it was, and whether
 /// the user took it back.
@@ -36,7 +53,6 @@ fn correction_line(c: &Correction) -> String {
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn run_tui(control: Arc<AppControl>) -> std::io::Result<()> {
     // Setup terminal
     let mut stdout = io::stdout();
@@ -63,11 +79,7 @@ pub fn run_tui(control: Arc<AppControl>) -> std::io::Result<()> {
     res
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    mut app: App,
-) -> std::io::Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &app))?;
         if crossterm::event::poll(Duration::from_millis(100))? {
@@ -85,7 +97,7 @@ fn run_app<B: Backend>(
                             app.tab += 1;
                         }
                     }
-                    // Toggle layout correction on/off.
+                    // The one switch: layout, spelling and completion together.
                     KeyCode::Char('e') | KeyCode::Char(' ') => {
                         let enabled = !app.control.is_switched_on();
                         app.control.set_enabled(enabled);
@@ -106,19 +118,19 @@ fn run_app<B: Backend>(
                 }
             }
         }
-        app.update();
     }
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn ui(f: &mut Frame, app: &App) {
     let enabled = app.control.is_enabled();
     let uptime = app.start.elapsed().as_secs();
     let history = app.control.history();
 
     // Styles
-    let title_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let border_style = Style::default().fg(Color::Gray);
     let normal = Style::default().fg(Color::White);
     let enabled_col = Style::default().fg(Color::Green);
@@ -128,17 +140,25 @@ fn ui(f: &mut Frame, app: &App) {
     // Layout
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(0),    // body
-            Constraint::Length(3), // footer
-        ].as_ref())
+        .constraints(
+            [
+                Constraint::Length(3), // header
+                Constraint::Min(0),    // body
+                Constraint::Length(3), // footer
+            ]
+            .as_ref(),
+        )
         .split(f.size());
 
     // Header
     let header = Paragraph::new(Span::styled(
-        "recast – layout correction daemon",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        format!(
+            "ReCast v{} — layout correction, autocorrect and completion",
+            env!("CARGO_PKG_VERSION")
+        ),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     ))
     .block(
         Block::default()
@@ -153,10 +173,7 @@ fn ui(f: &mut Frame, app: &App) {
     // Body: horizontal split
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ].as_ref())
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
         .split(chunks[1]);
 
     // Left: tabs
@@ -172,20 +189,28 @@ fn ui(f: &mut Frame, app: &App) {
         )
         .style(normal)
         .highlight_style(highlight);
-    f.render_widget(tabs, Layout::default()
-        .constraints([Constraint::Length(3)].as_ref())
-        .split(body_chunks[0])[0]);
+    f.render_widget(
+        tabs,
+        Layout::default()
+            .constraints([Constraint::Length(3)].as_ref())
+            .split(body_chunks[0])[0],
+    );
 
     // Tab content
     let tab_area = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-        ].as_ref())
+        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(body_chunks[0]);
     match app.tab {
-        0 => render_info(f, tab_area[1], app, uptime, &normal, &enabled_col, &disabled_col),
+        0 => render_info(
+            f,
+            tab_area[1],
+            app,
+            uptime,
+            &normal,
+            &enabled_col,
+            &disabled_col,
+        ),
         1 => render_log(f, tab_area[1], &history, &normal),
         2 => render_help(f, tab_area[1], &normal),
         _ => {}
@@ -194,17 +219,10 @@ fn ui(f: &mut Frame, app: &App) {
     // Right: gauge + recent log
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Min(0),
-        ].as_ref())
+        .constraints([Constraint::Length(5), Constraint::Min(0)].as_ref())
         .split(body_chunks[1]);
     let gauge = Gauge::default()
-        .gauge_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(Color::DarkGray)
-        )
+        .gauge_style(Style::default().fg(Color::Yellow).bg(Color::DarkGray))
         .label(format!("{}%", if enabled { 100 } else { 0 }))
         .ratio(if enabled { 1.0 } else { 0.0 })
         .block(
@@ -249,12 +267,24 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(footer, chunks[2]);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
-fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u64, normal: &Style, enabled_col: &Style, disabled_col: &Style) {
+fn render_info(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    app: &App,
+    uptime: u64,
+    normal: &Style,
+    enabled_col: &Style,
+    disabled_col: &Style,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Information", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            "Information",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(Alignment::Center);
     let enabled = app.control.is_enabled();
     let paused = app.control.pause_remaining();
@@ -281,8 +311,7 @@ fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u6
         ]),
         Line::from(vec![
             Span::from("Uptime: "),
-            Span::styled(uptime.to_string(), *normal),
-            Span::from(" s"),
+            Span::styled(uptime_human(uptime), *normal),
         ]),
     ];
     if let Some(hint) = app.control.tighten_hint() {
@@ -293,14 +322,14 @@ fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u6
         )));
     }
     text.push(Line::from(""));
-    text.push(Line::from("Recast corrects mistyped keyboard layouts by switching the layout and re‑typing the word."));
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    text.push(Line::from(
+        "ReCast retypes words you typed in the wrong keyboard layout, fixes English \
+         typos in place, and finishes words on a tap of Right Shift.",
+    ));
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 /// The corrections themselves, newest first. This used to be a heartbeat of
 /// "enabled=ON, fixed=3" lines, which said that something had happened without
 /// ever saying what — the one question a log of silent text replacement exists
@@ -308,12 +337,20 @@ fn render_info(f: &mut Frame, area: ratatui::layout::Rect, app: &App, uptime: u6
 fn render_log(f: &mut Frame, area: ratatui::layout::Rect, history: &[Correction], normal: &Style) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Corrections", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            "Corrections",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(Alignment::Center);
     let items: Vec<ListItem> = if history.is_empty() {
         vec![ListItem::new("No corrections yet.")]
     } else {
-        history.iter().map(|c| ListItem::new(correction_line(c))).collect()
+        history
+            .iter()
+            .map(|c| ListItem::new(correction_line(c)))
+            .collect()
     };
     let list = List::new(items)
         .block(block)
@@ -323,11 +360,15 @@ fn render_log(f: &mut Frame, area: ratatui::layout::Rect, history: &[Correction]
     f.render_widget(list, area);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled("Help", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            "Help",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .title_alignment(Alignment::Center);
     // What the user needs from a help tab is the two gestures and where their
     // files live — none of which is visible anywhere else, since ReCast has no
@@ -348,6 +389,8 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         Line::from("                       and stop correcting that word. On a word that"),
         Line::from("                       was skipped because it is listed, it does the"),
         Line::from("                       opposite: unlists it and corrects it."),
+        Line::from("  Undo immediately: more typing or cursor movement ends the opportunity."),
+        Line::from("  One undo skips a word this session; two occasions remember it."),
         Line::from(""),
         Line::from("Your files (edits are picked up within ~2s, no restart):"),
         Line::from("  abbrev.txt : `btw = by the way`, one per line"),
@@ -360,16 +403,21 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
     f.render_widget(paragraph, area);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct App {
     control: Arc<AppControl>,
     start: Instant,
     tab: usize,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-impl App {
-    fn update(&self) {
-        // No-op
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_reads_as_a_duration_rather_than_a_number() {
+        assert_eq!(uptime_human(0), "0m 0s");
+        assert_eq!(uptime_human(90), "1m 30s");
+        assert_eq!(uptime_human(3600), "1h 0m");
+        assert_eq!(uptime_human(90_061), "1d 1h 1m");
     }
 }

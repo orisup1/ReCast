@@ -1,6 +1,6 @@
 [package]
 name = "recast"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Ori Supino <ori@supino.org>"]
 description = "Automatic English/Hebrew keyboard-layout correction that lives in your tray/menubar and retypes words you typed in the wrong layout."
@@ -56,7 +56,7 @@ rdev = "0.5.3"
 tray-icon = "0.24"
 tao = "0.35"
 winapi = { version = "0.3", features = [
-    "winuser", "windef",
+    "winuser", "windef", "wingdi",
     # Reattaching the parent console at startup so the banner can print even
     # though release builds run under `windows_subsystem = "windows"` (see
     # platform::windows::attach_parent_console).
@@ -65,7 +65,7 @@ winapi = { version = "0.3", features = [
     # "Start at login": the per-user Run key (see prefs::windows_autostart).
     # Listed explicitly rather than relied on through tao/tray-icon's own
     # feature set, which cargo happens to unify with ours today.
-    "winreg", "winerror", "minwindef",
+    "winreg", "winerror", "minwindef", "shellapi",
     # Finding and stopping an already-running ReCast at startup
     # (src/instance.rs): the Toolhelp snapshot enumerates processes,
     # OpenProcess/TerminateProcess stops them, WaitForSingleObject waits.
@@ -74,4 +74,5 @@ winapi = { version = "0.3", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13.2"
+serde_json = "1" # parse compositor focus replies using the existing dependency graph
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

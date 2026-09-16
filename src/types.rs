@@ -22,26 +22,39 @@ impl Language {
     }
 }
 
-/// Global runtime configuration, set once at startup.
-static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
+/// Runtime configuration. Menu edits replace values under a short-held lock;
+/// callers take snapshots so dictionary searches never hold up a settings edit.
+static GLOBAL_CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
 
 impl Config {
     /// Access the global config, falling back to defaults if not yet set
     /// (matches the `from_env` defaults: short-word switching on, split off,
     /// spelling autocorrect on).
-    pub fn global() -> &'static Config {
-        GLOBAL_CONFIG.get_or_init(|| Config {
-            short_enabled: true,
-            split_enabled: false,
-            freq_enabled: true,
-            spell_enabled: true,
-            spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
-            spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
-            spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
-            complete_enabled: true,
-            complete_min_len: crate::config::DEFAULT_COMPLETE_MIN_LEN,
-            complete_max_rank: crate::config::DEFAULT_COMPLETE_MAX_RANK,
-        })
+    pub fn global() -> Config {
+        lock_forgiving(GLOBAL_CONFIG.get_or_init(|| {
+            Mutex::new(Config {
+                excluded_apps: Vec::new(),
+                layout_only_apps: Vec::new(),
+                undo_shortcut: "none".into(),
+                personal_enabled: false,
+                short_enabled: true,
+                split_enabled: false,
+                freq_enabled: true,
+                spell_enabled: true,
+                spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
+                spell_max_rank: crate::config::DEFAULT_SPELL_MAX_RANK,
+                spell_max_dist: crate::config::DEFAULT_SPELL_MAX_DIST,
+                complete_enabled: true,
+                complete_min_len: crate::config::DEFAULT_COMPLETE_MIN_LEN,
+                complete_max_rank: crate::config::DEFAULT_COMPLETE_MAX_RANK,
+            })
+        }))
+        .clone()
+    }
+
+    pub fn update_live(update: impl FnOnce(&mut Config)) {
+        let _ = Self::global();
+        update(&mut lock_forgiving(GLOBAL_CONFIG.get().unwrap()));
     }
 }
 
@@ -61,7 +74,9 @@ impl Config {
 /// time, while the process stays up and looks healthy. That is the failure this
 /// avoids — see [`ReplaceGuard`], which handles the other half of it.
 pub fn lock_forgiving<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The part of a platform's listener state that a replacement has to put back.
@@ -115,11 +130,11 @@ impl<S: Replaceable> Drop for ReplaceGuard<'_, S> {
         // one may already have poisoned this lock.
         {
             let mut st = lock_forgiving(self.state);
+            if let Some(flag) = self.injecting {
+                flag.store(false, Ordering::Relaxed);
+            }
             st.set_replacing(false);
             st.clear_buffered();
-        }
-        if let Some(flag) = self.injecting {
-            flag.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -247,6 +262,8 @@ pub enum FixKind {
     Layout,
     /// The English speller rewrote it, or an abbreviation expanded.
     Spelling,
+    /// The layout changed and the alternate reading was spell-corrected.
+    LayoutSpelling,
     /// The completion key finished a partial word.
     Complete,
 }
@@ -257,6 +274,7 @@ impl FixKind {
         match self {
             FixKind::Layout => "layout",
             FixKind::Spelling => "spell",
+            FixKind::LayoutSpelling => "layout+spell",
             FixKind::Complete => "complete",
         }
     }
@@ -285,6 +303,11 @@ const HISTORY_LEN: usize = 20;
 
 /// Shared runtime state between the keyboard listener and the optional GUI.
 pub struct AppControl {
+    pub excluded_apps: Mutex<Vec<String>>,
+    pub layout_only_apps: Mutex<Vec<String>>,
+    pub listener_ready: AtomicBool,
+    pub practice_open: AtomicBool,
+    pub practice_stage: std::sync::atomic::AtomicU8,
     enabled: AtomicBool,
     fixed_count: AtomicU64,
     undo_count: AtomicU64,
@@ -293,18 +316,27 @@ pub struct AppControl {
     /// same as being switched off: it expires by itself and it does not change
     /// what the user gets back when it does.
     paused_until: Mutex<Option<Instant>>,
+    paused_app: Mutex<Option<String>>,
     history: Mutex<VecDeque<Correction>>,
 }
 
 impl AppControl {
     /// Create a new control and register the provided config globally.
     pub fn new_with_config(cfg: Config) -> Self {
-        let _ = GLOBAL_CONFIG.set(cfg);
+        let excluded_apps = Mutex::new(cfg.excluded_apps.clone());
+        let layout_only_apps = Mutex::new(cfg.layout_only_apps.clone());
+        let _ = GLOBAL_CONFIG.set(Mutex::new(cfg));
         Self {
+            excluded_apps,
+            layout_only_apps,
+            listener_ready: AtomicBool::new(false),
+            practice_open: AtomicBool::new(false),
+            practice_stage: std::sync::atomic::AtomicU8::new(0),
             enabled: AtomicBool::new(true),
             fixed_count: AtomicU64::new(0),
             undo_count: AtomicU64::new(0),
             paused_until: Mutex::new(None),
+            paused_app: Mutex::new(None),
             history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
         }
     }
@@ -318,6 +350,10 @@ impl AppControl {
     #[cfg(test)]
     pub fn new_for_test() -> Self {
         Self::new_with_config(Config {
+            excluded_apps: Vec::new(),
+            layout_only_apps: Vec::new(),
+            undo_shortcut: "none".into(),
+            personal_enabled: false,
             short_enabled: true,
             split_enabled: false,
             freq_enabled: true,
@@ -341,6 +377,66 @@ impl AppControl {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed) && self.pause_remaining().is_none()
+    }
+
+    pub fn has_app_rules(&self) -> bool {
+        let excluded = lock_forgiving(&self.excluded_apps);
+        let layout = lock_forgiving(&self.layout_only_apps);
+        !excluded.is_empty() || !layout.is_empty() || self.paused_app().is_some()
+    }
+
+    pub fn paused_app(&self) -> Option<String> {
+        lock_forgiving(&self.paused_app).clone()
+    }
+
+    pub fn pause_in_app(&self, app: &str) {
+        if !app.trim().is_empty() {
+            *lock_forgiving(&self.paused_app) = Some(app.to_lowercase());
+        }
+    }
+
+    pub fn resume_app(&self) {
+        *lock_forgiving(&self.paused_app) = None;
+    }
+
+    /// Only a positively identified external app can end the temporary pause.
+    /// ReCast's controls and missing identity must not accidentally resume it.
+    pub fn effective_app_mode(
+        &self,
+        app: Option<&str>,
+        own_focus: bool,
+    ) -> Option<crate::config::AppMode> {
+        {
+            let mut paused = lock_forgiving(&self.paused_app);
+            if let Some(id) = paused.as_ref() {
+                let app = app.filter(|app| !app.is_empty());
+                if own_focus || app.is_none() {
+                    return None;
+                }
+                if app.unwrap().eq_ignore_ascii_case(id) {
+                    return Some(crate::config::AppMode::Off);
+                }
+                *paused = None;
+            }
+        }
+        self.app_mode(app)
+    }
+
+    pub fn app_mode(&self, app: Option<&str>) -> Option<crate::config::AppMode> {
+        use crate::config::AppMode;
+        let Some(app) = app.filter(|s| !s.is_empty()) else {
+            return (!self.has_app_rules()).then_some(AppMode::Full);
+        };
+        let app = app.to_lowercase();
+        let excluded = lock_forgiving(&self.excluded_apps);
+        let layout = lock_forgiving(&self.layout_only_apps);
+        Some(if !crate::config::app_allowed(&excluded, Some(&app)) {
+            AppMode::Off
+        } else if layout.contains(&app) {
+            AppMode::LayoutOnly
+        } else {
+            AppMode::Full
+        })
     }
 
     /// The enabled switch on its own, ignoring any running pause — what the
@@ -451,7 +547,7 @@ impl AppControl {
         let undone = self.undo_count();
         let kept = self.fixed_count();
         (undone >= 5 && undone * 3 >= kept + undone)
-            .then_some("Many corrections taken back — try RECAST_SPELL_DIST=1")
+            .then_some("Many corrections taken back — try Conservative spelling in Settings")
     }
 }
 
@@ -501,7 +597,10 @@ mod tests {
         // returned early, and the listener discarded every key as its own.
         let st = lock_forgiving(&state);
         assert!(!st.replacing, "is_replacing left set — corrections wedged");
-        assert_eq!(st.buffered, 0, "keys typed during a failed replacement kept");
+        assert_eq!(
+            st.buffered, 0,
+            "keys typed during a failed replacement kept"
+        );
         assert!(
             !injecting.load(Ordering::Relaxed),
             "injecting left set — the keyboard would stop working entirely"
@@ -602,7 +701,10 @@ mod tests {
             c.record_fix("x", "y", FixKind::Spelling);
             c.record_undo();
         }
-        assert!(c.tighten_hint().is_none(), "four undos is not a pattern yet");
+        assert!(
+            c.tighten_hint().is_none(),
+            "four undos is not a pattern yet"
+        );
 
         c.record_fix("x", "y", FixKind::Spelling);
         c.record_undo();

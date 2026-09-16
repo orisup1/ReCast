@@ -1,34 +1,69 @@
-# Refresh the committed binaries in `exec/`.
+# Build the downloadable binaries and attach them to a GitHub Release.
 #
-# `exec/` holds release builds tracked in git, so someone can download a working
-# ReCast without a Rust toolchain. Keeping them current by hand means building
-# on three machines; this does it on three runners instead and commits the
-# result back to the branch it was started from.
+# These used to be committed into Git, which meant every refresh added
+# ~45 MB to the repository *permanently* — git history cannot be made smaller
+# after the fact, so a download nobody keeps forever was being kept forever.
+# Release assets live outside the object database and can be replaced or
+# deleted, which is what a build artifact wants.
 #
-# Deliberately `workflow_dispatch` only. Each refresh adds ~45 MB to the
-# repository permanently — git history cannot be made smaller after the fact —
-# so this is a button pressed at release time, not something that fires on
-# every push.
+# Still `workflow_dispatch` only: this is a button pressed at release time.
+# `tag` defaults to the crate version, so the usual run needs no input at all.
 
 name: Binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (default: v<Cargo.toml version>)"
+        required: false
+        type: string
+      draft:
+        description: "Publish as a draft"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
+  quality:
+    name: Tests and lints (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgl1-mesa-dev
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
   # ───────────────────────────────────────────────────────────────────────────
   # Build each artifact on its own OS. No cache: what ships should come from a
   # clean build, not from whatever a previous run happened to leave behind.
   # ───────────────────────────────────────────────────────────────────────────
   linux:
     name: Linux
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +79,7 @@ jobs:
             libgl1-mesa-dev
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - uses: actions/upload-artifact@v4
         with:
@@ -54,6 +89,7 @@ jobs:
 
   macos:
     name: macOS (universal)
+    needs: quality
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,12 +97,35 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MACOS_CERTIFICATE" ]]; then
+            echo "No Developer ID certificate configured; using an ad-hoc signature."
+            exit 0
+          fi
+          CERTIFICATE_PATH="$RUNNER_TEMP/recast.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/recast-signing.keychain-db"
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
       # The committed binary was arm64-only, which is silently useless on an
       # Intel Mac. Both slices cost one extra compile and one `lipo`.
       - name: Build both architectures
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
 
       - name: Merge into a universal binary
         run: |
@@ -75,14 +134,64 @@ jobs:
             target/x86_64-apple-darwin/release/recast
           lipo -info recastMac
 
+      # The .app is assembled here rather than downloaded from git: `make
+      # bundle` builds it out of the release binary, a generated Info.plist and
+      # assets/recast.icns. The universal binary replaces the single-arch one
+      # `make bundle` staged, so the bundle ships both slices too.
+      - name: Assemble and sign the .app bundle
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          make bundle
+          install -m 755 recastMac target/bundle/ReCast.app/Contents/MacOS/recast
+          # Signing has to happen *after* the universal binary replaces the one
+          # `make bundle` staged and signed, and before the zip: a signature
+          # covers the bundle's contents, so swapping the executable under it
+          # invalidates it, and an invalid or missing signature is what makes a
+          # downloaded build announce itself as damaged.
+          if [[ -n "$MACOS_SIGNING_IDENTITY" ]]; then
+            make sign CODESIGN_ID="$MACOS_SIGNING_IDENTITY"
+            codesign --force --sign "$MACOS_SIGNING_IDENTITY" \
+              --options runtime --timestamp recastMac
+          else
+            make sign
+            codesign --force --sign - --timestamp=none recastMac
+          fi
+          # The bare binary is a separate download and needs its own signature
+          # for the same reason; `lipo` writes a fat file that carries none.
+          codesign --verify --strict recastMac
+          # A .zip, not a bare directory: a bundle uploaded file-by-file
+          # arrives as a folder and loses the executable bit. `ditto` keeps the
+          # macOS metadata that makes it launchable — and the _CodeSignature
+          # directory the signature lives in.
+          ditto -c -k --sequesterRsrc --keepParent target/bundle/ReCast.app ReCast.app.zip
+          if [[ -n "$MACOS_SIGNING_IDENTITY" && -n "$APPLE_ID" && \
+                -n "$APPLE_TEAM_ID" && -n "$APPLE_APP_PASSWORD" ]]; then
+            xcrun notarytool submit ReCast.app.zip --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+            xcrun stapler staple target/bundle/ReCast.app
+            ditto -c -k --sequesterRsrc --keepParent \
+              target/bundle/ReCast.app ReCast.app.notarized.zip
+            mv ReCast.app.notarized.zip ReCast.app.zip
+          else
+            echo "Notarization secrets are incomplete; publishing the signed/ad-hoc build."
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: recastMac
-          path: recastMac
+          path: |
+            recastMac
+            ReCast.app.zip
           if-no-files-found: error
 
   windows:
     name: Windows
+    needs: quality
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,7 +207,32 @@ jobs:
       - name: Build
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build --release
+        run: |
+          cargo build --locked --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --test cli
+
+      - name: Authenticode sign
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host 'No Windows certificate configured; publishing an unsigned executable.'
+            exit 0
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'recast.pfx'
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          $signature = Set-AuthenticodeSignature -FilePath target\release\recast.exe -Certificate $certificate -HashAlgorithm SHA256 -TimestampServer http://timestamp.digicert.com
+          if ($signature.Status -ne 'Valid') {
+            throw "Authenticode signing failed: $($signature.StatusMessage)"
+          }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -107,13 +241,15 @@ jobs:
           if-no-files-found: error
 
   # ───────────────────────────────────────────────────────────────────────────
-  # One job collects all three and makes a single commit. Three jobs each
-  # pushing to the same branch would race.
+  # One job collects all three and publishes them as release assets. Nothing is
+  # committed, so there is no branch to race over any more.
   # ───────────────────────────────────────────────────────────────────────────
-  commit:
-    name: Update exec/
+  release:
+    name: Publish release
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -122,43 +258,56 @@ jobs:
           path: incoming
 
       # Artifacts arrive without the executable bit — the upload action does
-      # not carry file modes — so it is set back here.
-      - name: Place the binaries
+      # not carry file modes — so it is set back here, under the names the
+      # README tells people to look for.
+      - name: Stage the assets
+        id: stage
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          install -m 755 incoming/recastLinux/recast   exec/recastLinux
-          install -m 755 incoming/recastMac/recastMac  exec/recastMac
-          install -m 755 incoming/ReCast.exe/recast.exe exec/ReCast.exe
-          # The .app bundle runs the same macOS binary; its Info.plist is
-          # generated from Cargo.toml so the version inside it tracks the crate.
-          install -m 755 incoming/recastMac/recastMac \
-            exec/ReCast.app/Contents/MacOS/recast
-          make bundle-plist
-
-      - name: Report what was built
-        run: |
-          file exec/recastLinux exec/recastMac exec/ReCast.exe
-          ls -lh exec/recastLinux exec/recastMac exec/ReCast.exe
-
-      - name: Commit
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add exec/
-          if git diff --cached --quiet; then
-            echo "exec/ already matches this build — nothing to commit."
-            exit 0
-          fi
+          mkdir -p dist
+          install -m 755 incoming/recastLinux/recast     dist/recastLinux
+          install -m 755 incoming/recastMac/recastMac    dist/recastMac
+          install -m 755 incoming/ReCast.exe/recast.exe  dist/ReCast.exe
+          cp incoming/recastMac/ReCast.app.zip           dist/ReCast.app.zip
+          file dist/recastLinux dist/recastMac dist/ReCast.exe
+          ls -lh dist
           version=$(make version)
-          # Written through a heredoc rather than `-m`, so the body is not
-          # indented by this file's own YAML block indentation.
-          git commit -F - <<EOF
-          build: refresh exec/ binaries for $version
+          if [[ -n "$REQUESTED_TAG" && "$REQUESTED_TAG" != "v${version}" ]]; then
+            echo "Requested tag $REQUESTED_TAG does not match Cargo.toml version v${version}." >&2
+            exit 1
+          fi
+          (cd dist && sha256sum recastLinux recastMac ReCast.exe ReCast.app.zip > SHA256SUMS)
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+          echo "default_tag=v${version}" >> "$GITHUB_OUTPUT"
 
-          Built by the Binaries workflow from ${GITHUB_SHA}.
-          macOS is a universal (arm64 + x86_64) binary.
-
-          [skip ci]
-          EOF
-          git push
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.stage.outputs.tag || steps.stage.outputs.default_tag }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          draft_flag=""
+          if [ "$DRAFT" = "true" ]; then draft_flag="--draft"; fi
+          git fetch --tags origin
+          if tagged_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}" 2>/dev/null); then
+            if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+              echo "Tag $TAG points to $tagged_commit, but these assets were built from $GITHUB_SHA." >&2
+              exit 1
+            fi
+          fi
+          # `create` fails if the tag already has a release, so an existing one
+          # is updated in place instead — re-running after a failed build
+          # replaces the assets rather than erroring out.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              $draft_flag \
+              --title "$TAG" \
+              --target "$GITHUB_SHA" \
+              --notes "Built by the Binaries workflow from ${GITHUB_SHA}.
+          macOS assets are universal (arm64 + x86_64)."
+          fi
