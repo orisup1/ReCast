@@ -610,6 +610,17 @@ pub enum Fix {
     Spelling { text: String },
 }
 
+/// A deliberate request may select a valid other-layout word even when the
+/// current reading is valid too. No frequency or word-specific exceptions.
+pub fn manual_layout(text: &str, lang: Language, en: Dict, he: Dict) -> Option<Fix> {
+    let word = text.trim_end_matches(|c: char| !c.is_alphanumeric());
+    valid_strict(&word.to_lowercase(), lang, en, he).then(|| Fix::Layout {
+        start: 0,
+        text: text.to_owned(),
+        lang,
+    })
+}
+
 /// Everything a finished word produced: what to do about it, and what language
 /// it turned out to be.
 ///

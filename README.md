@@ -117,11 +117,34 @@ Use `-Target service-uninstall` to remove the task, or `-Target help` for all ta
 | Action | Gesture or control |
 | --- | --- |
 | Complete an English word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
+| Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space/Enter |
+| Rescue selected text (macOS) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Undo the latest correction | Tap **Ctrl twice within half a second**, immediately after the correction |
 | Allow an ignored word again | Type that word and its space, then immediately double-tap Ctrl |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
 | Ignore a correction permanently | Click it in the tray's **Recent** menu, or add it to `ignore.txt` |
 | Review gestures | **Typing shortcuts** in the tray or Linux control window |
+
+Double-Ctrl gives an unchanged word a second look. A dictionary word in the other
+layout takes priority, even when the current reading is also a valid word. This
+rule applies to every word, in both directions; automatic correction keeps its
+usual conservative behavior. If no valid alternate reading exists, the normal
+correction pipeline is tried. A further double-Ctrl undoes a manual correction
+without teaching a word exception. Typing another character or moving the cursor
+ends the opportunity. The optional single-Ctrl shortcut remains for undo/unlisting;
+manual conversion still requires two taps.
+
+On macOS, selected-text rescue converts physical English/Hebrew key positions,
+without dictionary checks. The first English or Hebrew letter determines the
+source layout; select one language at a time for predictable results. Spaces,
+line breaks, digits, and unmapped characters are preserved. Converted text stays
+selected, and double-Ctrl again restores the exact original, including case.
+It uses Accessibility selection editing, leaves the clipboard and keyboard layout
+untouched, and requires an editable control that exposes writable selected-text
+and selection-range attributes. Unsupported controls are left unchanged. Selections
+are limited to 64 KiB of UTF-8 text. Windows/Linux selected-text rescue is not yet
+available; manual word conversion works through the shared engine on all platforms.
+App exclusions, pause/disabled state, and Secure Input still apply.
 
 Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures.
 **Settings → Extra undo shortcut** can additionally enable a single tap of

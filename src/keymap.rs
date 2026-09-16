@@ -490,3 +490,61 @@ mod tests {
         assert_eq!(english_char_to_key('ש'), None);
     }
 }
+
+/// Convert a selection by physical key positions, using the first English or
+/// Hebrew letter as its source layout. Unmapped characters remain unchanged.
+pub fn convert_selection(text: &str) -> String {
+    let hebrew = text.chars().find_map(|c| {
+        if ('א'..='ת').contains(&c) {
+            Some(true)
+        } else if c.is_ascii_alphabetic() {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    let Some(hebrew) = hebrew else {
+        return text.to_owned();
+    };
+    let mapping = |c: char| {
+        #[cfg(target_os = "linux")]
+        {
+            english_char_to_evkey_shifted(c).and_then(|(key, _)| evkey_to_hebrew_char(key))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            english_char_to_key(c).and_then(|(key, _)| key_to_hebrew_char(key))
+        }
+    };
+    text.chars()
+        .map(|c| {
+            if hebrew {
+                (' '..='~')
+                    .filter(|c| !c.is_ascii_uppercase() && !"~!@#$%^&*()_+{}|:\"<>?".contains(*c))
+                    .find(|&key| mapping(key) == Some(c))
+                    .unwrap_or(c)
+            } else if c.is_ascii_alphabetic() || "`[];',./".contains(c) {
+                mapping(c).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod selection_tests {
+    #[test]
+    fn rescue_uses_key_positions_and_preserves_unmapped_text() {
+        for (before, after) in [
+            ("akuo guko", "שלום עולם"),
+            ("שלום עולם", "akuo guko"),
+            ("AKUO\n123 🙂", "שלום\n123 🙂"),
+            ("שלום,", "akuo'"),
+            ("123 🙂", "123 🙂"),
+            ("hello שלום", "יקךךם שלום"),
+        ] {
+            assert_eq!(super::convert_selection(before), after, "{before}");
+        }
+    }
+}

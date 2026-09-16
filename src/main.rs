@@ -128,13 +128,18 @@ Auto-complete:
   first tap too; define them one per line as `abbr = expansion` in
   <config dir>/recast/abbrev.txt.
 
-Undo (Ctrl tapped twice, quickly):
+Undo and manual correction (Ctrl tapped twice, quickly):
   After a correction, it puts back what you typed — the layout too, if the
   correction changed it — and leaves that word alone from then on.
   After a word that was left alone *because* you had listed it, the same
   gesture takes it off the list (ignore.txt included) and corrects it.
-  Only the word the cursor is still sitting on: type anything else and the
-  gesture has nothing to act on.
+  For an unchanged word, a valid reading in the other layout takes priority,
+  even when both readings are words. This works before or after Space/Enter.
+  Undoing a manual conversion does not teach an exception.
+  Typing anything else or moving the cursor ends the word gesture.
+  On macOS, select text in an editable field and double-tap Ctrl to convert
+  its layout. Repeat to restore the original. Requires accessibility selection
+  editing; the clipboard is untouched.
 
 Your files (<config dir>/recast/):
   config.toml `key = value` per line, everything under Settings above

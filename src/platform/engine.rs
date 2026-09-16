@@ -57,6 +57,9 @@ pub const TAP_MAX: Duration = Duration::from_millis(300);
 /// not read as one gesture.
 pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
 
+/// Keep explicit accessibility edits and their undo payload bounded.
+pub const MAX_SELECTION_BYTES: usize = 64 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // What a platform supplies
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +107,21 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// Confirm an empty text field; unavailable context must remain suppressed.
     fn input_empty(_: &Self::Injector) -> bool {
         false
+    }
+
+    /// Selected text is read only on an explicit gesture, never during typing.
+    fn selection(_focus: &Self::Focus) -> Option<Selection> {
+        None
+    }
+    /// Replace only if the same selection still exists. Return its new range.
+    fn replace_selection(
+        _engine: &Engine<Self>,
+        _focus: &Self::Focus,
+        _expected: &Selection,
+        _text: &str,
+        _generation: u64,
+    ) -> Option<Selection> {
+        None
     }
 
     // ── the keys the state machine names ────────────────────────────────────
@@ -239,19 +257,33 @@ pub struct Typed<K> {
     pub shift: bool,
 }
 
+/// Native selection offsets, in UTF-16 units, plus the exact selected text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Selection {
+    pub start: isize,
+    pub length: isize,
+    pub text: String,
+}
+
 /// What the Ctrl double-tap would do to the word the cursor is sitting on.
 ///
-/// The gesture is a *toggle* over the user's lists, which is why both cases
-/// live behind one field: a word has either just been corrected (so the gesture
-/// takes the correction back and retires the word) or just been left alone
-/// because it is already retired (so the gesture un-retires it and corrects it
-/// after all). Never both, and never anything else — a word that is simply
-/// spelled right does not arm it.
+/// Corrections can be undone; skipped words can be unlisted; unchanged words
+/// can be explicitly reconsidered. Cursor movement invalidates all three.
 pub enum LastAction<P: Platform> {
     /// A correction landed and the cursor is still on it.
     Fixed(LastFix<P>),
+    Selection {
+        before: String,
+        after: Selection,
+    },
     /// A word was passed over only because it is on one of the user's lists.
     Skipped(LastSkip<P>),
+    /// An unchanged word can be explicitly reconsidered, including ambiguous words.
+    Unchanged {
+        keys: Vec<Typed<P::Key>>,
+        terminator: Option<P::Key>,
+        layout: Language,
+    },
 }
 
 /// A correction that is on screen right now, with the cursor still sitting
@@ -323,6 +355,7 @@ pub struct AppState<P: Platform> {
     practice: bool,
     pub keys: WordBuffer<Typed<P::Key>>,
     pub is_replacing: bool,
+    selection_replacing: bool,
     pub buffered_keys: WordBuffer<Typed<P::Key>>,
     /// Physical keys currently held down. Tracked from press/release events so
     /// injection can wait for the user to lift the keys it is about to retype —
@@ -379,6 +412,7 @@ impl<P: Platform> AppState<P> {
             practice: false,
             keys: WordBuffer::new(),
             is_replacing: false,
+            selection_replacing: false,
             buffered_keys: WordBuffer::new(),
             held_keys: HashSet::new(),
             caps_lock: false,
@@ -463,6 +497,9 @@ impl<P: Platform> AppState<P> {
 impl<P: Platform> Replaceable for AppState<P> {
     fn set_replacing(&mut self, replacing: bool) {
         self.is_replacing = replacing;
+        if !replacing {
+            self.selection_replacing = false;
+        }
     }
     fn clear_buffered(&mut self) {
         self.buffered_keys.clear();
@@ -688,6 +725,10 @@ impl<P: Platform> Engine<P> {
             st.forget_gestures();
         }
         let shift = st.shift_active();
+        if st.selection_replacing && !is_ctrl {
+            st.invalidate_text();
+            return;
+        }
 
         // A bare Ctrl changes no text. Keep its tap even while injecting so an
         // eager undo does not cancel a half-written correction. Chords still
@@ -837,7 +878,12 @@ impl<P: Platform> Engine<P> {
                 },
                 Vec::new(),
                 Some(undo),
-                note.map(|(from, to, kind)| Commit::Fix { from, to, kind }),
+                note.map(|(from, to, kind)| Commit::Fix {
+                    from,
+                    to,
+                    kind,
+                    deferred_layout: None,
+                }),
             );
             return;
         }
@@ -867,6 +913,15 @@ impl<P: Platform> Engine<P> {
                 terminator: Some(key),
                 word,
             }));
+        }
+        if st.last_action.is_none() {
+            if let Some(layout) = P::current_layout() {
+                st.last_action = Some(LastAction::Unchanged {
+                    keys: st.keys.to_vec(),
+                    terminator: Some(key),
+                    layout,
+                });
+            }
         }
         st.keys.clear();
     }
@@ -1013,6 +1068,7 @@ impl<P: Platform> Engine<P> {
                 from: was.clone(),
                 to: candidates[index].clone(),
                 kind: FixKind::Complete,
+                deferred_layout: None,
             })
         } else {
             None
@@ -1080,8 +1136,13 @@ impl<P: Platform> Engine<P> {
         }
         let now = Instant::now();
         let shortcut = crate::config::Config::global().undo_shortcut;
-        let single = (shortcut == "left_ctrl" && key == P::CTRL_LEFT)
-            || (shortcut == "right_ctrl" && key == P::CTRL_RIGHT);
+        let single = ((shortcut == "left_ctrl" && key == P::CTRL_LEFT)
+            || (shortcut == "right_ctrl" && key == P::CTRL_RIGHT))
+            && ((st.is_replacing && !st.selection_replacing)
+                || matches!(
+                    st.last_action,
+                    Some(LastAction::Fixed(_) | LastAction::Skipped(_))
+                ));
         match st.last_ctrl_tap.take() {
             _ if single => {}
             Some(prev) if now.duration_since(prev) <= DOUBLE_TAP_WINDOW => {}
@@ -1102,6 +1163,22 @@ impl<P: Platform> Engine<P> {
         let Some((mut st, focus)) = self.refresh_focus(st) else {
             return;
         };
+        if !single
+            && st.keys.is_empty()
+            && matches!(st.last_action, None | Some(LastAction::Selection { .. }))
+        {
+            if let Some(focus) = focus {
+                if matches!(st.last_action, Some(LastAction::Selection { .. }))
+                    && st.focus.as_ref() != Some(&focus)
+                {
+                    st.invalidate_text();
+                    return;
+                }
+                st.focus = Some(focus);
+                self.rescue_selection(st);
+            }
+            return;
+        }
         if (P::requires_focus() && st.focus.is_none()) || st.focus != focus || !P::input_allowed() {
             st.invalidate_text();
             return;
@@ -1109,8 +1186,110 @@ impl<P: Platform> Engine<P> {
         match st.last_action.take() {
             Some(LastAction::Fixed(fix)) => self.undo_fix(st, fix),
             Some(LastAction::Skipped(skip)) => self.unlist_and_correct(st, skip),
-            None => {}
+            Some(LastAction::Unchanged {
+                keys,
+                terminator,
+                layout,
+            }) if !single => {
+                if P::current_layout() == Some(layout) {
+                    self.manual_correct(st, keys, terminator, layout);
+                }
+            }
+            None if !single && !st.no_fix && !st.keys.is_empty() => {
+                if let Some(layout) = P::current_layout() {
+                    let keys = st.keys.to_vec();
+                    self.manual_correct(st, keys, None, layout);
+                }
+            }
+            _ => {}
         }
+    }
+
+    fn rescue_selection(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>) {
+        let undo = st.last_action.take();
+        let generation = st.generation;
+        st.is_replacing = true;
+        st.selection_replacing = true;
+        drop(st);
+        let engine = Arc::clone(self);
+        thread::spawn(move || {
+            let _gate = ReplaceGuard::new(&engine.state, P::injecting_flag(&engine.injector));
+            let Some(focus) = P::focus() else {
+                return;
+            };
+            if !engine.replacement_valid(generation) {
+                return;
+            }
+            let Some(selected) = P::selection(&focus) else {
+                return;
+            };
+            let text = match undo {
+                Some(LastAction::Selection { before, after }) if after == selected => before,
+                Some(LastAction::Selection { .. }) => return,
+                _ => crate::keymap::convert_selection(&selected.text),
+            };
+            if text == selected.text
+                || text.len() > MAX_SELECTION_BYTES
+                || !engine.replacement_valid(generation)
+            {
+                return;
+            }
+            let Some(after) = P::replace_selection(&engine, &focus, &selected, &text, generation)
+            else {
+                return;
+            };
+            let mut st = engine.lock();
+            if st.generation == generation {
+                st.last_action = Some(LastAction::Selection {
+                    before: selected.text,
+                    after,
+                });
+                st.no_fix = true;
+            }
+        });
+    }
+
+    /// Explicit intent overrides automatic ambiguity guards, never dictionary validity.
+    fn manual_correct(
+        self: &Arc<Self>,
+        mut st: MutexGuard<'_, AppState<P>>,
+        keys: Vec<Typed<P::Key>>,
+        terminator: Option<P::Key>,
+        layout: Language,
+    ) {
+        let text = reading::<P>(&keys, layout.other());
+        let manual =
+            crate::dictionary::manual_layout(&text, layout.other(), self.en_dict, self.he_dict);
+        let deferred_layout = manual.as_ref().map(|_| layout.other());
+        let fix = manual.or_else(|| self.check(&keys, st.history.run(), st.mode).fix);
+        let note = fix.as_ref().map(|fix| note_of::<P>(&keys, fix));
+        let Some(rep) = replacement::<P>(&keys, fix) else {
+            return;
+        };
+        let mut undo = undo_of::<P>(&keys, &rep, terminator);
+        // Asking for a conversion is not training a word exception.
+        undo.suppress = None;
+        if terminator.is_none() {
+            undo.keep = keys;
+        }
+        st.keys.clear();
+        st.no_fix = terminator.is_none();
+        self.start_replacement(
+            st,
+            Plan {
+                erase: rep.erase + usize::from(terminator.is_some()),
+                retype: rep.retype,
+                terminator,
+            },
+            Vec::new(),
+            Some(undo),
+            note.map(|(from, to, kind)| Commit::Fix {
+                from,
+                to,
+                kind,
+                deferred_layout,
+            }),
+        );
     }
 
     /// Put back what the user typed before the correction on screen replaced it.
@@ -1152,9 +1331,11 @@ impl<P: Platform> Engine<P> {
         // rather than a second word.
         let result = self.check(&skip.keys, st.history.run(), st.mode).fix;
         let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
-        // Off the list, but the pipelines have nothing to say about it after
-        // all — which is a fine outcome, and not one to rewrite the screen over.
+        // An explicit request can also resolve ambiguity after unlisting.
         let Some(rep) = replacement::<P>(&skip.keys, result) else {
+            if let Some(layout) = P::current_layout() {
+                self.manual_correct(st, skip.keys, skip.terminator, layout);
+            }
             return;
         };
         st.cycle = None;
@@ -1168,7 +1349,12 @@ impl<P: Platform> Engine<P> {
             },
             Vec::new(),
             None,
-            note.map(|(from, to, kind)| Commit::Fix { from, to, kind }),
+            note.map(|(from, to, kind)| Commit::Fix {
+                from,
+                to,
+                kind,
+                deferred_layout: None,
+            }),
         );
     }
 
@@ -1240,14 +1426,19 @@ impl<P: Platform> Engine<P> {
         }
         // Layout confirmation can block. Keep it off the capture callback and
         // outside the state lock so releases and cancellation remain responsive.
-        if let Some(Commit::Undo {
-            layout: Some(lang), ..
-        }) = &commit
-        {
-            let outcome = P::switch_layout_to(*lang);
-            if (P::ABORT_UNDO_IF_LAYOUT_REFUSED && !outcome.ready())
-                || !self.replacement_valid(generation)
-            {
+        let switch = match &commit {
+            Some(Commit::Undo {
+                layout: Some(lang), ..
+            }) => Some((*lang, P::ABORT_UNDO_IF_LAYOUT_REFUSED)),
+            Some(Commit::Fix {
+                deferred_layout: Some(lang),
+                ..
+            }) => Some((*lang, true)),
+            _ => None,
+        };
+        if let Some((lang, required)) = switch {
+            let outcome = P::switch_layout_to(lang);
+            if (required && !outcome.ready()) || !self.replacement_valid(generation) {
                 let mut st = self.lock();
                 if st.generation == generation {
                     st.invalidate_text();
@@ -1268,7 +1459,7 @@ impl<P: Platform> Engine<P> {
         };
         let mut learn = None;
         match commit {
-            Some(Commit::Fix { from, to, kind }) => {
+            Some(Commit::Fix { from, to, kind, .. }) => {
                 if practice {
                     crate::practice::fixed(&self.control, &from, &to, kind);
                 }
@@ -1337,6 +1528,7 @@ enum Commit {
         from: String,
         to: String,
         kind: FixKind,
+        deferred_layout: Option<Language>,
     },
     Undo {
         suppress: Option<String>,
@@ -1498,6 +1690,7 @@ mod tests {
         mpsc,
     };
 
+    static SELECTION: Mutex<Option<Selection>> = Mutex::new(None);
     static FOCUS: AtomicUsize = AtomicUsize::new(1);
     static SIMULATED_LAYOUT: AtomicUsize = AtomicUsize::new(0);
     static INPUT_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -1589,6 +1782,46 @@ mod tests {
         }
         fn input_allowed() -> bool {
             INPUT_ALLOWED.load(Ordering::SeqCst)
+        }
+        fn selection(_: &usize) -> Option<Selection> {
+            SELECTION.lock().unwrap().clone()
+        }
+        fn replace_selection(
+            engine: &Engine<Self>,
+            _: &usize,
+            expected: &Selection,
+            text: &str,
+            generation: u64,
+        ) -> Option<Selection> {
+            engine.injector.ready.send(()).unwrap();
+            engine
+                .injector
+                .proceed
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            if !engine.replacement_valid(generation) {
+                return None;
+            }
+            let mut selection = SELECTION.lock().unwrap();
+            if selection.as_ref() != Some(expected) {
+                return None;
+            }
+            let mut screen = engine.injector.text.lock().unwrap();
+            let mut utf16: Vec<_> = screen.encode_utf16().collect();
+            utf16.splice(
+                expected.start as usize..(expected.start + expected.length) as usize,
+                text.encode_utf16(),
+            );
+            *screen = String::from_utf16(&utf16).unwrap();
+            let after = Selection {
+                start: expected.start,
+                length: text.encode_utf16().count() as isize,
+                text: text.to_owned(),
+            };
+            *selection = Some(after.clone());
+            Some(after)
         }
         fn input_empty(screen: &Screen) -> bool {
             screen.text.lock().unwrap().is_empty()
@@ -2391,5 +2624,120 @@ mod tests {
         worker.join().unwrap();
         assert!(s.engine.lock().keys.is_empty());
         assert!(s.engine.lock().held_keys.is_empty());
+
+        // All ambiguous words use the same explicit conversion rule, before
+        // or after a terminator, and in either direction.
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for (english, hebrew) in [("do", "גם"), ("go", "עם"), ("to", "אם")] {
+            for reverse in [false, true] {
+                for suffix in ["", " "] {
+                    SIMULATED_LAYOUT.store(usize::from(reverse), Ordering::SeqCst);
+                    let s = Session::new();
+                    s.type_text(&format!("{english}{suffix}"));
+                    let (before, after) = if reverse {
+                        (hebrew, english)
+                    } else {
+                        (english, hebrew)
+                    };
+                    *s.engine.injector.text.lock().unwrap() = format!("{before}{suffix}");
+                    assert!(!s.engine.lock().is_replacing);
+                    s.tap(Simulated::CTRL_LEFT);
+                    s.tap(Simulated::CTRL_LEFT);
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{after}{suffix}"));
+                    s.tap(Simulated::CTRL_LEFT);
+                    s.tap(Simulated::CTRL_LEFT);
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{before}{suffix}"));
+                    assert!(!crate::complete::suppressed(before));
+                }
+            }
+        }
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "left_ctrl".into());
+        let s = Session::new();
+        s.type_text("do ");
+        s.tap(Simulated::CTRL_LEFT);
+        assert!(!s.engine.lock().is_replacing);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "גם ");
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "do ");
+        crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "none".into());
+        for interruption in ["none", "click", "focus", "disabled", "secure"] {
+            let s = Session::new();
+            s.type_text(if interruption == "none" {
+                "zzzzqqqq "
+            } else {
+                "do "
+            });
+            let original = s.text();
+            match interruption {
+                "click" => s.engine.mouse_click(),
+                "focus" => {
+                    FOCUS.store(2, Ordering::SeqCst);
+                }
+                "disabled" => s.engine.control.set_enabled(false),
+                "secure" => INPUT_ALLOWED.store(false, Ordering::SeqCst),
+                _ => {}
+            }
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            // No native selection exists, so a selection query is harmless.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while s.engine.lock().is_replacing {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(s.text(), original);
+            assert!(s.ready.try_recv().is_err());
+            FOCUS.store(1, Ordering::SeqCst);
+            INPUT_ALLOWED.store(true, Ordering::SeqCst);
+        }
+        for interruption in ["none", "click", "typing", "focus", "selection"] {
+            let s = Session::new();
+            let original = "prefix AKUO GUKO 🙂 suffix";
+            *s.engine.injector.text.lock().unwrap() = original.into();
+            *SELECTION.lock().unwrap() = Some(Selection {
+                start: 7,
+                length: 9,
+                text: "AKUO GUKO".into(),
+            });
+            s.engine.mouse_click();
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            s.pending();
+            match interruption {
+                "click" => s.engine.mouse_click(),
+                "typing" => s.engine.key_press('x'),
+                "focus" => {
+                    FOCUS.store(2, Ordering::SeqCst);
+                }
+                "selection" => {
+                    *SELECTION.lock().unwrap() = None;
+                }
+                _ => {}
+            }
+            s.finish();
+            if interruption == "none" {
+                assert_eq!(s.text(), "prefix שלום עולם 🙂 suffix");
+                s.tap(Simulated::CTRL_LEFT);
+                s.tap(Simulated::CTRL_LEFT);
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), original);
+            } else {
+                assert_eq!(s.text(), original);
+            }
+            FOCUS.store(1, Ordering::SeqCst);
+            *SELECTION.lock().unwrap() = None;
+        }
+        ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
     }
 }

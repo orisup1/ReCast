@@ -101,6 +101,18 @@ impl Platform for Mac {
             result
         }
     }
+    fn selection(focus: &Focus) -> Option<engine::Selection> {
+        selected_text(focus)
+    }
+    fn replace_selection(
+        engine: &Engine<Self>,
+        focus: &Focus,
+        expected: &engine::Selection,
+        text: &str,
+        generation: u64,
+    ) -> Option<engine::Selection> {
+        replace_selected_text(engine, focus, expected, text, generation)
+    }
     fn input_empty(_: &AtomicBool) -> bool {
         use core_foundation::{base::TCFType, string::CFString};
         use core_foundation_sys::{base::CFGetTypeID, string::*};
@@ -869,6 +881,144 @@ extern "C" {
         value: *mut *const c_void,
     ) -> i32;
     fn AXUIElementSetMessagingTimeout(element: *const c_void, seconds: f32) -> i32;
+    fn AXUIElementIsAttributeSettable(
+        element: *const c_void,
+        attribute: core_foundation_sys::string::CFStringRef,
+        settable: *mut u8,
+    ) -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: *const c_void,
+        attribute: core_foundation_sys::string::CFStringRef,
+        value: *const c_void,
+    ) -> i32;
+    fn AXValueGetTypeID() -> core_foundation_sys::base::CFTypeID;
+    fn AXValueGetValue(value: *const c_void, kind: u32, output: *mut c_void) -> u8;
+    fn AXValueCreate(kind: u32, value: *const c_void) -> *const c_void;
+
+}
+
+/// Keep AX ownership local. Never fetch the full document or the clipboard.
+fn ax_attribute(focus: &Focus, name: &str) -> Option<core_foundation::base::CFType> {
+    use core_foundation::{
+        base::{CFType, TCFType},
+        string::CFString,
+    };
+    let name = CFString::new(name);
+    let mut value = std::ptr::null();
+    unsafe {
+        AXUIElementSetMessagingTimeout(focus.0, 0.05);
+        (AXUIElementCopyAttributeValue(focus.0, name.as_concrete_TypeRef(), &mut value) == 0
+            && !value.is_null())
+        .then(|| CFType::wrap_under_create_rule(value))
+    }
+}
+
+fn selected_text(focus: &Focus) -> Option<engine::Selection> {
+    use core_foundation::{base::TCFType, string::CFString};
+    use core_foundation_sys::base::{CFGetTypeID, CFRange};
+    let value = ax_attribute(focus, "AXSelectedText")?;
+    let string = value.downcast::<CFString>()?;
+    if string.char_len() > engine::MAX_SELECTION_BYTES as isize {
+        return None;
+    }
+    let text = string.to_string();
+    if text.is_empty() || text.len() > engine::MAX_SELECTION_BYTES {
+        return None;
+    }
+    let value = ax_attribute(focus, "AXSelectedTextRange")?;
+    let mut range = CFRange {
+        location: 0,
+        length: 0,
+    };
+    unsafe {
+        if CFGetTypeID(value.as_CFTypeRef()) != AXValueGetTypeID()
+            || AXValueGetValue(value.as_CFTypeRef(), 4, (&mut range as *mut CFRange).cast()) == 0
+        {
+            return None;
+        }
+    }
+    if range.location < 0
+        || range.length <= 0
+        || range.length as usize != text.encode_utf16().count()
+    {
+        return None;
+    }
+    Some(engine::Selection {
+        start: range.location,
+        length: range.length,
+        text,
+    })
+}
+
+fn replace_selected_text(
+    engine: &Engine<Mac>,
+    focus: &Focus,
+    expected: &engine::Selection,
+    text: &str,
+    generation: u64,
+) -> Option<engine::Selection> {
+    use core_foundation::{
+        base::{CFType, TCFType},
+        string::CFString,
+    };
+    use core_foundation_sys::base::CFRange;
+    let text_attribute = CFString::new("AXSelectedText");
+    let range_attribute = CFString::new("AXSelectedTextRange");
+    unsafe {
+        for attribute in [&text_attribute, &range_attribute] {
+            let mut writable = 0;
+            if AXUIElementIsAttributeSettable(
+                focus.0,
+                attribute.as_concrete_TypeRef(),
+                &mut writable,
+            ) != 0
+                || writable == 0
+            {
+                return None;
+            }
+        }
+        let range = CFRange {
+            location: expected.start,
+            length: text.encode_utf16().count() as isize,
+        };
+        let value = AXValueCreate(4, (&range as *const CFRange).cast());
+        if value.is_null() {
+            return None;
+        }
+        let value = CFType::wrap_under_create_rule(value);
+        let replacement = CFString::new(text);
+        if Mac::selection(focus).as_ref() != Some(expected) || !engine.replacement_valid(generation)
+        {
+            return None;
+        }
+        // Write just the selection. Unsupported controls are left unchanged;
+        // never fall back to replacing the entire document.
+        if AXUIElementSetAttributeValue(
+            focus.0,
+            text_attribute.as_concrete_TypeRef(),
+            replacement.as_CFTypeRef(),
+        ) != 0
+        {
+            return None;
+        }
+        if !engine.replacement_valid(generation) {
+            return None;
+        }
+        if AXUIElementSetAttributeValue(
+            focus.0,
+            range_attribute.as_concrete_TypeRef(),
+            value.as_CFTypeRef(),
+        ) != 0
+        {
+            return None;
+        }
+        let after = engine::Selection {
+            start: range.location,
+            length: range.length,
+            text: text.to_owned(),
+        };
+        (Mac::selection(focus).as_ref() == Some(&after)).then_some(after)
+    }
 }
 
 fn focused_target() -> Option<Focus> {
