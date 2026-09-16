@@ -15,6 +15,7 @@ impl Platform for Mac {
     type Injector = AtomicBool;
     type Focus = Focus;
     const REQUIRES_FOCUS: bool = true;
+    const QUEUE_UNDO_DURING_REPLACEMENT: bool = true;
     const SHIFT_LEFT: Key = textkeys::SHIFT_LEFT;
     const SHIFT_RIGHT: Key = textkeys::SHIFT_RIGHT;
     const CTRL_LEFT: Key = textkeys::CTRL_LEFT;
@@ -204,6 +205,7 @@ extern "C" {
     /// which key changed but not in which direction, so this is what turns it
     /// back into a press or a release.
     fn CGEventGetFlags(event: CGEventRef) -> u64;
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
 
     // Text injection (see `paste_text`). A keyboard event carrying a Unicode
@@ -718,14 +720,24 @@ pub fn setup_event_tap(
     }
 }
 
-fn post_key(key: Key, down: bool) -> Option<()> {
-    let code = (0..128).find(|&code| key_from_code(code) == key)?;
+fn keyboard_event(code: u16, down: bool, shift: bool) -> Option<CGEventRef> {
     unsafe {
         let event = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, down);
         if event.is_null() {
             return None;
         }
         CGEventSetIntegerValueField(event, EVENT_USER_DATA, RECAST_EVENT);
+        // Do not inherit a physical Ctrl/Shift pressed during the correction.
+        // Inherited flags can turn a backspace into a shortcut or select text.
+        CGEventSetFlags(event, if shift { 0x0002_0000 } else { 0 });
+        Some(event)
+    }
+}
+
+fn post_key(key: Key, down: bool, shift: bool) -> Option<()> {
+    let code = (0..128).find(|&code| key_from_code(code) == key)?;
+    let event = keyboard_event(code, down, shift)?;
+    unsafe {
         CGEventPost(KCG_HID_EVENT_TAP, event);
         CFRelease(event as _);
     }
@@ -741,11 +753,7 @@ fn paste_text(text: &str) -> Option<()> {
         // A press/release pair: some applications only act on one of the two,
         // and the string is attached to both so either order works.
         for down in [true, false] {
-            let event = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, down);
-            if event.is_null() {
-                return None;
-            }
-            CGEventSetIntegerValueField(event, EVENT_USER_DATA, RECAST_EVENT);
+            let event = keyboard_event(0, down, false)?;
             CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
             CGEventPost(KCG_HID_EVENT_TAP, event);
             CFRelease(event as *const c_void);
@@ -772,10 +780,10 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     // Press + release a single key with pacing that macOS won't drop. Only the
     // backspaces and the odd replayed key go through this now; the word itself
     // is one event.
-    let tap_key = |k: Key| {
-        post_key(k, true)?;
+    let tap_key = |k: Key, shift: bool| {
+        post_key(k, true, shift)?;
         crate::timing::pause(gaps.press_gap);
-        post_key(k, false)?;
+        post_key(k, false, shift)?;
         crate::timing::pause(gaps.inter_key_gap);
         Some(())
     };
@@ -785,7 +793,7 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         if !engine.replacement_valid(generation) {
             return None;
         }
-        tap_key(Key::Backspace)?;
+        tap_key(Key::Backspace, false)?;
     }
     if !engine.replacement_valid(generation) {
         return None;
@@ -796,7 +804,7 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
             if !engine.replacement_valid(generation) {
                 return None;
             }
-            tap_key(Key::Return)?;
+            tap_key(Key::Return, false)?;
         }
         // The trailing space is part of the same paste, so nothing has to be
         // pressed at all.
@@ -815,17 +823,7 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         if !engine.replacement_valid(generation) {
             return None;
         }
-        if t.shift {
-            post_key(Key::ShiftLeft, true)?;
-            crate::timing::pause(gaps.press_gap);
-            let typed = tap_key(t.key);
-            let released = post_key(Key::ShiftLeft, false);
-            typed?;
-            released?;
-            crate::timing::pause(gaps.inter_key_gap);
-        } else {
-            tap_key(t.key)?;
-        }
+        tap_key(t.key, t.shift)?;
     }
 
     // The last injected key already paid `inter_key_gap`, and settling is the
@@ -901,6 +899,27 @@ fn focused_target() -> Option<Focus> {
 mod setup_tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    #[ignore = "requires an unsandboxed macOS WindowServer; constructs events without posting"]
+    fn injected_events_have_only_the_requested_modifiers() {
+        // Construct events without posting them or capturing any real typing.
+        for code in [0, 36, 51] {
+            for down in [false, true] {
+                for shift in [false, true] {
+                    let event = keyboard_event(code, down, shift).unwrap();
+                    unsafe {
+                        assert_eq!(CGEventGetFlags(event), if shift { 0x0002_0000 } else { 0 });
+                        assert_eq!(
+                            CGEventGetIntegerValueField(event, EVENT_USER_DATA),
+                            RECAST_EVENT
+                        );
+                        CFRelease(event as _);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn permission_target_is_the_running_copy_not_another_installed_bundle() {

@@ -15,7 +15,9 @@ clipboard is never touched.
 ReCast checks words when you finish them with Space, Enter, or punctuation. It
 uses the current keyboard layout, dictionary matches, and word frequency to decide
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
-the terminator are preserved. A confident English spelling fix can also correct a
+the terminator are preserved. Same-layout corrections keep an unchanged prefix
+on screen and rewrite only the remaining suffix, reducing visible deletion.
+A confident English spelling fix can also correct a
 wrong-layout word in the same replacement.
 
 Spelling correction protects dictionary words, ALL CAPS, and tokens containing
@@ -130,6 +132,8 @@ Further typing or cursor movement ends the undo opportunity. Undo restores the
 original text and, when changed, the previous layout. One undo suppresses that word
 for the session; undo counts are saved in `learned.txt`, and two occasions make the
 exception survive restarts. Allowing the word again clears its saved exception.
+On macOS, an undo gesture completed while a correction is landing waits for that
+correction to finish; later typing or cursor movement still cancels the queued undo.
 
 The macOS/Windows tray and Linux control window offer live **Settings** for spelling,
 completion/abbreviations, and **Conservative spelling**. Conservative spelling caps

@@ -130,11 +130,11 @@ impl<S: Replaceable> Drop for ReplaceGuard<'_, S> {
         // one may already have poisoned this lock.
         {
             let mut st = lock_forgiving(self.state);
+            if let Some(flag) = self.injecting {
+                flag.store(false, Ordering::Relaxed);
+            }
             st.set_replacing(false);
             st.clear_buffered();
-        }
-        if let Some(flag) = self.injecting {
-            flag.store(false, Ordering::Relaxed);
         }
     }
 }

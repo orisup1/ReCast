@@ -322,6 +322,12 @@ pub fn learn(word: &str) {
     let Ok(mut counts) = learned_words().lock() else {
         return;
     };
+    // The engine releases its injection gate before saving. A newer unlist
+    // must win over an undo worker that has not reached persistence yet.
+    // Check under the counts lock so a concurrent unlearn removes our update.
+    if !suppressed(&word) {
+        return;
+    }
     *counts.entry(word).or_insert(0) += 1;
     write_learned(&counts);
 }

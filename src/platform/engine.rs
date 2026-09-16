@@ -27,9 +27,8 @@
 //!   macOS and Windows, because they do and the result then does not depend on
 //!   the layout switch having propagated.
 //! * How to put it on screen ([`Platform::inject`]).
-//! * Two deliberate divergences, spelled out as associated constants rather
-//!   than left implicit: [`Platform::DEDUP_WINDOW`] and
-//!   [`Platform::ABORT_UNDO_IF_LAYOUT_REFUSED`].
+//! * Platform safety differences, spelled out as associated constants rather
+//!   than left implicit.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -203,7 +202,11 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// name instead and has nothing here.
     fn injecting_flag(injector: &Self::Injector) -> Option<&std::sync::atomic::AtomicBool>;
 
-    // ── the two deliberate divergences ──────────────────────────────────────
+    // ── platform safety differences ────────────────────────────────────────
+
+    /// Only safe when injected events explicitly ignore physical Ctrl flags.
+    /// Other platforms still cancel rather than risk injecting Ctrl+Backspace.
+    const QUEUE_UNDO_DURING_REPLACEMENT: bool = false;
 
     /// How long the same key repeating counts as one physical press.
     ///
@@ -339,6 +342,8 @@ pub struct AppState<P: Platform> {
     /// When the last completed Ctrl tap happened; a second one inside
     /// [`DOUBLE_TAP_WINDOW`] is the undo gesture.
     pub last_ctrl_tap: Option<Instant>,
+    /// An undo gesture completed while the current correction was landing.
+    pending_undo: bool,
     /// A key combination shaped like a layout-switch hotkey has been pressed and
     /// the modifiers holding it have not all come back up yet. When they do, the
     /// cached layout is dropped — see [`crate::layout::invalidate`].
@@ -380,6 +385,7 @@ impl<P: Platform> AppState<P> {
             right_shift_tap: false,
             ctrl_down: None,
             last_ctrl_tap: None,
+            pending_undo: false,
             layout_hotkey: false,
             last_action: None,
             cycle: None,
@@ -441,6 +447,7 @@ impl<P: Platform> AppState<P> {
         self.last_action = None;
         self.cycle = None;
         self.last_ctrl_tap = None;
+        self.pending_undo = false;
     }
     fn invalidate_text(&mut self) {
         self.revision = self.revision.wrapping_add(1);
@@ -620,7 +627,8 @@ impl<P: Platform> Engine<P> {
 
     /// Called after waits and immediately before destructive injection.
     pub fn replacement_valid(&self, generation: u64) -> bool {
-        if !self.control.is_enabled() || !P::input_allowed() {
+        if self.lock().generation != generation || !self.control.is_enabled() || !P::input_allowed()
+        {
             return false;
         }
         let (focus, mode) = self.read_focus();
@@ -680,6 +688,14 @@ impl<P: Platform> Engine<P> {
             st.forget_gestures();
         }
         let shift = st.shift_active();
+
+        // A bare Ctrl changes no text. Keep its tap even while injecting so an
+        // eager undo does not cancel a half-written correction. Chords still
+        // cancel below, and any later text clears the queued undo.
+        if P::QUEUE_UNDO_DURING_REPLACEMENT && st.is_replacing && is_ctrl && st.held_keys.len() == 1
+        {
+            return;
+        }
 
         // Cancel before any OS query: the worker must see a shortcut/deletion
         // immediately, even while the compositor is slow to answer focus.
@@ -883,6 +899,17 @@ impl<P: Platform> Engine<P> {
             crate::layout::invalidate();
         }
 
+        // Ordinary releases have no text action. Tracking the held key above
+        // is enough unless personalization needs its timing; an accessibility
+        // round trip here only delays the next key and any queued undo tap.
+        if key != P::CTRL_LEFT
+            && key != P::CTRL_RIGHT
+            && key != P::SHIFT_RIGHT
+            && !crate::config::Config::global().personal_enabled
+        {
+            return;
+        }
+
         if self.control.has_app_rules()
             || self
                 .control
@@ -977,7 +1004,10 @@ impl<P: Platform> Engine<P> {
         // typed is none at all.
         let was = reading::<P>(&typed, Language::English);
         let commit = if back_to_typed {
-            Some(Commit::Undo { suppress: None })
+            Some(Commit::Undo {
+                suppress: None,
+                layout: None,
+            })
         } else if index == 0 {
             Some(Commit::Fix {
                 from: was.clone(),
@@ -1062,7 +1092,11 @@ impl<P: Platform> Engine<P> {
             }
         }
 
-        if st.is_replacing || !self.control.is_enabled() {
+        if !self.control.is_enabled() {
+            return;
+        }
+        if st.is_replacing {
+            st.pending_undo = P::QUEUE_UNDO_DURING_REPLACEMENT;
             return;
         }
         let Some((mut st, focus)) = self.refresh_focus(st) else {
@@ -1081,21 +1115,6 @@ impl<P: Platform> Engine<P> {
 
     /// Put back what the user typed before the correction on screen replaced it.
     fn undo_fix(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, fix: LastFix<P>) {
-        // Put the layout back before the keys go out. On Linux that is a
-        // precondition rather than a courtesy — `uinput` speaks keycodes, so
-        // what they spell depends on the layout that is live when they land,
-        // and replaying them under the old one would just re-enter the
-        // correction. `.ready()`, not a bare bool: "already on that layout" is
-        // a reason to carry on, not to abandon the undo.
-        if let Some(lang) = fix.layout {
-            let outcome = P::switch_layout_to(lang);
-            if P::ABORT_UNDO_IF_LAYOUT_REFUSED && !outcome.ready() {
-                // Leave the text alone rather than churn it, and leave the word
-                // correctable rather than retire it on the strength of an undo
-                // that never happened.
-                return;
-            }
-        }
         st.cycle = None;
         self.start_replacement(
             st,
@@ -1109,6 +1128,7 @@ impl<P: Platform> Engine<P> {
             None,
             Some(Commit::Undo {
                 suppress: fix.suppress,
+                layout: fix.layout,
             }),
         );
     }
@@ -1199,7 +1219,7 @@ impl<P: Platform> Engine<P> {
     /// `undo` is the payload the Ctrl double-tap would put back, kept only if
     /// the user typed nothing while this was landing.
     fn replace_word(
-        &self,
+        self: &Arc<Self>,
         plan: Plan<P>,
         keep: Vec<Typed<P::Key>>,
         undo: Option<LastFix<P>>,
@@ -1209,7 +1229,7 @@ impl<P: Platform> Engine<P> {
         // Armed for the whole replacement: whatever happens below — including a
         // panic — `is_replacing` and the injecting gate are cleared, rather than
         // leaving the listener shut for the rest of the session.
-        let _gate = ReplaceGuard::new(&self.state, P::injecting_flag(&self.injector));
+        let gate = ReplaceGuard::new(&self.state, P::injecting_flag(&self.injector));
 
         if !self.replacement_valid(generation) {
             let mut st = self.lock();
@@ -1217,6 +1237,23 @@ impl<P: Platform> Engine<P> {
                 st.invalidate_text();
             }
             return;
+        }
+        // Layout confirmation can block. Keep it off the capture callback and
+        // outside the state lock so releases and cancellation remain responsive.
+        if let Some(Commit::Undo {
+            layout: Some(lang), ..
+        }) = &commit
+        {
+            let outcome = P::switch_layout_to(*lang);
+            if (P::ABORT_UNDO_IF_LAYOUT_REFUSED && !outcome.ready())
+                || !self.replacement_valid(generation)
+            {
+                let mut st = self.lock();
+                if st.generation == generation {
+                    st.invalidate_text();
+                }
+                return;
+            }
         }
         let Some(buffered) = P::inject(self, plan, generation) else {
             let mut st = self.lock();
@@ -1229,6 +1266,7 @@ impl<P: Platform> Engine<P> {
             let st = self.lock();
             (st.practice, st.mode)
         };
+        let mut learn = None;
         match commit {
             Some(Commit::Fix { from, to, kind }) => {
                 if practice {
@@ -1242,7 +1280,7 @@ impl<P: Platform> Engine<P> {
                     }
                 }
             }
-            Some(Commit::Undo { suppress }) => {
+            Some(Commit::Undo { suppress, .. }) => {
                 if practice && suppress.as_deref() == Some("akuo") {
                     let _ = self.control.practice_stage.compare_exchange(
                         1,
@@ -1253,7 +1291,7 @@ impl<P: Platform> Engine<P> {
                 }
                 if let Some(word) = suppress.filter(|_| !practice) {
                     crate::complete::suppress(&word);
-                    crate::complete::learn(&word);
+                    learn = Some(word);
                 }
                 if !practice {
                     self.control.record_undo();
@@ -1263,26 +1301,34 @@ impl<P: Platform> Engine<P> {
         }
 
         let mut st = self.lock();
-        if st.generation != generation {
-            return;
+        if st.generation == generation {
+            st.keys.replace_with(keep);
+            st.keys.extend(buffered.iter().copied());
+            // Undo is only safe while no later text follows the replacement.
+            st.last_action = if buffered.is_empty() {
+                undo.map(LastAction::Fixed)
+            } else {
+                None
+            };
+            st.last_key = None;
         }
-        st.keys.replace_with(keep);
-        st.keys.extend(buffered.iter().copied());
-        // Undo erases backwards from the cursor, so it is only valid while the
-        // cursor is still sitting on what we just injected. Keys the user got
-        // in during the replacement were replayed after it and have moved it on.
-        st.last_action = if buffered.is_empty() {
-            undo.map(LastAction::Fixed)
+        drop(st);
+        drop(gate);
+
+        let mut st = self.lock();
+        let pending = (!st.is_replacing && std::mem::take(&mut st.pending_undo))
+            .then(|| st.last_action.take())
+            .flatten();
+        if let Some(LastAction::Fixed(fix)) = pending {
+            self.undo_fix(st, fix);
         } else {
-            None
-        };
-        // Reset the dedup guard so the injected terminator is not silently
-        // dropped for sharing a keycode with the physical press that triggered
-        // this replacement (both arrive within the window).
-        st.last_key = None;
-        // `buffered_keys` and `is_replacing` are the guard's, and it clears them
-        // after this lock is dropped — on this path and on a panicking one
-        // alike.
+            drop(st);
+        }
+        // Persistence must not extend the injection window: real typing during
+        // a slow disk write used to be treated as an interrupted replacement.
+        if let Some(word) = learn {
+            crate::complete::learn(&word);
+        }
     }
 }
 
@@ -1294,6 +1340,7 @@ enum Commit {
     },
     Undo {
         suppress: Option<String>,
+        layout: Option<Language>,
     },
 }
 
@@ -1323,6 +1370,8 @@ pub struct Replacement<P: Platform> {
     /// The layout that was live before the fix, when the fix changed it — what
     /// undo has to switch back to.
     previous_layout: Option<Language>,
+    /// Start of the original word for undo learning, before prefix trimming.
+    original_start: usize,
 }
 
 /// Turn a [`Fix`] into what the injection thread needs.
@@ -1335,19 +1384,31 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
             erase: keys.len() - start,
             retype: P::retype_layout(&keys[start..], &text, lang)?,
             previous_layout: Some(lang.other()),
+            original_start: start,
         }),
         Fix::LayoutSpelling { text, lang } => Some(Replacement {
             erase: keys.len(),
             retype: P::retype_text(&text)?,
             previous_layout: Some(lang.other()),
+            original_start: 0,
         }),
-        // Same layout, different letters: erase the whole word and type the
-        // corrected spelling instead.
-        Fix::Spelling { text } => Some(Replacement {
-            erase: keys.len(),
-            retype: P::retype_text(&text)?,
-            previous_layout: None,
-        }),
+        Fix::Spelling { text } => {
+            // Keep the identical prefix on screen. This saves paced backspaces
+            // and focus queries on macOS, for corrections and their undo alike.
+            let original = reading::<P>(keys, Language::English);
+            let prefix = original
+                .chars()
+                .zip(text.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let suffix: String = text.chars().skip(prefix).collect();
+            Some(Replacement {
+                erase: keys.len() - prefix,
+                retype: P::retype_text(&suffix)?,
+                previous_layout: None,
+                original_start: 0,
+            })
+        }
     }
 }
 
@@ -1370,7 +1431,7 @@ fn undo_of<P: Platform>(
         // The terminator has already finished this word, so nothing carries
         // over into the buffer.
         keep: Vec::new(),
-        suppress: non_empty(reading::<P>(original, was)),
+        suppress: non_empty(reading::<P>(&keys[rep.original_start..], was)),
     }
 }
 
@@ -1447,6 +1508,7 @@ mod tests {
         proceed: mpsc::Receiver<()>,
     }
     static FOCUS_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
+    static LAYOUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
     struct Simulated;
     struct Screen {
         text: Mutex<String>,
@@ -1460,6 +1522,7 @@ mod tests {
         type Injector = Screen;
         type Focus = usize;
         const REQUIRES_FOCUS: bool = true;
+        const QUEUE_UNDO_DURING_REPLACEMENT: bool = true;
         const SHIFT_LEFT: char = '\x01';
         const SHIFT_RIGHT: char = '\x02';
         const CTRL_LEFT: char = '\x03';
@@ -1542,6 +1605,10 @@ mod tests {
                 ALLOW_LAYOUT_SWITCH.load(Ordering::SeqCst),
                 "English spelling and undo must not switch layouts"
             );
+            if let Some(gate) = LAYOUT_GATE.lock().unwrap().take() {
+                gate.ready.send(()).unwrap();
+                gate.proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
             SIMULATED_LAYOUT.store(usize::from(lang == Language::Hebrew), Ordering::SeqCst);
             crate::layout::LayoutSwitch::Switched
         }
@@ -1663,6 +1730,33 @@ mod tests {
     }
 
     #[test]
+    fn spelling_rewrites_only_the_changed_suffix_and_undo_learns_the_whole_word() {
+        for (before, after, erase) in [
+            ("keyboad", "keyboard", 1),
+            ("recieve", "receive", 4),
+            ("Recieve,", "Receive,", 5),
+            ("abc", "abcdef", 0),
+            ("abc", "ab", 1),
+            ("ab", "世界", 2),
+            ("hélo", "héllo", 1),
+        ] {
+            let keys: Vec<_> = before
+                .chars()
+                .map(|key| Typed { key, shift: false })
+                .collect();
+            let rep = replacement::<Simulated>(&keys, Some(Fix::Spelling { text: after.into() }))
+                .unwrap();
+            assert_eq!(rep.erase, erase, "{before}");
+            let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
+            let prefix: String = before.chars().take(keys.len() - rep.erase).collect();
+            assert_eq!(format!("{prefix}{}", rep.retype), after);
+            assert_eq!(format!("{prefix}{}", undo.restore), before);
+            assert_eq!(undo.suppress.as_deref(), Some(before));
+            assert_eq!(undo.on_screen, rep.retype.chars().count() + 1);
+        }
+    }
+
+    #[test]
     fn typing_correction_undo_and_interrupted_replacements() {
         // Undo changes process-wide suppression and learning state. Run this
         // scenario alone so it cannot change the parallel corpus test's results.
@@ -1699,6 +1793,54 @@ mod tests {
         assert_eq!(s.engine.control.undo_count(), 1);
         assert!(crate::complete::suppressed("keyboad"));
         assert!(s.engine.lock().last_action.is_none());
+
+        // An eager undo during injection waits for the correction to finish;
+        // neither Ctrl tap may invalidate a partly written word.
+        for shortcut in ["none", "right_ctrl"] {
+            crate::config::Config::update_live(|cfg| cfg.undo_shortcut = shortcut.into());
+            let s = Session::new();
+            s.type_text("acheive ");
+            s.pending();
+            s.engine.injector.injecting.store(true, Ordering::SeqCst);
+            if shortcut == "right_ctrl" {
+                s.tap(Simulated::CTRL_RIGHT);
+            } else {
+                s.tap(Simulated::CTRL_LEFT);
+                s.tap(Simulated::CTRL_LEFT);
+            }
+            assert!(s.engine.lock().pending_undo);
+            s.proceed.send(()).unwrap();
+            s.pending();
+            assert_eq!(s.text(), "achieve ");
+            s.finish();
+            assert_eq!(s.text(), "acheive ");
+            assert_eq!(s.engine.control.undo_count(), 1);
+            crate::complete::unlist("acheive");
+            // A delayed learning write must not resurrect a newer unlist.
+            crate::complete::learn("acheive");
+            crate::complete::learn("acheive");
+            assert!(!crate::complete::learned("acheive"));
+        }
+        crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "none".into());
+
+        // Cursor changes and later typing still cancel an eager undo.
+        for click in [false, true] {
+            let s = Session::new();
+            s.type_text("recieve ");
+            s.pending();
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            assert!(s.engine.lock().pending_undo);
+            if click {
+                s.engine.mouse_click();
+            } else {
+                s.type_text("next");
+            }
+            s.finish();
+            assert_eq!(s.text(), if click { "recieve " } else { "receive next" });
+            assert_eq!(s.engine.control.undo_count(), 0);
+            assert!(!s.engine.lock().pending_undo);
+        }
 
         // Pause the worker at injection, then move the cursor, paste, edit, or
         // change focus. None may erase, learn, count a fix, or re-arm undo.
@@ -2186,10 +2328,45 @@ mod tests {
         ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
         FOCUS.store(1, Ordering::SeqCst);
 
+        // Undo layout confirmation runs on the worker, without the typing
+        // lock. A click while it stalls must prevent destructive injection.
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("akuo ");
+        s.pending();
+        s.finish();
+        let (ready, waiting) = mpsc::sync_channel(1);
+        let (proceed, reply) = mpsc::sync_channel(1);
+        *LAYOUT_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: reply,
+        });
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            s.engine.state.try_lock().is_ok(),
+            "layout wait holds the typing lock"
+        );
+        s.engine.mouse_click();
+        proceed.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while s.engine.lock().is_replacing {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(s.text(), "שלום ");
+        assert_eq!(s.engine.control.undo_count(), 0);
+        assert!(s.ready.try_recv().is_err());
+        ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+
         // Hold the OS reply indefinitely: releases and clicks still run, and
         // the late reply must not resurrect the canceled word. This used to
         // hold state.lock() for the entire focus query (up to 250 ms on Linux).
         let s = Session::new();
+        *lock_forgiving(&s.engine.control.excluded_apps) = vec!["secret.exe".into()];
         let (ready, waiting) = mpsc::sync_channel(1);
         let (proceed, reply) = mpsc::sync_channel(1);
         *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
