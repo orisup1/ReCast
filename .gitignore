@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target
+__pycache__/
 
 # Legacy binary output (bundles now live under target/bundle).
 /exec/

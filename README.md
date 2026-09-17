@@ -365,6 +365,28 @@ release CLI behavior on Linux, macOS, and Windows. The manual
 checksums, with signing/notarization when repository credentials are configured.
 `make help` and `.\deploy.ps1 -Target help` list build, install, and service targets.
 
+## Dictionary expansion
+
+English additions are imported automatically from the SCOWL-derived
+[wooorm English dictionary](https://github.com/wooorm/dictionaries/tree/8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/en).
+Only explicit lowercase entries of at least four letters that also occur in
+`en_freq.txt` are added. This cross-check avoids importing raw subtitle noise,
+capitalized names, or short layout collisions. Hunspell affixes are not expanded.
+Existing entries and frequency rankings are preserved. Hebrew already contains
+all pure Hebrew words of at least four letters in its bundled frequency list.
+
+To repeat the import (Python 3, no packages required):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wooorm/dictionaries/8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/en/index.dic -o /tmp/recast-en.dic
+python3 scripts/expand_dictionary.py /tmp/recast-en.dic
+python3 scripts/expand_dictionary.py /tmp/recast-en.dic --check
+```
+
+The importer verifies the pinned source checksum and adds only missing entries.
+These additions are a filtered extract; SCOWL's notices and redistribution terms
+are retained in [licenses/scowl.txt](licenses/scowl.txt).
+
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Application code: Apache-2.0 — see [LICENSE](LICENSE).

@@ -1593,7 +1593,7 @@ mod real_data {
     fn leaves_names_and_shorthand_alone() {
         // A file makes real-world false-positive reports easy to add without
         // turning this test into a source-code edit.
-        for word in include_str!("../tests/data/false_positives.txt")
+        for word in include_str!("../../tests/data/false_positives.txt")
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))

@@ -1012,6 +1012,14 @@ impl<P: Platform> Engine<P> {
             st.cycle = None;
             return;
         }
+        let current = match &st.cycle {
+            Some(cycle) => cycle
+                .candidates
+                .get(cycle.index)
+                .cloned()
+                .unwrap_or_else(|| reading::<P>(&cycle.typed, Language::English)),
+            None => reading::<P>(&st.keys, Language::English),
+        };
         let (typed, candidates, index, erase) = match st.cycle.take() {
             Some(cycle) => {
                 let next = if cycle.index >= cycle.candidates.len() {
@@ -1081,12 +1089,28 @@ impl<P: Platform> Engine<P> {
         } else {
             P::buffer_after(&retype)
         };
+        // Keep the prefix shared by the original, current offer, and next offer.
+        // First completion usually appends only; cycling and undo touch suffixes.
+        let target = if back_to_typed {
+            &was
+        } else {
+            &candidates[index]
+        };
+        let prefix = was
+            .chars()
+            .zip(current.chars())
+            .zip(target.chars())
+            .take_while(|((original, current), target)| original == current && current == target)
+            .count();
+        let Some(suffix) = P::retype_text(&target.chars().skip(prefix).collect::<String>()) else {
+            return;
+        };
         // A completion can be taken back with the undo gesture too — except
         // when it has just handed back the user's own text, which is nothing to
         // undo.
         let undo = (!back_to_typed).then(|| LastFix {
-            on_screen: P::retype_len(&retype),
-            restore: P::retype_original(&typed, Language::English),
+            on_screen: P::retype_len(&retype) - prefix,
+            restore: P::retype_original(&typed[prefix..], Language::English),
             terminator: None,
             layout: None,
             keep: typed.clone(),
@@ -1104,8 +1128,8 @@ impl<P: Platform> Engine<P> {
         self.start_replacement(
             st,
             Plan {
-                erase,
-                retype,
+                erase: erase - prefix,
+                retype: suffix,
                 terminator: None,
             },
             keep,
@@ -1705,6 +1729,7 @@ mod tests {
     struct Simulated;
     struct Screen {
         text: Mutex<String>,
+        erasures: Mutex<Vec<usize>>,
         injecting: std::sync::atomic::AtomicBool,
         ready: mpsc::SyncSender<()>,
         proceed: Mutex<mpsc::Receiver<()>>,
@@ -1850,6 +1875,7 @@ mod tests {
             plan: Plan<Self>,
             generation: u64,
         ) -> Option<Vec<Typed<char>>> {
+            engine.injector.erasures.lock().unwrap().push(plan.erase);
             engine.injector.ready.send(()).unwrap();
             engine
                 .injector
@@ -1893,6 +1919,7 @@ mod tests {
                 Arc::new(AppControl::new_for_test()),
                 Screen {
                     text: Mutex::new(String::new()),
+                    erasures: Mutex::new(Vec::new()),
                     injecting: std::sync::atomic::AtomicBool::new(false),
                     ready: ready_tx,
                     proceed: Mutex::new(proceed_rx),
@@ -2303,6 +2330,11 @@ mod tests {
         s.pending();
         s.finish();
         assert!(s.text().starts_with("hel") && s.text().len() > 3);
+        assert_eq!(
+            *s.engine.injector.erasures.lock().unwrap(),
+            [0],
+            "first completion must append without deleting the prefix"
+        );
         let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
         for _ in 0..count {
             s.tap(Simulated::SHIFT_RIGHT);
@@ -2332,6 +2364,31 @@ mod tests {
         s.finish();
         assert_eq!(s.text(), "hel");
         crate::config::Config::update_live(|cfg| cfg.complete_enabled = true);
+
+        // Expansions keep their full text across cycles even though the live
+        // word buffer may contain only the last word. Undo restores the prefix.
+        let s = Session::new();
+        s.type_text("btw");
+        {
+            let mut st = s.engine.lock();
+            st.cycle = Some(Cycle {
+                typed: st.keys.to_vec(),
+                candidates: vec!["by the way".into(), "between".into()],
+                index: 2,
+                on_screen: 3,
+            });
+        }
+        for expected in ["by the way", "between", "btw", "by the way"] {
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), expected);
+        }
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "btw");
 
         // Exclusions stop capture before any planner, debug log or learning call.
         // A new exclusion also cancels a correction planned before the UI change.

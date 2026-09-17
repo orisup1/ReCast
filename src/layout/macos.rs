@@ -19,6 +19,18 @@ struct __TISInputSource {
 }
 type TISInputSourceRef = *mut __TISInputSource;
 
+/// Carbon input-source calls assert main-queue ownership on current macOS.
+/// Workers hold no engine/cache lock while waiting; main-thread callers run inline.
+fn on_main<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    use objc::{class, msg_send, sel, sel_impl};
+    let main: bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+    if main {
+        work()
+    } else {
+        dispatch::Queue::main().exec_sync(work)
+    }
+}
+
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
     fn TISCopyInputSourceForLanguage(language: CFStringRef) -> TISInputSourceRef;
@@ -37,6 +49,10 @@ extern "C" {
 }
 
 pub fn enabled_languages() -> (bool, bool) {
+    on_main(enabled_languages_on_main)
+}
+
+fn enabled_languages_on_main() -> (bool, bool) {
     let enabled = |code| unsafe {
         let language = CFString::new(code);
         let source = TISCopyInputSourceForLanguage(language.as_concrete_TypeRef());
@@ -65,59 +81,44 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
         Language::English => "en",
         Language::Hebrew => "he",
     };
-    unsafe {
+    let selected = on_main(move || unsafe {
         let cf_lang = CFString::new(code);
         let src = TISCopyInputSourceForLanguage(cf_lang.as_concrete_TypeRef());
         if src.is_null() {
             eprintln!("No input source found for language code '{code}'");
-            return LayoutSwitch::Failed;
+            return false;
         }
-
         let status = TISSelectInputSource(src);
+        CFRelease(src as CFTypeRef);
         if status != 0 {
             eprintln!("TISSelectInputSource failed for '{code}' with status {status}");
-            CFRelease(src as CFTypeRef);
+        }
+        status == 0
+    });
+    if !selected {
+        return LayoutSwitch::Failed;
+    }
+
+    // Poll outside the dispatched closure so a worker never sleeps on the
+    // main queue. Read the actual source, not the cached pre-switch layout.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    loop {
+        if query_layout() == Some(lang) {
+            set_layout_cache(lang);
+            return LayoutSwitch::Switched;
+        }
+        if Instant::now() >= deadline {
             return LayoutSwitch::Failed;
         }
-
-        // TISSelectInputSource is asynchronous: the focused app does not see
-        // the new layout the instant the call returns. If we retype before the
-        // switch propagates, the injected keys are interpreted under the OLD
-        // layout and the "corrected" word comes out as garbage. Poll the
-        // current input source until it actually equals the target (or a
-        // deadline elapses), so callers can retype immediately afterwards —
-        // parity with the Linux/Windows pollers.
-        let deadline = Instant::now() + Duration::from_millis(300);
-        let mut landed;
-        loop {
-            let cur = TISCopyCurrentKeyboardInputSource();
-            landed = !cur.is_null()
-                && core_foundation_sys::base::CFEqual(src as CFTypeRef, cur as CFTypeRef) != 0;
-            if !cur.is_null() {
-                CFRelease(cur as CFTypeRef);
-            }
-            if landed || Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        CFRelease(src as CFTypeRef);
-        if landed {
-            set_layout_cache(lang);
-        }
-        // Only report success once the switch is confirmed. On timeout this is
-        // `Failed`, so the caller skips the retype rather than typing the word
-        // out under the old layout (garbage) — parity with the other two.
-        if landed {
-            LayoutSwitch::Switched
-        } else {
-            LayoutSwitch::Failed
-        }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
 pub fn query_layout() -> Option<Language> {
+    on_main(query_layout_on_main)
+}
+
+fn query_layout_on_main() -> Option<Language> {
     use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 
     unsafe {

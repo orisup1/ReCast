@@ -11,6 +11,10 @@ license = "Apache-2.0"
 keywords = ["keyboard", "layout", "hebrew", "typing", "productivity"]
 categories = ["command-line-utilities", "text-processing"]
 
+[[test]]
+name = "macos_layout"
+harness = false # Carbon and the dispatch main queue need the process main thread
+
 # Smaller, faster release binary — the embedded dictionaries dominate size,
 # but LTO + a single codegen unit still shave several MB and help the hot
 # dictionary-lookup path.
@@ -43,6 +47,7 @@ ratatui = { version = "0.26", features = ["crossterm"] }
 chrono = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+dispatch = "0.2" # already in the dependency graph; Carbon input sources require the main queue
 rdev = "0.5.3"
 core-foundation = "0.9"
 core-foundation-sys = "0.8"

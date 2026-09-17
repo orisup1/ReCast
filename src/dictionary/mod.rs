@@ -1412,7 +1412,7 @@ mod tests {
         let mut missed = Vec::new();
         let mut wrong = Vec::new();
         let mut regressions = Vec::new();
-        for (line, row) in include_str!("../tests/data/corrections.tsv")
+        for (line, row) in include_str!("../../tests/data/corrections.tsv")
             .lines()
             .enumerate()
         {
@@ -1600,6 +1600,17 @@ mod tests {
         }
         assert!(en_dict().contains("hello"));
         assert!(en_dict().contains("dont")); // the folded variant of "don't"
+        for word in [
+            "website",
+            "cellphone",
+            "texting",
+            "smartphone",
+            "podcast",
+            "username",
+        ] {
+            assert!(en_dict().contains(word), "missing imported word: {word}");
+        }
+        assert!(!en_dict().contains("chffffff")); // subtitle noise is not a word
         assert!(!en_dict().contains("zzzqqq"));
         assert!(he_dict().contains("שלום"));
         assert!(en_freq().rank("the").is_some());
