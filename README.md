@@ -202,8 +202,10 @@ ends ReCast. On macOS, use the menubar instead of the dashboard.
 Starting ReCast normally replaces an existing instance. If a service manager would
 immediately restart the old copy, ReCast explains how to stop that service first.
 `--keep-others` bypasses replacement, but concurrent copies can correct text twice.
-`--status` reports settings and memory for its own invocation, not the running
-process's live configuration or memory.
+`--status` queries each running copy for its live settings, memory, listener health,
+active application mode, and pause/disabled reason, including on Windows. An older
+or unresponsive copy is reported as running with live status unavailable. If no
+copy is running, it prints clearly labeled offline configuration diagnostics.
 
 ## Configuration and files
 
@@ -297,7 +299,7 @@ After returning to an allowed app, finish the current word with Space/Enter to r
 The tray's **Status** submenu and Linux window explain Ready, Disabled, Paused,
 Excluded application, Secure Input, unavailable keyboard capture, and unknown
 application identity, with a suggested recovery action. Routine corrections stay
-silent. `--status` still describes its own invocation rather than live daemon state.
+silent. `--status` exposes the same status from the running process.
 
 ## Privacy
 
@@ -305,6 +307,11 @@ ReCast processes global keyboard events locally: no telemetry, remote dictionari
 or update checks. Recent corrections stay in memory. Undo counts and explicitly
 ignored words are saved locally; debug logging and personalization are off by default.
 Synthetic input replaces text without using the clipboard.
+
+Live status uses an authenticated connection on localhost only. Its random access
+token is stored under the user's cache directory (owner-only on Unix); status
+responses contain configuration and application identity, never typed words or
+recent corrections. Nothing is sent to a remote service.
 
 On macOS, ReCast suspends processing while the OS reports **Secure Input**.
 Linux and Windows have no equivalent check: exclusions can protect a whole app,
@@ -355,6 +362,9 @@ owns typing, cancellation, completion cycling, and undo across all platforms.
 Native adapters handle capture/injection; [src/layout](src/layout) handles layout backends.
 
 Add real correction reports to [tests/data/corrections.tsv](tests/data/corrections.tsv).
+Optional sequence and application-mode columns exercise language history across
+words, switches between English and Hebrew, and layout-only behavior. A different
+sequence or application mode resets history, matching the engine's cancellation.
 The corpus separates unwanted, missed, and wrong corrections; it is a regression
 check, not an estimate of accuracy for all typing. Engine tests use a simulated
 screen; focus benchmarks require a desktop session.
@@ -366,6 +376,17 @@ checksums, with signing/notarization when repository credentials are configured.
 `make help` and `.\deploy.ps1 -Target help` list build, install, and service targets.
 
 ## Dictionary expansion
+
+`en_dict.txt` includes curated programming terms, tools, formats, and infrastructure
+names. These entries protect valid technical words from spelling/layout rewrites;
+they do not invent frequency rankings or promote jargon into general-purpose spelling
+suggestions. Their unchanged English readings are covered by the correction corpus.
+
+Build-time preprocessing merges, deduplicates, and sorts dictionary entries for
+binary search. Source dictionary order therefore does not affect lookup speed.
+Do not reorder `en_freq.txt` or `he_freq.txt`: their line order defines frequency
+rank, which controls correction decisions. Generated frequency blobs are sorted
+by word while preserving those ranks.
 
 English additions are imported automatically from the SCOWL-derived
 [wooorm English dictionary](https://github.com/wooorm/dictionaries/tree/8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/en).

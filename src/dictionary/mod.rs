@@ -1412,6 +1412,9 @@ mod tests {
         let mut missed = Vec::new();
         let mut wrong = Vec::new();
         let mut regressions = Vec::new();
+        let mut history = History::default();
+        let mut sequence = "";
+        let mut previous_mode = false;
         for (line, row) in include_str!("../../tests/data/corrections.tsv")
             .lines()
             .enumerate()
@@ -1421,8 +1424,8 @@ mod tests {
             }
             let fields: Vec<_> = row.split('\t').collect();
             assert!(
-                matches!(fields.len(), 4 | 5),
-                "corpus line {} must have four columns, optionally a known-failure baseline",
+                matches!(fields.len(), 4 | 5 | 7),
+                "corpus line {} needs four columns, optionally baseline, sequence and mode",
                 line + 1
             );
             let current = match fields[0] {
@@ -1431,6 +1434,20 @@ mod tests {
                 other => panic!("invalid layout {other}"),
             };
             let (en_text, he_text, expected) = (fields[1], fields[2], fields[3]);
+            let next_sequence = fields.get(5).copied().unwrap_or("");
+            let layout_only = match fields.get(6).copied().unwrap_or("full") {
+                "full" => false,
+                "layout-only" => true,
+                other => panic!("invalid corpus application mode {other}"),
+            };
+            // Each named sequence models one text field. Changing the field or
+            // app mode clears context, just as the shared engine does.
+            if next_sequence.is_empty() || next_sequence != sequence || layout_only != previous_mode
+            {
+                history.clear();
+            }
+            sequence = next_sequence;
+            previous_mode = layout_only;
             let before = if current == Language::English {
                 en_text
             } else {
@@ -1458,13 +1475,16 @@ mod tests {
                 |k| Some(k.0),
                 |k| Some(k.1),
                 |k| k.2,
-                Run::default(),
+                history.run(),
                 en_dict(),
                 he_dict(),
                 Some(current),
-                false,
+                layout_only,
                 |_| crate::layout::LayoutSwitch::Switched,
             );
+            if let Some(lang) = result.lang {
+                history.push(lang);
+            }
             let after = match result.fix {
                 None => before.to_string(),
                 Some(
@@ -1482,7 +1502,11 @@ mod tests {
             );
             // Desired results still count toward accuracy. A documented existing
             // failure gets an exact baseline so new damage cannot hide in a budget.
-            let baseline = fields.get(4).copied().unwrap_or(expected);
+            let baseline = fields
+                .get(4)
+                .copied()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(expected);
             if after != baseline {
                 regressions.push(format!(
                     "{detail}; baseline {baseline:?} (remove baseline if fixed)"

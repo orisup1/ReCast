@@ -3,6 +3,9 @@
 # Unchanged expectations protect text; changed expectations measure useful fixes.
 # Optional fifth column: exact existing failure, not the desired result. It still
 # counts as an accuracy error; remove this column when the defect is fixed.
+# Seven-column rows add sequence and mode (full/layout-only) after the baseline.
+# Empty baseline means expected. Consecutive rows in a sequence share language
+# history; a different sequence or app mode resets it, matching the engine.
 en	hello	יקךךם	hello
 en	github	עןאיונ	github
 en	async	שדטמב	async
@@ -209,3 +212,201 @@ en	accomodate	שבבםצםגשאק	accommodate
 he	accomodate	שבבםצםגשאק	accommodate
 en	untill	ומאןךך	until
 he	untill	ומאןךך	until
+
+# Technical vocabulary: lowercase words must survive automatic correction.
+en	ansible	שמדןנךק	ansible
+en	argparse	שרעפשרדק	argparse
+en	asyncio	שדטמבןם	asyncio
+en	async	שדטמב	async
+en	await	ש'שןא	await
+en	backend	נשבלקמג	backend
+en	backends	נשבלקמגד	backends
+en	bitbucket	נןאנובלקא	bitbucket
+en	bootstrap	נםםאדארשפ	bootstrap
+en	bytecode	נטאקבםגק	bytecode
+en	callback	בשךךנשבל	callback
+en	callbacks	בשךךנשבלד	callbacks
+en	chmod	ביצםג	chmod
+en	chown	בים'מ	chown
+en	codebase	בםגקנשדק	codebase
+en	coroutine	בםרםואןמק	coroutine
+en	coroutines	בםרםואןמקד	coroutines
+en	dataclass	גשאשבךשדד	dataclass
+en	dataframe	גשאשכרשצק	dataframe
+en	deadlock	גקשגךםבל	deadlock
+en	debounce	גקנםומבק	debounce
+en	deserialize	גקדקרןשךןזק	deserialize
+en	deserialization	גקדקרןשךןזשאןםמ	deserialization
+en	devops	גקהםפד	devops
+en	docker	גםבלקר	docker
+en	dotenv	גםאקמה	dotenv
+en	elasticsearch	קךשדאןבדקשרבי	elasticsearch
+en	enum	קמוצ	enum
+en	enums	קמוצד	enums
+en	fastapi	כשדאשפן	fastapi
+en	frontend	כרםמאקמג	frontend
+en	frontends	כרםמאקמגד	frontends
+en	github	עןאיונ	github
+en	gitlab	עןאךשנ	gitlab
+en	golang	עםךשמע	golang
+en	grafana	ערשכשמש	grafana
+en	graphql	ערשפי/ך	graphql
+en	grpc	ערפב	grpc
+en	hashcode	ישדיבםגק	hashcode
+en	hashmap	ישדיצשפ	hashmap
+en	hashmaps	ישדיצשפד	hashmaps
+en	hashset	ישדידקא	hashset
+en	hostname	יםדאמשצק	hostname
+en	http	יאאפ	http
+en	https	יאאפד	https
+en	idempotent	ןגקצפםאקמא	idempotent
+en	instanceof	ןמדאשמבקםכ	instanceof
+en	javascript	חשהשדברןפא	javascript
+en	json	חדםמ	json
+en	junit	חומןא	junit
+en	keymap	לקטצשפ	keymap
+en	keymaps	לקטצשפד	keymaps
+en	kotlin	לםאךןמ	kotlin
+en	kubectl	לונקבאך	kubectl
+en	kubernetes	לונקרמקאקד	kubernetes
+en	localhost	ךםבשךיםדא	localhost
+en	lockfile	ךםבלכןךק	lockfile
+en	mariadb	צשרןשגנ	mariadb
+en	middleware	צןגגךק'שרק	middleware
+en	mongodb	צםמעםגנ	mongodb
+en	mutex	צואקס	mutex
+en	mysql	צטד/ך	mysql
+en	namespace	משצקדפשבק	namespace
+en	namespaces	משצקדפשבקד	namespaces
+en	nginx	מעןמס	nginx
+en	nodejs	מםגקחד	nodejs
+en	noexcept	מםקסבקפא	noexcept
+en	nosql	מםד/ך	nosql
+en	numpy	מוצפט	numpy
+en	oauth	םשואי	oauth
+en	observability	םנדקרהשנןךןאט	observability
+en	openapi	םפקמשפן	openapi
+en	openid	םפקמןג	openid
+en	opensearch	םפקמדקשרבי	opensearch
+en	pathlib	פשאיךןנ	pathlib
+en	pipenv	פןפקמה	pipenv
+en	podman	פםגצשמ	podman
+en	postgres	פםדאערקד	postgres
+en	postgresql	פםדאערקד/ך	postgresql
+en	protobuf	פרםאםנוכ	protobuf
+en	pydantic	פטגשמאןב	pydantic
+en	pyproject	פטפרםחקבא	pyproject
+en	pytest	פטאקדא	pytest
+en	pythonic	פטאיםמןב	pythonic
+en	reactjs	רקשבאחד	reactjs
+en	readonly	רקשגםמךט	readonly
+en	redis	רקגןד	redis
+en	refactor	רקכשבאםר	refactor
+en	refactoring	רקכשבאםרןמע	refactoring
+en	regex	רקעקס	regex
+en	regexp	רקעקספ	regexp
+en	restapi	רקדאשפן	restapi
+en	restful	רקדאכוך	restful
+en	rustacean	רודאשבקשמ	rustacean
+en	rustfmt	רודאכצא	rustfmt
+en	serde	דקרגק	serde
+en	serverless	דקרהקרךקדד	serverless
+en	sqlalchemy	ד/ךשךביקצט	sqlalchemy
+en	sqlite	ד/ךןאק	sqlite
+en	stacktrace	דאשבלארשבק	stacktrace
+en	stdlib	דאגךןנ	stdlib
+en	subprocess	דונפרםבקדד	subprocess
+en	sudo	דוגם	sudo
+en	syscalls	דטדבשךךד	syscalls
+en	tailwind	אשןך'ןמג	tailwind
+en	terraform	אקררשכםרצ	terraform
+en	tokio	אםלןם	tokio
+en	toml	אםצך	toml
+en	toolchain	אםםךבישןמ	toolchain
+en	traceback	ארשבקנשבל	traceback
+en	transpiler	ארשמדפןךקר	transpiler
+en	typescript	אטפקדברןפא	typescript
+en	uint	וןמא	uint
+en	unicode	ומןבםגק	unicode
+en	unittest	ומןאאקדא	unittest
+en	urlpatterns	ורךפשאאקרמד	urlpatterns
+en	urllib	ורךךןנ	urllib
+en	vite	הןאק	vite
+en	vscode	הדבםגק	vscode
+en	webpack	'קנפשבל	webpack
+en	webhook	'קניםםל	webhook
+en	webhooks	'קניםםלד	webhooks
+en	websocket	'קנדםבלקא	websocket
+en	websockets	'קנדםבלקאד	websockets
+en	yaml	טשצך	yaml
+
+# Language transitions, one-word ambiguity, focus resets, and application modes.
+he	akuo	שלום	שלום		he-run	full
+he	,usv	תודה	תודה		he-run	full
+en	go	עם	עם		he-run	full
+en	hello	יקךךם	hello		he-run	full
+en	keyboard	לקטנםשרג	keyboard		he-run	full
+he	to	אם	to		he-run	full
+he	akuo	שלום	שלום		one-he-word	full
+en	go	עם	go		one-he-word	full
+en	hello	יקךךם	hello		en-run	full
+en	keyboard	לקטנםשרג	keyboard		en-run	full
+he	to	אם	to		en-run	full
+he	akuo	שלום	שלום		en-run	full
+he	,usv	תודה	תודה		en-run	full
+en	go	עם	עם		en-run	full
+en	go	עם	go		new-field	full
+he	to	אם	אם		new-field	full
+en	recieve	רקבןקהק	recieve		layout-mode	layout-only
+en	akuo	שלום	שלום		layout-mode	layout-only
+he	hello	יקךךם	hello		layout-mode	layout-only
+he	recieve	רקבןקהק	רקבןקהק		layout-mode	layout-only
+en	teh	אקי	teh		layout-mode	layout-only
+en	Recieve	רקבןקהק	Recieve		layout-mode	layout-only
+he	akuo	שלום	שלום		mode-change	full
+he	,usv	תודה	תודה		mode-change	full
+en	go	עם	go		mode-change	layout-only
+en	recieve	רקבןקהק	receive		mode-change	full
+he	akuo	שלום	שלום		jargon-in-he-run	full
+he	,usv	תודה	תודה		jargon-in-he-run	full
+en	backend	נשבלקמג	backend		jargon-in-he-run	full
+en	mutex	צואקס	mutex		jargon-in-he-run	full
+en	serde	דקרגק	serde		jargon-in-he-run	full
+en	sudo	דוגם	sudo		jargon-in-he-run	full
+en	hello	יקךךם	hello		names	full
+en	keyboard	לקטנםשרג	keyboard		names	full
+en	supino	דופןמם	supino		names	full
+en	sami	דשצן	sami		names	full
+he	akuo	שלום	שלום		names	full
+he	akuo	שלום	שלום		he-layout-only	layout-only
+he	,usv	תודה	תודה		he-layout-only	layout-only
+en	go	עם	עם		he-layout-only	layout-only
+
+# Technical additions also restore wrong-layout text and preserve case.
+he	backend	נשבלקמג	backend
+he	mutex	צואקס	mutex
+he	serde	דקרגק	serde
+he	postgres	פםדאערקד	postgres
+he	typescript	אטפקדברןפא	typescript
+he	webhook	'קניםםל	webhook
+he	kubernetes	לונקרמקאקד	kubernetes
+he	devops	גקהםפד	devops
+he	graphql	ערשפי/ך	graphql
+he	json	חדםמ	json
+he	yaml	טשצך	yaml
+he	tokio	אםלןם	tokio
+he	refactor	רקכשבאםר	refactor
+he	hostname	יםדאמשצק	hostname
+he	redis	רקגןד	redis
+he	toml	אםצך	toml
+he	sudo	דוגם	דוגם
+en	Backend	נשבלקמג	Backend
+en	Mutex	צואקס	Mutex
+en	Serde	דקרגק	Serde
+en	TypeScript	אטפקדברןפא	TypeScript
+en	GraphQL	ערשפי/ך	GraphQL
+en	PostgreSQL	פםדאערקד/ך	PostgreSQL
+en	JSON	חדםמ	JSON
+en	YAML	טשצך	YAML
+en	SUDO	דוגם	SUDO
+en	Redis!	רקגןד!	Redis!
