@@ -198,7 +198,7 @@ pub fn attach_parent_console() {
 /// main thread to the tray (or the TUI with `--gui`). Keeping it here means
 /// changes to the Windows launch path can't touch the Linux or macOS paths.
 pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
-    super::start_background_tasks();
+    super::start_background_tasks(&control);
     if with_gui {
         let listener_control = Arc::clone(&control);
         thread::spawn(move || {

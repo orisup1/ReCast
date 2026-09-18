@@ -21,11 +21,7 @@
 
 /// Resident set size in bytes, if the OS will tell us cheaply.
 ///
-/// Linux only. macOS and Windows both have an answer — `task_info` and
-/// `GetProcessMemoryInfo` — but each costs an FFI surface and a dependency
-/// feature for a number that is only ever displayed, and the daemon case this
-/// exists for is the Linux one. `None` is reported as "unknown" rather than
-/// guessed at.
+/// Read the current process so live status reports the daemon's own footprint.
 pub fn rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -36,7 +32,39 @@ pub fn rss_bytes() -> Option<u64> {
         let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         Some(kb * 1024)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        use nix::libc;
+        let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        #[allow(deprecated)]
+        let result = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                libc::MACH_TASK_BASIC_INFO,
+                info.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        (result == libc::KERN_SUCCESS).then(|| unsafe { info.assume_init().resident_size })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use winapi::um::{
+            processthreadsapi::GetCurrentProcess,
+            psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        };
+        let mut info = std::mem::MaybeUninit::<PROCESS_MEMORY_COUNTERS>::zeroed();
+        let result = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                info.as_mut_ptr(),
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        };
+        (result != 0).then(|| unsafe { info.assume_init().WorkingSetSize as u64 })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         None
     }
@@ -46,6 +74,11 @@ pub fn rss_bytes() -> Option<u64> {
 pub fn rss_human() -> Option<String> {
     let bytes = rss_bytes()?;
     Some(format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)))
+}
+
+#[test]
+fn current_process_has_resident_memory() {
+    assert!(rss_bytes().is_some_and(|bytes| bytes > 0));
 }
 
 /// The ceiling ReCast is expected to stay under, whatever it is asked to do.

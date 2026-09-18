@@ -208,7 +208,7 @@ pub fn start(
     if !with_window && !with_gui && !with_foreground && !under_systemd {
         crate::daemon::daemonize();
     }
-    super::start_background_tasks();
+    super::start_background_tasks(&control);
 
     if with_window {
         // Control window: eframe owns the main thread, listener runs in the

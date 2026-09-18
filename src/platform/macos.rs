@@ -512,7 +512,7 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
     if !setup_guidance() {
         return;
     }
-    super::start_background_tasks();
+    super::start_background_tasks(&control);
     // The event tap must live on the main run loop (see `setup_event_tap`), so
     // a main-thread TUI can't coexist with it — the tray is the UI here.
     if with_gui {

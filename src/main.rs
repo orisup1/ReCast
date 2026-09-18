@@ -30,6 +30,7 @@ mod practice;
 mod prefs;
 mod settings;
 mod spell;
+mod status;
 mod timing;
 mod types;
 // The terminal dashboard is Linux/Windows only: on macOS the event tap owns the
@@ -180,8 +181,7 @@ fn main() {
             "-f" | "--foreground" => with_foreground = true,
             "--keep-others" => keep_others = true,
             "--status" => {
-                require_readable_config();
-                print_status();
+                status::print();
                 return;
             }
             "--write-config" => {
@@ -351,128 +351,5 @@ fn require_readable_config() {
     if let Err(error) = settings::check_readable() {
         eprintln!("{error}; refusing to discard configured settings.");
         process::exit(1);
-    }
-}
-
-/// Report running state and this invocation's settings, without needing a daemon.
-fn print_status() {
-    println!("recast {}", env!("CARGO_PKG_VERSION"));
-    println!("Settings, layout backend, and memory below describe this status process, not the running daemon.");
-
-    // Linux and macOS write a pidfile, so both can answer this from disk
-    // without attaching to anything. Windows does not: its instance is found
-    // through the process table instead, which `--status` does not walk.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    match daemon::running_pid() {
-        Some(pid) => println!("  running:        yes (pid {pid})"),
-        None => println!("  running:        no"),
-    }
-
-    println!(
-        "  correction:     {}",
-        if prefs::load_enabled() {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    // The layout pipeline is the headline feature and the one that can be
-    // silently unavailable: on a Linux session ReCast cannot drive, mistyped
-    // words go through untouched and nothing else says why.
-    println!("  layout switch:  {}", layout::describe_backend());
-    match prefs::autostart_enabled() {
-        Some(true) => println!("  start at login: yes"),
-        Some(false) => println!("  start at login: no"),
-        None => {}
-    }
-    match complete::config_dir() {
-        Some(dir) => println!("  config dir:     {}", dir.display()),
-        None => println!("  config dir:     (none — no OS config directory)"),
-    }
-    // Whether the file exists is the first thing to check when a setting in it
-    // did nothing, and the most likely answer is that it is somewhere else.
-    match settings::file_path() {
-        Some(path) if path.exists() => println!("  config.toml:    {}", path.display()),
-        Some(path) => println!(
-            "  config.toml:    none ({} — --write-config makes one)",
-            path.display()
-        ),
-        None => println!("  config.toml:    (none — no OS config directory)"),
-    }
-    let (abbrevs, ignored, learned) = complete::list_counts();
-    println!("  abbrev.txt:     {abbrevs} abbreviation(s)");
-    println!("  ignore.txt:     {ignored} word(s)");
-    println!("  learned.txt:    {learned} word(s) retired by undo");
-    // This process, not the daemon's — `--status` is a separate invocation and
-    // cannot see the running one's figure. Still worth showing: it is the same
-    // binary doing the same page-faulting, so it answers "roughly what does
-    // this cost" without attaching to anything.
-    if let Some(rss) = footprint::rss_human() {
-        println!("  memory (this):  {rss}");
-    }
-
-    // The other half of "is it configured the way I think it is". Every one of
-    // these can be overridden from the environment and none of them used to be
-    // reported, so someone who set RECAST_SPELL_DIST had no way to confirm it
-    // had been read — least of all when the value was a typo and had silently
-    // fallen back to the default.
-    let cfg = config::Config::from_env();
-    println!("\n  settings (this process; config.toml and RECAST_* applied):");
-    println!(
-        "    excluded apps        {}",
-        if cfg.excluded_apps.is_empty() {
-            "none".to_string()
-        } else {
-            cfg.excluded_apps.join(", ")
-        }
-    );
-    println!(
-        "    layout-only apps     {}",
-        if cfg.layout_only_apps.is_empty() {
-            "none".into()
-        } else {
-            cfg.layout_only_apps.join(", ")
-        }
-    );
-    println!(
-        "    extra undo shortcut  {}",
-        crate::practice::shortcut_label(&cfg.undo_shortcut)
-    );
-    println!("    short words          {}", on_off(cfg.short_enabled));
-    println!("    missing-space split  {}", on_off(cfg.split_enabled));
-    println!("    frequency tie-break  {}", on_off(cfg.freq_enabled));
-    println!(
-        "    spelling             {}  (min length {}, max rank {}, max distance {})",
-        on_off(cfg.spell_enabled),
-        cfg.spell_min_len,
-        cfg.spell_max_rank,
-        cfg.spell_max_dist,
-    );
-    println!(
-        "    auto-complete        {}  (min prefix {}, max rank {})",
-        on_off(cfg.complete_enabled),
-        cfg.complete_min_len,
-        cfg.complete_max_rank,
-    );
-    println!(
-        "    personalization      {}{}",
-        on_off(cfg.personal_enabled),
-        personal::data_dir()
-            .map(|path| format!("  ({})", path.display()))
-            .unwrap_or_default(),
-    );
-
-    for complaint in
-        settings::complaints(config::NUMERIC_KEYS, config::BOOLEAN_KEYS, config::ALL_KEYS)
-    {
-        eprintln!("\n  ! {complaint}");
-    }
-}
-
-fn on_off(value: bool) -> &'static str {
-    if value {
-        "on"
-    } else {
-        "off"
     }
 }

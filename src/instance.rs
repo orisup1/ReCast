@@ -51,6 +51,11 @@ const FORCE_GRACE: Duration = Duration::from_millis(500);
 /// it is tight; the loop costs one cheap liveness check per tick.
 const POLL: Duration = Duration::from_millis(20);
 
+/// Discover running copies without signalling them, including Windows and GUI modes.
+pub fn running_pids() -> Vec<u32> {
+    imp::peers()
+}
+
 /// What happened to one previously-running instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {

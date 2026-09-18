@@ -1,5 +1,19 @@
 use std::process::Command;
 
+// A unique executable name keeps status tests from discovering a developer's
+// actual ReCast instance or another CLI test running in parallel.
+fn isolated_binary(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("recast-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!(
+        "rc-{}-{name}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::copy(env!("CARGO_BIN_EXE_recast"), &path).unwrap();
+    path
+}
+
 #[test]
 fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     let dir = std::env::temp_dir().join(format!("recast-explain-{}", std::process::id()));
@@ -151,8 +165,9 @@ fn cli_reports_version_help_and_bad_options() {
 
 #[test]
 fn status_reports_numeric_fallbacks_and_application_exclusions() {
+    let binary = isolated_binary("status");
     for value in ["4", "256", "-1", "l"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_recast"))
+        let output = Command::new(&binary)
             .arg("--status")
             .env("RECAST_LAYOUT_BACKEND", "none")
             .env("RECAST_SPELL_DIST", value)
@@ -170,7 +185,7 @@ fn status_reports_numeric_fallbacks_and_application_exclusions() {
         assert!(stderr.contains("RECAST_SPELL_DIST="), "{stderr}");
         assert!(stderr.contains("RECAST_COMPLETE_RANK="), "{stderr}");
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_recast"))
+    let output = Command::new(&binary)
         .arg("--status")
         .env("RECAST_LAYOUT_BACKEND", "none")
         .env("RECAST_SPELL_DIST", "0")
@@ -179,15 +194,17 @@ fn status_reports_numeric_fallbacks_and_application_exclusions() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("max distance 0)"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("RECAST_SPELL_DIST="));
+    std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn unreadable_config_stops_startup_and_status_but_not_help() {
+    let binary = isolated_binary("config");
     let dir = std::env::temp_dir().join(format!("recast-cli-config-read-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("recast/config.toml")).unwrap();
     for arg in ["--foreground", "--status", "--help"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_recast"))
+        let output = Command::new(&binary)
             .env("XDG_CONFIG_HOME", &dir)
             .arg(arg)
             .output()
@@ -201,6 +218,7 @@ fn unreadable_config_stops_startup_and_status_but_not_help() {
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
 }
 
 #[cfg(target_os = "linux")]

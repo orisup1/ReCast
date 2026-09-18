@@ -179,27 +179,11 @@ fn our_name() -> String {
         .unwrap_or_else(|| "recast".to_string())
 }
 
-/// The PID of a running instance, if there is one.
-///
-/// Linux and macOS, the two that write a pidfile; on Windows the OS is the
-/// thing that knows. A stale pidfile left by a killed process reads as "not
-/// running", which is what the user means by the question.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn running_pid() -> Option<u32> {
-    let pid: u32 = fs::read_to_string(pidfile_path()?)
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    is_our_process(pid).then_some(pid)
-}
-
 /// Remove the pidfile if — and only if — it names `pid`.
 ///
 /// For whoever stopped that process to call afterwards. The daemon cannot clean
 /// up after itself here: it is stopped by a signal it does not handle, so it
-/// never gets the chance, and the file it leaves behind is what makes
-/// `running_pid` (and so `--status`) claim a daemon that is not there.
+/// never gets the chance, leaving a stale entry for the next stop command.
 ///
 /// The equality test is the whole point. A blind `remove_file` would delete the
 /// *new* instance's pidfile in the ordinary case, because by the time an
