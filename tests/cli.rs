@@ -43,6 +43,13 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     };
     for (word, layout, expected, reason) in [
         ("recieve", "en", "receive", "English spelling"),
+        ("thos", "en", "this", "English spelling"),
+        (
+            "איםד",
+            "he",
+            "this",
+            "Keyboard-layout correction with spelling",
+        ),
         ("Recieve!", "en", "Receive!", "English spelling"),
         ("akuo", "en", "שלום", "Keyboard-layout correction"),
         ("יקךךם", "he", "hello", "Keyboard-layout correction"),

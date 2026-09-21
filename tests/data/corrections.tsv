@@ -410,3 +410,11 @@ en	JSON	חדםמ	JSON
 en	YAML	טשצך	YAML
 en	SUDO	דוגם	SUDO
 en	Redis!	רקגןד!	Redis!
+
+# Rare dictionary typos and discounted multi-letter edits compose with layout repair.
+en	thos	איםד	this
+he	thos	איםד	this
+en	Thos!	איםד!	This!
+he	Thos!	איםד!	This!
+en	commmittteee	בםצצצןאאאקקק	committee
+he	commmittteee	בםצצצןאאאקקק	committee

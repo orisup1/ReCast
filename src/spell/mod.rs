@@ -46,7 +46,8 @@
 //! word. So the posterior only ranks candidates that have already cleared a set
 //! of hard gates:
 //!
-//! * the typed word is not itself an English word (the caller guarantees this),
+//! * dictionary words seen in the frequency corpus are protected; unobserved
+//!   entries require a cheap edit into a very common word,
 //! * it is not a token the corpus sees often enough to be deliberate — a name
 //!   or a handle rather than a typo (see [`correct_with`]),
 //! * it is long enough to be a real typo rather than an initialism (`min_len`),
@@ -225,11 +226,17 @@ pub fn correct_with(
     {
         return Some("the".into());
     }
-    let budget = budget_for(word, min_len, max_dist)?;
-    // A word we already know is never a typo. The caller normally checks this
-    // too, but it is cheap and this must never "correct" a valid word.
+    let mut budget = budget_for(word, min_len, max_dist)?;
+    let mut max_rank = max_rank;
+    // Broad dictionaries include archaic forms and abbreviations that also
+    // look like everyday slips. Only reconsider unobserved entries, requiring
+    // a cheap edit into a very common word; corpus-attested words stay intact.
     if en_dict.contains(word) {
-        return None;
+        if en_freq.rank(word).is_some() {
+            return None;
+        }
+        budget = budget.min(COST_VOWEL);
+        max_rank = max_rank.min(1_000);
     }
     // Not in the dictionary, but common enough in the corpus that people
     // clearly type it on purpose: names and internet spellings ("sami", "ori",
@@ -300,7 +307,7 @@ impl Search<'_> {
         if rank > self.max_rank {
             return;
         }
-        let len_gap = cb.len().abs_diff(self.typed.len()) as u32 * COST_EDIT;
+        let len_gap = cb.len().abs_diff(self.typed.len()) as u32 * COST_DOUBLE;
         if len_gap > self.budget || bag_bound(&self.typed_letters, cb) > self.budget {
             return;
         }
@@ -921,6 +928,42 @@ mod tests {
     }
 
     #[test]
+    fn rare_dictionary_entries_need_strong_frequency_and_edit_evidence() {
+        let d = dict(&["thos", "this", "helo", "hello", "form", "from"]);
+        let f = freq(&[("this", 16), ("hello", 500), ("from", 20), ("form", 40_000)]);
+        assert_eq!(fix("thos", d, f).as_deref(), Some("this"));
+        assert_eq!(fix("helo", d, f).as_deref(), Some("hello"));
+        assert_eq!(fix("form", d, f), None, "attested rare words stay intact");
+        assert_eq!(fix("helo", d, freq(&[("hello", 1_001)])), None);
+        assert_eq!(correct_with("thos", d, f, 4, 10, 2), None);
+        assert_eq!(correct_with("thos", d, f, 5, 20_000, 2), None);
+        assert_eq!(correct_with("thos", d, f, 4, 20_000, 0), None);
+    }
+
+    #[test]
+    fn length_pruning_keeps_discounted_insertions_and_deletions() {
+        for (typed, intended) in [
+            ("baloons", "balloons"),
+            ("commmittee", "committee"),
+            ("comittee", "committee"),
+            ("comitte", "committee"),
+            ("committteee", "committee"),
+        ] {
+            let d = dict(&[intended]);
+            let f = freq(&[(intended, 100)]);
+            assert_eq!(fix(typed, d, f).as_deref(), Some(intended), "{typed}");
+        }
+        // Three discounted deletions fit a long word's budget; three full
+        // edits (the former length filter) did not fit the configured limit.
+        let d = dict(&["committee"]);
+        let f = freq(&[("committee", 100)]);
+        assert_eq!(
+            correct_with("commmittteee", d, f, 4, 20_000, 2).as_deref(),
+            Some("committee")
+        );
+    }
+
+    #[test]
     fn corrects_a_one_letter_typo() {
         let d = dict(&["hello", "hell"]);
         let f = freq(&[("hello", 500), ("hell", 4000)]);
@@ -1231,6 +1274,7 @@ mod tests {
         // distance would have accepted, so check it against the matrix itself.
         let mut dp = Dp::default();
         for (a, b) in [
+            ("thos", "this"),
             ("helo", "hello"),
             ("hellp", "help"),
             ("theri", "their"),
@@ -1444,6 +1488,7 @@ mod real_data {
     #[test]
     fn fixes_everyday_typos() {
         for (typo, want) in [
+            ("thos", "this"),
             ("helo", "hello"),
             ("hellp", "help"),
             ("recieve", "receive"),

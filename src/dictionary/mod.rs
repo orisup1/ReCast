@@ -886,6 +886,15 @@ fn plan(
         None => decide_unknown(word_en, word_he, run, en_dict, he_dict, en_freq, he_freq),
     };
     if let Some(lang) = whole {
+        // A layout hit may itself be a rare dictionary spelling of a typo.
+        // Compose both changes before injection, preserving one-step undo.
+        if lang == Language::English && !layout_only {
+            if let Some(spelling) =
+                plan_spelling(word_en, word_he, current, case, en_dict, he_dict, en_freq)
+            {
+                return Some(spelling);
+            }
+        }
         return Some(Plan::Switch { lang, start: 0 });
     }
 
@@ -2175,6 +2184,25 @@ mod tests {
                 }),
                 "{typed} should pass through both pipelines"
             );
+        }
+    }
+
+    #[test]
+    fn rare_dictionary_typos_stack_without_word_specific_rules() {
+        for letter in b'a'..=b'z' {
+            let letter = char::from(letter);
+            let corrected = format!("ba{letter}{letter}er");
+            let typed = format!("ba{letter}er");
+            let en = dict(&[&typed, &corrected]);
+            let he = dict(&[]);
+            let en_f = freq(&[(&corrected, 100)]);
+            for current in [Language::English, Language::Hebrew] {
+                assert_eq!(
+                    plan_for(&typed, "טקסט", Some(current), en, he, en_f),
+                    Some(compose_spelling(current, corrected.clone())),
+                    "{typed} in {current:?}"
+                );
+            }
         }
     }
 
