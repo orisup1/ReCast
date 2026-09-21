@@ -55,10 +55,17 @@ make app
 
 Setup opens on first launch or whenever a requirement is missing. It checks
 **Accessibility** and both keyboards, links to System Settings, and offers
-**Check again**. A separate Input Monitoring entry is not required by setup.
+**Check again**. Keyboard capture uses an active session event tap authorized by
+Accessibility, so a separate Input Monitoring grant is not required.
 If ReCast is missing from Accessibility, click **+**, then **Cmd+Shift+G**, and enter
 the exact path shown in setup. **Show ReCast in Finder** reveals that copy.
 Quit and reopen ReCast if permission changes require a relaunch.
+
+For a release smoke test, use a fresh macOS account, install the downloaded app
+in `/Applications`, and grant only Accessibility. Leave Input Monitoring off.
+Enable English and Hebrew keyboards, reopen ReCast, and verify correction, undo,
+and completion in TextEdit. Quit and reopen once more to check that access persists.
+Automated tests cannot verify macOS privacy grants for a downloaded app.
 
 Use **Start at login** in the menubar menu for autostart. Alternatively,
 `make service` installs a bare binary with a launchd LaunchAgent;

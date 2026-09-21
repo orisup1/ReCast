@@ -163,8 +163,11 @@ type CGEventSourceRef = *mut c_void;
 type CFIndex = isize;
 
 const KCG_HID_EVENT_TAP: u32 = 0;
+const KCG_SESSION_EVENT_TAP: u32 = 1;
 const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
-const KCG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+// Active taps use Accessibility authorization. Listen-only taps use Input
+// Monitoring. Our callback still returns every event unchanged.
+const KCG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
 const KCG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const KCG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
@@ -202,7 +205,6 @@ const RECAST_EVENT: i64 = 0x5245_4341_5354;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn CGRequestListenEventAccess() -> bool;
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -249,9 +251,9 @@ extern "C" {
 /// focus right now.
 ///
 /// While it does, ReCast stops looking at the keyboard entirely: the buffer is
-/// dropped, nothing is checked, nothing is corrected. The tap is listen-only
-/// and macOS already withholds the characters, but "we couldn't have read it
-/// anyway" is a weaker promise than not being in the loop at all — and the
+/// dropped, nothing is checked, nothing is corrected. macOS already withholds
+/// the characters, but "we couldn't have read it anyway" is a weaker promise
+/// than not being in the loop at all — and the
 /// visible half matters too, since a correction firing inside a password field
 /// would rewrite a password on the strength of a dictionary lookup.
 ///
@@ -593,8 +595,7 @@ pub fn setup_guidance() -> bool {
     loop {
         let accessibility = unsafe { AXIsProcessTrusted() != 0 };
         let (english, hebrew) = crate::layout::enabled_languages();
-        // Accessibility grants both event posting and listening. Requiring an
-        // additional Input Monitoring entry can strand an already-authorized app.
+        // The active session tap and event posting both use Accessibility.
         let ready = accessibility && english && hebrew;
         if ready && !first {
             return true;
@@ -673,8 +674,7 @@ pub fn setup_event_tap(
     he_dict: Dict,
     control: Arc<AppControl>,
 ) -> Option<EventTapHandle> {
-    // A listen-only tap can succeed without Accessibility, but focus checks
-    // then fail and every correction is discarded. Ask before starting capture.
+    // Capture, focus checks, and injection all require Accessibility.
     if !request_accessibility() {
         eprintln!(
             "ReCast needs Accessibility access to correct words. Enable ReCast in \
@@ -695,18 +695,18 @@ pub fn setup_event_tap(
 
     unsafe {
         let tap = CGEventTapCreate(
-            KCG_HID_EVENT_TAP,
+            KCG_SESSION_EVENT_TAP,
             KCG_HEAD_INSERT_EVENT_TAP,
-            KCG_EVENT_TAP_OPTION_LISTEN_ONLY,
+            KCG_EVENT_TAP_OPTION_DEFAULT,
             EVENT_MASK,
             tap_callback,
             std::ptr::null_mut(),
         );
         if tap.is_null() {
-            CGRequestListenEventAccess();
             eprintln!(
-                "Could not create event tap. Grant 'Input Monitoring' permission \
-                 in System Settings > Privacy & Security, then relaunch."
+                "Could not create event tap. Quit and reopen ReCast after granting \
+                 Accessibility access. If an older entry is enabled, remove it and \
+                 add this copy again in System Settings > Privacy & Security > Accessibility."
             );
             return None;
         }
