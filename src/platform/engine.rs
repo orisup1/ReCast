@@ -2469,11 +2469,15 @@ mod tests {
             .control
             .listener_ready
             .store(true, Ordering::Relaxed);
-        assert!(crate::platform::status_for::<Simulated>(&s.engine.control)
-            .starts_with("Paused in editor"));
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, None)
+                .starts_with("Paused in editor")
+        );
         // The existing status poll notices leaving even without a keystroke.
         FOCUS.store(2, Ordering::SeqCst);
-        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).starts_with("Ready"));
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, None).starts_with("Active")
+        );
         assert!(s.engine.control.paused_app().is_none());
         FOCUS.store(1, Ordering::SeqCst);
         s.type_text(" recieve ");
@@ -2512,28 +2516,82 @@ mod tests {
             .control
             .listener_ready
             .store(true, Ordering::Relaxed);
-        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).contains("layout only"));
+        let application = ("Text Editor".into(), "editor".into());
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, Some(&application))
+                .starts_with("Active in Text Editor · Layout only —")
+        );
+        let stale_application = ("Other App".into(), "other".into());
+        assert!(crate::platform::status_for::<Simulated>(
+            &s.engine.control,
+            Some(&stale_application)
+        )
+        .starts_with("Active in Editor · Layout only —"));
         SIMULATED_LAYOUT.store(2, Ordering::SeqCst);
-        assert!(crate::platform::status_for::<Simulated>(&s.engine.control)
-            .starts_with("Keyboard layout unavailable"));
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, None)
+                .starts_with("Keyboard layout unavailable")
+        );
         SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
         FOCUS.store(0, Ordering::SeqCst);
         assert!(
-            crate::platform::status_for::<Simulated>(&s.engine.control).contains("Cannot identify")
+            crate::platform::status_for::<Simulated>(&s.engine.control, None)
+                .starts_with("Text focus unavailable —")
         );
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, Some(&application))
+                .starts_with("Enabled in Text Editor · Layout only —")
+        );
+        lock_forgiving(&s.engine.control.layout_only_apps).clear();
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, Some(&application))
+                .starts_with("Enabled in Text Editor · Full correction —")
+        );
+        s.type_text(" recieve ");
+        assert!(
+            !s.engine.lock().is_replacing,
+            "status must not bypass missing focus"
+        );
+        *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()];
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, Some(&application))
+                .starts_with("Excluded application —")
+        );
+        lock_forgiving(&s.engine.control.excluded_apps).clear();
+        // Knowing the frontmost app is not permission to bypass missing focus
+        // or end a pause whose actual focused application is still unknown.
+        s.engine.control.pause_in_app("secret.exe");
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, Some(&application))
+                .starts_with("Paused in secret.exe")
+        );
+        assert_eq!(s.engine.control.paused_app().as_deref(), Some("secret.exe"));
+        s.engine.control.resume_app();
         FOCUS.store(1, Ordering::SeqCst);
 
         // Single-tap undo uses the same focus and modifier-chord guards.
         INPUT_ALLOWED.store(false, Ordering::SeqCst);
         assert!(
-            crate::platform::status_for::<Simulated>(&s.engine.control).contains("Secure Input")
+            crate::platform::status_for::<Simulated>(&s.engine.control, None)
+                .contains("Secure Input")
         );
         INPUT_ALLOWED.store(true, Ordering::SeqCst);
         s.engine.control.pause_for(Duration::from_secs(60));
-        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).starts_with("Paused"));
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, None)
+                .starts_with("Paused · 1 min remaining —")
+        );
+        let disabled =
+            AppControl::new_with_config_and_state(crate::config::Config::global(), false);
+        disabled.pause_for(Duration::from_secs(60));
+        assert!(crate::platform::status_for::<Simulated>(&disabled, None)
+            .starts_with("Disabled until you enable it —"));
         s.engine.control.resume();
         *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()];
-        assert!(crate::platform::status_for::<Simulated>(&s.engine.control).starts_with("Excluded"));
+        assert!(
+            crate::platform::status_for::<Simulated>(&s.engine.control, None)
+                .starts_with("Excluded")
+        );
 
         // Layout-only still fixes the layout, but never expands abbreviations.
         ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);

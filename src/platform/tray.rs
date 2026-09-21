@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 // Only the macOS menubar title uses the banner (Windows shows a tooltip).
@@ -46,7 +46,7 @@ pub fn run(control: Arc<AppControl>) {
     // Informational row: what it has done, and how much of that was thrown
     // back at it (see `status_label`).
     let status_item = MenuItem::new(status_label(&control), false, None);
-    let health_menu = Submenu::new("Status", true);
+    let health_menu = Submenu::new("Starting keyboard listener…", true);
     let health_detail = MenuItem::new("Starting keyboard listener…", false, None);
     health_menu
         .append(&health_detail)
@@ -54,7 +54,11 @@ pub fn run(control: Arc<AppControl>) {
     let toggle_item = MenuItem::new(toggle_label(control.is_switched_on()), true, None);
     let pause_item = MenuItem::new(pause_label(None), true, None);
     let app_pause_item = MenuItem::new("Pause in application (waiting for focus)", false, None);
-    let sep = MenuItem::new("", false, None);
+    let pause_menu = Submenu::new("Pause correction", true);
+    pause_menu.append(&pause_item).expect("append timed pause");
+    pause_menu
+        .append(&app_pause_item)
+        .expect("append app pause");
 
     // The recent-corrections list. Silent text replacement is the whole
     // premise of this app, so "what did it just change?" needs an answer that
@@ -148,12 +152,12 @@ pub fn run(control: Arc<AppControl>) {
     let about_item = MenuItem::new("About ReCast", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
-    menu.append(&status_item).expect("append status");
     menu.append(&health_menu).expect("append health");
+    menu.append(&pause_menu).expect("append pause controls");
     menu.append(&toggle_item).expect("append toggle");
-    menu.append(&pause_item).expect("append pause");
-    menu.append(&app_pause_item).expect("append app pause");
-    menu.append(&sep).expect("append separator");
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("append separator");
+    menu.append(&status_item).expect("append status");
     menu.append(&recent_menu).expect("append recent");
     menu.append(&settings_menu).expect("append settings");
     menu.append(&apps_menu).expect("append apps");
@@ -219,8 +223,10 @@ pub fn run(control: Arc<AppControl>) {
         if last_health_check.elapsed() >= STATUS_REFRESH {
             health = super::status(&control);
             let (state, detail) = health.split_once(" — ").unwrap_or((&health, ""));
-            health_menu.set_text(format!("Status: {state}"));
+            health_menu.set_text(state);
             health_detail.set_text(detail);
+            pause_menu.set_text(if control.pause_remaining().is_some() || control.paused_app().is_some() { "Resume / pause correction" } else { "Pause correction" });
+            pause_menu.set_enabled(control.is_switched_on());
             if let Some(tray) = &_tray { let _ = tray.set_tooltip(Some(format!("ReCast — {state}"))); }
             last_health_check = Instant::now();
         }
@@ -302,7 +308,7 @@ pub fn run(control: Arc<AppControl>) {
                 #[allow(unused_mut)]
                 let mut tray_builder = TrayIconBuilder::new()
                     .with_menu(Box::new(menu))
-                    .with_tooltip(tooltip(&control))
+                    .with_tooltip(format!("ReCast — {}", health.split_once(" — ").map_or(health.as_str(), |(state, _)| state)))
                     .with_icon(icon);
 #[cfg(target_os = "macos")]
 {
@@ -351,9 +357,7 @@ pub fn run(control: Arc<AppControl>) {
                 let new_enabled = !control.is_switched_on();
                 control.set_enabled(new_enabled);
                 toggle_item.set_text(toggle_label(new_enabled));
-                // The hover text carries the same state as the menu, so it is
-                // refreshed here rather than waiting for the next timer wake.
-                let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+                last_health_check = Instant::now() - STATUS_REFRESH;
             } else if event.id == app_pause_id {
                 if control.paused_app().is_some() {
                     control.resume_app();
@@ -371,7 +375,7 @@ pub fn run(control: Arc<AppControl>) {
                     control.pause_for(PAUSE_LENGTH);
                 }
                 pause_item.set_text(pause_label(control.pause_remaining()));
-                let _ = _tray.as_ref().map(|t| t.set_tooltip(Some(tooltip(&control))));
+                last_health_check = Instant::now() - STATUS_REFRESH;
             } else if event.id == practice_id {
                 if let Some(practice) = &practice_window {
                     practice.focus();
@@ -581,9 +585,9 @@ fn windows_balloon(tray: &TrayIcon, message: Option<(&str, &str)>) {
 
 fn toggle_label(enabled: bool) -> &'static str {
     if enabled {
-        "Disable"
+        "Disable until I enable it again"
     } else {
-        "Enable"
+        "Enable correction"
     }
 }
 
@@ -626,15 +630,6 @@ fn recent_label(correction: &crate::types::Correction) -> String {
         correction.to,
         correction.kind.tag()
     )
-}
-
-fn tooltip(control: &AppControl) -> String {
-    let state = match control.pause_remaining() {
-        Some(left) => format!("Paused, {} min left", left.as_secs() / 60 + 1),
-        None if control.is_switched_on() => "Enabled".to_string(),
-        None => "Disabled".to_string(),
-    };
-    format!("ReCast - {state} - {} fixed", control.fixed_count())
 }
 
 // Compose a single-line menubar banner: a compact half-block icon strip

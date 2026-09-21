@@ -296,7 +296,12 @@ On **native GNOME/KDE Wayland**, this means correction pauses throughout the ses
 the Linux window disables adding restrictions when detection is unavailable.
 After returning to an allowed app, finish the current word with Space/Enter to resume.
 
-The tray's **Status** submenu and Linux window explain Ready, Disabled, Paused,
+The tray leads with the current status and application mode, with recovery details
+in its submenu. **Pause correction** groups temporary pauses; **Disable until I
+enable it again** persists across restarts. Correction counts appear below these
+controls. The Linux window uses the same status wording and groups pause controls.
+
+The status submenu and Linux window explain Active, Disabled, Paused,
 Excluded application, Secure Input, unavailable keyboard capture, and unknown
 application identity, with a suggested recovery action. Routine corrections stay
 silent. `--status` exposes the same status from the running process.

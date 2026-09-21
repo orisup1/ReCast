@@ -77,7 +77,9 @@ impl eframe::App for App {
                         .color(egui::Color32::LIGHT_GRAY),
                 );
                 ui.add_space(12.0);
-                ui.label(&self.health);
+                let (state, detail) = self.health.split_once(" — ").unwrap_or((&self.health, ""));
+                ui.heading(state);
+                ui.label(detail);
 
                 // Keep the saved switch distinct from the temporary pause.
                 let mut enabled = self.control.is_switched_on();
@@ -92,7 +94,11 @@ impl eframe::App for App {
                 response.on_hover_ui(|ui| {
                     ui.label("Layout switching, spelling and completion — the one switch for all three");
                 });
+                ui.small("Turning this off keeps correction disabled after restarting ReCast.");
 
+                ui.group(|ui| {
+                ui.label("Pause correction");
+                ui.add_enabled_ui(enabled, |ui| {
                 if let Some(left) = self.control.pause_remaining() {
                     if ui.button(format!("Resume (paused, {} min left)", left.as_secs() / 60 + 1)).clicked() {
                         self.control.resume();
@@ -112,11 +118,13 @@ impl eframe::App for App {
                 } else {
                     ui.add_enabled(false, egui::Button::new("Pause in application (waiting for focus)"));
                 }
+                });
+                });
 
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(format!("Words fixed: {}", self.control.fixed_count()))
-                        .size(18.0)
+                        .size(14.0)
                         .color(egui::Color32::LIGHT_GRAY),
                 );
                 // Shown next to the fixed count, and only once there is

@@ -104,25 +104,29 @@ pub fn active_application() -> Option<(String, String)> {
 
 /// Shared status wording for live controls. It never reads the focused text.
 pub fn status(control: &crate::types::AppControl) -> String {
+    let application = active_application();
     #[cfg(target_os = "macos")]
-    return status_for::<macos::Mac>(control);
+    return status_for::<macos::Mac>(control, application.as_ref());
     #[cfg(target_os = "windows")]
-    return status_for::<windows::Windows>(control);
+    return status_for::<windows::Windows>(control, application.as_ref());
     #[cfg(target_os = "linux")]
-    return status_for::<linux::Linux>(control);
+    return status_for::<linux::Linux>(control, application.as_ref());
 }
 
-fn status_for<P: engine::Platform>(control: &crate::types::AppControl) -> String {
+fn status_for<P: engine::Platform>(
+    control: &crate::types::AppControl,
+    application: Option<&(String, String)>,
+) -> String {
     let focus = P::focus();
     let app = focus.as_ref().and_then(P::app_id);
     let mode =
         control.effective_app_mode(app.as_deref(), focus.as_ref().is_some_and(P::is_own_focus));
     if !control.is_switched_on() {
-        return "Disabled — enable correction to resume.".into();
+        return "Disabled until you enable it — stays disabled after restarting ReCast.".into();
     }
     if let Some(left) = control.pause_remaining() {
         return format!(
-            "Paused — {} min left. Choose Resume to continue now.",
+            "Paused · {} min remaining — choose Resume to continue now.",
             left.as_secs() / 60 + 1
         );
     }
@@ -138,9 +142,36 @@ fn status_for<P: engine::Platform>(control: &crate::types::AppControl) -> String
     if let Some(id) = control.paused_app() {
         return format!("Paused in {id} — switch to another application or choose Resume in {id}.");
     }
-    if mode.is_none() || (P::requires_focus() && focus.is_none()) {
-        return "Cannot identify this application — switch to a text field and check focus/accessibility support. Configured app restrictions stay enforced.".into();
+    // Opening a menu can hide the text control while the frontmost app remains
+    // known. Report that app's enabled mode, not a failed focus probe. This is
+    // display-only: it neither relaxes engine focus checks nor ends an app pause.
+    let waiting_for_focus = P::requires_focus() && focus.is_none();
+    if waiting_for_focus && application.is_none() {
+        return "Text focus unavailable — click a text field. If this persists, check ReCast's Accessibility permission. Correction waits for identifiable focus.".into();
     }
+    let mode = mode.or_else(|| {
+        application
+            .filter(|_| focus.is_none())
+            .and_then(|(_, id)| control.app_mode(Some(id)))
+    });
+    if mode.is_none() {
+        return "Cannot identify this application — check application-detection support. Configured app restrictions stay enforced.".into();
+    }
+    let app_name = application
+        .filter(|(_, id)| {
+            focus.is_none()
+                || app
+                    .as_deref()
+                    .is_some_and(|app| app.eq_ignore_ascii_case(id))
+        })
+        .map(|(name, _)| name.as_str())
+        .or(app.as_deref());
+    let state = if waiting_for_focus {
+        "Enabled"
+    } else {
+        "Active"
+    };
+    let active = app_name.map_or_else(|| state.to_string(), |name| format!("{state} in {name}"));
     match mode.unwrap() {
         crate::config::AppMode::Off => {
             "Excluded application — choose Full correction or Layout only in Application modes."
@@ -148,8 +179,8 @@ fn status_for<P: engine::Platform>(control: &crate::types::AppControl) -> String
         }
         _ if P::current_layout().is_none() => "Keyboard layout unavailable — enable English and Hebrew keyboards and check the layout backend.".into(),
         crate::config::AppMode::LayoutOnly => {
-            "Ready — layout only; spelling, abbreviations, and completion are off.".into()
+            format!("{active} · Layout only — spelling, abbreviations, and completion are off.")
         }
-        crate::config::AppMode::Full => "Ready — correction follows your enabled settings.".into(),
+        crate::config::AppMode::Full => format!("{active} · Full correction — correction follows your enabled settings."),
     }
 }
