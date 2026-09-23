@@ -320,10 +320,8 @@ fn matches_hebrew(word: &str, dict: Dict) -> bool {
         && dict.contains(stem)
 }
 
-/// Strict dictionary membership for `lang`. This is the *trigger* test — "these
-/// keystrokes are unambiguously a word in the other language, switch to it." It
-/// is strict on both sides so a name/typo is never flipped just because its
-/// prefix-stripped reading happens to be a Hebrew word.
+/// Exact dictionary membership, used for current-layout protection and
+/// homograph comparisons. Inferred targets use [`valid_target`] separately.
 fn valid_strict(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool {
     if text.is_empty() {
         return false;
@@ -332,6 +330,24 @@ fn valid_strict(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> boo
         Language::English => en_dict.contains(text),
         Language::Hebrew => he_dict.contains(text),
     }
+}
+
+/// A layout target may also be a productive Hebrew prefix attached to a
+/// common dictionary stem. Require four stem letters to limit accidental hits.
+// ponytail: prefix heuristic cannot validate grammar; add morphological analysis
+// if the accuracy corpus exposes false positives.
+fn valid_target(text: &str, lang: Language, en: Dict, he: Dict, he_freq: Freq) -> bool {
+    valid_strict(text, lang, en, he)
+        || (lang == Language::Hebrew
+            && HE_PREFIXES.iter().any(|&prefix| {
+                text.strip_prefix(prefix).is_some_and(|stem| {
+                    stem.chars().count() >= 4
+                        && he.contains(stem)
+                        && he_freq
+                            .rank(stem)
+                            .is_some_and(|rank| rank <= FREQ_COMMON_MAX)
+                })
+            }))
 }
 
 /// Looser membership for `lang`. This is the *guard* test — "the user already
@@ -361,7 +377,7 @@ fn valid_loose(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool
 ///      "to change a word it must not mean anything in the current language."
 ///      It also covers homographs (valid in both layouts), which are left to
 ///      the layout the user is actually in.
-///   2. Else they form a confident (strict) word in the **other** layout →
+///   2. Else they form a confident word in the **other** layout →
 ///      the user typed in the wrong layout, switch. (Fixes the actual
 ///      mistypes.) Short words (≤3 chars) are collision-prone, so this trigger
 ///      can be turned off for them via `RECAST_SHORT=0`.
@@ -431,7 +447,7 @@ fn decide_known(
         return None;
     }
     // Trigger: the other layout yields a confident word → switch.
-    if oth_strict {
+    if valid_target(oth_text, other, en_dict, he_dict, he_freq) {
         // …unless the current reading is a *loose* match — a Hebrew form the
         // prefix rules recognise without the dictionary holding it outright.
         // That is weaker evidence than a strict hit, since it is inferred
@@ -456,9 +472,8 @@ fn decide_known(
 }
 
 /// Whole-word decision when the current layout can't be determined. Falls back
-/// to a symmetric rule: switch only when exactly one language is a strict word
-/// and the other isn't even a loose match — conservative, so it neither mangles
-/// nor fires on ambiguous input.
+/// to a symmetric rule using dictionary words and confident Hebrew prefix
+/// targets, with frequency evidence resolving competing readings.
 fn decide_unknown(
     text_en: &str,
     text_he: &str,
@@ -484,14 +499,14 @@ fn decide_unknown(
     let short_ok = |text: &str, lang| !too_short_to_trigger(text, lang, enabled, en_freq, he_freq);
     let en_strict = short_ok(text_en, Language::English)
         && valid_strict(text_en, Language::English, en_dict, he_dict);
-    let he_strict = short_ok(text_he, Language::Hebrew)
-        && valid_strict(text_he, Language::Hebrew, en_dict, he_dict);
-    // If exactly one layout has a strict match, switch to that layout.
-    if en_strict && !he_strict {
+    let he_target = short_ok(text_he, Language::Hebrew)
+        && valid_target(text_he, Language::Hebrew, en_dict, he_dict, he_freq);
+    // If exactly one layout has a confident target, switch to that layout.
+    if en_strict && !he_target {
         return Some(Language::English);
-    } else if he_strict && !en_strict {
+    } else if he_target && !en_strict {
         return Some(Language::Hebrew);
-    } else if en_strict && he_strict {
+    } else if en_strict && he_target {
         // Both layouts read as words: break the tie by frequency (and by the
         // run, which is usually the stronger of the two), else leave it alone.
         // The winner must be decisively more common than the loser.
@@ -1409,6 +1424,47 @@ mod tests {
     /// Frequency list from `(word, rank)` pairs (rank 0 = most common).
     fn freq(entries: &[(&str, u32)]) -> Freq {
         Freq::of(entries)
+    }
+
+    #[test]
+    fn prefixed_layout_targets_need_common_long_stems_and_preserve_real_words() {
+        let en = dict(&["hello"]);
+        let he = dict(&["מחשב", "שלום", "בית"]);
+        let ranks = freq(&[("מחשב", 100), ("שלום", 2_001), ("בית", 50)]);
+        assert!(valid_target("למחשב", Language::Hebrew, en, he, ranks));
+        assert!(!valid_target("לשלום", Language::Hebrew, en, he, ranks));
+        assert!(!valid_target("לבית", Language::Hebrew, en, he, ranks));
+        assert!(!valid_target("למחשב", Language::Hebrew, en, he, nofreq()));
+        assert_eq!(
+            decide_known(
+                "knjac",
+                "למחשב",
+                Language::English,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                ranks
+            ),
+            Some(Language::Hebrew)
+        );
+        assert_eq!(
+            decide_unknown("knjac", "למחשב", Run::default(), en, he, nofreq(), ranks),
+            Some(Language::Hebrew)
+        );
+        assert_eq!(
+            decide_known(
+                "hello",
+                "למחשב",
+                Language::English,
+                Run::default(),
+                en,
+                he,
+                nofreq(),
+                ranks
+            ),
+            None
+        );
     }
 
     #[test]

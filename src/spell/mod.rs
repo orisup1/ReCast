@@ -230,9 +230,12 @@ pub fn correct_with(
     let mut max_rank = max_rank;
     // Broad dictionaries include archaic forms and abbreviations that also
     // look like everyday slips. Only reconsider unobserved entries, requiring
-    // a cheap edit into a very common word; corpus-attested words stay intact.
+    // a cheap edit into a very common word. Corpus-attested words and curated
+    // technical terms stay intact.
     if en_dict.contains(word) {
-        if en_freq.rank(word).is_some() {
+        if en_freq.rank(word).is_some()
+            || Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_tech.blob"))).contains(word)
+        {
             return None;
         }
         budget = budget.min(COST_VOWEL);
@@ -272,7 +275,7 @@ pub fn correct_with(
             }
         });
     }
-    search.consider_neighbouring_openings(en_dict, en_freq);
+    search.consider_edited_openings(en_dict, en_freq);
 
     search.best.map(|(_, _, _, fixed)| fixed)
 }
@@ -283,7 +286,7 @@ pub fn correct_with(
 /// A struct rather than a pile of locals because candidates arrive from two
 /// places now — the scan of the frequency list, and the handful of words a
 /// mistyped opening could have been (see
-/// [`consider_neighbouring_openings`](Self::consider_neighbouring_openings)) —
+/// [`consider_edited_openings`](Self::consider_edited_openings)) —
 /// and both have to be scored and compared the same way.
 struct Search<'a> {
     typed: &'a [u8],
@@ -331,21 +334,9 @@ impl Search<'_> {
         }
     }
 
-    /// The words a *fat-fingered opening* could have been: the typed word with
-    /// its first letter replaced by one of the keys beside it.
-    ///
-    /// Looked up rather than scanned for, which is the whole reason this is
-    /// affordable. The other openings are guesses about a *class* of candidate
-    /// and have to be searched for; here the candidate is known exactly, so a
-    /// dozen binary searches do what a dozen more passes over the frequency
-    /// list would otherwise have cost — measured at 1.6 ms against 2.3 ms per
-    /// correction, on a path that runs at the end of every word.
-    ///
-    /// Only an otherwise-perfect word is reachable this way, and that is not a
-    /// restriction so much as an observation: a first-letter slip costs
-    /// [`COST_ADJACENT_DIAG`] + [`COST_INITIAL`] = 162, and the cheapest further
-    /// edit (55) does not fit under the 200 such a word's budget allows.
-    fn consider_neighbouring_openings(&mut self, en_dict: Dict, en_freq: Freq) {
+    /// Look up otherwise-exact words with a neighbouring, missing, or extra
+    /// first letter. Direct lookups avoid scanning every possible opening.
+    fn consider_edited_openings(&mut self, en_dict: Dict, en_freq: Freq) {
         // Two edits' worth of budget is the floor for this, so a short word —
         // which is overwhelmingly a name — cannot reach it at all.
         if self.budget < 2 * COST_EDIT {
@@ -354,21 +345,24 @@ impl Search<'_> {
         let Some((&first, rest)) = self.typed.split_first() else {
             return;
         };
-        let mut candidate = Vec::with_capacity(self.typed.len());
+        let mut candidate = String::with_capacity(self.typed.len() + 1);
+        let typed = std::str::from_utf8(self.typed).expect("eligible ASCII word");
+        let rest = std::str::from_utf8(rest).expect("eligible ASCII suffix");
+        if let Some(rank) = en_freq.rank(rest) {
+            self.consider(rest, rank, en_dict);
+        }
         for letter in b'a'..=b'z' {
-            if letter == first || !adjacent(first, letter) {
-                continue;
+            for suffix in [typed, rest] {
+                if suffix == rest && (letter == first || !adjacent(first, letter)) {
+                    continue;
+                }
+                candidate.clear();
+                candidate.push(char::from(letter));
+                candidate.push_str(suffix);
+                if let Some(rank) = en_freq.rank(&candidate) {
+                    self.consider(&candidate, rank, en_dict);
+                }
             }
-            candidate.clear();
-            candidate.push(letter);
-            candidate.extend_from_slice(rest);
-            let Ok(cand) = std::str::from_utf8(&candidate) else {
-                continue;
-            };
-            let Some(rank) = en_freq.rank(cand) else {
-                continue;
-            };
-            self.consider(cand, rank, en_dict);
         }
     }
 }
@@ -423,7 +417,7 @@ impl Opening {
 /// opening is what turns a name into an unrelated word. The *neighbouring* key
 /// is a different event — the hand was in the right place and landed one key
 /// over — and it is reached without a scan at all, in
-/// [`Search::consider_neighbouring_openings`].
+/// [`Search::consider_edited_openings`].
 fn openings(word: &str) -> Vec<Opening> {
     let typed = word.as_bytes();
     let mut openings = vec![Opening {
@@ -925,6 +919,31 @@ mod tests {
             crate::config::DEFAULT_SPELL_MAX_RANK,
             crate::config::DEFAULT_SPELL_MAX_DIST,
         )
+    }
+
+    #[test]
+    fn missing_and_extra_openings_keep_the_existing_confidence_gates() {
+        let d = dict(&["computer", "keyboard", "hello"]);
+        let f = freq(&[("computer", 100), ("keyboard", 500), ("hello", 50)]);
+        for (typed, expected) in [
+            ("omputer", "computer"),
+            ("xcomputer", "computer"),
+            ("eyboard", "keyboard"),
+            ("xkeyboard", "keyboard"),
+        ] {
+            assert_eq!(fix(typed, d, f).as_deref(), Some(expected));
+            assert_eq!(correct_with(typed, d, f, 4, 20_000, 1), None);
+        }
+        assert_eq!(fix("ello", d, f), None);
+        assert_eq!(fix("xhello", d, f), None);
+        assert_eq!(
+            fix(
+                "omputer",
+                dict(&["omputer", "computer"]),
+                freq(&[("omputer", 500), ("computer", 100)])
+            ),
+            None
+        );
     }
 
     #[test]

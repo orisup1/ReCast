@@ -389,10 +389,18 @@ checksums, with signing/notarization when repository credentials are configured.
 
 ## Dictionary expansion
 
-`en_dict.txt` includes curated programming terms, tools, formats, and infrastructure
-names. These entries protect valid technical words from spelling/layout rewrites;
-they do not invent frequency rankings or promote jargon into general-purpose spelling
-suggestions. Their unchanged English readings are covered by the correction corpus.
+`en_dict.txt` and `en_tech.txt` include curated programming terms, tools, formats,
+and infrastructure names. `en_tech.txt` is merged at build time and explicitly
+protected from spelling changes even when a term is absent from the frequency list.
+These additions enable wrong-layout recovery without inventing frequency rankings
+or promoting jargon into general-purpose spelling suggestions. Their unchanged English readings are covered by the correction corpus.
+
+Spelling correction also considers missing or extra first letters on longer words
+(e.g. `omputer` and `xcomputer` become `computer`), using the existing edit-cost
+and frequency limits. Layout correction recognizes an attached Hebrew prefix
+when its dictionary stem has at least four letters and ranks in the top 2,001
+frequency entries. These inferred forms never override an exact current-layout
+word when the layout is known.
 
 Build-time preprocessing merges, deduplicates, and sorts dictionary entries for
 binary search. Source dictionary order therefore does not affect lookup speed.

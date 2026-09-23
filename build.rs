@@ -50,9 +50,14 @@ fn prepare_dictionaries() {
     for (src, dst) in [
         ("en_dict.txt", "en_dict.blob"),
         ("he_dict.txt", "he_dict.blob"),
+        ("en_tech.txt", "en_tech.blob"),
     ] {
         println!("cargo:rerun-if-changed={src}");
-        let content = read(src);
+        let mut content = read(src);
+        if src == "en_dict.txt" {
+            content.push('\n');
+            content.push_str(&read("en_tech.txt"));
+        }
         let mut words: Vec<String> = Vec::with_capacity(content.len() / 8);
         for line in content.lines() {
             let word = line.trim();
