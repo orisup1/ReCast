@@ -63,7 +63,7 @@ impl eframe::App for App {
         egui::Window::new("Typing shortcuts")
             .open(&mut self.show_shortcuts)
             .show(ctx, |ui| {
-                ui.label(crate::notify::SHORTCUTS);
+                ui.label(crate::notify::shortcuts());
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -178,7 +178,22 @@ impl eframe::App for App {
                     }
                 }
                 ui.label("Changes are saved and applied immediately.");
-                ui.label("Extra undo shortcut (double-tap Ctrl stays available):");
+                for (label, key, current, choices) in [
+                    ("Double-tap action (undo / convert)", "action_shortcut", &cfg.action_shortcut, crate::config::ACTION_SHORTCUTS),
+                    ("Completion (single tap)", "completion_shortcut", &cfg.completion_shortcut, crate::config::MODIFIER_SHORTCUTS),
+                ] {
+                    let mut selected = current.clone();
+                    egui::ComboBox::from_id_source(key).selected_text(crate::config::modifier_label(&selected)).show_ui(ui, |ui| {
+                        for &(value, text) in choices {
+                            ui.selectable_value(&mut selected, value.into(), text);
+                        }
+                    });
+                    ui.label(label);
+                    if &selected != current {
+                        self.error = crate::settings::set_live(&self.control, key, &selected).err();
+                    }
+                }
+                ui.label("Extra undo shortcut (single tap):");
                 let mut shortcut = cfg.undo_shortcut.clone();
                 egui::ComboBox::from_id_source("undo_shortcut").selected_text(crate::practice::shortcut_label(&shortcut)).show_ui(ui, |ui| {
                     for value in ["none", "left_ctrl", "right_ctrl"] {

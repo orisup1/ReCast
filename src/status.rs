@@ -287,6 +287,8 @@ fn diagnostics(control: Option<&AppControl>) -> String {
         }
     )
     .unwrap();
+    writeln!(out, "    action shortcut      {}", cfg.action_gesture()).unwrap();
+    writeln!(out, "    completion shortcut  {}", cfg.completion_gesture()).unwrap();
     writeln!(
         out,
         "    extra undo shortcut  {}",

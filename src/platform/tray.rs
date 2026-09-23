@@ -106,7 +106,7 @@ pub fn run(control: Arc<AppControl>) {
         .expect("append conservative");
     let undo_menu = Submenu::new("Extra undo shortcut", true);
     let undo_items: Vec<_> = [
-        ("none", "Double-tap Ctrl only"),
+        ("none", "Disabled"),
         ("left_ctrl", "Also single-tap Left Ctrl"),
         ("right_ctrl", "Also single-tap Right Ctrl"),
     ]
@@ -118,6 +118,31 @@ pub fn run(control: Arc<AppControl>) {
     })
     .collect();
     settings_menu.append(&undo_menu).expect("append undo menu");
+    let mut shortcut_items = Vec::new();
+    for (title, setting, current, choices) in [
+        (
+            "Double-tap action (undo / convert)",
+            "action_shortcut",
+            config.action_shortcut.as_str(),
+            crate::config::ACTION_SHORTCUTS,
+        ),
+        (
+            "Completion (single tap)",
+            "completion_shortcut",
+            config.completion_shortcut.as_str(),
+            crate::config::MODIFIER_SHORTCUTS,
+        ),
+    ] {
+        let submenu = Submenu::new(title, true);
+        for &(value, label) in choices {
+            let item = CheckMenuItem::new(label, true, current == value, None);
+            submenu.append(&item).expect("append shortcut choice");
+            shortcut_items.push((item, setting, value));
+        }
+        settings_menu
+            .append(&submenu)
+            .expect("append shortcut menu");
+    }
     settings_item.set_text("Advanced settings… (file edits need restart)");
     settings_menu
         .append(&settings_item)
@@ -402,6 +427,16 @@ pub fn run(control: Arc<AppControl>) {
                 spell_item.set_checked(config.spell_enabled);
                 complete_item.set_checked(config.complete_enabled);
                 conservative_item.set_checked(config.spell_max_dist == 1);
+            } else if shortcut_items.iter().any(|(item, _, _)| *item.id() == event.id) {
+                let (_, setting, value) = shortcut_items.iter().find(|(item, _, _)| *item.id() == event.id).unwrap();
+                if let Err(error) = crate::settings::set_live(&control, setting, value) {
+                    crate::notify::notify("Shortcut unchanged", &error);
+                }
+                let config = crate::config::Config::global();
+                for (item, setting, value) in &shortcut_items {
+                    let current = if *setting == "action_shortcut" { &config.action_shortcut } else { &config.completion_shortcut };
+                    item.set_checked(current == value);
+                }
             } else if undo_items.iter().any(|(item, _)| *item.id() == event.id) {
                 let value = undo_items.iter().find(|(item, _)| *item.id() == event.id).unwrap().1;
                 if let Err(error) = crate::settings::set_live(&control, "undo_shortcut", value) {

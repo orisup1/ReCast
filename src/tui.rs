@@ -324,7 +324,7 @@ fn render_info(
     text.push(Line::from(""));
     text.push(Line::from(
         "ReCast retypes words you typed in the wrong keyboard layout, fixes English \
-         typos in place, and finishes words on a tap of Right Shift.",
+         typos in place, and offers word completion.",
     ));
     let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
@@ -384,8 +384,14 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         Line::from("  F1 / ?    : show this help"),
         Line::from(""),
         Line::from("While typing anywhere:"),
-        Line::from("  Right Shift (tap)  : finish the word; tap again to cycle guesses"),
-        Line::from("  Ctrl Ctrl (tap x2) : undo the correction the cursor is sitting on,"),
+        Line::from(format!(
+            "  {}: finish the word; repeat to cycle guesses",
+            crate::config::Config::global().completion_gesture()
+        )),
+        Line::from(format!(
+            "  {}: undo the correction the cursor is sitting on,",
+            crate::config::Config::global().action_gesture()
+        )),
         Line::from("                       and stop correcting that word. On a word that"),
         Line::from("                       was skipped because it is listed, it does the"),
         Line::from("                       opposite: unlists it and corrects it."),

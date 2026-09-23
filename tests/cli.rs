@@ -201,6 +201,53 @@ fn status_reports_numeric_fallbacks_and_application_exclusions() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("max distance 0)"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("RECAST_SPELL_DIST="));
+    for (action, completion, expected_action, expected_completion, complaint) in [
+        (
+            "left_shift",
+            "right_ctrl",
+            "double-tap Left Shift",
+            "tap Right Ctrl",
+            "",
+        ),
+        (
+            "none",
+            "none",
+            "double-tap action disabled",
+            "completion shortcut disabled",
+            "",
+        ),
+        (
+            "ctrl",
+            "left_ctrl",
+            "double-tap Either Ctrl",
+            "completion shortcut disabled",
+            "conflicts",
+        ),
+        (
+            "invalid",
+            "tab",
+            "double-tap Either Ctrl",
+            "tap Right Shift",
+            "is invalid",
+        ),
+    ] {
+        let output = Command::new(&binary)
+            .arg("--status")
+            .env("RECAST_LAYOUT_BACKEND", "none")
+            .env("RECAST_ACTION_SHORTCUT", action)
+            .env("RECAST_COMPLETION_SHORTCUT", completion)
+            .env("RECAST_UNDO_SHORTCUT", "none")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains(expected_action), "{stdout}");
+        assert!(stdout.contains(expected_completion), "{stdout}");
+        if !complaint.is_empty() {
+            assert!(stderr.contains(complaint), "{stderr}");
+        }
+    }
     std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
 }
 

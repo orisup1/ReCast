@@ -3,8 +3,10 @@ pub struct Config {
     /// Exact application IDs in which capture, learning and correction stop.
     pub excluded_apps: Vec<String>,
     pub layout_only_apps: Vec<String>,
-    /// An optional single modifier tap; double-tap Ctrl remains available.
+    /// An optional single Ctrl tap for undo, in addition to the action shortcut.
     pub undo_shortcut: String,
+    pub action_shortcut: String,
+    pub completion_shortcut: String,
     /// Persist local word-frequency, correction-pair, and typing-timing data.
     /// Off by default because the word files may contain sensitive text.
     pub personal_enabled: bool,
@@ -79,7 +81,7 @@ impl Config {
     /// RECAST_PERSONAL – set to `1` to persist local personalization data
     ///                   (default: disabled).
     pub fn from_env() -> Self {
-        Self {
+        let mut config = Self {
             excluded_apps: parse_excluded_apps(
                 &crate::settings::get("RECAST_EXCLUDE_APPS").unwrap_or_default(),
             ),
@@ -89,6 +91,12 @@ impl Config {
             undo_shortcut: crate::settings::get("RECAST_UNDO_SHORTCUT")
                 .filter(|value| valid_undo_shortcut(value))
                 .unwrap_or_else(|| "none".into()),
+            action_shortcut: crate::settings::get("RECAST_ACTION_SHORTCUT")
+                .filter(|value| valid_action_shortcut(value))
+                .unwrap_or_else(|| "ctrl".into()),
+            completion_shortcut: crate::settings::get("RECAST_COMPLETION_SHORTCUT")
+                .filter(|value| valid_completion_shortcut(value))
+                .unwrap_or_else(|| "right_shift".into()),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
             split_enabled: crate::settings::flag("RECAST_SPLIT", false),
@@ -100,7 +108,12 @@ impl Config {
             complete_enabled: crate::settings::flag("RECAST_COMPLETE", true),
             complete_min_len: env_num("RECAST_COMPLETE_MIN", DEFAULT_COMPLETE_MIN_LEN),
             complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
+        };
+        // Keep the explicit action/undo bindings; disable ambiguous completion.
+        if config.shortcut_conflict() {
+            config.completion_shortcut = "none".into();
         }
+        config
     }
 }
 
@@ -124,6 +137,61 @@ impl AppMode {
 
 pub fn valid_undo_shortcut(value: &str) -> bool {
     matches!(value, "none" | "left_ctrl" | "right_ctrl")
+}
+
+/// Bare modifier taps avoid typing characters or swallowing application shortcuts.
+pub const MODIFIER_SHORTCUTS: &[(&str, &str)] = &[
+    ("none", "Disabled"),
+    ("left_ctrl", "Left Ctrl"),
+    ("right_ctrl", "Right Ctrl"),
+    ("left_shift", "Left Shift"),
+    ("right_shift", "Right Shift"),
+];
+pub const ACTION_SHORTCUTS: &[(&str, &str)] = &[
+    ("none", "Disabled"),
+    ("ctrl", "Either Ctrl"),
+    ("left_ctrl", "Left Ctrl"),
+    ("right_ctrl", "Right Ctrl"),
+    ("left_shift", "Left Shift"),
+    ("right_shift", "Right Shift"),
+];
+
+pub fn valid_completion_shortcut(value: &str) -> bool {
+    MODIFIER_SHORTCUTS.iter().any(|(key, _)| *key == value)
+}
+pub fn valid_action_shortcut(value: &str) -> bool {
+    ACTION_SHORTCUTS.iter().any(|(key, _)| *key == value)
+}
+pub fn modifier_label(value: &str) -> &'static str {
+    ACTION_SHORTCUTS
+        .iter()
+        .find(|(key, _)| *key == value)
+        .map_or("Disabled", |(_, label)| *label)
+}
+
+impl Config {
+    pub fn shortcut_conflict(&self) -> bool {
+        let completion = self.completion_shortcut.as_str();
+        completion != "none"
+            && (completion == self.action_shortcut
+                || completion == self.undo_shortcut
+                || (self.action_shortcut == "ctrl"
+                    && matches!(completion, "left_ctrl" | "right_ctrl")))
+    }
+    pub fn action_gesture(&self) -> String {
+        if self.action_shortcut == "none" {
+            "double-tap action disabled".into()
+        } else {
+            format!("double-tap {}", modifier_label(&self.action_shortcut))
+        }
+    }
+    pub fn completion_gesture(&self) -> String {
+        if self.completion_shortcut == "none" {
+            "completion shortcut disabled".into()
+        } else {
+            format!("tap {}", modifier_label(&self.completion_shortcut))
+        }
+    }
 }
 
 pub fn parse_excluded_apps(value: &str) -> Vec<String> {
@@ -190,6 +258,8 @@ pub const ALL_KEYS: &[&str] = &[
     "RECAST_EXCLUDE_APPS",
     "RECAST_LAYOUT_ONLY_APPS",
     "RECAST_UNDO_SHORTCUT",
+    "RECAST_ACTION_SHORTCUT",
+    "RECAST_COMPLETION_SHORTCUT",
     "RECAST_PERSONAL",
     "RECAST_SHORT",
     "RECAST_SPLIT",

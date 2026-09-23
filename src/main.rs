@@ -99,7 +99,11 @@ Settings:
   RECAST_LAYOUT_ONLY_APPS=  Exact app IDs for layout correction only; spelling,
                       abbreviations, completion, and personalization are off there.
   RECAST_UNDO_SHORTCUT=  none (default), left_ctrl, or right_ctrl to add a
-                      single Ctrl tap for undo. Double-tap Ctrl stays available.
+                      single Ctrl tap for undo in addition to the action shortcut.
+  RECAST_ACTION_SHORTCUT=  Double-tap key: ctrl (default), left_ctrl, right_ctrl,
+                      left_shift, right_shift, or none.
+  RECAST_COMPLETION_SHORTCUT=  Single-tap key: right_shift (default), left_shift,
+                      left_ctrl, right_ctrl, or none. Must not share an action/undo key.
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.
@@ -123,6 +127,7 @@ scrambled, or if you want them faster and are willing to measure):
                                 the end of long words
 
 Auto-complete:
+  Default shortcuts (change in Settings or config.toml):
   Tap Right Shift mid-word to finish it; tap again to cycle through the
   next guesses, and once more to get back exactly what you typed.
   Abbreviations expand when a word is finished, and are offered by the

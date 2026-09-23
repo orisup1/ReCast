@@ -1640,6 +1640,24 @@ mod real_data {
     }
 
     #[test]
+    fn fixes_missing_and_extra_first_letters() {
+        for (typo, want) in [
+            ("omputer", "computer"),
+            ("overnment", "government"),
+            ("nformation", "information"),
+            ("xkeyboard", "keyboard"),
+            ("zcomputer", "computer"),
+        ] {
+            assert_eq!(fix(typo).as_deref(), Some(want), "{typo}");
+            assert_eq!(
+                correct_with(typo, en_dict(), en_freq(), 4, 20_000, 1),
+                None,
+                "conservative spelling: {typo}"
+            );
+        }
+    }
+
+    #[test]
     fn a_short_word_still_keeps_its_first_letter() {
         // The protection that mattered is intact where it mattered: a short
         // unknown token is overwhelmingly a name, and it cannot afford the

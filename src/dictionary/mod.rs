@@ -295,29 +295,51 @@ const HE_STEM_MIN: usize = 2;
 /// test, so a word it recognises is a word left alone rather than a word
 /// rewritten.
 fn matches_hebrew(word: &str, dict: Dict) -> bool {
-    if dict.contains(word) {
-        return true;
-    }
+    dict.contains(word) || hebrew_stem(word, dict).is_some()
+}
+
+fn hebrew_stem(word: &str, dict: Dict) -> Option<&str> {
     let mut chars = word.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
+    let first = chars.next()?;
     if !HE_PREFIXES.contains(&first) {
-        return false;
+        return None;
     }
     let rest = chars.as_str();
     if !rest.is_empty() && dict.contains(rest) {
-        return true;
+        return Some(rest);
     }
     let mut rest_chars = rest.chars();
-    let Some(second) = rest_chars.next() else {
-        return false;
-    };
+    let second = rest_chars.next()?;
     let stem = rest_chars.as_str();
     let pair: String = [first, second].into_iter().collect();
-    HE_PREFIX_PAIRS.contains(&pair.as_str())
+    (HE_PREFIX_PAIRS.contains(&pair.as_str())
         && stem.chars().count() >= HE_STEM_MIN
-        && dict.contains(stem)
+        && dict.contains(stem))
+    .then_some(stem)
+}
+
+/// Infer an unlisted Hebrew inflection only from a ranked dictionary stem.
+/// Existing English words and common names still take precedence.
+fn prefixed_hebrew_target(
+    text_en: &str,
+    text_he: &str,
+    en_dict: Dict,
+    he_dict: Dict,
+    en_freq: Freq,
+    he_freq: Freq,
+) -> bool {
+    // ponytail: fixed stem-rank cutoff; tune against more real typing reports.
+    const MAX_STEM_RANK: u32 = 50_000;
+    Config::global().freq_enabled
+        && text_he.chars().count() >= 5
+        && !en_dict.contains(text_en)
+        && en_freq
+            .rank(text_en)
+            .is_none_or(|rank| rank > MAX_STEM_RANK)
+        && hebrew_stem(text_he, he_dict).is_some_and(|stem| {
+            stem.chars().count() >= 3
+                && he_freq.rank(stem).is_some_and(|rank| rank <= MAX_STEM_RANK)
+        })
 }
 
 /// Exact dictionary membership, used for current-layout protection and
@@ -381,7 +403,9 @@ fn valid_loose(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool
 ///      the user typed in the wrong layout, switch. (Fixes the actual
 ///      mistypes.) Short words (≤3 chars) are collision-prone, so this trigger
 ///      can be turned off for them via `RECAST_SHORT=0`.
-///   3. Otherwise it's an unknown word (name/typo/slang) → leave it alone.
+///   3. In English, an unlisted Hebrew prefix form with a ranked stem may
+///      trigger a switch, unless the English reading is a common name/token.
+///   4. Otherwise it's an unknown word (name/typo/slang) → leave it alone.
 ///
 /// Note: the guard is deliberately *strict*, not loose — a looked-up word is
 /// better evidence than an inferred one. But a prefixed Hebrew form whose keys
@@ -466,6 +490,11 @@ fn decide_known(
         {
             return None;
         }
+        return Some(other);
+    }
+    if other == Language::Hebrew
+        && prefixed_hebrew_target(text_en, text_he, en_dict, he_dict, en_freq, he_freq)
+    {
         return Some(other);
     }
     None
@@ -1794,6 +1823,56 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn unlisted_hebrew_prefixes_trigger_only_with_a_ranked_stem() {
+        let en = dict(&["hello"]);
+        let he = dict(&["מקלדת"]);
+        for (english, hebrew) in [("cneks,", "במקלדת"), ("ucneks,", "ובמקלדת")] {
+            assert!(!he.contains(hebrew));
+            assert_eq!(
+                decide_known(
+                    english,
+                    hebrew,
+                    Language::English,
+                    Run::default(),
+                    en,
+                    he,
+                    nofreq(),
+                    freq(&[("מקלדת", 32_000)])
+                ),
+                Some(Language::Hebrew)
+            );
+            for he_freq in [nofreq(), freq(&[("מקלדת", 50_001)])] {
+                assert_eq!(
+                    decide_known(
+                        english,
+                        hebrew,
+                        Language::English,
+                        Run::default(),
+                        en,
+                        he,
+                        nofreq(),
+                        he_freq
+                    ),
+                    None
+                );
+            }
+            assert_eq!(
+                decide_known(
+                    english,
+                    hebrew,
+                    Language::English,
+                    Run::default(),
+                    en,
+                    he,
+                    freq(&[(english, 100)]),
+                    freq(&[("מקלדת", 32_000)])
+                ),
+                None
+            );
+        }
     }
 
     #[test]

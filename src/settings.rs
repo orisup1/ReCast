@@ -51,7 +51,19 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "spell_dist" if parse_number("RECAST_SPELL_DIST", value).is_ok() => (),
         "exclude_apps" | "layout_only_apps" if !value.contains(['\n', '\r', '"', '#', '\\']) => (),
         "undo_shortcut" if crate::config::valid_undo_shortcut(value) => (),
+        "action_shortcut" if crate::config::valid_action_shortcut(value) => (),
+        "completion_shortcut" if crate::config::valid_completion_shortcut(value) => (),
         _ => return Err("Invalid setting value".into()),
+    }
+    let mut candidate = crate::config::Config::global();
+    match key {
+        "undo_shortcut" => candidate.undo_shortcut = value.into(),
+        "action_shortcut" => candidate.action_shortcut = value.into(),
+        "completion_shortcut" => candidate.completion_shortcut = value.into(),
+        _ => (),
+    }
+    if candidate.shortcut_conflict() {
+        return Err("Completion must use a different key from double-tap actions and extra undo. Disable or move the conflicting shortcut first.".into());
     }
     let path = file_path().ok_or("No config directory available")?;
     save_value(&path, key, value).map_err(|e| format!("Could not save settings: {e}"))?;
@@ -62,6 +74,8 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "exclude_apps" => cfg.excluded_apps = crate::config::parse_excluded_apps(value),
         "layout_only_apps" => cfg.layout_only_apps = crate::config::parse_excluded_apps(value),
         "undo_shortcut" => cfg.undo_shortcut = value.into(),
+        "action_shortcut" => cfg.action_shortcut = value.into(),
+        "completion_shortcut" => cfg.completion_shortcut = value.into(),
         _ => unreachable!(),
     });
     if key == "exclude_apps" {
@@ -347,6 +361,33 @@ pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str
         }
     }
 
+    for (key, default, valid) in [
+        (
+            "RECAST_ACTION_SHORTCUT",
+            "ctrl",
+            crate::config::valid_action_shortcut as fn(&str) -> bool,
+        ),
+        (
+            "RECAST_COMPLETION_SHORTCUT",
+            "right_shift",
+            crate::config::valid_completion_shortcut,
+        ),
+    ] {
+        if get(key).is_some_and(|value| !valid(&value)) {
+            out.push(format!("{} is invalid — using {default}.", file_key(key)));
+        }
+    }
+    let mut shortcuts = crate::config::Config::from_env();
+    shortcuts.completion_shortcut = get("RECAST_COMPLETION_SHORTCUT")
+        .filter(|value| crate::config::valid_completion_shortcut(value))
+        .unwrap_or_else(|| "right_shift".into());
+    if shortcuts.shortcut_conflict() {
+        out.push(
+            "Completion shortcut conflicts with an action/undo key — completion shortcut disabled."
+                .into(),
+        );
+    }
+
     for key in numeric_keys {
         if let Some((raw, source)) = lookup(key) {
             if let Err(reason) = parse_number(key, &raw) {
@@ -406,7 +447,9 @@ pub fn sample() -> String {
 # Correction pipelines
 #exclude_apps = \"\"    # exact app IDs where correction is Off
 #layout_only_apps = \"\" # exact app IDs where only layout correction is allowed
-#undo_shortcut = \"none\" # none, left_ctrl, or right_ctrl; double-tap Ctrl stays active
+#undo_shortcut = \"none\" # optional single-tap undo: none, left_ctrl, right_ctrl
+#action_shortcut = \"ctrl\" # double-tap: ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
+#completion_shortcut = \"right_shift\" # single-tap: left_ctrl, right_ctrl, left_shift, right_shift, none
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
 #short = true          # short switches: rank <= 20000; false restricts to <= 500
 #split = false         # missing-space split fallback (opt-in; can mis-split)
@@ -573,6 +616,31 @@ mod tests {
         set_live(&control, "undo_shortcut", "right_ctrl").unwrap();
         assert_eq!(crate::config::Config::global().undo_shortcut, "right_ctrl");
         assert!(set_live(&control, "undo_shortcut", "ctrl+z").is_err());
+        assert!(set_live(&control, "completion_shortcut", "left_ctrl").is_err());
+        assert_eq!(
+            crate::config::Config::global().completion_shortcut,
+            "right_shift"
+        );
+        assert!(set_live(&control, "action_shortcut", "right_shift").is_err());
+        set_live(&control, "action_shortcut", "left_shift").unwrap();
+        assert!(set_live(&control, "completion_shortcut", "right_ctrl").is_err());
+        set_live(&control, "completion_shortcut", "left_ctrl").unwrap();
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["completion_shortcut"],
+            "left_ctrl"
+        );
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["action_shortcut"],
+            "left_shift"
+        );
+        assert!(set_live(&control, "undo_shortcut", "left_ctrl").is_err());
+        assert!(set_live(&control, "action_shortcut", "ctrl+z").is_err());
+        assert!(set_live(&control, "completion_shortcut", "tab").is_err());
+        std::env::set_var("RECAST_ACTION_SHORTCUT", "ctrl");
+        assert!(set_live(&control, "action_shortcut", "none").is_err());
+        std::env::remove_var("RECAST_ACTION_SHORTCUT");
+        set_live(&control, "action_shortcut", "none").unwrap();
+        set_live(&control, "completion_shortcut", "none").unwrap();
         std::fs::write(file_path().unwrap(), [0xff]).unwrap();
         assert!(set_app_mode(&control, "Editor", AppMode::Full).is_err());
         assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));

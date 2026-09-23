@@ -6,7 +6,7 @@
 //! inserted by `SendInput`. Everything *between* those two ends is not
 //! different, and used to be written out three times anyway: `Typed`,
 //! `AppState`, `LastAction`, `LastFix`, `LastSkip`, `Cycle`, `shift_active`,
-//! `replacement`, `undo_of`, `reading`, `note_of`, `handle_ctrl_tap`,
+//! `replacement`, `undo_of`, `reading`, `note_of`, `handle_action_tap`,
 //! `undo_fix`, `unlist_and_correct` and the body of `replace_word` all existed
 //! per platform, near-identical, with nothing keeping them in step. A fix
 //! landed in one and forgotten in the other two was the most likely regression
@@ -43,7 +43,7 @@ use crate::types::{
     lock_forgiving, AppControl, FixKind, Language, ReplaceGuard, Replaceable, WordBuffer,
 };
 
-/// Longest a Ctrl press may last and still count as a *tap* rather than a hold.
+/// Longest a modifier press may last and still count as a *tap* rather than a hold.
 /// Ctrl held down is the start of a shortcut; Ctrl let straight back up types
 /// nothing and means nothing, which is what makes it usable as a gesture.
 ///
@@ -52,7 +52,7 @@ use crate::types::{
 /// on the OS for no reason anyone had decided on.
 pub const TAP_MAX: Duration = Duration::from_millis(300);
 
-/// Two Ctrl taps inside this window are the undo gesture. Wide enough not to
+/// Two action modifier taps inside this window are the undo gesture. Wide enough not to
 /// demand a drum roll, short enough that two unrelated taps a second apart are
 /// not read as one gesture.
 pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
@@ -349,6 +349,17 @@ pub struct Cycle<P: Platform> {
     on_screen: usize,
 }
 
+fn shortcut_matches<P: Platform>(binding: &str, key: P::Key) -> bool {
+    match binding {
+        "ctrl" => key == P::CTRL_LEFT || key == P::CTRL_RIGHT,
+        "left_ctrl" => key == P::CTRL_LEFT,
+        "right_ctrl" => key == P::CTRL_RIGHT,
+        "left_shift" => key == P::SHIFT_LEFT,
+        "right_shift" => key == P::SHIFT_RIGHT,
+        _ => false,
+    }
+}
+
 /// Listener state, shared by every capture thread of a platform.
 pub struct AppState<P: Platform> {
     mode: crate::config::AppMode,
@@ -365,23 +376,23 @@ pub struct AppState<P: Platform> {
     /// Caps Lock latch. Together with the held shifts it is what decides
     /// whether a letter came out capitalized.
     pub caps_lock: bool,
-    /// Right Shift went down and nothing else has been pressed since — so if it
-    /// comes back up untouched, it was a tap, which is the completion request.
-    pub right_shift_tap: bool,
-    /// When a Ctrl key went down with nothing pressed since. `None` once
+    /// When the configured completion modifier went down alone.
+    pub completion_down: Option<Instant>,
+    /// When an action modifier went down with nothing pressed since. `None` once
     /// another key joins it, because that makes it a shortcut rather than a
     /// tap.
-    pub ctrl_down: Option<Instant>,
-    /// When the last completed Ctrl tap happened; a second one inside
+    pub action_down: Option<Instant>,
+    /// When the last completed action tap happened; a second one inside
     /// [`DOUBLE_TAP_WINDOW`] is the undo gesture.
-    pub last_ctrl_tap: Option<Instant>,
+    pub last_action_tap: Option<Instant>,
     /// An undo gesture completed while the current correction was landing.
     pending_undo: bool,
+    shortcut_bindings: Option<(String, String, String)>,
     /// A key combination shaped like a layout-switch hotkey has been pressed and
     /// the modifiers holding it have not all come back up yet. When they do, the
     /// cached layout is dropped — see [`crate::layout::invalidate`].
     pub layout_hotkey: bool,
-    /// What the Ctrl double-tap would do to the word the cursor is sitting on,
+    /// What the action double-tap would do to the word the cursor is sitting on,
     /// if it would do anything.
     pub last_action: Option<LastAction<P>>,
     /// The completion cycle in progress, if the user is tapping through guesses.
@@ -416,10 +427,11 @@ impl<P: Platform> AppState<P> {
             buffered_keys: WordBuffer::new(),
             held_keys: HashSet::new(),
             caps_lock: false,
-            right_shift_tap: false,
-            ctrl_down: None,
-            last_ctrl_tap: None,
+            completion_down: None,
+            action_down: None,
+            last_action_tap: None,
             pending_undo: false,
+            shortcut_bindings: None,
             layout_hotkey: false,
             last_action: None,
             cycle: None,
@@ -430,6 +442,28 @@ impl<P: Platform> AppState<P> {
             revision: 0,
             focus: None,
             no_fix: false,
+        }
+    }
+
+    fn sync_shortcuts(&mut self, config: &crate::config::Config) {
+        if !self
+            .shortcut_bindings
+            .as_ref()
+            .is_some_and(|(action, completion, undo)| {
+                action == &config.action_shortcut
+                    && completion == &config.completion_shortcut
+                    && undo == &config.undo_shortcut
+            })
+        {
+            self.action_down = None;
+            self.completion_down = None;
+            self.last_action_tap = None;
+            self.pending_undo = false;
+            self.shortcut_bindings = Some((
+                config.action_shortcut.clone(),
+                config.completion_shortcut.clone(),
+                config.undo_shortcut.clone(),
+            ));
         }
     }
 
@@ -480,7 +514,7 @@ impl<P: Platform> AppState<P> {
     fn forget_gestures(&mut self) {
         self.last_action = None;
         self.cycle = None;
-        self.last_ctrl_tap = None;
+        self.last_action_tap = None;
         self.pending_undo = false;
     }
     fn invalidate_text(&mut self) {
@@ -640,8 +674,8 @@ impl<P: Platform> Engine<P> {
         let mut st = self.lock();
         st.invalidate_text();
         st.held_keys.retain(|key| !held.contains(key));
-        st.right_shift_tap = false;
-        st.ctrl_down = None;
+        st.completion_down = None;
+        st.action_down = None;
         st.layout_hotkey = false;
         st.last_key = None;
         crate::layout::invalidate();
@@ -680,7 +714,9 @@ impl<P: Platform> Engine<P> {
 
     /// A key went down.
     pub fn key_press(self: &Arc<Self>, key: P::Key) {
+        let config = crate::config::Config::global();
         let mut st = self.lock();
+        st.sync_shortcuts(&config);
 
         // One physical press arrives on several evdev nodes; the same key again
         // inside the window is that, not a second press.
@@ -705,7 +741,7 @@ impl<P: Platform> Engine<P> {
         });
         let chorded_shortcut = !is_modifier_key && !is_shift && other_modifier_held;
 
-        st.held_keys.insert(key);
+        let fresh_press = st.held_keys.insert(key);
         // Noted on the way down, acted on when the modifiers come back up: that
         // is when the compositor has had the whole combination and the layout it
         // was asking for is live.
@@ -713,28 +749,28 @@ impl<P: Platform> Engine<P> {
         if key == P::CAPS_LOCK {
             st.caps_lock = !st.caps_lock;
         }
-        // Any key other than Right Shift itself means the shift is being *held*
-        // for something, not tapped, so it is no longer a completion request.
-        st.right_shift_tap = key == P::SHIFT_RIGHT && st.held_keys.len() == 1;
-        // Same idea for Ctrl, which is the undo gesture: a Ctrl with another
-        // key on top of it is a shortcut, and only a bare press/release pair is
-        // a tap.
-        let is_ctrl = key == P::CTRL_LEFT || key == P::CTRL_RIGHT;
-        st.ctrl_down = (is_ctrl && st.held_keys.len() == 1).then(Instant::now);
-        if !is_ctrl && key != P::SHIFT_RIGHT {
+        let is_action = shortcut_matches::<P>(&config.action_shortcut, key)
+            || shortcut_matches::<P>(&config.undo_shortcut, key);
+        let is_completion = shortcut_matches::<P>(&config.completion_shortcut, key);
+        let bare = fresh_press && st.held_keys.len() == 1;
+        st.completion_down = (is_completion && bare).then(Instant::now);
+        st.action_down = (is_action && bare).then(Instant::now);
+        if !is_action {
+            st.last_action_tap = None;
+        }
+        if !is_action && !is_completion {
             st.forget_gestures();
         }
         let shift = st.shift_active();
-        if st.selection_replacing && !is_ctrl {
+        if st.selection_replacing && !is_action {
             st.invalidate_text();
             return;
         }
 
-        // A bare Ctrl changes no text. Keep its tap even while injecting so an
+        // A bare action modifier changes no text. Keep its tap while injecting so an
         // eager undo does not cancel a half-written correction. Chords still
         // cancel below, and any later text clears the queued undo.
-        if P::QUEUE_UNDO_DURING_REPLACEMENT && st.is_replacing && is_ctrl && st.held_keys.len() == 1
-        {
+        if P::QUEUE_UNDO_DURING_REPLACEMENT && st.is_replacing && is_action && bare {
             return;
         }
 
@@ -928,20 +964,12 @@ impl<P: Platform> Engine<P> {
 
     /// A key came back up.
     ///
-    /// Releases matter for three things: knowing which keys the user is still
-    /// holding (so injection can avoid a press the OS would swallow as a
-    /// duplicate), spotting the Right Shift *tap* that asks for a completion,
-    /// and spotting the Ctrl double-tap that takes a correction back.
-    ///
-    /// Both gestures are built on modifier taps for the same reason: Ctrl and
-    /// Right Shift are the only keys on every keyboard that type nothing and
-    /// mean nothing to the focused application on their own, so a tap of either
-    /// can't move focus, indent a line or open the editor's own completion
-    /// popup the way Tab would — nothing has to be un-done when ReCast
-    /// declines. Holding either one (for a capital, for a shortcut) is
-    /// unaffected; only a press and release with nothing in between counts.
+    /// Track held keys and configured modifier taps. Only a short, bare
+    /// press/release pair counts; chords and holds retain their normal meaning.
     pub fn key_release(self: &Arc<Self>, key: P::Key) {
+        let config = crate::config::Config::global();
         let mut st = self.lock();
+        st.sync_shortcuts(&config);
         st.revision = st.revision.wrapping_add(1);
         st.held_keys.remove(&key);
 
@@ -957,11 +985,10 @@ impl<P: Platform> Engine<P> {
         // Ordinary releases have no text action. Tracking the held key above
         // is enough unless personalization needs its timing; an accessibility
         // round trip here only delays the next key and any queued undo tap.
-        if key != P::CTRL_LEFT
-            && key != P::CTRL_RIGHT
-            && key != P::SHIFT_RIGHT
-            && !crate::config::Config::global().personal_enabled
-        {
+        let is_action = shortcut_matches::<P>(&config.action_shortcut, key)
+            || shortcut_matches::<P>(&config.undo_shortcut, key);
+        let is_completion = shortcut_matches::<P>(&config.completion_shortcut, key);
+        if !is_action && !is_completion && !config.personal_enabled {
             return;
         }
 
@@ -983,11 +1010,16 @@ impl<P: Platform> Engine<P> {
             crate::personal::record_key_release(&format!("{key:?}"));
         }
 
-        if key == P::CTRL_LEFT || key == P::CTRL_RIGHT {
-            self.ctrl_tap(st, key);
+        if is_action {
+            self.action_tap(st, key);
             return;
         }
-        if key != P::SHIFT_RIGHT || !std::mem::take(&mut st.right_shift_tap) {
+        if !is_completion
+            || st
+                .completion_down
+                .take()
+                .is_none_or(|down| down.elapsed() > TAP_MAX)
+        {
             return;
         }
         if st.is_replacing || st.no_fix || !self.control.is_enabled() {
@@ -1138,7 +1170,7 @@ impl<P: Platform> Engine<P> {
         );
     }
 
-    /// A Ctrl key came back up. If it was a bare tap and the second one inside
+    /// An action modifier came back up. If it was a bare tap and the second one inside
     /// [`DOUBLE_TAP_WINDOW`], act on the word the cursor is sitting on — take
     /// back the correction that landed on it, or take it off the user's list
     /// and correct it after all. Which of the two is decided by what happened
@@ -1149,17 +1181,18 @@ impl<P: Platform> Engine<P> {
     /// ([`AppState::last_action`], cleared by the next keystroke). That is the
     /// same bargain every in-place autocorrect makes, and it is what keeps a
     /// mistimed double-tap from eating text further back.
-    fn ctrl_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, key: P::Key) {
-        let Some(down) = st.ctrl_down.take() else {
+    fn action_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, key: P::Key) {
+        let Some(down) = st.action_down.take() else {
             return;
         };
-        // Held rather than tapped: the user was using Ctrl for what it is for.
+        // A held modifier is not a gesture.
         if down.elapsed() > TAP_MAX {
-            st.last_ctrl_tap = None;
+            st.last_action_tap = None;
             return;
         }
         let now = Instant::now();
-        let shortcut = crate::config::Config::global().undo_shortcut;
+        let config = crate::config::Config::global();
+        let shortcut = &config.undo_shortcut;
         let single = ((shortcut == "left_ctrl" && key == P::CTRL_LEFT)
             || (shortcut == "right_ctrl" && key == P::CTRL_RIGHT))
             && ((st.is_replacing && !st.selection_replacing)
@@ -1167,12 +1200,16 @@ impl<P: Platform> Engine<P> {
                     st.last_action,
                     Some(LastAction::Fixed(_) | LastAction::Skipped(_))
                 ));
-        match st.last_ctrl_tap.take() {
+        if !single && !shortcut_matches::<P>(&config.action_shortcut, key) {
+            st.last_action_tap = None;
+            return;
+        }
+        match st.last_action_tap.take() {
             _ if single => {}
             Some(prev) if now.duration_since(prev) <= DOUBLE_TAP_WINDOW => {}
             // First tap of a possible pair: remember it and wait for the second.
             _ => {
-                st.last_ctrl_tap = Some(now);
+                st.last_action_tap = Some(now);
                 return;
             }
         }
@@ -1976,8 +2013,8 @@ mod tests {
                 key: 'a',
                 shift: false,
             });
-            st.ctrl_down = Some(Instant::now());
-            st.right_shift_tap = true;
+            st.action_down = Some(Instant::now());
+            st.completion_down = Some(Instant::now());
             st.generation
         };
         s.engine
@@ -1986,7 +2023,7 @@ mod tests {
         assert_ne!(st.generation, generation);
         assert!(st.keys.is_empty() && st.no_fix);
         assert_eq!(st.held_keys, HashSet::from(['x']));
-        assert!(st.ctrl_down.is_none() && !st.right_shift_tap);
+        assert!(st.action_down.is_none() && st.completion_down.is_none());
     }
 
     #[test]
@@ -2853,6 +2890,125 @@ mod tests {
             FOCUS.store(1, Ordering::SeqCst);
             *SELECTION.lock().unwrap() = None;
         }
+        // Rebinding exercises the same screen/injection path as the defaults.
+        for (binding, action_key, completion_binding, completion_key) in [
+            (
+                "left_shift",
+                Simulated::SHIFT_LEFT,
+                "right_ctrl",
+                Simulated::CTRL_RIGHT,
+            ),
+            (
+                "right_shift",
+                Simulated::SHIFT_RIGHT,
+                "left_ctrl",
+                Simulated::CTRL_LEFT,
+            ),
+            (
+                "left_ctrl",
+                Simulated::CTRL_LEFT,
+                "left_shift",
+                Simulated::SHIFT_LEFT,
+            ),
+            (
+                "right_ctrl",
+                Simulated::CTRL_RIGHT,
+                "right_shift",
+                Simulated::SHIFT_RIGHT,
+            ),
+        ] {
+            crate::config::Config::update_live(|cfg| {
+                cfg.action_shortcut = binding.into();
+                cfg.completion_shortcut = completion_binding.into();
+                cfg.undo_shortcut = "none".into();
+            });
+            SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+            let s = Session::new();
+            s.type_text("keyb");
+            // A held key, a repeated press, or a chord must not complete.
+            s.engine.key_press(completion_key);
+            s.engine.lock().completion_down =
+                Some(Instant::now() - TAP_MAX - Duration::from_millis(1));
+            s.engine.key_release(completion_key);
+            assert!(!s.engine.lock().is_replacing);
+            s.engine.key_press(completion_key);
+            s.engine.key_press(completion_key);
+            s.engine.key_release(completion_key);
+            assert!(!s.engine.lock().is_replacing);
+            s.tap(completion_key);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "keyboard");
+            s.tap(action_key);
+            assert!(!s.engine.lock().is_replacing);
+            s.tap(action_key);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "keyb");
+
+            let s = Session::new();
+            s.type_text("do ");
+            s.engine.key_press(action_key);
+            s.engine.lock().action_down = Some(Instant::now() - TAP_MAX - Duration::from_millis(1));
+            s.engine.key_release(action_key);
+            s.tap(action_key);
+            assert!(!s.engine.lock().is_replacing);
+            s.tap(action_key);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "גם ");
+            s.tap(action_key);
+            s.tap(action_key);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "do ");
+
+            let s = Session::new();
+            s.type_text("keyb");
+            s.engine.key_press(completion_key);
+            s.engine.key_press(action_key);
+            s.engine.key_release(action_key);
+            s.engine.key_release(completion_key);
+            assert!(!s.engine.lock().is_replacing);
+            assert!(s.ready.try_recv().is_err());
+        }
+        // Disable both shortcuts, then ensure changing a binding mid-tap
+        // cannot reinterpret an old key-down or the first half of a pair.
+        crate::config::Config::update_live(|cfg| {
+            cfg.action_shortcut = "none".into();
+            cfg.completion_shortcut = "none".into();
+        });
+        let s = Session::new();
+        s.type_text("keyb");
+        for key in [
+            Simulated::CTRL_LEFT,
+            Simulated::CTRL_RIGHT,
+            Simulated::SHIFT_LEFT,
+            Simulated::SHIFT_RIGHT,
+        ] {
+            s.tap(key);
+            s.tap(key);
+        }
+        assert!(!s.engine.lock().is_replacing);
+        s.engine.key_press(Simulated::SHIFT_LEFT);
+        crate::config::Config::update_live(|cfg| cfg.completion_shortcut = "left_shift".into());
+        s.engine.key_release(Simulated::SHIFT_LEFT);
+        assert!(!s.engine.lock().is_replacing);
+        crate::config::Config::update_live(|cfg| cfg.action_shortcut = "ctrl".into());
+        let s = Session::new();
+        s.type_text("do ");
+        s.tap(Simulated::CTRL_LEFT);
+        crate::config::Config::update_live(|cfg| cfg.action_shortcut = "left_ctrl".into());
+        s.tap(Simulated::CTRL_LEFT);
+        assert!(!s.engine.lock().is_replacing);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "גם ");
+        crate::config::Config::update_live(|cfg| {
+            cfg.action_shortcut = "ctrl".into();
+            cfg.completion_shortcut = "right_shift".into();
+        });
         ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
     }
 }

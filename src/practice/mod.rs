@@ -18,28 +18,53 @@ pub fn opened(control: &AppControl) {
     }
 }
 
-pub fn instructions() -> &'static str {
-    "1. Select your English keyboard. In the field below, press Space, type akuo, then Space. Watch it become שלום.\n2. Immediately double-tap Ctrl to restore akuo.\n3. Select all and delete. Press Space, type keyb, then tap Right Shift to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts."
+fn undo_instruction(config: &crate::config::Config) -> String {
+    if config.action_shortcut != "none" {
+        config.action_gesture()
+    } else if config.undo_shortcut != "none" {
+        format!(
+            "tap {}",
+            crate::config::modifier_label(&config.undo_shortcut)
+        )
+    } else {
+        "enable an undo shortcut in Settings, then use it".into()
+    }
+}
+
+pub fn instructions() -> String {
+    let config = crate::config::Config::global();
+    format!(
+    "1. Select your English keyboard. In the field below, press Space, type akuo, then Space. Watch it become שלום.\n2. Immediately {} to restore akuo.\n3. Select all and delete. Press Space, type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", undo_instruction(&config), config.completion_gesture())
 }
 
 pub fn shortcut_label(value: &str) -> &'static str {
     match value {
         "left_ctrl" => "Also single-tap Left Ctrl",
         "right_ctrl" => "Also single-tap Right Ctrl",
-        _ => "Double-tap Ctrl only",
+        _ => "No extra single-tap undo",
     }
 }
 
 pub fn feedback(control: &AppControl) -> String {
     let stage = control.practice_stage.load(Ordering::Relaxed);
     let config = crate::config::Config::global();
+    let undo_step = format!(
+        "Correction worked. Now {} to undo, without clicking or typing first.",
+        undo_instruction(&config)
+    );
+    let completion_step = format!(
+        "Undo worked. Clear the field, press Space, type keyb, then {}.",
+        config.completion_gesture()
+    );
     let step = match stage {
         0 if crate::complete::ignored("akuo") || crate::complete::learned("akuo") || crate::complete::suppressed("akuo") => "The practice word akuo is ignored. Allow it in your word lists before trying this exercise; practice will not change your exceptions.",
         0 => "Try step 1. If nothing changes, check the status below and enable both keyboards.",
-        1 => "Correction worked. Double-tap Ctrl now to undo, without clicking or typing first.",
+        1 if config.action_shortcut == "none" && config.undo_shortcut == "none" => "Enable a shortcut in Settings to practice undo.",
+        1 => &undo_step,
+        2 if config.completion_shortcut == "none" => "Undo worked. Enable a completion shortcut in Settings to continue.",
         2 if !config.complete_enabled => "Undo worked. Enable Word completion in Settings, then clear the field and continue step 3.",
         2 if config.complete_min_len > 4 => "Undo worked. Your minimum completion prefix is longer than keyb. Set complete_min to 4 or less and reopen ReCast to finish this exercise.",
-        2 => "Undo worked. Clear the field, press Space, then try keyb + Right Shift.",
+        2 => &completion_step,
         _ => "You did it: correction, undo, and completion. Close this window and keep typing anywhere.",
     };
     format!("{step}\n{}\nOutside practice, one undo creates a session exception; two occasions save it across restarts.", shortcut_label(&config.undo_shortcut))

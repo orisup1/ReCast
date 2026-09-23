@@ -20,6 +20,13 @@ on screen and rewrite only the remaining suffix, reducing visible deletion.
 A confident English spelling fix can also correct a
 wrong-layout word in the same replacement.
 
+Spelling also checks missing or extra first letters in longer words, such as
+`omputer` → `computer` and `xkeyboard` → `keyboard`, including when typed in the
+Hebrew layout. Layout correction recognizes unlisted Hebrew words with supported
+one- or two-letter prefixes, such as `במקלדת` and `ובמקלדת`, when the stem is a
+ranked dictionary word and the English reading is not a known word or common name.
+Conservative spelling keeps its existing single-edit limit.
+
 Spelling correction protects dictionary words, ALL CAPS, and tokens containing
 digits or internal punctuation. It uses word frequency and weighted typo costs,
 without surrounding-sentence context, so unfamiliar names or jargon can still get
@@ -121,6 +128,15 @@ Use `-Target service-uninstall` to remove the task, or `-Target help` for all ta
 
 ## Controls
 
+The gestures below are defaults. In **Settings**, choose **Double-tap action
+(undo / convert)** and **Completion (single tap)** to use Left/Right Ctrl or
+Left/Right Shift, or disable either gesture. Double-tap actions also offer
+**Either Ctrl**. Changes save and apply immediately; help, status, and practice
+show your current bindings. Completion cannot share a key with the double-tap
+action or extra single-tap undo. Disable or move the conflicting binding first.
+Only bare taps shorter than 300 ms count; double taps must finish within 500 ms
+of each other. Holding a modifier or using it in a chord keeps its normal behavior.
+
 | Action | Gesture or control |
 | --- | --- |
 | Complete an English word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
@@ -139,7 +155,7 @@ usual conservative behavior. If no valid alternate reading exists, the normal
 correction pipeline is tried. A further double-Ctrl undoes a manual correction
 without teaching a word exception. Typing another character or moving the cursor
 ends the opportunity. The optional single-Ctrl shortcut remains for undo/unlisting;
-manual conversion still requires two taps.
+manual conversion still requires the configured double-tap action.
 
 On macOS, selected-text rescue converts physical English/Hebrew key positions,
 without dictionary checks. The first English or Hebrew letter determines the
@@ -155,7 +171,7 @@ App exclusions, pause/disabled state, and Secure Input still apply.
 
 Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures.
 **Settings → Extra undo shortcut** can additionally enable a single tap of
-Left Ctrl or Right Ctrl. Double-tap Ctrl remains available. Holding Ctrl or using
+Left Ctrl or Right Ctrl. The configured double-tap action remains available unless disabled. Holding Ctrl or using
 it in a chord never triggers the extra shortcut; the same cursor/focus safeguards
 apply to both gestures.
 Further typing or cursor movement ends the undo opportunity. Undo restores the
@@ -291,9 +307,15 @@ You can also edit these values and restart:
 # Exact IDs, comma-separated and case-insensitive; no wildcards.
 exclude_apps = "Alacritty, org.keepassxc.KeePassXC"
 layout_only_apps = "code, org.gnome.TextEditor"
-undo_shortcut = "right_ctrl" # none (default), left_ctrl, right_ctrl
+undo_shortcut = "right_ctrl" # optional single-tap undo; none (default), left_ctrl, right_ctrl
+# Shortcut defaults; these settings are global, not per-application.
+action_shortcut = "ctrl" # ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
+completion_shortcut = "right_shift" # left_ctrl, right_ctrl, left_shift, right_shift, none
 # macOS uses bundle IDs; Windows uses executable filenames including .exe.
 ```
+
+A conflicting shortcut configuration disables the completion gesture at startup
+and reports the conflict in diagnostics. Abbreviation expansion is unaffected.
 
 Excluded apps receive no corrections, expansions, completion, undo rewrites,
 word logging, or learning. Global events still track key releases. Off takes

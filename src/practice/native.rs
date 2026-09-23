@@ -107,7 +107,7 @@ unsafe fn mac_controls(window: &tao::window::Window) -> (cocoa::base::id, cocoa:
         let _: () = msg_send![field, release];
         field
     };
-    make(240.0, 180.0, false, super::instructions());
+    make(240.0, 180.0, false, &super::instructions());
     let field = make(192.0, 32.0, true, "");
     {
         use cocoa::foundation::NSString;
@@ -158,7 +158,7 @@ unsafe fn windows_controls(
         SendMessageW(child, WM_SETFONT, font as usize, 1);
         Ok(child)
     };
-    make("STATIC", super::instructions(), 20.0, 180.0, 0)?;
+    make("STATIC", &super::instructions(), 20.0, 180.0, 0)?;
     make("STATIC", "Practice typing field", 198.0, 18.0, 0)?;
     let field = make(
         "EDIT",

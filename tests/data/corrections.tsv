@@ -657,3 +657,24 @@ en	fscrho	כדברים	כדברים
 he	fscrho	כדברים	כדברים
 en	fgcusv	כעבודה	כעבודה
 he	fgcusv	כעבודה	כעבודה
+
+# Broader opening-typo and prefixed-Hebrew coverage.
+en	overnment	םהקרמצקמא	government
+he	overnment	םהקרמצקמא	government
+en	zcomputer	זבםצפואקר	computer
+he	zcomputer	זבםצפואקר	computer
+en	cneks,	במקלדת	במקלדת
+he	cneks,	במקלדת	במקלדת
+en	cneks,	במקלדת	במקלדת			layout-only
+en	ucneks,	ובמקלדת	ובמקלדת
+he	ucneks,	ובמקלדת	ובמקלדת
+en	ucneks,	ובמקלדת	ובמקלדת			layout-only
+en	unjac	ומחשב	ומחשב
+he	unjac	ומחשב	ומחשב
+en	unjac	ומחשב	ומחשב			layout-only
+en	nv,ufbv	מהתוכנה	מהתוכנה
+he	nv,ufbv	מהתוכנה	מהתוכנה
+en	nv,ufbv	מהתוכנה	מהתוכנה			layout-only
+en	c,hehhv	בתיקייה	בתיקייה
+he	c,hehhv	בתיקייה	בתיקייה
+en	c,hehhv	בתיקייה	בתיקייה			layout-only
