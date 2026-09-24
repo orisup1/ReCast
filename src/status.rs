@@ -334,6 +334,12 @@ fn diagnostics(control: Option<&AppControl>) -> String {
             .unwrap_or_default(),
     )
     .unwrap();
+    writeln!(
+        out,
+        "    rule statistics      {}",
+        on_off(cfg.rule_stats_enabled)
+    )
+    .unwrap();
 
     for complaint in
         settings::complaints(config::NUMERIC_KEYS, config::BOOLEAN_KEYS, config::ALL_KEYS)

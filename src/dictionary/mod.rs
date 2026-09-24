@@ -675,6 +675,8 @@ pub fn manual_layout(text: &str, lang: Language, en: Dict, he: Dict) -> Option<F
 pub struct Outcome {
     /// The selected planner operation, also shown by the offline preview.
     pub reason: &'static str,
+    /// Stable aggregate statistics tag, only for an applied correction.
+    pub rule: Option<&'static str>,
     /// The correction to apply, or `None` to leave the word alone.
     pub fix: Option<Fix>,
     /// The language the word turned out to be, when that is knowable at all.
@@ -1132,6 +1134,7 @@ pub fn check_and_correct<K: Copy>(
     if keys.is_empty() {
         return Outcome {
             reason: "Empty input",
+            rule: None,
             fix: None,
             lang: None,
         };
@@ -1225,19 +1228,21 @@ pub fn check_and_correct<K: Copy>(
         debug_log(&full_en, &full_he, None, false);
         return Outcome {
             reason: "Protected word or no confident correction under these settings",
+            rule: None,
             fix: None,
             lang: seen,
         };
     };
 
-    let reason = match &plan {
-        Plan::Switch { start: 0, .. } => "Keyboard-layout correction",
-        Plan::Switch { .. } => "Missing-space layout correction",
-        Plan::Spell { .. } => "English spelling or learned replacement",
-        Plan::Expand { .. } => "Configured abbreviation",
-        Plan::SwitchAndSpell { .. } => {
-            "Keyboard-layout correction with spelling or learned replacement"
-        }
+    let (reason, rule) = match &plan {
+        Plan::Switch { start: 0, .. } => ("Keyboard-layout correction", "layout"),
+        Plan::Switch { .. } => ("Missing-space layout correction", "split"),
+        Plan::Spell { .. } => ("English spelling or learned replacement", "spelling"),
+        Plan::Expand { .. } => ("Configured abbreviation", "abbreviation"),
+        Plan::SwitchAndSpell { .. } => (
+            "Keyboard-layout correction with spelling or learned replacement",
+            "layout+spelling",
+        ),
     };
     let (fix, lang) = match plan {
         Plan::Switch { lang, start } => {
@@ -1306,7 +1311,12 @@ pub fn check_and_correct<K: Copy>(
         }
     };
 
-    Outcome { fix, lang, reason }
+    Outcome {
+        rule: fix.as_ref().map(|_| rule),
+        fix,
+        lang,
+        reason,
+    }
 }
 
 /// The word `keys` spells, if the pipelines left it alone *only* because the
@@ -1575,6 +1585,12 @@ mod tests {
                 Some(current),
                 layout_only,
                 |_| crate::layout::LayoutSwitch::Switched,
+            );
+            assert_eq!(
+                result.rule.is_some(),
+                result.fix.is_some(),
+                "corpus line {} must tag exactly the applied corrections",
+                line + 1
             );
             if let Some(lang) = result.lang {
                 history.push(lang);

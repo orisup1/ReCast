@@ -451,6 +451,7 @@ pub fn sample() -> String {
 #action_shortcut = \"ctrl\" # double-tap: ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
 #completion_shortcut = \"right_shift\" # single-tap: left_ctrl, right_ctrl, left_shift, right_shift, none
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
+#rule_stats = false    # persist only aggregate automatic correction/undo counts
 #short = true          # short switches: rank <= 20000; false restricts to <= 500
 #split = false         # missing-space split fallback (opt-in; can mis-split)
 #freq = true           # homograph frequency tie-break

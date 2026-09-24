@@ -64,8 +64,8 @@ Options:
                     (no keyboard capture, layout changes, or typing)
       --write-config  Write a commented config.toml with every setting in it
                     (never overwrites an existing one), then exit
-      --clear-personal-data  Delete locally learned word, correction, and
-                    typing-timing files, then exit (stop ReCast first)
+      --clear-personal-data  Delete local personalization and rule statistics
+                    files, then exit (stop ReCast first)
   -v, --version     Print the version and exit
   -h, --help        Show this help
 
@@ -93,6 +93,8 @@ Settings:
   RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
   RECAST_PERSONAL=1   Opt in to local word/correction/timing personalization;
                       off by default because its files can contain typed words
+  RECAST_RULE_STATS=1 Save local automatic correction/undo counts by rule;
+                      off by default; no typed words or app names stored
   RECAST_EXCLUDE_APPS=  Comma-separated exact application IDs to leave alone:
                       Linux app_id/WM_CLASS, macOS bundle ID, Windows exe name.
                       Case-insensitive; unknown apps are skipped when set.
@@ -151,7 +153,8 @@ Your files (<config dir>/recast/):
   config.toml `key = value` per line, everything under Settings above
   abbrev.txt  `abbr = expansion` per line
   ignore.txt  one word per line, never corrected
-  personal/   created only with RECAST_PERSONAL=1; may contain typed words
+  personal/   created with RECAST_PERSONAL=1 or RECAST_RULE_STATS=1;
+              word files exist only with RECAST_PERSONAL=1
   The two lists are re-read within a couple of seconds of being edited;
   config.toml is read once, so a change to it takes a restart.";
 

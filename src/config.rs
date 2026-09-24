@@ -10,6 +10,8 @@ pub struct Config {
     /// Persist local word-frequency, correction-pair, and typing-timing data.
     /// Off by default because the word files may contain sensitive text.
     pub personal_enabled: bool,
+    /// Persist only aggregate counts of automatic corrections and undos by rule.
+    pub rule_stats_enabled: bool,
     /// Allow short (≤3 char) switches up to frequency rank 20,000.
     /// Turning this off restricts them to very common words (rank ≤500).
     pub short_enabled: bool,
@@ -98,6 +100,7 @@ impl Config {
                 .filter(|value| valid_completion_shortcut(value))
                 .unwrap_or_else(|| "right_shift".into()),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
+            rule_stats_enabled: crate::settings::flag("RECAST_RULE_STATS", false),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
             split_enabled: crate::settings::flag("RECAST_SPLIT", false),
             freq_enabled: crate::settings::flag("RECAST_FREQ", true),
@@ -245,6 +248,7 @@ pub const NUMERIC_KEYS: &[&str] = &[
 /// quietly inverting the user's intent.
 pub const BOOLEAN_KEYS: &[&str] = &[
     "RECAST_PERSONAL",
+    "RECAST_RULE_STATS",
     "RECAST_SHORT",
     "RECAST_SPLIT",
     "RECAST_FREQ",
@@ -261,6 +265,7 @@ pub const ALL_KEYS: &[&str] = &[
     "RECAST_ACTION_SHORTCUT",
     "RECAST_COMPLETION_SHORTCUT",
     "RECAST_PERSONAL",
+    "RECAST_RULE_STATS",
     "RECAST_SHORT",
     "RECAST_SPLIT",
     "RECAST_FREQ",

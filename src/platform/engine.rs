@@ -314,6 +314,8 @@ pub struct LastFix<P: Platform> {
     /// only rewrote the screen would be undone again by the next repetition of
     /// the same word (see `complete::suppress`).
     suppress: Option<String>,
+    /// Automatic planner rule, absent for manual conversion and completion.
+    rule: Option<&'static str>,
 }
 
 /// A word the pipelines passed over because the user had already told us to
@@ -897,10 +899,12 @@ impl<P: Platform> Engine<P> {
             st.history.push(lang);
         }
         let result = outcome.fix;
+        let rule = outcome.rule;
         // Describe the fix for the history before `replacement` consumes it.
         let note = result.as_ref().map(|fix| note_of::<P>(&st.keys, fix));
         if let Some(rep) = replacement::<P>(&st.keys, result) {
-            let undo = undo_of::<P>(&st.keys, &rep, Some(key));
+            let mut undo = undo_of::<P>(&st.keys, &rep, Some(key));
+            undo.rule = rule;
             // +1 for the terminator the user physically typed, which is erased
             // along with the word and pressed again afterwards.
             let erase = rep.erase + 1;
@@ -918,6 +922,7 @@ impl<P: Platform> Engine<P> {
                     from,
                     to,
                     kind,
+                    rule,
                     deferred_layout: None,
                 }),
             );
@@ -1102,12 +1107,14 @@ impl<P: Platform> Engine<P> {
             Some(Commit::Undo {
                 suppress: None,
                 layout: None,
+                rule: None,
             })
         } else if index == 0 {
             Some(Commit::Fix {
                 from: was.clone(),
                 to: candidates[index].clone(),
                 kind: FixKind::Complete,
+                rule: None,
                 deferred_layout: None,
             })
         } else {
@@ -1147,6 +1154,7 @@ impl<P: Platform> Engine<P> {
             layout: None,
             keep: typed.clone(),
             suppress: non_empty(was),
+            rule: None,
         });
 
         st.cycle = Some(Cycle {
@@ -1348,6 +1356,7 @@ impl<P: Platform> Engine<P> {
                 from,
                 to,
                 kind,
+                rule: None,
                 deferred_layout,
             }),
         );
@@ -1369,6 +1378,7 @@ impl<P: Platform> Engine<P> {
             Some(Commit::Undo {
                 suppress: fix.suppress,
                 layout: fix.layout,
+                rule: fix.rule,
             }),
         );
     }
@@ -1414,6 +1424,7 @@ impl<P: Platform> Engine<P> {
                 from,
                 to,
                 kind,
+                rule: None,
                 deferred_layout: None,
             }),
         );
@@ -1520,19 +1531,28 @@ impl<P: Platform> Engine<P> {
         };
         let mut learn = None;
         match commit {
-            Some(Commit::Fix { from, to, kind, .. }) => {
+            Some(Commit::Fix {
+                from,
+                to,
+                kind,
+                rule,
+                ..
+            }) => {
                 if practice {
                     crate::practice::fixed(&self.control, &from, &to, kind);
                 }
                 if !practice {
                     self.control.record_fix(&from, &to, kind);
+                    if let Some(rule) = rule {
+                        crate::personal::record_rule(rule, false);
+                    }
                     if mode == crate::config::AppMode::Full {
                         crate::personal::record_confusion(&from, &to);
                         crate::personal::record_word(&to);
                     }
                 }
             }
-            Some(Commit::Undo { suppress, .. }) => {
+            Some(Commit::Undo { suppress, rule, .. }) => {
                 if practice && suppress.as_deref() == Some("akuo") {
                     let _ = self.control.practice_stage.compare_exchange(
                         1,
@@ -1547,6 +1567,9 @@ impl<P: Platform> Engine<P> {
                 }
                 if !practice {
                     self.control.record_undo();
+                    if let Some(rule) = rule {
+                        crate::personal::record_rule(rule, true);
+                    }
                 }
             }
             None => {}
@@ -1589,11 +1612,13 @@ enum Commit {
         from: String,
         to: String,
         kind: FixKind,
+        rule: Option<&'static str>,
         deferred_layout: Option<Language>,
     },
     Undo {
         suppress: Option<String>,
         layout: Option<Language>,
+        rule: Option<&'static str>,
     },
 }
 
@@ -1685,6 +1710,7 @@ fn undo_of<P: Platform>(
         // over into the buffer.
         keep: Vec::new(),
         suppress: non_empty(reading::<P>(&keys[rep.original_start..], was)),
+        rule: None,
     }
 }
 

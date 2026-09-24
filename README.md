@@ -272,7 +272,7 @@ an unreadable config stops startup so exclusions are not silently discarded.
 | `welcomed` | Marker for the one-time correction hint |
 | `setup-complete` | macOS setup marker; missing requirements still reopen setup |
 | `practice-offered` | Marker for the optional first-run practice window |
-| `personal/` | Opt-in word counts, correction pairs, and aggregate typing timings |
+| `personal/` | Opt-in personalization files and `rules.txt` rule statistics |
 
 `abbrev.txt` and `ignore.txt` reload within about two seconds of edits. The tray's
 **Advanced settings** and **Open ignored words** open files in your editor, creating
@@ -352,6 +352,14 @@ Linux and Windows have no equivalent check: exclusions can protect a whole app,
 but cannot identify individual password fields in an allowed browser or application.
 
 `RECAST_DEBUG=1` prints checked words and may expose sensitive text in service logs.
+Set `rule_stats = true` in `config.toml` (or `RECAST_RULE_STATS=1`) to save
+automatic correction and undo counts in `personal/rules.txt`. Rows cover layout,
+missing-space split, spelling or learned replacement, abbreviation, and combined
+layout plus spelling. They contain no typed words, application names, or key
+timings. Manual conversions and completion taps are excluded. Counts update on
+successful text replacements and flush about every 30 seconds. This setting is
+independent of personalization and is off by default.
+
 `RECAST_PERSONAL=1` saves word/correction data and aggregate key timings under
 `personal/`; on Linux/Windows, this may include password-field text. Personal files
 are user-only on Unix. To clear them, **stop ReCast first**, then run:
@@ -360,7 +368,8 @@ are user-only on Unix. To clear them, **stop ReCast first**, then run:
 recast --clear-personal-data
 ```
 
-This removes ReCast's personal-data files, not your ignored words or undo exceptions.
+This removes ReCast's personalization and rule-statistics files, not your ignored
+words or undo exceptions.
 
 ## Troubleshooting
 
@@ -389,8 +398,8 @@ cargo test correction_accuracy_corpus -- --nocapture
 make bench
 ```
 
-The shared correction planner is in [src/dictionary.rs](src/dictionary.rs), with
-spelling in [src/spell.rs](src/spell.rs) and completion/lists in
+The shared correction planner is in [src/dictionary/mod.rs](src/dictionary/mod.rs), with
+spelling in [src/spell/mod.rs](src/spell/mod.rs) and completion/lists in
 [src/complete.rs](src/complete.rs). [src/platform/engine.rs](src/platform/engine.rs)
 owns typing, cancellation, completion cycling, and undo across all platforms.
 Native adapters handle capture/injection; [src/layout](src/layout) handles layout backends.

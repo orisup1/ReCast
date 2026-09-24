@@ -27,6 +27,14 @@ const CONFUSIONS_FILE: &str = "confusions.txt";
 
 /// Typing pattern profile: aggregated statistics, JSON-ish text for readability.
 const PROFILE_FILE: &str = "profile.txt";
+const RULE_STATS_FILE: &str = "rules.txt";
+const RULES: [&str; 5] = [
+    "layout",
+    "split",
+    "spelling",
+    "abbreviation",
+    "layout+spelling",
+];
 
 /// Max entries kept in each file. Kept bounded so a long-running daemon
 /// doesn't accumulate unbounded memory/disk.
@@ -41,9 +49,75 @@ const MIN_WORD_LEN: usize = 3;
 static FREQ_DIRTY: AtomicBool = AtomicBool::new(false);
 static CONFUSIONS_DIRTY: AtomicBool = AtomicBool::new(false);
 static PROFILE_DIRTY: AtomicBool = AtomicBool::new(false);
+static RULE_STATS_DIRTY: AtomicBool = AtomicBool::new(false);
 
 fn increment(count: &mut u64) {
     *count = count.saturating_add(1);
+}
+
+fn rule_stats() -> &'static Mutex<[[u64; 2]; RULES.len()]> {
+    static STATS: OnceLock<Mutex<[[u64; 2]; RULES.len()]>> = OnceLock::new();
+    STATS.get_or_init(|| {
+        let saved = personal_path(RULE_STATS_FILE)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        Mutex::new(parse_rule_stats(&saved))
+    })
+}
+
+fn parse_rule_stats(text: &str) -> [[u64; 2]; RULES.len()] {
+    let mut counts = [[0; 2]; RULES.len()];
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let mut fields = line.split('\t');
+        let (Some(tag), Some(applied), Some(undone), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if let (Some(index), Ok(applied), Ok(undone)) = (
+            RULES.iter().position(|known| *known == tag),
+            applied.parse(),
+            undone.parse(),
+        ) {
+            counts[index] = [applied, undone];
+        }
+    }
+    counts
+}
+
+fn rule_stats_text(counts: [[u64; 2]; RULES.len()]) -> String {
+    let mut out = String::from("# rule\tautomatic corrections\tundos\n");
+    for (tag, [applied, undone]) in RULES.iter().zip(counts) {
+        out.push_str(&format!("{tag}\t{applied}\t{undone}\n"));
+    }
+    out
+}
+
+/// Count a completed automatic correction or its undo, without its text.
+pub fn record_rule(tag: &str, undone: bool) {
+    if !Config::global().rule_stats_enabled {
+        return;
+    }
+    let Some(index) = RULES.iter().position(|known| *known == tag) else {
+        return;
+    };
+    if let Ok(mut counts) = rule_stats().lock() {
+        increment(&mut counts[index][usize::from(undone)]);
+        RULE_STATS_DIRTY.store(true, Ordering::Relaxed);
+    }
+}
+
+fn flush_rule_stats() -> std::io::Result<()> {
+    let Some(path) = personal_path(RULE_STATS_FILE) else {
+        return Ok(());
+    };
+    let counts = *rule_stats()
+        .lock()
+        .map_err(|_| std::io::Error::other("rule statistics lock poisoned"))?;
+    let out = rule_stats_text(counts);
+    let tmp = path.with_extension("txt.tmp");
+    write_private(&tmp, &out)?;
+    std::fs::rename(tmp, path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -433,13 +507,14 @@ fn spawn_periodic_flusher() {
             flush_if_dirty(&FREQ_DIRTY, flush_personal_freq);
             flush_if_dirty(&CONFUSIONS_DIRTY, flush_confusions);
             flush_if_dirty(&PROFILE_DIRTY, flush_profile);
+            flush_if_dirty(&RULE_STATS_DIRTY, flush_rule_stats);
         })
         .ok();
 }
 
-/// Initialize personal data directory and start background flusher.
+/// Initialize whichever opt-in local data stores are enabled.
 pub fn init() {
-    if !enabled() {
+    if !enabled() && !Config::global().rule_stats_enabled {
         return;
     }
     let Some(dir) = data_dir() else {
@@ -450,8 +525,13 @@ pub fn init() {
     }
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
-        personal_freq_map();
-        confusions_map();
+        if enabled() {
+            personal_freq_map();
+            confusions_map();
+        }
+        if Config::global().rule_stats_enabled {
+            rule_stats();
+        }
         spawn_periodic_flusher();
     });
 }
@@ -465,7 +545,7 @@ pub fn data_dir() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join(PERSONAL_DIR))
 }
 
-/// Delete only the three files ReCast owns. The directory removal is
+/// Delete only files ReCast owns. The directory removal is
 /// non-recursive, so an unexpected user file can never be erased with them.
 pub fn clear_data() -> Result<Option<PathBuf>, String> {
     let Some(dir) = data_dir() else {
@@ -476,7 +556,12 @@ pub fn clear_data() -> Result<Option<PathBuf>, String> {
 }
 
 fn clear_dir(dir: &std::path::Path) -> Result<(), String> {
-    for name in [PERSONAL_FREQ_FILE, CONFUSIONS_FILE, PROFILE_FILE] {
+    for name in [
+        PERSONAL_FREQ_FILE,
+        CONFUSIONS_FILE,
+        PROFILE_FILE,
+        RULE_STATS_FILE,
+    ] {
         let path = dir.join(name);
         if let Err(error) = std::fs::remove_file(&path) {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -533,6 +618,20 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_statistics_keep_only_fixed_tags_and_counts() {
+        let mut counts = [[0; 2]; RULES.len()];
+        counts[0] = [7, 2];
+        counts[3] = [4, 1];
+        let text = rule_stats_text(counts);
+        assert_eq!(parse_rule_stats(&text), counts);
+        assert!(!text.contains("privateword"));
+        assert_eq!(
+            parse_rule_stats("privateword\t10\t1\n"),
+            [[0; 2]; RULES.len()]
+        );
+    }
 
     #[test]
     fn dirty_flush_skips_clean_data_and_preserves_retries_and_new_changes() {
@@ -601,7 +700,12 @@ mod tests {
         );
         let dir = std::env::temp_dir().join(unique);
         create_private_dir(&dir).expect("create private test directory");
-        for name in [PERSONAL_FREQ_FILE, CONFUSIONS_FILE, PROFILE_FILE] {
+        for name in [
+            PERSONAL_FREQ_FILE,
+            CONFUSIONS_FILE,
+            PROFILE_FILE,
+            RULE_STATS_FILE,
+        ] {
             write_private(&dir.join(name), "sensitive\n").expect("write owned file");
         }
         let keep = dir.join("keep.txt");
@@ -609,7 +713,12 @@ mod tests {
 
         clear_dir(&dir).expect("clear personal data");
         assert!(keep.exists(), "an unexpected file must be preserved");
-        for name in [PERSONAL_FREQ_FILE, CONFUSIONS_FILE, PROFILE_FILE] {
+        for name in [
+            PERSONAL_FREQ_FILE,
+            CONFUSIONS_FILE,
+            PROFILE_FILE,
+            RULE_STATS_FILE,
+        ] {
             assert!(!dir.join(name).exists(), "{name} was not removed");
         }
 
