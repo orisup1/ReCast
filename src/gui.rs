@@ -12,6 +12,7 @@ struct App {
     last_app_check: std::time::Instant,
     error: Option<String>,
     show_shortcuts: bool,
+    show_log: bool,
     health: String,
     show_practice: bool,
     practice_text: String,
@@ -29,6 +30,7 @@ impl eframe::App for App {
             }
             self.last_app_check = std::time::Instant::now();
             self.health = crate::platform::status(&self.control);
+            self.control.live_log.observe_health(&self.health);
         }
         if !self.practice_offered
             && self
@@ -65,6 +67,28 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.label(crate::notify::shortcuts());
             });
+
+        let was_showing_log = self.show_log;
+        egui::Window::new("Live log")
+            .open(&mut self.show_log)
+            .default_size([720.0, 400.0])
+            .show(ctx, |ui| {
+                if self.control.live_log.active() {
+                    if ui.button("Stop logging").clicked() {
+                        self.control.live_log.stop();
+                    }
+                } else if ui.button("Start logging").clicked() {
+                    self.control.live_log.start();
+                    self.control.live_log.observe_health(&self.health);
+                }
+                ui.small("Memory only. Closing this window stops logging. New sessions clear earlier entries.");
+                egui::ScrollArea::both().stick_to_bottom(true).show(ui, |ui| {
+                    ui.monospace(self.control.live_log.text());
+                });
+            });
+        if was_showing_log && !self.show_log {
+            self.control.live_log.close();
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -231,6 +255,9 @@ impl eframe::App for App {
                 if ui.button("Typing shortcuts…").clicked() {
                     self.show_shortcuts = true;
                 }
+                if ui.button("Live log…").clicked() {
+                    self.show_log = true;
+                }
                 if ui.button("Practice correction and undo…").clicked() {
                     self.show_practice = true;
                     self.practice_text.clear();
@@ -279,6 +306,7 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
                 last_app_check: std::time::Instant::now(),
                 error: None,
                 show_shortcuts: false,
+                show_log: false,
                 health: "Starting…".into(),
                 show_practice: false,
                 practice_text: String::new(),

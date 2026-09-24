@@ -303,6 +303,109 @@ pub struct Correction {
 /// change?" after a few more words, short enough to stay a glance rather than a
 /// log to read.
 const HISTORY_LEN: usize = 20;
+const LIVE_LOG_LEN: usize = 500;
+
+/// Explicitly started, memory-only log for the live viewer.
+pub struct LiveLog {
+    active: AtomicBool,
+    lines: Mutex<VecDeque<String>>,
+    last_issue: Mutex<Option<String>>,
+}
+
+impl LiveLog {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            lines: Mutex::new(VecDeque::new()),
+            last_issue: Mutex::new(None),
+        }
+    }
+
+    pub fn start(&self) {
+        *lock_forgiving(&self.last_issue) = None;
+        lock_forgiving(&self.lines).clear();
+        self.active.store(true, Ordering::Release);
+    }
+
+    pub fn stop(&self) {
+        let _lines = lock_forgiving(&self.lines);
+        self.active.store(false, Ordering::Release);
+    }
+
+    pub fn close(&self) {
+        self.stop();
+        lock_forgiving(&self.lines).clear();
+        *lock_forgiving(&self.last_issue) = None;
+    }
+
+    pub fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn push(&self, message: String) {
+        if !self.active() {
+            return;
+        }
+        let mut lines = lock_forgiving(&self.lines);
+        if !self.active() {
+            return;
+        }
+        if lines.len() == LIVE_LOG_LEN {
+            lines.pop_front();
+        }
+        lines.push_back(format!(
+            "[{}] {message}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ));
+    }
+
+    pub fn correction(&self, from: &str, to: &str, kind: FixKind) {
+        if self.active() {
+            self.push(format!("{}: {from:?} -> {to:?}", kind.tag()));
+        }
+    }
+
+    pub fn undo(&self, from: &str, to: &str) {
+        if self.active() {
+            self.push(format!("undo: {to:?} -> {from:?}"));
+        }
+    }
+
+    /// Record actionable health changes once, without logging normal focus changes.
+    pub fn observe_health(&self, health: &str) {
+        if !self.active() {
+            return;
+        }
+        let issue = [
+            "Accessibility permission unavailable",
+            "Keyboard listener unavailable",
+            "Keyboard layout unavailable",
+            "Cannot identify this application",
+        ]
+        .into_iter()
+        .find(|prefix| health.starts_with(prefix));
+        let mut last = lock_forgiving(&self.last_issue);
+        if issue.map(str::to_string) == *last {
+            return;
+        }
+        if let Some(issue) = issue {
+            self.push(format!("Issue: {health}"));
+            *last = Some(issue.to_string());
+        } else if (health.starts_with("Active") || health.starts_with("Enabled"))
+            && last.take().is_some()
+        {
+            self.push("Issue cleared".into());
+        }
+    }
+
+    pub fn text(&self) -> String {
+        lock_forgiving(&self.lines)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 /// Shared runtime state between the keyboard listener and the optional GUI.
 pub struct AppControl {
@@ -321,6 +424,7 @@ pub struct AppControl {
     paused_until: Mutex<Option<Instant>>,
     paused_app: Mutex<Option<String>>,
     history: Mutex<VecDeque<Correction>>,
+    pub live_log: LiveLog,
 }
 
 impl AppControl {
@@ -341,6 +445,7 @@ impl AppControl {
             paused_until: Mutex::new(None),
             paused_app: Mutex::new(None),
             history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
+            live_log: LiveLog::new(),
         }
     }
 
@@ -503,6 +608,7 @@ impl AppControl {
 
     pub fn record_fix(&self, from: &str, to: &str, kind: FixKind) {
         self.fixed_count.fetch_add(1, Ordering::Relaxed);
+        self.live_log.correction(from, to, kind);
         if let Ok(mut log) = self.history.lock() {
             if log.len() == HISTORY_LEN {
                 log.pop_back();
@@ -533,6 +639,7 @@ impl AppControl {
         if let Ok(mut log) = self.history.lock() {
             if let Some(last) = log.iter_mut().find(|c| !c.undone) {
                 last.undone = true;
+                self.live_log.undo(&last.from, &last.to);
             }
         }
     }
@@ -661,6 +768,46 @@ mod tests {
         let log = c.history();
         assert_eq!(log[0].from, "b");
         assert_eq!(log[1].from, "a");
+    }
+
+    #[test]
+    fn live_log_only_collects_during_explicit_session() {
+        let log = LiveLog::new();
+        log.correction("akuo", "שלום", FixKind::Layout);
+        assert!(log.text().is_empty());
+
+        log.start();
+        log.correction("akuo", "שלום", FixKind::Layout);
+        let issue = "Keyboard listener unavailable — check permissions and connected keyboards";
+        log.observe_health(issue);
+        log.observe_health(issue);
+        log.observe_health("Text focus unavailable — click a text field");
+        let lines = log.text();
+        assert!(lines.contains("layout: \"akuo\" -> \"שלום\""));
+        assert_eq!(lines.matches("Keyboard listener unavailable").count(), 1);
+        assert!(!lines.contains("Issue cleared"));
+        log.observe_health("Active · Full correction");
+        assert!(log.text().contains("Issue cleared"));
+        log.observe_health("Accessibility permission unavailable — relaunch ReCast");
+        assert!(log.text().contains("Accessibility permission unavailable"));
+
+        log.stop();
+        log.correction("after", "stopped", FixKind::Spelling);
+        assert!(!log.text().contains("after"));
+        log.start();
+        assert!(log.text().is_empty());
+        log.correction("new", "session", FixKind::Spelling);
+        log.close();
+        assert!(log.text().is_empty());
+        assert!(!log.active());
+
+        let control = control();
+        control.live_log.start();
+        control.record_fix("recieve", "receive", FixKind::Spelling);
+        control.record_undo();
+        let lines = control.live_log.text();
+        assert!(lines.contains("spell: \"recieve\" -> \"receive\""));
+        assert!(lines.contains("undo: \"receive\" -> \"recieve\""));
     }
 
     #[test]

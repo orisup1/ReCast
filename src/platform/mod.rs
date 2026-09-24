@@ -35,6 +35,9 @@ pub mod windows;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod tray;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod log_viewer;
+
 /// Friendly label plus the exact identifier used by the exclusion engine.
 pub fn active_application() -> Option<(String, String)> {
     #[cfg(target_os = "macos")]

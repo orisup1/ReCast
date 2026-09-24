@@ -168,6 +168,8 @@ pub fn run(control: Arc<AppControl>) {
     let mut last_app: Option<(String, String)> = None;
     let shortcuts_item = MenuItem::new("Typing shortcuts…", true, None);
     let practice_item = MenuItem::new("Practice correction and undo…", true, None);
+    let start_log_item = MenuItem::new("Start live log…", true, None);
+    let stop_log_item = MenuItem::new("Stop live log", false, None);
     let ignored_item = MenuItem::new("Open ignored words", true, None);
     let reload_item = MenuItem::new("Reload lists", true, None);
     // Only offered where it is wired up; elsewhere the item would be a
@@ -188,6 +190,8 @@ pub fn run(control: Arc<AppControl>) {
     menu.append(&apps_menu).expect("append apps");
     menu.append(&shortcuts_item).expect("append shortcuts");
     menu.append(&practice_item).expect("append practice");
+    menu.append(&start_log_item).expect("append live log start");
+    menu.append(&stop_log_item).expect("append live log stop");
     menu.append(&ignored_item).expect("append ignored words");
     menu.append(&reload_item).expect("append reload");
     if let Some(item) = &autostart_item {
@@ -206,6 +210,8 @@ pub fn run(control: Arc<AppControl>) {
     let conservative_id = conservative_item.id().clone();
     let shortcuts_id = shortcuts_item.id().clone();
     let practice_id = practice_item.id().clone();
+    let start_log_id = start_log_item.id().clone();
+    let stop_log_id = stop_log_item.id().clone();
     let ignored_id = ignored_item.id().clone();
     let reload_id = reload_item.id().clone();
     let autostart_id = autostart_item.as_ref().map(|i| i.id().clone());
@@ -229,6 +235,7 @@ pub fn run(control: Arc<AppControl>) {
     let mut health = String::new();
     let mut last_health_check = Instant::now() - STATUS_REFRESH;
     let mut practice_window: Option<crate::practice::native::Window> = None;
+    let mut log_window: Option<super::log_viewer::Window> = None;
     let mut practice_offered = false;
     #[cfg(target_os = "windows")]
     let mut balloon_until: Option<Instant> = None;
@@ -247,6 +254,7 @@ pub fn run(control: Arc<AppControl>) {
         excluded.dedup();
         if last_health_check.elapsed() >= STATUS_REFRESH {
             health = super::status(&control);
+            observe_log_health(&control, &health);
             let (state, detail) = health.split_once(" — ").unwrap_or((&health, ""));
             health_menu.set_text(state);
             health_detail.set_text(detail);
@@ -260,8 +268,15 @@ pub fn run(control: Arc<AppControl>) {
                 control.practice_open.store(false, std::sync::atomic::Ordering::Relaxed);
                 practice_window = None;
             }
+            if log_window.as_ref().is_some_and(|log| log.window.id() == *window_id) {
+                control.live_log.close();
+                log_window = None;
+                start_log_item.set_text("Start live log…");
+            }
         }
         if let Some(practice) = &mut practice_window { practice.update(&control, &health); }
+        if let Some(log) = &mut log_window { log.update(&control.live_log); }
+        stop_log_item.set_enabled(control.live_log.active());
         if let Some(id) = control.paused_app() {
             app_pause_item.set_text(format!("Resume in {id}"));
             app_pause_item.set_enabled(true);
@@ -410,6 +425,34 @@ pub fn run(control: Arc<AppControl>) {
                         Err(error) => crate::notify::notify("Could not open practice", &error),
                     }
                 }
+            } else if event.id == start_log_id {
+                let initial_health = (!control.live_log.active()).then(|| super::status(&control));
+                if let Some(log) = &log_window {
+                    if let Some(initial_health) = &initial_health {
+                        control.live_log.start();
+                        observe_log_health(&control, initial_health);
+                        start_log_item.set_text("Show live log…");
+                    }
+                    log.focus();
+                } else {
+                    match super::log_viewer::Window::new(target) {
+                        Ok(mut window) => {
+                            control.live_log.start();
+                            if let Some(initial_health) = &initial_health {
+                                observe_log_health(&control, initial_health);
+                            }
+                            window.update(&control.live_log);
+                            log_window = Some(window);
+                            start_log_item.set_text("Show live log…");
+                            stop_log_item.set_enabled(true);
+                        }
+                        Err(error) => crate::notify::notify("Could not open live log", &error),
+                    }
+                }
+            } else if event.id == stop_log_id {
+                control.live_log.stop();
+                stop_log_item.set_enabled(false);
+                start_log_item.set_text("Start live log…");
             } else if event.id == shortcuts_id {
                 crate::notify::show_shortcuts();
             } else if event.id == spell_id || event.id == complete_id || event.id == conservative_id {
@@ -578,6 +621,18 @@ pub fn run(control: Arc<AppControl>) {
             }
         }
     });
+}
+
+fn observe_log_health(control: &AppControl, health: &str) {
+    if !control.live_log.active() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if !super::macos::accessibility_granted() {
+        control.live_log.observe_health("Accessibility permission unavailable — grant ReCast access in Privacy & Security → Accessibility, then relaunch.");
+        return;
+    }
+    control.live_log.observe_health(health);
 }
 
 /// Native balloon on the tray's hidden window: no foreground window or focus change.

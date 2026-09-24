@@ -146,6 +146,7 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 | Allow an ignored word again | Type that word and its space, then immediately double-tap Ctrl |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
 | Ignore a correction permanently | Click it in the tray's **Recent** menu, or add it to `ignore.txt` |
+| Inspect live activity | **Start live log…** in the tray/menubar, or **Live log…** in the Linux control window |
 | Review gestures | **Typing shortcuts** in the tray or Linux control window |
 
 Double-Ctrl gives an unchanged word a second look. A dictionary word in the other
@@ -341,6 +342,15 @@ ReCast processes global keyboard events locally: no telemetry, remote dictionari
 or update checks. Recent corrections stay in memory. Undo counts and explicitly
 ignored words are saved locally; debug logging and personalization are off by default.
 Synthetic input replaces text without using the clipboard.
+
+The live log starts only when you choose **Start live log…** in the tray/menubar
+or press **Start logging** in the Linux control window. It shows timestamps,
+correction and undo text, and Accessibility, listener, or keyboard setup issues
+as they appear.
+Closing its window stops recording and clears the entries; **Stop live log**
+stops it while keeping the window open for review. Entries stay in memory only,
+up to 500 lines. A new session clears earlier entries. Leave it off when typing
+sensitive text.
 
 Live status uses an authenticated connection on localhost only. Its random access
 token is stored under the user's cache directory (owner-only on Unix); status

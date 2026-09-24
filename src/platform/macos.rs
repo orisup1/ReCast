@@ -263,6 +263,11 @@ fn secure_input_active() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
+/// Read-only permission check for the explicitly started live log.
+pub fn accessibility_granted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFMachPortCreateRunLoopSource(
