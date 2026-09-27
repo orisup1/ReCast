@@ -730,6 +730,14 @@ impl<P: Platform> Engine<P> {
         st.last_key_at = Instant::now();
         st.last_key = Some(key);
         st.revision = st.revision.wrapping_add(1);
+        if self
+            .control
+            .word_rules_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            st.invalidate_text();
+            return;
+        }
 
         // Check for chorded shortcut BEFORE inserting the key into held_keys:
         // if a non-modifier key is pressed while a modifier (Ctrl/Alt/Super,
@@ -977,6 +985,14 @@ impl<P: Platform> Engine<P> {
         st.sync_shortcuts(&config);
         st.revision = st.revision.wrapping_add(1);
         st.held_keys.remove(&key);
+        if self
+            .control
+            .word_rules_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            st.invalidate_text();
+            return;
+        }
 
         // A layout hotkey has been let go of. Drop the cached layout rather than
         // let the next word be anchored on what was true before it — the 300 ms
@@ -2102,6 +2118,60 @@ mod tests {
             );
             return;
         }
+        // Editing rules cancels work already queued and never corrects the editor itself.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.engine
+            .control
+            .word_rules_open
+            .store(true, Ordering::Relaxed);
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        s.type_text("keyboad ");
+        assert!(s.engine.lock().keys.is_empty());
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        s.engine
+            .control
+            .word_rules_open
+            .store(false, Ordering::Relaxed);
+        s.type_text(" recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve keyboad  receive ");
+
+        // Focus changes between the two undo taps cannot act on another field.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.tap(Simulated::CTRL_LEFT);
+        FOCUS.store(2, Ordering::SeqCst);
+        s.tap(Simulated::CTRL_LEFT);
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.text(), "receive ");
+        assert_eq!(s.engine.control.undo_count(), 0);
+        FOCUS.store(1, Ordering::SeqCst);
+
+        // A late second tap starts a new pair; a timely third tap completes it.
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.tap(Simulated::CTRL_LEFT);
+        s.engine.lock().last_action_tap =
+            Some(Instant::now() - DOUBLE_TAP_WINDOW - Duration::from_millis(1));
+        s.tap(Simulated::CTRL_LEFT);
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.text(), "receive ");
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        assert_eq!(s.engine.control.undo_count(), 1);
+        crate::complete::unlist("recieve");
+
         let s = Session::new();
         s.type_text("keyboad ");
         s.pending();

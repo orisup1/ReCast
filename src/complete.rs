@@ -1115,3 +1115,246 @@ mod watch_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The three lists users can review without finding their configuration folder.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RuleKind {
+    Ignored,
+    Learned,
+    Abbreviations,
+}
+
+impl RuleKind {
+    pub const ALL: [Self; 3] = [Self::Ignored, Self::Learned, Self::Abbreviations];
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Ignored => "Ignored words",
+            Self::Learned => "Learned exceptions",
+            Self::Abbreviations => "Abbreviations",
+        }
+    }
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Ignored => "One word per line. Add words to protect them; remove words to allow correction.",
+            Self::Learned => "Saved exceptions from repeated undos, one word per line. Remove a word to allow correction, or add one to protect it.",
+            Self::Abbreviations => "One shortcut = expansion per line. Example: btw = by the way",
+        }
+    }
+    fn file(self) -> &'static str {
+        match self {
+            Self::Ignored => "ignore.txt",
+            Self::Learned => LEARNED_FILE,
+            Self::Abbreviations => "abbrev.txt",
+        }
+    }
+}
+
+pub struct RuleEditor {
+    pub kind: RuleKind,
+    pub text: String,
+    original: String,
+}
+
+fn read_rules(path: &std::path::Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("Could not read word rules: {e}")),
+    }
+}
+
+impl RuleEditor {
+    pub fn open(kind: RuleKind) -> Result<Self, String> {
+        let path = user_path(kind.file()).ok_or("No configuration directory")?;
+        let original = read_rules(&path)?;
+        let text = if kind == RuleKind::Learned {
+            let mut words: Vec<_> = parse_learned(&original)
+                .into_iter()
+                .filter(|(_, count)| *count >= LEARNED_MIN)
+                .map(|(word, _)| word)
+                .collect();
+            words.sort();
+            words.join("\n")
+        } else {
+            original.clone()
+        };
+        Ok(Self {
+            kind,
+            text,
+            original,
+        })
+    }
+
+    pub fn save(&mut self) -> Result<(), String> {
+        // Validate before touching either disk or the live tables. Existing
+        // file parsers remain forgiving of hand-written files.
+        for (index, line) in self.text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let word = if self.kind == RuleKind::Abbreviations {
+                let (key, value) = line
+                    .split_once('=')
+                    .or_else(|| line.split_once('\t'))
+                    .ok_or_else(|| format!("Line {}: use shortcut = expansion", index + 1))?;
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(format!("Line {}: enter a single-line expansion", index + 1));
+                }
+                key.trim()
+            } else {
+                line
+            };
+            if word.is_empty() || word.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!("Line {}: enter one word without spaces", index + 1));
+            }
+        }
+        let path = user_path(self.kind.file()).ok_or("No configuration directory")?;
+        // Hold the same lock as undo learning until its replacement is applied.
+        let mut counts = learned_words().lock().map_err(|_| "Word rules are busy")?;
+        if read_rules(&path)? != self.original {
+            return Err("These rules changed since opening. Copy your edits, then reopen the editor to review the latest rules.".into());
+        }
+        let words = parse_ignore_list(&self.text);
+        let mut next_counts = parse_learned(&self.original);
+        let text = if self.kind == RuleKind::Learned {
+            next_counts.retain(|word, count| *count < LEARNED_MIN || words.contains(word));
+            for word in &words {
+                let count = next_counts.entry(word.clone()).or_default();
+                *count = (*count).max(LEARNED_MIN);
+            }
+            learned_text(&next_counts)
+        } else {
+            self.text.clone()
+        };
+        crate::settings::write_atomic(&path, &text)
+            .map_err(|e| format!("Could not save word rules: {e}"))?;
+        match self.kind {
+            RuleKind::Ignored => {
+                let old = parse_ignore_list(&self.original);
+                if let Ok(mut suppressed) = suppressed_words().lock() {
+                    for word in old.difference(&words) {
+                        suppressed.remove(word);
+                    }
+                }
+                *ignore_list()
+                    .lock()
+                    .map_err(|_| "Could not apply ignored words")? = words;
+            }
+            RuleKind::Learned => {
+                if let Ok(mut suppressed) = suppressed_words().lock() {
+                    for word in counts
+                        .keys()
+                        .filter(|word| !next_counts.contains_key(*word))
+                    {
+                        suppressed.remove(word);
+                    }
+                }
+                *counts = next_counts;
+            }
+            RuleKind::Abbreviations => {
+                *abbreviations()
+                    .lock()
+                    .map_err(|_| "Could not apply abbreviations")? = parse_abbreviations(&text);
+            }
+        }
+        self.original = text;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rule_editor_tests {
+    use super::*;
+
+    #[test]
+    fn rules_save_apply_validate_and_preserve_concurrent_edits() {
+        // Rule tables are process-global; keep these edits out of other tests.
+        const CHILD: &str = "RECAST_RULE_EDITOR_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "complete::rule_editor_tests::rules_save_apply_validate_and_preserve_concurrent_edits"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut editor = RuleEditor::open(RuleKind::Ignored).unwrap();
+        editor.text = "# Names\nSupino\nשלום\n".into();
+        editor.save().unwrap();
+        assert!(ignored("supino") && ignored("שלום"));
+        suppress("supino");
+        editor.text = "# Names\nשלום\n".into();
+        editor.save().unwrap();
+        assert!(!ignored("supino") && !suppressed("supino"));
+        assert_eq!(read_user_file("ignore.txt"), editor.text);
+        editor.text = "two words".into();
+        assert!(editor.save().unwrap_err().contains("Line 1"));
+        assert!(ignored("שלום"));
+
+        let mut editor = RuleEditor::open(RuleKind::Abbreviations).unwrap();
+        editor.text = "btw = by the way\nshalom = שלום עולם\n".into();
+        editor.save().unwrap();
+        assert_eq!(abbreviation("btw").as_deref(), Some("by the way"));
+        assert_eq!(abbreviation("shalom").as_deref(), Some("שלום עולם"));
+        editor.text = "broken line".into();
+        assert!(editor.save().is_err());
+        assert_eq!(abbreviation("btw").as_deref(), Some("by the way"));
+        editor.text.clear();
+        editor.save().unwrap();
+        assert!(abbreviation("btw").is_none());
+        std::fs::write(user_path("abbrev.txt").unwrap(), "omw = on my way\n").unwrap();
+        editor.text = "brb = be right back".into();
+        assert!(editor.save().unwrap_err().contains("changed since opening"));
+        assert_eq!(read_user_file("abbrev.txt"), "omw = on my way\n");
+
+        suppress("recieve");
+        learn("recieve");
+        learn("recieve");
+        suppress("keyboad");
+        learn("keyboad");
+        let mut editor = RuleEditor::open(RuleKind::Learned).unwrap();
+        assert_eq!(editor.text, "recieve");
+        editor.text = "Supino".into();
+        editor.save().unwrap();
+        assert!(!learned("recieve") && !suppressed("recieve"));
+        assert!(learned("supino"));
+        assert_eq!(
+            parse_learned(&read_user_file(LEARNED_FILE)).get("keyboad"),
+            Some(&1)
+        );
+        // A delayed undo must not reintroduce a removed exception.
+        learn("recieve");
+        assert!(!learned("recieve"));
+        let mut editor = RuleEditor::open(RuleKind::Learned).unwrap();
+        learn("keyboad");
+        editor.text.clear();
+        assert!(editor.save().unwrap_err().contains("changed since opening"));
+        assert!(learned("keyboad"));
+
+        // A failed write must leave the live table unchanged.
+        let mut editor = RuleEditor::open(RuleKind::Ignored).unwrap();
+        let temp = user_path("ignore.txt")
+            .unwrap()
+            .with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&temp, "occupied").unwrap();
+        editor.text.clear();
+        assert!(editor.save().is_err());
+        assert!(ignored("שלום"));
+        std::fs::remove_file(temp).unwrap();
+        #[cfg(unix)]
+        {
+            let path = user_path("ignore.txt").unwrap();
+            let target = user_path("managed-ignore.txt").unwrap();
+            std::fs::rename(&path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(editor.save().unwrap_err().contains("symlink"));
+            assert!(ignored("שלום"));
+        }
+        std::fs::remove_dir_all(config_dir().unwrap()).unwrap();
+    }
+}

@@ -121,6 +121,16 @@ fn save_values(path: &std::path::Path, values: &[(&str, &str)]) -> std::io::Resu
     for (key, value) in values {
         text.push_str(&format!("{key} = \"{value}\"\n"));
     }
+    write_atomic(path, &text)
+}
+
+/// Replace a small user file without exposing a partial write.
+pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other(
+            "This file is a symlink; edit its target instead",
+        ));
+    }
     std::fs::create_dir_all(
         path.parent()
             .ok_or_else(|| std::io::Error::other("Missing settings directory"))?,

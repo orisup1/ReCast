@@ -82,6 +82,18 @@ pub fn run(control: Arc<AppControl>) {
 
     let settings_item = MenuItem::new("Open settings", true, None);
     let settings_menu = Submenu::new("Settings", true);
+    let rules_menu = Submenu::new("Word rules", true);
+    let rule_items: Vec<_> = crate::complete::RuleKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let item = MenuItem::new(format!("{}…", kind.title()), true, None);
+            rules_menu.append(&item).expect("append word rules");
+            (item, kind)
+        })
+        .collect();
+    settings_menu
+        .append(&rules_menu)
+        .expect("append word rules menu");
     let config = crate::config::Config::global();
     let spell_item =
         CheckMenuItem::new("Correct English spelling", true, config.spell_enabled, None);
@@ -499,6 +511,8 @@ pub fn run(control: Arc<AppControl>) {
                         crate::notify::notify("Application mode unchanged", &error);
                     }
                 }
+            } else if let Some((_, kind)) = rule_items.iter().find(|(item, _)| event.id == *item.id()) {
+                super::word_rules::edit(*kind, &control);
             } else if event.id == settings_id || event.id == ignored_id {
                 let name = if event.id == settings_id { "config.toml" } else { "ignore.txt" };
                 if let Err(error) = open_user_file(name) {

@@ -12,6 +12,7 @@ struct App {
     last_app_check: std::time::Instant,
     error: Option<String>,
     show_shortcuts: bool,
+    rule_editor: Option<crate::complete::RuleEditor>,
     show_log: bool,
     health: String,
     show_practice: bool,
@@ -88,6 +89,51 @@ impl eframe::App for App {
             });
         if was_showing_log && !self.show_log {
             self.control.live_log.close();
+        }
+
+        if let Some(editor) = &mut self.rule_editor {
+            let mut open = true;
+            let mut done = false;
+            egui::Window::new(editor.kind.title())
+                .open(&mut open)
+                .default_size([600.0, 420.0])
+                .show(ctx, |ui| {
+                    ui.label(editor.kind.hint());
+                    ui.label("Correction pauses while this editor is open.");
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut editor.text)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(12),
+                            );
+                        });
+                    if let Some(error) = &self.error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            match editor.save() {
+                                Ok(()) => {
+                                    done = true;
+                                    self.error = None;
+                                }
+                                Err(error) => self.error = Some(error),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            done = true;
+                        }
+                    });
+                });
+            if done || !open {
+                self.rule_editor = None;
+                self.error = None;
+                self.control
+                    .word_rules_open
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -190,6 +236,20 @@ impl eframe::App for App {
                 });
                 ui.separator();
                 ui.heading("Settings");
+                ui.collapsing("Word rules", |ui| {
+                    for kind in crate::complete::RuleKind::ALL {
+                        if ui.add_enabled(self.rule_editor.is_none(), egui::Button::new(kind.title())).clicked() {
+                            match crate::complete::RuleEditor::open(kind) {
+                                Ok(editor) => {
+                                    self.rule_editor = Some(editor);
+                                    self.error = None;
+                                    self.control.word_rules_open.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(error) => self.error = Some(error),
+                            }
+                        }
+                    }
+                });
                 let cfg = crate::config::Config::global();
                 for (label, key, mut checked) in [
                     ("Correct English spelling", "spell", cfg.spell_enabled),
@@ -306,6 +366,7 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
                 last_app_check: std::time::Instant::now(),
                 error: None,
                 show_shortcuts: false,
+                rule_editor: None,
                 show_log: false,
                 health: "Starting…".into(),
                 show_practice: false,

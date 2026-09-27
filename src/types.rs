@@ -413,6 +413,7 @@ pub struct AppControl {
     pub layout_only_apps: Mutex<Vec<String>>,
     pub listener_ready: AtomicBool,
     pub practice_open: AtomicBool,
+    pub word_rules_open: AtomicBool,
     pub practice_stage: std::sync::atomic::AtomicU8,
     enabled: AtomicBool,
     fixed_count: AtomicU64,
@@ -438,6 +439,7 @@ impl AppControl {
             layout_only_apps,
             listener_ready: AtomicBool::new(false),
             practice_open: AtomicBool::new(false),
+            word_rules_open: AtomicBool::new(false),
             practice_stage: std::sync::atomic::AtomicU8::new(0),
             enabled: AtomicBool::new(true),
             fixed_count: AtomicU64::new(0),
@@ -517,6 +519,9 @@ impl AppControl {
         app: Option<&str>,
         own_focus: bool,
     ) -> Option<crate::config::AppMode> {
+        if self.word_rules_open.load(Ordering::Relaxed) {
+            return None;
+        }
         {
             let mut paused = lock_forgiving(&self.paused_app);
             if let Some(id) = paused.as_ref() {

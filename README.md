@@ -336,6 +336,20 @@ Excluded application, Secure Input, unavailable keyboard capture, and unknown
 application identity, with a suggested recovery action. Routine corrections stay
 silent. `--status` exposes the same status from the running process.
 
+### Word-rule editor
+
+Open **Settings → Word rules** in the tray/menubar or Linux control window.
+Choose **Ignored words**, **Learned exceptions**, or **Abbreviations**. Add or
+remove words one per line; write abbreviations as `shortcut = expansion`.
+Learned exceptions shows saved exceptions from repeated undos; single-undo
+session exceptions are not listed. Other lists still apply when you remove a word.
+
+**Save** applies changes immediately. **Cancel** leaves the rules unchanged.
+Correction pauses while the editor is open and returns to its previous enabled
+or paused state when you close it. Invalid entries and failed saves keep your
+edits open. If rules changed on disk while you were editing, copy your edits and
+reopen the editor before saving, so newer changes are not overwritten.
+
 ## Privacy
 
 ReCast processes global keyboard events locally: no telemetry, remote dictionaries,

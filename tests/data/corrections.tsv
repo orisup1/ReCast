@@ -678,3 +678,31 @@ en	nv,ufbv	מהתוכנה	מהתוכנה			layout-only
 en	c,hehhv	בתיקייה	בתיקייה
 he	c,hehhv	בתיקייה	בתיקייה
 en	c,hehhv	בתיקייה	בתיקייה			layout-only
+
+# Synthetic chat regressions: names, mixed scripts, language switches, and layout-only mode.
+en	hello	יקךךם	hello		chat-names	full
+en	Ori	םרן	Ori		chat-names	full
+en	recieve	רקבןקהק	receive		chat-names	full
+en	github	עןאיונ	github		chat-names	full
+he	akuo	שלום	שלום		chat-names	full
+he	,usv	תודה	תודה		chat-names	full
+en	Supino	דופןמם	Supino		chat-names	full
+en	user_id	ודקר_ןג	user_id		chat-names	full
+en	hello	יקךךם	hello		chat-layout-only	layout-only
+en	recieve	רקבןקהק	recieve		chat-layout-only	layout-only
+en	akuo	שלום	שלום		chat-layout-only	layout-only
+he	keyboard	לקטנםשרג	keyboard		chat-layout-only	layout-only
+en	config.toml	בםמכןעץאםצך	config.toml		chat-layout-only	layout-only
+he	akuo	שלום	שלום		chat-switches	full
+en	hello	יקךךם	hello		chat-switches	full
+he	,usv	תודה	תודה		chat-switches	full
+en	NASA	משדש	NASA		chat-switches	full
+en	recieve	רקבןקהק	receive		chat-switches	full
+en	Ori,	םרןת	Ori,
+en	Supino!	דופןמם!	Supino!
+en	Sami.	דשצןץ	Sami.
+en	Claude?	בךשוגק?	Claude?
+en	user_id2	ודקר_ןג2	user_id2
+en	release_v2	רקךקשדק_ה2	release_v2
+en	helloשלום	helloשלום	helloשלום
+en	שלוםworld	שלוםworld	שלוםworld

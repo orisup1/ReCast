@@ -38,6 +38,9 @@ pub mod tray;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod log_viewer;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod word_rules;
+
 /// Friendly label plus the exact identifier used by the exclusion engine.
 pub fn active_application() -> Option<(String, String)> {
     #[cfg(target_os = "macos")]
@@ -126,6 +129,12 @@ fn status_for<P: engine::Platform>(
         control.effective_app_mode(app.as_deref(), focus.as_ref().is_some_and(P::is_own_focus));
     if !control.is_switched_on() {
         return "Disabled until you enable it — stays disabled after restarting ReCast.".into();
+    }
+    if control
+        .word_rules_open
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return "Paused while editing word rules — save or cancel the editor to resume.".into();
     }
     if let Some(left) = control.pause_remaining() {
         return format!(
