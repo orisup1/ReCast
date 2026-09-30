@@ -12,7 +12,7 @@ pub struct Config {
     pub personal_enabled: bool,
     /// Persist only aggregate counts of automatic corrections and undos by rule.
     pub rule_stats_enabled: bool,
-    /// Allow short (≤3 char) switches up to frequency rank 20,000.
+    /// Allow short (≤3 char) switches up to frequency rank 30,000.
     /// Turning this off restricts them to very common words (rank ≤500).
     pub short_enabled: bool,
     /// Enable missing‑space split fallback.
@@ -50,14 +50,12 @@ pub struct Config {
     pub complete_max_rank: u32,
 }
 
-/// Shipped defaults for the spelling autocorrect. Deliberately conservative:
-/// a missed correction is invisible, a wrong one rewrites the user's text.
+/// Shipped spelling defaults balance broader recall with word-length and cost gates.
 pub const DEFAULT_SPELL_MIN_LEN: usize = 4;
-pub const DEFAULT_SPELL_MAX_RANK: u32 = 20_000;
+pub const DEFAULT_SPELL_MAX_RANK: u32 = 50_000;
 pub const DEFAULT_SPELL_MAX_DIST: u8 = 3;
 
-/// Shipped defaults for auto-complete. Looser than the speller's, because a
-/// completion only ever happens when the user presses the key for it.
+/// Shipped defaults for completion, which requires an explicit user gesture.
 pub const DEFAULT_COMPLETE_MIN_LEN: usize = 3;
 pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
 
@@ -73,7 +71,7 @@ impl Config {
     ///                (default: enabled).
     /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
     /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
-    ///                     (default: 20000).
+    ///                     (default: 50000).
     /// RECAST_SPELL_DIST – maximum edit distance, 0 to 3 (default: 3; 0 disables).
     /// RECAST_COMPLETE   – set to `0` to disable auto-complete (default:
     ///                     enabled).

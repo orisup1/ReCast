@@ -44,6 +44,22 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     for (word, layout, expected, reason) in [
         ("recieve", "en", "receive", "English spelling"),
         ("thos", "en", "this", "English spelling"),
+        ("xocmputer", "en", "computer", "English spelling"),
+        ("computerx", "en", "computer", "English spelling"),
+        (
+            "סםבצפואקר",
+            "he",
+            "computer",
+            "Keyboard-layout correction with spelling",
+        ),
+        ("גםמ,א", "he", "don't", "Keyboard-layout correction"),
+        ("ן,צ", "he", "i'm", "Keyboard-layout correction"),
+        (
+            "לקטנםשרג,ד",
+            "he",
+            "keyboard's",
+            "Keyboard-layout correction",
+        ),
         (
             "איםד",
             "he",
@@ -118,7 +134,7 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     #[cfg(unix)]
     {
         std::fs::write(config.join("config.toml"), "spell = false\n").unwrap();
-        for word in ["teh", "recieve"] {
+        for word in ["teh", "recieve", "xocmputer", "computerx"] {
             let output = preview(&["--explain", word, "--layout", "en"]);
             assert!(output.status.success());
             assert!(

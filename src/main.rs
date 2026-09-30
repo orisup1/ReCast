@@ -86,7 +86,7 @@ Settings:
   RECAST_FREQ=0       Disable the homograph frequency tie-break
   RECAST_SPELL=0      Disable the English spelling autocorrect
   RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
-  RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 20000)
+  RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 50000)
   RECAST_SPELL_DIST=n Maximum edit distance, 0 to 3 (0 disables; default 3)
   RECAST_COMPLETE=0   Disable auto-complete (word completion + abbreviations)
   RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)

@@ -61,13 +61,12 @@
 //!
 //! Rather than generating the ring of all strings one edit away (which explodes
 //! past distance 1 — 26² insertions of insertions), we scan the frequency list
-//! itself and score each entry. The list is sorted, so each possible opening
-//! letter is one contiguous run of it, and the scan is limited to the few
-//! openings a correction could plausibly have: the typed word's own first
-//! letter, its second (a transposed opening, `hte` → `the`), and whatever a
-//! word-initial rule could produce (`fone` → **ph**`one`). A length filter and
-//! a letter-bag lower bound then throw out most of what is left before the
-//! matrix is touched.
+//! itself and score each entry. The sorted list gives narrow runs for unchanged
+//! openings, transpositions (`hte` → `the`) and spelling rules (`fone` →
+//! **ph**`one`). Other changed openings use the same channel to bound two- and
+//! three-letter prefixes before scanning their runs, so a second nearby typo
+//! does not have to leave an intact opening anchor. Length, letter-bag, rank
+//! and posterior bounds reject candidates before expensive alignments.
 //!
 //! Everything here is pure and dictionary-driven, so it is unit testable and
 //! never touches the OS.
@@ -86,7 +85,7 @@ use crate::dictionary::{Dict, Freq};
 /// Longest word we try to correct. Beyond this a "word" is almost certainly a
 /// URL fragment, a path or an identifier, and scanning for a correction gets
 /// pointlessly wide.
-const MAX_LEN: usize = 20;
+const MAX_LEN: usize = 24;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Channel costs, in negative-log-probability units where one ordinary edit — a
@@ -141,10 +140,10 @@ const COST_SECOND: u32 = 25;
 /// much of the word that the "correction" is usually a different word — and
 /// short unknown tokens are overwhelmingly names, which is exactly what must
 /// not be rewritten.
-const DIST2_MIN_LEN: usize = 7;
+const DIST2_MIN_LEN: usize = 6;
 /// Shortest word allowed a three-edit correction. A word this long that is
 /// three edits from a very common word is almost always that word, badly typed.
-const DIST3_MIN_LEN: usize = 10;
+const DIST3_MIN_LEN: usize = 8;
 
 /// A two-edit suggestion has to be this many times more common than a one-edit
 /// one would need to be: two edits is a much weaker signal, so only genuinely
@@ -171,6 +170,7 @@ const PRIOR_WEIGHT: f32 = 8.0;
 /// Added to a rank before taking its log, so rank 0 is finite and the very top
 /// of the list isn't spread out absurdly far from the rest of it.
 const PRIOR_SMOOTHING: f32 = 10.0;
+const MAX_PERSONAL_DISCOUNT: f32 = 50.0;
 
 /// Posterior score of a candidate: the channel cost of the slip plus the
 /// improbability of the word, both as negative log probabilities, so lower is
@@ -181,7 +181,7 @@ const PRIOR_SMOOTHING: f32 = 10.0;
 fn score(cost: u32, rank: u32, word: &str) -> f32 {
     let base = cost as f32 + PRIOR_WEIGHT * (rank as f32 + PRIOR_SMOOTHING).ln();
     let boost = crate::personal::personal_boost(word);
-    base - (boost - 1.0) * 50.0 // Personal boost reduces score by up to 50 points
+    base - (boost - 1.0) * MAX_PERSONAL_DISCOUNT
 }
 
 /// Best English correction for `word`, or `None` to leave it alone.
@@ -227,7 +227,11 @@ pub fn correct_with(
         return Some("the".into());
     }
     let mut budget = budget_for(word, min_len, max_dist)?;
-    let mut max_rank = max_rank;
+    let mut max_rank = if word.len() < DIST3_MIN_LEN {
+        max_rank.min(20_000)
+    } else {
+        max_rank
+    };
     // Broad dictionaries include archaic forms and abbreviations that also
     // look like everyday slips. Only reconsider unobserved entries, requiring
     // a cheap edit into a very common word. Corpus-attested words and curated
@@ -247,7 +251,11 @@ pub fn correct_with(
     // token we would have been willing to *suggest* is not one to overwrite.
     // (The bound matters: the tail of the corpus is itself full of misspellings
     // — "adress", "goverment" — which are exactly what we are here to fix.)
-    if en_freq.rank(word).is_some_and(|rank| rank <= max_rank) {
+    // Keep protection calibrated independently of the broader suggestion list.
+    if en_freq
+        .rank(word)
+        .is_some_and(|rank| rank <= max_rank.min(20_000))
+    {
         return None;
     }
 
@@ -310,11 +318,16 @@ impl Search<'_> {
         if rank > self.max_rank {
             return;
         }
+        // A candidate whose best possible posterior already loses needs no
+        // alignment above the cost at which it could still beat the winner.
+        let budget = self.best.as_ref().map_or(self.budget, |(best, ..)| {
+            self.budget.min((best - score(0, rank, cand)).ceil() as u32)
+        });
         let len_gap = cb.len().abs_diff(self.typed.len()) as u32 * COST_DOUBLE;
-        if len_gap > self.budget || bag_bound(&self.typed_letters, cb) > self.budget {
+        if len_gap > budget || bag_bound(&self.typed_letters, cb) > budget {
             return;
         }
-        let Some(cost) = self.dp.distance(self.typed, cb, self.budget) else {
+        let Some(cost) = self.dp.distance(self.typed, cb, budget) else {
             return;
         };
         if cost == 0 || rank > rank_budget(cost, self.max_rank, self.typed.len()) {
@@ -334,33 +347,72 @@ impl Search<'_> {
         }
     }
 
-    /// Look up otherwise-exact words with a neighbouring, missing, or extra
-    /// first letter. Direct lookups avoid scanning every possible opening.
+    /// Search changed openings without requiring the next letters to be intact.
+    /// The same edit channel bounds two- and three-letter prefixes before their narrow
+    /// frequency runs are scanned; complete candidates still pass every gate.
     fn consider_edited_openings(&mut self, en_dict: Dict, en_freq: Freq) {
-        // Two edits' worth of budget is the floor for this, so a short word —
-        // which is overwhelmingly a name — cannot reach it at all.
         if self.budget < 2 * COST_EDIT {
             return;
         }
-        let Some((&first, rest)) = self.typed.split_first() else {
-            return;
+        let discount = if Config::global().personal_enabled {
+            MAX_PERSONAL_DISCOUNT
+        } else {
+            0.0
         };
-        let mut candidate = String::with_capacity(self.typed.len() + 1);
-        let typed = std::str::from_utf8(self.typed).expect("eligible ASCII word");
-        let rest = std::str::from_utf8(rest).expect("eligible ASCII suffix");
-        if let Some(rank) = en_freq.rank(rest) {
-            self.consider(rest, rank, en_dict);
+        let budget = self.best.as_ref().map_or(self.budget, |(best, ..)| {
+            self.budget
+                .min((best + discount - PRIOR_WEIGHT * PRIOR_SMOOTHING.ln()).ceil() as u32)
+        });
+        if budget < COST_ADJACENT_ROW + COST_INITIAL {
+            return;
         }
-        for letter in b'a'..=b'z' {
-            for suffix in [typed, rest] {
-                if suffix == rest && (letter == first || !adjacent(first, letter)) {
+        // Other rules and transpositions were already scanned. Every remaining
+        // changed opening pays at least a neighbouring-key edit plus the
+        // initial surcharge, so its rank gate can run before the full matrix.
+        let covered: Vec<_> = RULES
+            .iter()
+            .filter(|rule| self.typed.starts_with(rule.from.as_bytes()))
+            .map(|rule| rule.to.as_bytes())
+            .collect();
+        let max_rank =
+            (self.max_rank.min(20_000) / DIST2_RANK_FACTOR).max(self.max_rank / DIST3_RANK_FACTOR);
+        for first in b'a'..=b'z' {
+            if first == self.typed[0] {
+                continue; // the ordinary opening scan already covers this run
+            }
+            for second in b'a'..=b'z' {
+                let prefix = [first, second];
+                if self.dp.align(self.typed, &prefix, budget, true).is_none() {
                     continue;
                 }
-                candidate.clear();
-                candidate.push(char::from(letter));
-                candidate.push_str(suffix);
-                if let Some(rank) = en_freq.rank(&candidate) {
-                    self.consider(&candidate, rank, en_dict);
+                let prefix_text = std::str::from_utf8(&prefix).expect("ASCII opening");
+                let mut thirds = 0u32;
+                en_freq.for_each_with_prefix(prefix_text, |cand, rank| {
+                    if rank <= max_rank {
+                        if let Some(&third) =
+                            cand.as_bytes().get(2).filter(|b| b.is_ascii_lowercase())
+                        {
+                            thirds |= 1 << (third - b'a');
+                        }
+                    }
+                });
+                for third in b'a'..=b'z' {
+                    if thirds & (1 << (third - b'a')) == 0 {
+                        continue;
+                    }
+                    let prefix = [first, second, third];
+                    if self.dp.align(self.typed, &prefix, budget, true).is_none() {
+                        continue;
+                    }
+                    let prefix = std::str::from_utf8(&prefix).expect("ASCII opening");
+                    en_freq.for_each_with_prefix(prefix, |cand, rank| {
+                        if rank <= max_rank
+                            && !cand.as_bytes().starts_with(&[self.typed[1], self.typed[0]])
+                            && !covered.iter().any(|to| cand.as_bytes().starts_with(to))
+                        {
+                            self.consider(cand, rank, en_dict);
+                        }
+                    });
                 }
             }
         }
@@ -412,11 +464,9 @@ impl Opening {
 /// `the`), and the first letter of any rule matching at the start of the word,
 /// which is what makes `fone` → `phone` reachable.
 ///
-/// A first letter from the other side of the keyboard stays out of reach by
-/// construction, and that is the case worth keeping out: an arbitrary wrong
-/// opening is what turns a name into an unrelated word. The *neighbouring* key
-/// is a different event — the hand was in the right place and landed one key
-/// over — and it is reached without a scan at all, in
+/// Edited openings use bounded prefix scans. Their full channel cost and rank
+/// gates decide whether changing the opening is affordable, including additional
+/// errors beside it. See
 /// [`Search::consider_edited_openings`].
 fn openings(word: &str) -> Vec<Opening> {
     let typed = word.as_bytes();
@@ -468,7 +518,14 @@ fn budget_for(word: &str, min_len: usize, max_dist: u8) -> Option<u32> {
         1
     };
     let edits = by_length.min(max_dist as u32);
-    (edits > 0).then(|| edits * COST_EDIT)
+    (edits > 0).then(|| {
+        let budget = edits * COST_EDIT;
+        if word.len() == DIST2_MIN_LEN {
+            budget.min(CHEAPLY_EXPLAINED)
+        } else {
+            budget
+        }
+    })
 }
 
 /// Whether `word` is a token the speller may touch at all.
@@ -501,8 +558,8 @@ fn eligible(word: &str, min_len: usize) -> bool {
 /// already measures exactly that, so it is what the loosening is conditioned on
 /// — see [`CHEAPLY_EXPLAINED`].
 ///
-/// Three edits are left alone. The same argument would apply, but nothing in the
-/// corpus needs it and the only thing it could add is a wrong answer.
+/// Speculative two-edit targets retain the calibrated rank ceiling. The wider
+/// suggestion list is available for one-edit and cheaply explained long words.
 fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
     if cost <= COST_EDIT {
         max_rank
@@ -510,7 +567,7 @@ fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
         if len >= LONG_ENOUGH_FOR_TWO && cost <= CHEAPLY_EXPLAINED {
             max_rank
         } else {
-            max_rank / DIST2_RANK_FACTOR
+            max_rank.min(20_000) / DIST2_RANK_FACTOR
         }
     } else {
         max_rank / DIST3_RANK_FACTOR
@@ -519,7 +576,7 @@ fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
 
 /// Length past which a two-edit correction stops being treated as speculative.
 ///
-/// Two more than [`DIST2_MIN_LEN`], which is the shortest word allowed two edits
+/// Three more than [`DIST2_MIN_LEN`], which is the shortest word allowed two edits
 /// at all: right at that floor two edits are still a third of the word, and the
 /// tighter rank budget is what stands between a name and a rewrite.
 const LONG_ENOUGH_FOR_TWO: usize = 9;
@@ -797,6 +854,28 @@ impl Dp {
     /// entries the whole row goes over budget within a couple of letters and the
     /// rest of the matrix is never computed.
     fn distance(&mut self, a: &[u8], b: &[u8], budget: u32) -> Option<u32> {
+        let cost = self.align(a, b, budget, false);
+        // A single stray final key after an otherwise exact word is a timing
+        // slip. Discount only that complete alignment: extending the discount
+        // to multiple deletions can turn names such as "yarden" into "yard".
+        // Short bases remain protected from shortening unknown initialisms.
+        if b.len() >= crate::config::DEFAULT_SPELL_MIN_LEN
+            && a.len() == b.len() + 1
+            && a.starts_with(b)
+        {
+            let extra = extra_cost(a, a.len()).min(COST_STRAY_KEY);
+            if extra <= budget {
+                return Some(cost.map_or(extra, |cost| cost.min(extra)));
+            }
+        }
+        cost
+    }
+
+    /// Prefix searches may stop before consuming all typed letters. Rules and
+    /// transpositions may also cross the candidate prefix boundary, so their
+    /// partial output is admitted at its full cost rather than priced as a
+    /// different edit. This is optimistic; the complete alignment decides.
+    fn align(&mut self, a: &[u8], b: &[u8], budget: u32, prefix: bool) -> Option<u32> {
         let (n, m) = (a.len(), b.len());
         let width = m + 1;
         // Rules look back up to MAX_RULE_LEN rows and columns, so the whole
@@ -817,8 +896,16 @@ impl Dp {
             // Turning the empty prefix of `a` into `b[..j]` is all insertions,
             // every one of them at the start of the typed word.
             self.cells[j] = self.cells[j - 1]
-                .saturating_add(missing_cost(b, j))
+                .saturating_add(if prefix && j == m {
+                    COST_DOUBLE
+                } else {
+                    missing_cost(b, j)
+                })
                 .saturating_add(position_penalty(0));
+        }
+
+        if prefix && self.cells[m] <= budget {
+            return Some(self.cells[m]);
         }
 
         let index = rules_by_last_byte();
@@ -845,7 +932,11 @@ impl Dp {
                     // was dropped, one only in `a` was added — and only the
                     // second can be explained by where the keys are.
                     let insertion = self.cells[at(i, j - 1)]
-                        .saturating_add(missing_cost(b, j))
+                        .saturating_add(if prefix && j == m {
+                            COST_DOUBLE
+                        } else {
+                            missing_cost(b, j)
+                        })
                         .saturating_add(position_penalty(i));
                     let deletion = self.cells[at(i - 1, j)]
                         .saturating_add(self.extra[i])
@@ -865,6 +956,10 @@ impl Dp {
                         best =
                             best.min(self.cells[at(i - 2, j - 2)].saturating_add(COST_TRANSPOSE));
                     }
+                    if prefix && j == m && i >= 2 && a[i - 1] == b[j - 1] {
+                        best =
+                            best.min(self.cells[at(i - 2, j - 1)].saturating_add(COST_TRANSPOSE));
+                    }
                     best
                 };
 
@@ -873,16 +968,26 @@ impl Dp {
                 // so only a couple of rules are ever tested here.
                 for rule in &index[(a[i - 1] - b'a') as usize] {
                     let (fl, tl) = (rule.from.len(), rule.to.len());
-                    if i < fl || j < tl {
+                    if i < fl || &a[i - fl..i] != rule.from.as_bytes() {
                         continue;
                     }
-                    if &a[i - fl..i] == rule.from.as_bytes() && &b[j - tl..j] == rule.to.as_bytes()
-                    {
-                        best = best.min(self.cells[at(i - fl, j - tl)].saturating_add(rule.cost));
+                    let lengths = if prefix && j == m {
+                        1..=tl.min(j)
+                    } else {
+                        tl..=tl
+                    };
+                    for tl in lengths {
+                        if j >= tl && b[j - tl..j] == rule.to.as_bytes()[..tl] {
+                            best =
+                                best.min(self.cells[at(i - fl, j - tl)].saturating_add(rule.cost));
+                        }
                     }
                 }
 
                 self.cells[at(i, j)] = best;
+                if prefix && j == m && best <= budget {
+                    return Some(best);
+                }
                 row_min = row_min.min(best);
             }
             recent[i % LOOKBACK] = row_min;
@@ -942,6 +1047,61 @@ mod tests {
                 dict(&["omputer", "computer"]),
                 freq(&[("omputer", 500), ("computer", 100)])
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn edited_openings_allow_later_typos_within_the_existing_budget() {
+        let d = dict(&["communication"]);
+        let f = freq(&[("communication", 100)]);
+        for typed in ["ommunicaton", "xcommuncation", "vommuncation"] {
+            assert_eq!(
+                fix(typed, d, f).as_deref(),
+                Some("communication"),
+                "{typed}"
+            );
+            assert_eq!(correct_with(typed, d, f, 4, 20_000, 1), None);
+            assert_eq!(fix(typed, d, freq(&[("communication", 20_001)])), None);
+        }
+        assert_eq!(fix("pommuncation", d, f).as_deref(), Some("communication"));
+        assert_eq!(
+            fix(
+                "ommunicaton",
+                dict(&["ommunicaton", "communication"]),
+                freq(&[("ommunicaton", 50), ("communication", 100)])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn long_typos_can_use_three_edits_but_conservative_cannot() {
+        let d = dict(&["wonderful"]);
+        let f = freq(&[("wonderful", 100)]);
+        assert_eq!(fix("wonqerqxl", d, f).as_deref(), Some("wonderful"));
+        assert_eq!(correct_with("wonqerqxl", d, f, 4, 20_000, 2), None);
+        assert_eq!(correct_with("wonqerqxl", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn aggressive_reach_keeps_short_names_and_configured_limits() {
+        for (typed, intended) in [
+            ("helooo", "hello"),
+            ("comqztxr", "computer"),
+            ("pomputer", "computer"),
+        ] {
+            let d = dict(&[intended]);
+            let f = freq(&[(intended, 100)]);
+            assert_eq!(fix(typed, d, f).as_deref(), Some(intended), "{typed}");
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 1), None);
+        }
+        let d = dict(&["keyboard"]);
+        let f = freq(&[("keyboard", 40_000)]);
+        assert_eq!(fix("keyboarx", d, f).as_deref(), Some("keyboard"));
+        assert_eq!(correct_with("keyboarx", d, f, 4, 20_000, 3), None);
+        assert_eq!(
+            fix("supino", dict(&["suing"]), freq(&[("suing", 9_986)])),
             None
         );
     }
@@ -1076,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_first_letter_is_out_of_reach() {
+    fn short_words_keep_their_first_letter() {
         // "sork" is one substitution from both "work" and "sort". Only the one
         // that keeps the first letter is even scanned for, and that is
         // deliberate: rewriting the opening of a word is what turns a name into
@@ -1132,9 +1292,8 @@ mod tests {
 
     #[test]
     fn a_short_word_never_gets_a_two_edit_correction() {
-        // "cloud" is two edits from "claude" — a name, and short enough that the
-        // length gate refuses the second edit no matter how common the
-        // candidate is.
+        // Six-letter words only receive the cheap-edit budget. Rewriting this
+        // name requires more cost than that budget permits.
         let d = dict(&["cloud"]);
         let f = freq(&[("cloud", 900)]);
         assert_eq!(fix("claude", d, f), None);
@@ -1189,6 +1348,54 @@ mod tests {
         let d = dict(&["hello"]);
         let f = freq(&[("hello", 500)]);
         assert_eq!(correct_with("helo", d, f, 4, 20_000, 0), None);
+    }
+
+    #[test]
+    fn prefix_search_admits_complete_alignments_at_their_known_cost() {
+        let mut dp = Dp::default();
+        let mut pairs = vec![
+            ("xxcomputer".into(), "computer".into()),
+            ("xocmputer".into(), "computer".into()),
+            ("xmoputer".into(), "computer".into()),
+            ("omputer".into(), "computer".into()),
+            ("computerx".into(), "computer".into()),
+            ("comittee".into(), "committee".into()),
+        ];
+        pairs.extend(RULES.iter().map(|rule| {
+            (
+                format!("{}testing", rule.from),
+                format!("{}testing", rule.to),
+            )
+        }));
+        for (typed, intended) in pairs {
+            let cost = dp
+                .distance(typed.as_bytes(), intended.as_bytes(), 1_000)
+                .unwrap();
+            for end in 1..=intended.len() {
+                assert!(
+                    dp.align(typed.as_bytes(), &intended.as_bytes()[..end], cost, true)
+                        .is_some(),
+                    "{typed} -> {intended}: prefix {} rejected at complete cost {cost}",
+                    &intended[..end]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_stray_final_key_does_not_discount_multiple_deletions() {
+        let mut dp = Dp::default();
+        assert_eq!(
+            dp.distance(b"computerx", b"computer", COST_STRAY_KEY),
+            Some(COST_STRAY_KEY)
+        );
+        assert_eq!(
+            dp.distance(b"somewh", b"somew", 1_000),
+            Some(COST_HOMOPHONE)
+        );
+        assert_eq!(dp.distance(b"yarden", b"yard", CHEAPLY_EXPLAINED), None);
+        assert_eq!(dp.distance(b"toml", b"tom", COST_VOWEL), None);
+        assert_eq!(fix("yarden", dict(&["yard"]), freq(&[("yard", 500)])), None);
     }
 
     #[test]
@@ -1443,11 +1650,9 @@ mod tests {
     }
 
     #[test]
-    fn a_neighbouring_opening_is_looked_up_rather_than_scanned_for() {
-        // The candidate a fat-fingered opening could have been is known exactly
-        // — the typed word with its first letter replaced — so it never joins
-        // the scan, and `openings` stays the three kinds it always was. That is
-        // the whole reason this is affordable at the end of every word.
+    fn base_opening_runs_stay_narrow_for_mistyped_first_keys() {
+        // The broader changed-opening search is separate, so the original
+        // unchanged, transposed and phonetic runs retain their narrow scope.
         let letters = |w: &str| openings(w).iter().map(|o| o.letter).collect::<Vec<_>>();
         assert_eq!(letters("beed"), vec![b'b', b'e']);
         assert_eq!(letters("vusiness"), vec![b'v', b'u']);
@@ -1471,12 +1676,9 @@ mod tests {
         let d = dict(&["computer"]);
         let f = freq(&[("computer", 900)]);
         assert_eq!(fix("xomputer", d, f).as_deref(), Some("computer"));
-        // But not from a key nowhere near the one typed, however long the word
-        // and however affordable the arithmetic: that candidate is never asked
-        // about at all.
-        assert_eq!(fix("pomputer", d, f), None, "p is not beside c");
-        // And the rest of the word still has to be right — this reaches exactly
-        // one candidate, not a neighbourhood of them.
+        // Eight-letter words can afford a distant opening when the rest matches.
+        assert_eq!(fix("pomputer", d, f).as_deref(), Some("computer"));
+        // Candidates still compete using their full edit cost and frequency.
         let d = dict(&["computer", "computed"]);
         let f = freq(&[("computer", 900), ("computed", 200)]);
         assert_eq!(fix("xomputed", d, f).as_deref(), Some("computed"));
@@ -1502,6 +1704,86 @@ mod real_data {
             crate::config::DEFAULT_SPELL_MAX_RANK,
             crate::config::DEFAULT_SPELL_MAX_DIST,
         )
+    }
+
+    #[test]
+    fn corrects_each_typo_class_at_the_start_middle_and_end() {
+        for (typed, intended) in [
+            ("xcomputer", "computer"),
+            ("compxuter", "computer"),
+            ("computerx", "computer"),
+            ("ccomputer", "computer"),
+            ("compuuter", "computer"),
+            ("computerr", "computer"),
+            ("ommunication", "communication"),
+            ("commnication", "communication"),
+            ("communicatio", "communication"),
+            ("xomputer", "computer"),
+            ("compiter", "computer"),
+            ("computee", "computer"),
+            ("ocmputer", "computer"),
+            ("comptuer", "computer"),
+            ("computre", "computer"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+            assert_eq!(
+                correct_with(typed, en_dict(), en_freq(), 4, 50_000, 0),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn changed_openings_allow_immediate_extra_missing_and_transposed_letters() {
+        for (typed, intended) in [
+            ("xxcomputer", "computer"),
+            ("xcxomputer", "computer"),
+            ("xcoxmputer", "computer"),
+            ("xocmputer", "computer"),
+            ("xmoputer", "computer"),
+            ("xcmputer", "computer"),
+            ("xcoputer", "computer"),
+            ("zoxmputer", "computer"),
+            ("zeceive", "receive"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+            assert_eq!(
+                correct_with(typed, en_dict(), en_freq(), 4, 50_000, 1),
+                None
+            );
+            assert_eq!(correct_with(typed, en_dict(), en_freq(), 4, 50, 3), None);
+        }
+    }
+
+    #[test]
+    fn single_final_extras_keep_the_base_word_without_rewriting_names() {
+        for (typed, intended) in [
+            ("computerx", "computer"),
+            ("communicationx", "communication"),
+            ("governmentx", "government"),
+            ("languagex", "language"),
+            ("workx", "work"),
+            ("makex", "make"),
+            ("helpx", "help"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+            assert_eq!(
+                correct_with(typed, en_dict(), en_freq(), 4, 50_000, 1).as_deref(),
+                Some(intended),
+                "one-edit spelling: {typed}"
+            );
+        }
+        for word in [
+            "yarden",
+            "toml",
+            "works",
+            "makes",
+            "helps",
+            "computers",
+            "government",
+        ] {
+            assert_eq!(fix(word), None, "{word}");
+        }
     }
 
     #[test]

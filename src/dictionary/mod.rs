@@ -41,9 +41,15 @@ fn split_enabled() -> bool {
 
 /// Frequency rank of `text` in its language's frequency list, if the word is
 /// present (i.e. common enough to appear in the top-N list).
+/// English apostrophe forms reuse the folded entry or a possessive's stem.
 fn freq_rank(text: &str, lang: Language, en_freq: Freq, he_freq: Freq) -> Option<u32> {
     match lang {
-        Language::English => en_freq.rank(text),
+        Language::English => en_freq.rank(text).or_else(|| {
+            let stem = english_stem(text)?;
+            en_freq
+                .rank(&text.replace('\'', ""))
+                .or_else(|| text.ends_with("'s").then(|| en_freq.rank(stem)).flatten())
+        }),
         Language::Hebrew => he_freq.rank(text),
     }
 }
@@ -158,7 +164,7 @@ impl History {
 // on top of a standing reason to believe the user is writing that language, and
 // holding out for a top-2000 word ten times commoner than the alternative would
 // be ignoring most of what we know.
-const FREQ_COMMON_MAX: u32 = 2000; // the "other" reading must rank at least this common
+const FREQ_COMMON_MAX: u32 = 5_000; // the "other" reading must rank at least this common
 const FREQ_RARER_FACTOR: u32 = 10; // and be >= this many times more common than current
 
 /// The same two, for a word arriving at the end of a run in the other language.
@@ -231,7 +237,7 @@ const SHORT_COMMON_MAX: u32 = 500;
 /// Even with short switching enabled, rare dictionary hits are too ambiguous.
 // Fixed corpus-rank cutoff can miss uncommon words; tune against an
 // expanded accuracy corpus if short-word recall becomes a problem.
-const SHORT_ENABLED_MAX: u32 = 20_000;
+const SHORT_ENABLED_MAX: u32 = 30_000;
 
 /// Whether `text`, read as `lang`, is too short to be believed as a trigger.
 ///
@@ -272,26 +278,49 @@ const HE_PREFIXES: &[char] = &['ו', 'ה', 'ל', 'ב', 'כ', 'מ', 'ש'];
 /// the others, the relativiser ש over the simple prepositions, כש, and מ over
 /// ה or ש.
 ///
-/// Capped at two. Three-letter stacks exist (לכשה־) but they are rare enough
-/// that the recall is not worth widening a *guard* for, and the dictionary
-/// already holds many prefixed forms outright.
+/// Longer stacks are listed separately rather than stripping prefixes freely.
 const HE_PREFIX_PAIRS: &[&str] = &[
     "וה", "ול", "וב", "וכ", "ומ", "וש", "שה", "של", "שב", "שכ", "שמ", "כש", "מה", "מש",
 ];
 
-/// Shortest stem two stripped prefixes may leave behind. A single letter is not
+/// Conjunction over a supported pair, or כש over an article/preposition.
+const HE_PREFIX_TRIPLES: &[&str] = &[
+    "ושה", "ושל", "ושב", "ושכ", "ושמ", "וכש", "ומה", "ומש", "כשה", "כשב", "כשל", "כשמ", "לכש",
+];
+
+/// Supported conjunction and temporal stacks with four letters.
+const HE_PREFIX_QUADS: &[&str] = &["וכשה", "וכשל", "וכשב", "וכשמ", "לכשה", "ולכש"];
+
+/// Shortest stem multiple stripped prefixes may leave behind. A single letter is not
 /// a word anyone was writing — it is what is left over when the stripping was
 /// wrong, and matching on it would make the guard fire on almost anything
 /// starting with two of these letters.
 const HE_STEM_MIN: usize = 2;
 
+/// Inferred inflections need a stem people actually use, in either language.
+// ponytail: fixed stem-rank cutoff; tune against more real typing reports.
+const INFERRED_STEM_MAX_RANK: u32 = 50_000;
+
+/// A single English apostrophe joining a productive possessive or contraction.
+/// Reject other punctuation, digits, and multiple apostrophes before lookup.
+fn english_stem(text: &str) -> Option<&str> {
+    ["n't", "'s", "'ll", "'re", "'ve", "'d", "'m"]
+        .iter()
+        .find_map(|suffix| {
+            let stem = text.strip_suffix(suffix)?;
+            let enough_letters =
+                stem.len() >= 2 || (stem == "i" && matches!(*suffix, "'m" | "'d" | "'ll" | "'ve"));
+            (enough_letters && stem.bytes().all(|b| b.is_ascii_lowercase())).then_some(stem)
+        })
+}
+
 /// Hebrew lookup with a prefix fallback: if the word is not in the dict
 /// directly, try stripping the inflectional prefixes off the front and looking
 /// up the stem.
 ///
-/// One prefix is stripped unconditionally; a second only for the pairs in
-/// [`HE_PREFIX_PAIRS`], because stacking is what Hebrew does but not with every
-/// combination. Over-matching here is the safe direction — this is the *guard*
+/// One prefix is stripped unconditionally; longer stacks must appear in
+/// [`HE_PREFIX_PAIRS`], [`HE_PREFIX_TRIPLES`], or [`HE_PREFIX_QUADS`]. Over-matching here is the safe
+/// direction — this is the *guard*
 /// test, so a word it recognises is a word left alone rather than a word
 /// rewritten.
 fn matches_hebrew(word: &str, dict: Dict) -> bool {
@@ -312,10 +341,19 @@ fn hebrew_stem(word: &str, dict: Dict) -> Option<&str> {
     let second = rest_chars.next()?;
     let stem = rest_chars.as_str();
     let pair: String = [first, second].into_iter().collect();
-    (HE_PREFIX_PAIRS.contains(&pair.as_str())
+    if HE_PREFIX_PAIRS.contains(&pair.as_str())
         && stem.chars().count() >= HE_STEM_MIN
-        && dict.contains(stem))
-    .then_some(stem)
+        && dict.contains(stem)
+    {
+        return Some(stem);
+    }
+    HE_PREFIX_TRIPLES
+        .iter()
+        .chain(HE_PREFIX_QUADS)
+        .find_map(|prefix| {
+            let stem = word.strip_prefix(prefix)?;
+            (stem.chars().count() >= HE_STEM_MIN && dict.contains(stem)).then_some(stem)
+        })
 }
 
 /// Infer an unlisted Hebrew inflection only from a ranked dictionary stem.
@@ -328,38 +366,61 @@ fn prefixed_hebrew_target(
     en_freq: Freq,
     he_freq: Freq,
 ) -> bool {
-    // ponytail: fixed stem-rank cutoff; tune against more real typing reports.
-    const MAX_STEM_RANK: u32 = 50_000;
     Config::global().freq_enabled
         && text_he.chars().count() >= 5
         && !en_dict.contains(text_en)
         && en_freq
             .rank(text_en)
-            .is_none_or(|rank| rank > MAX_STEM_RANK)
+            .is_none_or(|rank| rank > INFERRED_STEM_MAX_RANK)
         && hebrew_stem(text_he, he_dict).is_some_and(|stem| {
             stem.chars().count() >= 3
-                && he_freq.rank(stem).is_some_and(|rank| rank <= MAX_STEM_RANK)
+                && he_freq
+                    .rank(stem)
+                    .is_some_and(|rank| rank <= INFERRED_STEM_MAX_RANK)
         })
 }
 
-/// Exact dictionary membership, used for current-layout protection and
-/// homograph comparisons. Inferred targets use [`valid_target`] separately.
+/// Dictionary membership, including canonical English apostrophe spellings of
+/// an existing folded entry. Inferred targets use [`valid_target`] separately.
 fn valid_strict(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool {
     if text.is_empty() {
         return false;
     }
     match lang {
-        Language::English => en_dict.contains(text),
+        // The English word list stores contractions without apostrophes;
+        // accept the canonical spelling through the same folded entry.
+        Language::English => {
+            en_dict.contains(text)
+                || english_stem(text).is_some_and(|stem| {
+                    (!text.ends_with("'s") || en_dict.contains(stem))
+                        && en_dict.contains(&text.replace('\'', ""))
+                })
+        }
         Language::Hebrew => he_dict.contains(text),
     }
 }
 
-/// A layout target may also be a productive Hebrew prefix attached to a
-/// common dictionary stem. Require four stem letters to limit accidental hits.
+/// A layout target may also be a productive English apostrophe form or Hebrew
+/// prefix attached to a common dictionary stem. Hebrew needs four stem letters
+/// to limit accidental hits.
 // ponytail: prefix heuristic cannot validate grammar; add morphological analysis
 // if the accuracy corpus exposes false positives.
-fn valid_target(text: &str, lang: Language, en: Dict, he: Dict, he_freq: Freq) -> bool {
+fn valid_target(
+    text: &str,
+    lang: Language,
+    en: Dict,
+    he: Dict,
+    en_freq: Freq,
+    he_freq: Freq,
+) -> bool {
     valid_strict(text, lang, en, he)
+        || (lang == Language::English
+            && Config::global().freq_enabled
+            && english_stem(text).is_some_and(|stem| {
+                en.contains(stem)
+                    && freq_rank(text, lang, en_freq, he_freq)
+                        .is_some_and(|rank| rank <= INFERRED_STEM_MAX_RANK)
+            }))
         || (lang == Language::Hebrew
             && HE_PREFIXES.iter().any(|&prefix| {
                 text.strip_prefix(prefix).is_some_and(|stem| {
@@ -375,14 +436,17 @@ fn valid_target(text: &str, lang: Language, en: Dict, he: Dict, he_freq: Freq) -
 /// Looser membership for `lang`. This is the *guard* test — "the user already
 /// typed a real word in this layout, leave it alone." Hebrew adds the one-letter
 /// inflectional-prefix fallback so prefixed real words (absent from the dict
-/// directly) still count and are never carved up. English has no such prefixes,
-/// so it is identical to the strict check.
+/// directly) still count and are never carved up. English also protects
+/// possessives and contractions with dictionary stems.
 fn valid_loose(text: &str, lang: Language, en_dict: Dict, he_dict: Dict) -> bool {
     if text.is_empty() {
         return false;
     }
     match lang {
-        Language::English => en_dict.contains(text),
+        Language::English => {
+            valid_strict(text, lang, en_dict, he_dict)
+                || english_stem(text).is_some_and(|stem| en_dict.contains(stem))
+        }
         Language::Hebrew => matches_hebrew(text, he_dict),
     }
 }
@@ -471,9 +535,9 @@ fn decide_known(
         return None;
     }
     // Trigger: the other layout yields a confident word → switch.
-    if valid_target(oth_text, other, en_dict, he_dict, he_freq) {
-        // …unless the current reading is a *loose* match — a Hebrew form the
-        // prefix rules recognise without the dictionary holding it outright.
+    if valid_target(oth_text, other, en_dict, he_dict, en_freq, he_freq) {
+        // …unless the current reading is a *loose* match — an inflected form
+        // the stem rules recognise without the dictionary holding it outright.
         // That is weaker evidence than a strict hit, since it is inferred
         // rather than looked up, but it is a long way from nothing: switching
         // on top of it rewrites a real Hebrew word into an unrelated English
@@ -481,8 +545,7 @@ fn decide_known(
         // English reading has to win a frequency contest first, and the run
         // counts towards it exactly as it does for a homograph above.
         //
-        // Only Hebrew can reach this: English has no inflectional prefixes, so
-        // its loose test is its strict one and the guard above already fired.
+        // Hebrew prefixes and English apostrophe forms both reach this guard.
         if valid_loose(cur_text, current, en_dict, he_dict)
             && !other_decisively_more_common(
                 cur_text, current, oth_text, other, run, en_freq, he_freq,
@@ -501,7 +564,7 @@ fn decide_known(
 }
 
 /// Whole-word decision when the current layout can't be determined. Falls back
-/// to a symmetric rule using dictionary words and confident Hebrew prefix
+/// to a symmetric rule using dictionary words and confident inflected
 /// targets, with frequency evidence resolving competing readings.
 fn decide_unknown(
     text_en: &str,
@@ -526,16 +589,30 @@ fn decide_unknown(
     // trigger — the same collision guard as in `decide_known`.
     let enabled = Config::global().short_enabled;
     let short_ok = |text: &str, lang| !too_short_to_trigger(text, lang, enabled, en_freq, he_freq);
-    let en_strict = short_ok(text_en, Language::English)
-        && valid_strict(text_en, Language::English, en_dict, he_dict);
+    let en_target = short_ok(text_en, Language::English)
+        && valid_target(
+            text_en,
+            Language::English,
+            en_dict,
+            he_dict,
+            en_freq,
+            he_freq,
+        );
     let he_target = short_ok(text_he, Language::Hebrew)
-        && valid_target(text_he, Language::Hebrew, en_dict, he_dict, he_freq);
+        && valid_target(
+            text_he,
+            Language::Hebrew,
+            en_dict,
+            he_dict,
+            en_freq,
+            he_freq,
+        );
     // If exactly one layout has a confident target, switch to that layout.
-    if en_strict && !he_target {
+    if en_target && !he_target {
         return Some(Language::English);
-    } else if he_target && !en_strict {
+    } else if he_target && !en_target {
         return Some(Language::Hebrew);
-    } else if en_strict && he_target {
+    } else if en_target && he_target {
         // Both layouts read as words: break the tie by frequency (and by the
         // run, which is usually the stronger of the two), else leave it alone.
         // The winner must be decisively more common than the loser.
@@ -1466,14 +1543,256 @@ mod tests {
     }
 
     #[test]
+    fn english_apostrophe_targets_need_dictionary_and_frequency_evidence() {
+        let en = dict(&[
+            "keyboard", "you", "cant", "wont", "shant", "hello", "class", "test", "i", "im", "id",
+            "ill", "ive", "am", "all", "ave",
+        ]);
+        let he = dict(&["שלום"]);
+        let ranks = freq(&[
+            ("keyboard", 100),
+            ("youll", 30_000),
+            ("im", 100),
+            ("id", 100),
+        ]);
+        for text in [
+            "keyboard's",
+            "you'll",
+            "can't",
+            "won't",
+            "shan't",
+            "i'm",
+            "i'd",
+            "i'll",
+            "i've",
+        ] {
+            assert!(valid_target(
+                text,
+                Language::English,
+                en,
+                he,
+                ranks,
+                nofreq()
+            ));
+            assert!(valid_loose(text, Language::English, en, he));
+            assert_eq!(
+                decide_known(
+                    text,
+                    "זזזזזז",
+                    Language::Hebrew,
+                    Run::default(),
+                    en,
+                    he,
+                    ranks,
+                    nofreq()
+                ),
+                Some(Language::English),
+                "{text}"
+            );
+            assert_eq!(
+                decide_unknown(text, "זזזזזז", Run::default(), en, he, ranks, nofreq()),
+                Some(Language::English),
+                "{text}"
+            );
+            assert_eq!(
+                decide_known(
+                    text,
+                    "שלום",
+                    Language::Hebrew,
+                    Run::default(),
+                    en,
+                    he,
+                    ranks,
+                    freq(&[("שלום", 100)])
+                ),
+                None,
+                "a common current Hebrew word must win over {text}"
+            );
+        }
+        for text in ["keyboard's", "you'll"] {
+            for ranks in [
+                nofreq(),
+                freq(&[
+                    ("keyboard", INFERRED_STEM_MAX_RANK + 1),
+                    ("youll", INFERRED_STEM_MAX_RANK + 1),
+                ]),
+            ] {
+                assert!(!valid_target(
+                    text,
+                    Language::English,
+                    en,
+                    he,
+                    ranks,
+                    nofreq()
+                ));
+            }
+        }
+        for text in [
+            "keyb'oard",
+            "keyboard''s",
+            "keyboard_1's",
+            "1's",
+            "qzrrr's",
+            "keyboard've",
+            "keyboardn't",
+            "clas's",
+            "tes't",
+            "a'm",
+            "a'll",
+            "a've",
+            "i're",
+            "i'n't",
+            "i's",
+        ] {
+            assert!(
+                !valid_target(text, Language::English, en, he, ranks, nofreq()),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            freq_rank("keyboard's", Language::English, ranks, nofreq()),
+            Some(100)
+        );
+        assert_eq!(
+            freq_rank("you'll", Language::English, ranks, nofreq()),
+            Some(30_000)
+        );
+        // Productive possessives are structural, not a list of favored words.
+        for letter in b'a'..=b'z' {
+            let stem = format!("ba{}er", char::from(letter));
+            let text = format!("{stem}'s");
+            assert!(valid_target(
+                &text,
+                Language::English,
+                dict(&[&stem]),
+                he,
+                freq(&[(&stem, 100)]),
+                nofreq()
+            ));
+        }
+    }
+
+    #[test]
+    fn wrong_layout_apostrophe_forms_keep_case_punctuation_and_atomic_switch() {
+        for (english, hebrew) in [
+            ("don't", "גםמ,א"),
+            ("couldn't", "בםוךגמ,א"),
+            ("can't", "בשמ,א"),
+            ("won't", "'םמ,א"),
+            ("shan't", "דישמ,א"),
+            ("we're", "'ק,רק"),
+            ("you'll", "טםו,ךך"),
+            ("keyboard's", "לקטנםשרג,ד"),
+            ("organisation's", "םרעשמןדשאןםמ,ד"),
+            ("Keyboard's!", "לקטנםשרג,ד1"),
+            ("i'm", "ן,צ"),
+            ("i'd", "ן,ג"),
+            ("i'll", "ן,ךך"),
+            ("i've", "ן,הק"),
+            ("I'm", "ן,צ"),
+            ("I'd", "ן,ג"),
+            ("I'll", "ן,ךך"),
+            ("I've", "ן,הק"),
+            ("I'm!", "ן,צ1"),
+        ] {
+            let keys: Vec<_> = english
+                .chars()
+                .zip(hebrew.chars())
+                .map(|(en, he)| {
+                    (
+                        en.to_ascii_lowercase(),
+                        he,
+                        en.is_ascii_uppercase() || en == '!',
+                    )
+                })
+                .collect();
+            for layout_only in [false, true] {
+                let switches = std::cell::Cell::new(0);
+                let correct = |current, accepted| {
+                    check_and_correct(
+                        &keys,
+                        |k| Some(k.0),
+                        |k| Some(k.1),
+                        |k| k.2,
+                        Run::default(),
+                        en_dict(),
+                        he_dict(),
+                        Some(current),
+                        layout_only,
+                        |lang| {
+                            switches.set(switches.get() + 1);
+                            assert_eq!(lang, Language::English);
+                            if accepted {
+                                crate::layout::LayoutSwitch::Switched
+                            } else {
+                                crate::layout::LayoutSwitch::Failed
+                            }
+                        },
+                    )
+                };
+                let outcome = correct(Language::Hebrew, true);
+                assert_eq!(
+                    outcome.fix,
+                    Some(Fix::Layout {
+                        start: 0,
+                        text: english.into(),
+                        lang: Language::English
+                    }),
+                    "{english}"
+                );
+                assert_eq!(outcome.rule, Some("layout"));
+                assert_eq!(switches.get(), 1);
+                assert!(
+                    correct(Language::English, true).fix.is_none(),
+                    "preserve {english}"
+                );
+                assert_eq!(switches.get(), 1, "already-English text needs no switch");
+                assert!(
+                    correct(Language::Hebrew, false).fix.is_none(),
+                    "refused switch must not erase {hebrew}"
+                );
+                assert_eq!(switches.get(), 2);
+            }
+        }
+    }
+
+    #[test]
     fn prefixed_layout_targets_need_common_long_stems_and_preserve_real_words() {
         let en = dict(&["hello"]);
         let he = dict(&["מחשב", "שלום", "בית"]);
-        let ranks = freq(&[("מחשב", 100), ("שלום", 2_001), ("בית", 50)]);
-        assert!(valid_target("למחשב", Language::Hebrew, en, he, ranks));
-        assert!(!valid_target("לשלום", Language::Hebrew, en, he, ranks));
-        assert!(!valid_target("לבית", Language::Hebrew, en, he, ranks));
-        assert!(!valid_target("למחשב", Language::Hebrew, en, he, nofreq()));
+        let ranks = freq(&[("מחשב", 100), ("שלום", FREQ_COMMON_MAX + 1), ("בית", 50)]);
+        assert!(valid_target(
+            "למחשב",
+            Language::Hebrew,
+            en,
+            he,
+            nofreq(),
+            ranks
+        ));
+        assert!(!valid_target(
+            "לשלום",
+            Language::Hebrew,
+            en,
+            he,
+            nofreq(),
+            ranks
+        ));
+        assert!(!valid_target(
+            "לבית",
+            Language::Hebrew,
+            en,
+            he,
+            nofreq(),
+            ranks
+        ));
+        assert!(!valid_target(
+            "למחשב",
+            Language::Hebrew,
+            en,
+            he,
+            nofreq(),
+            nofreq()
+        ));
         assert_eq!(
             decide_known(
                 "knjac",
@@ -2187,6 +2506,67 @@ mod tests {
     }
 
     #[test]
+    fn broader_layout_reach_still_requires_strong_evidence() {
+        let en = dict(&["keyboard"]);
+        let he = dict(&["עט", "מקלדת", "מחשב"]);
+        let english = freq(&[("keyboard", 4_500)]);
+        let hebrew = freq(&[("עט", 25_000), ("מקלדת", 100), ("מחשב", 50_000)]);
+        assert!(!too_short_to_trigger(
+            "עט",
+            Language::Hebrew,
+            true,
+            english,
+            hebrew
+        ));
+        assert!(too_short_to_trigger(
+            "עט",
+            Language::Hebrew,
+            false,
+            english,
+            hebrew
+        ));
+        assert_eq!(
+            decide_known(
+                "keyboard",
+                "מחשב",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                english,
+                hebrew
+            ),
+            Some(Language::English)
+        );
+        assert_eq!(
+            decide_known(
+                "keyboard",
+                "מקלדת",
+                Language::Hebrew,
+                Run::default(),
+                en,
+                he,
+                english,
+                hebrew
+            ),
+            None
+        );
+        assert_eq!(
+            decide_known(
+                "ufavneks,",
+                "וכשהמקלדת",
+                Language::English,
+                Run::default(),
+                en,
+                he,
+                english,
+                hebrew
+            ),
+            Some(Language::Hebrew)
+        );
+    }
+
+    #[test]
     fn homograph_keeps_current_when_both_common() {
         // Both readings are common words → no decisive winner, keep current.
         let en = dict(&["go"]);
@@ -2764,8 +3144,12 @@ mod tests {
         // A stem too short to be a stem, and a stem that is not a word.
         assert!(!matches_hebrew("ושב", he));
         assert!(!matches_hebrew("והספר", he));
-        // Three prefixes are past what is stripped.
-        assert!(!matches_hebrew("וכשהבית", he));
+        assert!(matches_hebrew("וכשבית", he));
+        assert!(matches_hebrew("ושלשלום", he));
+        assert!(matches_hebrew("כשהבית", he));
+        assert!(!matches_hebrew("ולהבית", he));
+        assert!(matches_hebrew("וכשהבית", he));
+        assert!(!matches_hebrew("ולההבית", he));
     }
 
     #[test]

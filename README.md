@@ -20,14 +20,23 @@ on screen and rewrite only the remaining suffix, reducing visible deletion.
 A confident English spelling fix can also correct a
 wrong-layout word in the same replacement.
 
-Spelling also checks missing or extra first letters in longer words, such as
-`omputer` → `computer` and `xkeyboard` → `keyboard`, including when typed in the
-Hebrew layout. Layout correction recognizes unlisted Hebrew words with supported
-one- or two-letter prefixes, such as `במקלדת` and `ובמקלדת`, when the stem is a
-ranked dictionary word and the English reading is not a known word or common name.
+Spelling also checks missing, extra, or wrong first letters in longer words,
+including combined opening mistakes (`xocmputer` → `computer`) and additional
+mistakes later in the word (`ommunicaton` → `communication`). Missing, repeated,
+extra, swapped, and wrong letters are checked throughout the word. A single
+stray ending letter can recover the unchanged base (`computerx` → `computer`).
+Words of eight or more letters can use the three-edit budget; six-letter words
+can recover multiple cheap slips. Shorter tokens keep their existing limits.
+These fixes also work when typed in the Hebrew layout.
+Layout correction also recognizes English contractions and possessives such as
+`don't`, `I'm`, and `keyboard's`, preserving capitalization and punctuation.
+Layout correction recognizes unlisted Hebrew words with supported
+one- through four-letter prefixes, such as `במקלדת`, `ושלמקלדת`, and `וכשהמקלדת`,
+when the stem is a ranked dictionary word and the English reading is not a known word or common name.
 Conservative spelling keeps its existing single-edit limit.
 
-Spelling correction protects dictionary words, ALL CAPS, and tokens containing
+Spelling correction protects frequency-attested dictionary words, curated
+technical terms, ALL CAPS, and tokens containing
 digits or internal punctuation. It uses word frequency and weighted typo costs,
 without surrounding-sentence context, so unfamiliar names or jargon can still get
 unwanted fixes. Undo, ignored words, and Conservative spelling give you control.
@@ -257,8 +266,11 @@ personal = false   # Persistent personalization (default: false)
 ```
 
 Spelling defaults to words of at least 4 characters and suggestions ranked within
-20,000; completion defaults to prefixes of at least 3 characters and rank 30,000.
-`short = false` restricts short layout switches to very common words;
+50,000 for words of at least eight letters (20,000 for shorter words). Completion
+defaults to prefixes of at least 3 characters and rank 30,000.
+Short layout switches accept ranks up to 30,000; `short = false` restricts them
+to ranks up to 500. Homograph overrides accept alternate readings ranked up to
+5,000, requiring a tenfold frequency advantage without language history;
 `freq = false` disables the frequency tie-break between valid readings in both layouts.
 An absent config uses defaults. Invalid values produce diagnostics and fall back;
 an unreadable config stops startup so exclusions are not silently discarded.
@@ -450,12 +462,12 @@ protected from spelling changes even when a term is absent from the frequency li
 These additions enable wrong-layout recovery without inventing frequency rankings
 or promoting jargon into general-purpose spelling suggestions. Their unchanged English readings are covered by the correction corpus.
 
-Spelling correction also considers missing or extra first letters on longer words
-(e.g. `omputer` and `xcomputer` become `computer`), using the existing edit-cost
-and frequency limits. Layout correction recognizes an attached Hebrew prefix
-when its dictionary stem has at least four letters and ranks in the top 2,001
-frequency entries. These inferred forms never override an exact current-layout
-word when the layout is known.
+Spelling correction also considers missing, extra, or wrong first letters
+on longer words, including later typos when the edit budget permits. Layout
+correction recognizes supported Hebrew prefix stacks when the dictionary stem
+has at least three letters and frequency rank at most 50,000; the full word must
+have at least five letters. These inferred forms never override an exact
+current-layout word when the layout is known.
 
 Build-time preprocessing merges, deduplicates, and sorts dictionary entries for
 binary search. Source dictionary order therefore does not affect lookup speed.
