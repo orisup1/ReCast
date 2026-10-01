@@ -39,7 +39,9 @@ Spelling correction protects frequency-attested dictionary words, curated
 technical terms, ALL CAPS, and tokens containing
 digits or internal punctuation. It uses word frequency and weighted typo costs,
 without surrounding-sentence context, so unfamiliar names or jargon can still get
-unwanted fixes. Undo, ignored words, and Conservative spelling give you control.
+unwanted fixes. When the two best spelling candidates have nearly equal scores,
+ReCast leaves the word unchanged. Undo, ignored words, and Conservative spelling
+give you control.
 Navigation, mouse clicks, and focus changes cancel stale corrections where detected.
 
 ## Install
@@ -148,7 +150,7 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 
 | Action | Gesture or control |
 | --- | --- |
-| Complete an English word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
+| Complete an English or Hebrew word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
 | Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space/Enter |
 | Rescue selected text (macOS) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Undo the latest correction | Tap **Ctrl twice within half a second**, immediately after the correction |
@@ -303,6 +305,13 @@ Right Shift also offers an expansion. Capitalization follows your input:
 `Btw` becomes `By the way`. No abbreviations ship enabled; `complete = false`
 disables both abbreviations and word completion.
 
+Word completion uses the active English or Hebrew layout. It first offers exact
+prefix matches; if there are none, it tries one missing, extra, wrong, or swapped
+prefix letter. Cycling and undo always restore your original prefix. Prefix
+length limits count characters in either language. Saved words in `ignore.txt`
+and persistent undo exceptions are also completion candidates, including names
+and technical terms absent from the bundled dictionary.
+
 ### Application exclusions
 
 Use **Application modes** in the tray or Linux window for the last detected app:
@@ -398,7 +407,13 @@ independent of personalization and is off by default.
 
 `RECAST_PERSONAL=1` saves word/correction data and aggregate key timings under
 `personal/`; on Linux/Windows, this may include password-field text. Personal files
-are user-only on Unix. To clear them, **stop ReCast first**, then run:
+are user-only on Unix. Automatic corrections train word frequency and replacement
+pairs only after subsequent typing retains the result; undo, deletion, and detected
+focus changes cancel pending learning. Completion offers do not train replacement
+pairs: only the chosen word, finished with Space or Enter, trains word frequency.
+With personalization enabled, words retained at least twice also become completion
+candidates even when absent from the bundled dictionary. To clear these files,
+**stop ReCast first**, then run:
 
 ```bash
 recast --clear-personal-data

@@ -952,12 +952,12 @@ fn plan(
         return None;
     }
 
-    // Personal confusion pair: the user has explicitly corrected this word
-    // before (via undo or post-fix edit). This outranks everything — it's
-    // their deliberate choice.
-    if let Some(correction) = (!layout_only)
-        .then(|| crate::personal::personal_correction(typed))
-        .flatten()
+    // A personal replacement needs repeated retained corrections, not merely
+    // automatic rewrites or offers that were cycled past.
+    if let Some(correction) =
+        (!layout_only && !crate::complete::ignored(typed) && !crate::complete::learned(typed))
+            .then(|| crate::personal::personal_correction(typed))
+            .flatten()
     {
         if current == Some(Language::Hebrew) && is_english_text(&correction) {
             return Some(Plan::SwitchAndSpell {
@@ -1463,37 +1463,46 @@ pub fn declined_by_list<K: Copy>(
 /// (the completion key — see the platform listeners).
 ///
 /// Unlike the correction pipelines this fires *mid-word*, with no terminator
-/// typed and nothing wrong with the input: the user asked. It still refuses
-/// under a non-English layout for the same reason the speller does — the result
-/// is injected as English text or English keystrokes, and under Hebrew that is
-/// not what the user is looking at.
+/// typed and nothing wrong with the input: the user asked. The caller supplies
+/// the active language's character mapping and dictionary; unknown layouts decline.
 ///
 /// Returns the candidates in offer order (each already capitalized to match
 /// what was typed), for the caller to swap in one at a time as the completion
 /// key is tapped again. Empty means there is nothing worth offering.
 pub fn complete_candidates<K: Copy>(
     keys: &[K],
-    to_en: impl Fn(K) -> Option<char>,
+    to_char: impl Fn(K) -> Option<char>,
     shift_of: impl Fn(K) -> bool,
-    en_dict: Dict,
+    dict: Dict,
     current: Option<Language>,
 ) -> Vec<String> {
-    if keys.is_empty() || current != Some(Language::English) {
+    if keys.is_empty() || current.is_none() {
         return Vec::new();
     }
     let mut prefix = String::with_capacity(keys.len());
     let mut shifted = Vec::with_capacity(keys.len());
     for &k in keys {
-        if let Some(c) = to_en(k) {
+        if let Some(c) = to_char(k) {
             prefix.push(c);
             shifted.push(shift_of(k));
+        } else {
+            return Vec::new();
         }
     }
-    let words = crate::complete::completions(&prefix, en_dict, en_freq());
+    let freq = if current == Some(Language::Hebrew) {
+        he_freq()
+    } else {
+        en_freq()
+    };
+    let words = crate::complete::completions(&prefix, dict, freq);
     if debug_enabled() && !words.is_empty() {
         println!("complete: {} -> {}", prefix, words.join(" | "));
     }
-    let case = Case::of(&shifted);
+    let case = if current == Some(Language::Hebrew) {
+        Case::Lower
+    } else {
+        Case::of(&shifted)
+    };
     words.into_iter().map(|w| case.apply(&w)).collect()
 }
 

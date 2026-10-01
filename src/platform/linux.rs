@@ -14,6 +14,34 @@ use std::time::Duration;
 type Typed = engine::Typed<KeyCode>;
 
 pub struct Linux;
+
+#[cfg(test)]
+#[test]
+fn completion_keys_match_the_active_language() {
+    let keys = Linux::retype_completion("שלום", Language::Hebrew).unwrap();
+    let text: String = keys
+        .iter()
+        .filter_map(|(key, _)| evkey_to_hebrew_char(*key))
+        .collect();
+    assert_eq!(text, "שלום");
+    assert!(keys.iter().all(|(_, shift)| !shift));
+    let keys = Linux::retype_completion("Keyboard", Language::English).unwrap();
+    let text: String = keys
+        .iter()
+        .filter_map(|(key, shift)| {
+            evkey_to_english_char_shifted(*key, *shift).map(|c| {
+                if *shift {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+        })
+        .collect();
+    assert_eq!(text, "Keyboard");
+    assert!(Linux::retype_completion("🙂", Language::Hebrew).is_none());
+}
+
 impl Platform for Linux {
     type Key = KeyCode;
     type Retype = Vec<(KeyCode, bool)>;
@@ -88,6 +116,13 @@ impl Platform for Linux {
     }
     fn retype_text(text: &str) -> Option<Self::Retype> {
         text.chars().map(english_char_to_evkey_shifted).collect()
+    }
+    fn retype_completion(text: &str, lang: Language) -> Option<Self::Retype> {
+        if lang == Language::Hebrew {
+            Self::retype_text(&crate::keymap::convert_selection(text))
+        } else {
+            Self::retype_text(text)
+        }
     }
     fn retype_len(retype: &Self::Retype) -> usize {
         retype.len()

@@ -190,6 +190,11 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// reason to drop the fix rather than inject half a word.
     fn retype_text(text: &str) -> Option<Self::Retype>;
 
+    /// Completion stays in the active layout, including Hebrew on keycode injectors.
+    fn retype_completion(text: &str, _lang: Language) -> Option<Self::Retype> {
+        Self::retype_text(text)
+    }
+
     /// How many characters this will put on screen. Every key produces exactly
     /// one character, which is what lets an erase count be a key count.
     fn retype_len(retype: &Self::Retype) -> usize;
@@ -349,6 +354,14 @@ pub struct Cycle<P: Platform> {
     index: usize,
     /// Characters the current offer put on screen, to erase for the next one.
     on_screen: usize,
+    lang: Language,
+}
+
+/// A rewrite is not a retained choice until subsequent trusted typing.
+struct PendingLearning {
+    /// A correction's original text; None for an unaccepted completion offer.
+    from: Option<String>,
+    to: String,
 }
 
 fn shortcut_matches<P: Platform>(binding: &str, key: P::Key) -> bool {
@@ -399,6 +412,7 @@ pub struct AppState<P: Platform> {
     pub last_action: Option<LastAction<P>>,
     /// The completion cycle in progress, if the user is tapping through guesses.
     pub cycle: Option<Cycle<P>>,
+    pending_learning: Option<PendingLearning>,
     /// What language the last few finished words were in — the context every
     /// ambiguous decision is missing when it looks at one word on its own.
     ///
@@ -437,6 +451,7 @@ impl<P: Platform> AppState<P> {
             layout_hotkey: false,
             last_action: None,
             cycle: None,
+            pending_learning: None,
             history: History::default(),
             last_key: None,
             last_key_at: Instant::now(),
@@ -525,6 +540,7 @@ impl<P: Platform> AppState<P> {
         self.keys.clear();
         self.buffered_keys.clear();
         self.forget_gestures();
+        self.pending_learning = None;
         self.history.clear();
         self.no_fix = true;
     }
@@ -705,8 +721,11 @@ impl<P: Platform> Engine<P> {
             return false;
         }
         let (focus, mode) = self.read_focus();
+        let completion_layout = self.lock().cycle.as_ref().map(|cycle| cycle.lang);
+        let layout_matches = completion_layout.is_none_or(|lang| P::current_layout() == Some(lang));
         let st = self.lock();
-        mode.is_some_and(|mode| mode != crate::config::AppMode::Off && mode == st.mode)
+        layout_matches
+            && mode.is_some_and(|mode| mode != crate::config::AppMode::Off && mode == st.mode)
             && st.generation == generation
             && st.focus == focus
             && (!P::requires_focus() || focus.is_some())
@@ -810,6 +829,7 @@ impl<P: Platform> Engine<P> {
                 .practice_open
                 .load(std::sync::atomic::Ordering::Relaxed)
             || key == P::BACKSPACE
+            || (st.pending_learning.is_some() && !is_modifier_key)
             || (P::is_terminator(key) && !st.keys.is_empty() && !st.is_replacing)
             || (is_text && st.keys.is_empty() && !st.is_replacing);
         let focus = if needs_focus {
@@ -821,6 +841,27 @@ impl<P: Platform> Engine<P> {
         } else {
             None
         };
+
+        if key == P::BACKSPACE {
+            st.pending_learning = None;
+        } else if !st.is_replacing && (is_text || P::is_terminator(key)) {
+            if let Some(pending) = st.pending_learning.take() {
+                if let Some(from) = &pending.from {
+                    if !st.practice
+                        && st.mode == crate::config::AppMode::Full
+                        && self.control.is_enabled()
+                        && P::input_allowed()
+                        && st.focus == focus
+                    {
+                        crate::personal::record_confusion(from, &pending.to);
+                        crate::personal::record_word(&pending.to);
+                    }
+                } else if P::is_terminator(key) {
+                    st.pending_learning = Some(pending);
+                }
+                // Continuing a completion is not acceptance of the offered word.
+            }
+        }
 
         // Record key press for typing pattern analysis (dwell, digraphs).
         // Use Debug representation as a stable-ish key name.
@@ -896,6 +937,22 @@ impl<P: Platform> Engine<P> {
             // This terminator already ended the untrusted word.
             st.no_fix = false;
             return;
+        }
+
+        if let Some(pending) = st.pending_learning.take() {
+            if pending.from.is_none() {
+                if let Some(lang) = P::current_layout() {
+                    if pending.to == reading::<P>(&st.keys, lang) {
+                        // An explicitly chosen word must not be autocorrected on acceptance.
+                        st.history.push(lang);
+                        if !st.practice && st.mode == crate::config::AppMode::Full {
+                            crate::personal::record_word(&pending.to);
+                        }
+                        st.keys.clear();
+                        return;
+                    }
+                }
+            }
         }
 
         let outcome = self.check(&st.keys, st.history.run(), st.mode);
@@ -1065,13 +1122,21 @@ impl<P: Platform> Engine<P> {
             st.cycle = None;
             return;
         }
+        let Some(lang) = P::current_layout() else {
+            st.invalidate_text();
+            return;
+        };
+        if st.cycle.as_ref().is_some_and(|cycle| cycle.lang != lang) {
+            st.invalidate_text();
+            return;
+        }
         let current = match &st.cycle {
             Some(cycle) => cycle
                 .candidates
                 .get(cycle.index)
                 .cloned()
-                .unwrap_or_else(|| reading::<P>(&cycle.typed, Language::English)),
-            None => reading::<P>(&st.keys, Language::English),
+                .unwrap_or_else(|| reading::<P>(&cycle.typed, lang)),
+            None => reading::<P>(&st.keys, lang),
         };
         let (typed, candidates, index, erase) = match st.cycle.take() {
             Some(cycle) => {
@@ -1088,10 +1153,17 @@ impl<P: Platform> Engine<P> {
                 }
                 let candidates = complete_candidates(
                     &st.keys,
-                    |t: Typed<P::Key>| P::english_char(t.key, t.shift),
+                    |t: Typed<P::Key>| match lang {
+                        Language::English => P::english_char(t.key, t.shift),
+                        Language::Hebrew => (!t.shift).then(|| P::hebrew_char(t.key)).flatten(),
+                    },
                     |t: Typed<P::Key>| t.shift,
-                    self.en_dict,
-                    P::current_layout(),
+                    if lang == Language::English {
+                        self.en_dict
+                    } else {
+                        self.he_dict
+                    },
+                    Some(lang),
                 );
                 if candidates.is_empty() {
                     return;
@@ -1105,11 +1177,11 @@ impl<P: Platform> Engine<P> {
         // capitalisation (`sHiFtY`) survives that way.
         let back_to_typed = index >= candidates.len();
         let retype = if back_to_typed {
-            P::retype_original(&typed, Language::English)
+            P::retype_original(&typed, lang)
         } else {
             // An untypeable candidate is dropped rather than injected in half;
             // the cycle carries on to the next tap.
-            match P::retype_text(&candidates[index]) {
+            match P::retype_completion(&candidates[index], lang) {
                 Some(r) => r,
                 None => return,
             }
@@ -1118,7 +1190,7 @@ impl<P: Platform> Engine<P> {
         // The counter tracks words changed, not taps: cycling from one guess to
         // the next is still the one fix, and landing back on what the user
         // typed is none at all.
-        let was = reading::<P>(&typed, Language::English);
+        let was = reading::<P>(&typed, lang);
         let commit = if back_to_typed {
             Some(Commit::Undo {
                 suppress: None,
@@ -1157,7 +1229,9 @@ impl<P: Platform> Engine<P> {
             .zip(target.chars())
             .take_while(|((original, current), target)| original == current && current == target)
             .count();
-        let Some(suffix) = P::retype_text(&target.chars().skip(prefix).collect::<String>()) else {
+        let Some(suffix) =
+            P::retype_completion(&target.chars().skip(prefix).collect::<String>(), lang)
+        else {
             return;
         };
         // A completion can be taken back with the undo gesture too — except
@@ -1165,7 +1239,7 @@ impl<P: Platform> Engine<P> {
         // undo.
         let undo = (!back_to_typed).then(|| LastFix {
             on_screen: P::retype_len(&retype) - prefix,
-            restore: P::retype_original(&typed[prefix..], Language::English),
+            restore: P::retype_original(&typed[prefix..], lang),
             terminator: None,
             layout: None,
             keep: typed.clone(),
@@ -1178,6 +1252,7 @@ impl<P: Platform> Engine<P> {
             candidates,
             index,
             on_screen: P::retype_len(&retype),
+            lang,
         });
         // The completion key types nothing, so only what is on screen for the
         // partial word is erased and there is no terminator to press again.
@@ -1546,6 +1621,7 @@ impl<P: Platform> Engine<P> {
             (st.practice, st.mode)
         };
         let mut learn = None;
+        let mut pending_learning = None;
         match commit {
             Some(Commit::Fix {
                 from,
@@ -1562,9 +1638,14 @@ impl<P: Platform> Engine<P> {
                     if let Some(rule) = rule {
                         crate::personal::record_rule(rule, false);
                     }
-                    if mode == crate::config::AppMode::Full {
-                        crate::personal::record_confusion(&from, &to);
-                        crate::personal::record_word(&to);
+                    if mode == crate::config::AppMode::Full
+                        && crate::config::Config::global().personal_enabled
+                        && kind != FixKind::Complete
+                    {
+                        pending_learning = Some(PendingLearning {
+                            from: Some(from),
+                            to,
+                        });
                     }
                 }
             }
@@ -1593,6 +1674,14 @@ impl<P: Platform> Engine<P> {
 
         let mut st = self.lock();
         if st.generation == generation {
+            st.pending_learning = if let Some(cycle) = &st.cycle {
+                cycle.candidates.get(cycle.index).map(|to| PendingLearning {
+                    from: None,
+                    to: to.clone(),
+                })
+            } else {
+                pending_learning
+            };
             st.keys.replace_with(keep);
             st.keys.extend(buffered.iter().copied());
             // Undo is only safe while no later text follows the replacement.
@@ -1862,7 +1951,13 @@ mod tests {
             text.chars().count()
         }
         fn buffer_after(text: &String) -> Vec<Typed<char>> {
-            text.chars()
+            let physical = if text.chars().any(|c| ('א'..='ת').contains(&c)) {
+                crate::keymap::convert_selection(text)
+            } else {
+                text.clone()
+            };
+            physical
+                .chars()
                 .map(|key| Typed { key, shift: false })
                 .collect()
         }
@@ -2014,7 +2109,12 @@ mod tests {
             for key in text.chars() {
                 // Capture runs before the application receives the character.
                 self.engine.key_press(key);
-                self.engine.injector.text.lock().unwrap().push(key);
+                let visible = if Simulated::current_layout() == Some(Language::Hebrew) {
+                    Simulated::hebrew_char(key).unwrap_or(key)
+                } else {
+                    key
+                };
+                self.engine.injector.text.lock().unwrap().push(visible);
                 self.engine.key_release(key);
             }
         }
@@ -2093,6 +2193,224 @@ mod tests {
             assert_eq!(undo.suppress.as_deref(), Some(before));
             assert_eq!(undo.on_screen, rep.retype.chars().count() + 1);
         }
+    }
+
+    #[test]
+    fn completions_and_learning_require_retained_choices() {
+        const CHILD: &str = "RECAST_COMPLETION_LEARNING_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::completions_and_learning_require_retained_choices",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|cfg| cfg.personal_enabled = true);
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(crate::personal::personal_count("receive"), None);
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        assert_eq!(crate::personal::personal_count("receive"), None);
+        assert_eq!(crate::personal::personal_correction("recieve"), None);
+        assert!(s.engine.lock().pending_learning.is_none());
+        crate::complete::unlist("recieve");
+
+        for count in 1..=2 {
+            let s = Session::new();
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(
+                crate::personal::personal_count("receive"),
+                (count > 1).then_some(count - 1)
+            );
+            s.type_text("x");
+            assert_eq!(crate::personal::personal_count("receive"), Some(count));
+        }
+        assert_eq!(
+            crate::personal::personal_correction("recieve").as_deref(),
+            Some("receive")
+        );
+        crate::complete::ignore_word("recieve");
+        let s = Session::new();
+        s.type_text("recieve ");
+        assert_eq!(s.text(), "recieve ");
+        assert!(!s.engine.lock().is_replacing);
+        crate::complete::unlist("recieve");
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        FOCUS.store(2, Ordering::SeqCst);
+        s.type_text("x");
+        assert_eq!(crate::personal::personal_count("receive"), Some(2));
+        FOCUS.store(1, Ordering::SeqCst);
+
+        let s = Session::new();
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        let first = s.text();
+        assert_eq!(crate::personal::personal_count(&first), None);
+        let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
+        for _ in 0..count {
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+        }
+        assert_eq!(s.text(), "keyb");
+        assert_eq!(crate::personal::personal_count(&first), None);
+        assert!(s.engine.lock().pending_learning.is_none());
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        s.type_text(" ");
+        assert_eq!(crate::personal::personal_count(&first), Some(1));
+        assert_eq!(crate::personal::personal_correction("keyb"), None);
+        assert!(!s.engine.lock().is_replacing);
+
+        // Explicit vocabulary is available without a dictionary or frequency entry.
+        crate::complete::ignore_word("qzcustomname");
+        for count in 1..=2 {
+            let s = Session::new();
+            s.type_text("qzc");
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "qzcustomname");
+            s.type_text(" ");
+            assert_eq!(s.text(), "qzcustomname ");
+            assert_eq!(crate::personal::personal_count("qzcustomname"), Some(count));
+        }
+        crate::complete::unlist("qzcustomname");
+        assert!(crate::personal::completion_words().contains(&"qzcustomname".into()));
+        let s = Session::new();
+        s.type_text("qzc");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "qzcustomname");
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "qzc");
+        assert_eq!(crate::personal::personal_count("qzcustomname"), Some(2));
+
+        // A prefix edit must also be restored exactly by completion undo.
+        let s = Session::new();
+        s.type_text("keyob");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert!(s
+            .engine
+            .lock()
+            .cycle
+            .as_ref()
+            .unwrap()
+            .candidates
+            .iter()
+            .any(|word| word == "keyboard"));
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyob");
+        assert_eq!(crate::personal::personal_correction("keyob"), None);
+
+        // Hebrew follows the same cycle, character counts, buffer and undo contract.
+        SIMULATED_LAYOUT.store(1, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("aku");
+        assert_eq!(s.text(), "שלו");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert!(s.text().starts_with("שלו") && s.text().chars().count() > 3);
+        assert_eq!(*s.engine.injector.erasures.lock().unwrap(), [0]);
+        assert_eq!(
+            reading::<Simulated>(&s.engine.lock().keys, Language::Hebrew),
+            s.text()
+        );
+        let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
+        for _ in 0..count {
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+        }
+        assert_eq!(s.text(), "שלו");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "שלו");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        let accepted = s.text();
+        s.type_text(" ");
+        assert_eq!(s.text(), format!("{accepted} "));
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(crate::personal::personal_count(&accepted), Some(1));
+
+        let s = Session::new();
+        s.type_text("aku");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        s.finish();
+        assert_eq!(
+            s.text(),
+            "שלו",
+            "layout changes must cancel an in-flight completion"
+        );
+        assert!(s.engine.lock().pending_learning.is_none());
+
+        // Saved exceptions remain completion vocabulary when personalization is off.
+        crate::config::Config::update_live(|cfg| cfg.personal_enabled = false);
+        crate::complete::suppress("qzlearnedname");
+        crate::complete::learn("qzlearnedname");
+        crate::complete::learn("qzlearnedname");
+        let s = Session::new();
+        s.type_text("qzl");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "qzlearnedname");
+        assert_eq!(crate::personal::personal_count("qzlearnedname"), None);
+
+        // A configured expansion cannot appear again as a dictionary offer.
+        let path = crate::complete::user_path("abbrev.txt").unwrap();
+        std::fs::write(&path, "keyb = keyboard\n").unwrap();
+        crate::complete::reload_user_files();
+        let words = crate::complete::completions(
+            "keyb",
+            crate::dictionary::en_dict(),
+            crate::dictionary::en_freq(),
+        );
+        assert_eq!(words.iter().filter(|w| *w == "keyboard").count(), 1);
     }
 
     #[test]
@@ -2509,6 +2827,7 @@ mod tests {
                 candidates: vec!["by the way".into(), "between".into()],
                 index: 2,
                 on_screen: 3,
+                lang: Language::English,
             });
         }
         for expected in ["by the way", "between", "btw", "by the way"] {

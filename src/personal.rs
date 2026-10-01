@@ -193,6 +193,22 @@ pub fn personal_count(word: &str) -> Option<u64> {
     personal_freq_map().lock().ok()?.get(&word).copied()
 }
 
+/// Repeatedly retained words can be completed even when absent from the dictionary.
+pub fn completion_words() -> Vec<String> {
+    if !enabled() {
+        return Vec::new();
+    }
+    personal_freq_map()
+        .lock()
+        .map(|map| {
+            map.iter()
+                .filter(|(_, count)| **count >= 2)
+                .map(|(word, _)| word.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Boost a candidate's score in completions/spelling based on personal frequency.
 /// Returns a multiplier (>= 1.0) applied to the candidate's value.
 pub fn personal_boost(word: &str) -> f32 {

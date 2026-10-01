@@ -171,6 +171,9 @@ const PRIOR_WEIGHT: f32 = 8.0;
 /// of the list isn't spread out absurdly far from the rest of it.
 const PRIOR_SMOOTHING: f32 = 10.0;
 const MAX_PERSONAL_DISCOUNT: f32 = 50.0;
+/// Abstain when two distinct words have almost the same posterior score.
+// ponytail: fixed score margin; recalibrate from ambiguity reports if recall suffers.
+const MIN_SCORE_GAP: f32 = 4.0;
 
 /// Posterior score of a candidate: the channel cost of the slip plus the
 /// improbability of the word, both as negative log probabilities, so lower is
@@ -267,6 +270,7 @@ pub fn correct_with(
         max_rank,
         dp: Dp::default(),
         best: None,
+        runner_up: None,
     };
 
     for opening in openings(word) {
@@ -285,7 +289,12 @@ pub fn correct_with(
     }
     search.consider_edited_openings(en_dict, en_freq);
 
-    search.best.map(|(_, _, _, fixed)| fixed)
+    search.best.and_then(|(score, _, _, fixed)| {
+        search
+            .runner_up
+            .is_none_or(|second| second - score >= MIN_SCORE_GAP)
+            .then_some(fixed)
+    })
 }
 
 /// The best correction found so far, and everything needed to judge the next
@@ -307,6 +316,7 @@ struct Search<'a> {
     /// (score, cost, rank, word) — the score decides, the rest only makes ties
     /// deterministic.
     best: Option<(f32, u32, u32, String)>,
+    runner_up: Option<f32>,
 }
 
 impl Search<'_> {
@@ -315,13 +325,21 @@ impl Search<'_> {
         // Cheap gates first: the whole point of scanning the list is that almost
         // every entry is thrown out before the matrix is touched.
         let cb = cand.as_bytes();
+        if self
+            .best
+            .as_ref()
+            .is_some_and(|(_, _, _, word)| word == cand)
+        {
+            return;
+        }
         if rank > self.max_rank {
             return;
         }
-        // A candidate whose best possible posterior already loses needs no
-        // alignment above the cost at which it could still beat the winner.
+        // Keep candidates close enough to the winner to establish ambiguity,
+        // even when they cannot win themselves.
         let budget = self.best.as_ref().map_or(self.budget, |(best, ..)| {
-            self.budget.min((best - score(0, rank, cand)).ceil() as u32)
+            self.budget
+                .min((best + MIN_SCORE_GAP - score(0, rank, cand)).ceil() as u32)
         });
         let len_gap = cb.len().abs_diff(self.typed.len()) as u32 * COST_DOUBLE;
         if len_gap > budget || bag_bound(&self.typed_letters, cb) > budget {
@@ -340,10 +358,16 @@ impl Search<'_> {
             .is_none_or(|(cur, cur_cost, cur_rank, _)| {
                 (candidate, cost, rank) < (*cur, *cur_cost, *cur_rank)
             });
-        // Checked last: it is the only expensive test, and a candidate that
-        // isn't going to win doesn't need it.
-        if better && en_dict.contains(cand) {
-            self.best = Some((candidate, cost, rank, cand.to_string()));
+        // Only dictionary words may win or provide evidence of ambiguity.
+        if en_dict.contains(cand) {
+            if better {
+                if let Some((score, ..)) = self.best.take() {
+                    self.runner_up = Some(self.runner_up.map_or(score, |cur| cur.min(score)));
+                }
+                self.best = Some((candidate, cost, rank, cand.to_string()));
+            } else {
+                self.runner_up = Some(self.runner_up.map_or(candidate, |cur| cur.min(candidate)));
+            }
         }
     }
 
@@ -360,8 +384,10 @@ impl Search<'_> {
             0.0
         };
         let budget = self.best.as_ref().map_or(self.budget, |(best, ..)| {
-            self.budget
-                .min((best + discount - PRIOR_WEIGHT * PRIOR_SMOOTHING.ln()).ceil() as u32)
+            self.budget.min(
+                (best + MIN_SCORE_GAP + discount - PRIOR_WEIGHT * PRIOR_SMOOTHING.ln()).ceil()
+                    as u32,
+            )
         });
         if budget < COST_ADJACENT_ROW + COST_INITIAL {
             return;
@@ -1150,6 +1176,31 @@ mod tests {
         // from "hell"; restoring the dropped half of the "ll" is the cheaper
         // edit, and the more common word too.
         assert_eq!(fix("helo", d, f).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn close_distinct_candidates_are_not_silently_chosen() {
+        let d = dict(&["bake", "bare"]);
+        for entries in [
+            [("bake", 100), ("bare", 101)],
+            [("bake", 101), ("bare", 100)],
+        ] {
+            assert_eq!(fix("baxe", d, freq(&entries)), None);
+        }
+        assert_eq!(
+            fix("baxe", d, freq(&[("bake", 100), ("bare", 10_000)])).as_deref(),
+            Some("bake")
+        );
+        // A corpus token outside the dictionary must not become a runner-up.
+        assert_eq!(
+            fix(
+                "baxe",
+                dict(&["bake"]),
+                freq(&[("bake", 100), ("bare", 101)])
+            )
+            .as_deref(),
+            Some("bake")
+        );
     }
 
     #[test]

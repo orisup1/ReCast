@@ -72,7 +72,7 @@ fn value(saved: usize, rank: u32, word: &str) -> f64 {
 ///
 /// Empty when there is nothing worth offering. The user's own abbreviation for
 /// the prefix, if they defined one, always comes first.
-pub fn completions(prefix: &str, en_dict: Dict, en_freq: Freq) -> Vec<String> {
+pub fn completions(prefix: &str, dict: Dict, freq: Freq) -> Vec<String> {
     let cfg = Config::global();
     if !cfg.complete_enabled {
         return Vec::new();
@@ -83,13 +83,18 @@ pub fn completions(prefix: &str, en_dict: Dict, en_freq: Freq) -> Vec<String> {
     if let Some(text) = abbreviation(prefix) {
         out.push(text);
     }
-    out.extend(completions_with(
+    for word in completions_from(
         prefix,
-        en_dict,
-        en_freq,
+        dict,
+        freq,
         cfg.complete_min_len,
         cfg.complete_max_rank,
-    ));
+        &saved_words(),
+    ) {
+        if !out.contains(&word) {
+            out.push(word);
+        }
+    }
     out
 }
 
@@ -100,6 +105,7 @@ pub fn completions(prefix: &str, en_dict: Dict, en_freq: Freq) -> Vec<String> {
 /// to itself is a no-op the caller shouldn't have to unwind), a dictionary word
 /// — the frequency list is corpus-derived and full of junk tokens — and common
 /// enough to be a word someone reaching for that prefix might mean.
+#[cfg(test)]
 pub fn completions_with(
     prefix: &str,
     en_dict: Dict,
@@ -107,40 +113,129 @@ pub fn completions_with(
     min_len: usize,
     max_rank: u32,
 ) -> Vec<String> {
-    if prefix.len() < min_len
-        || prefix.len() > MAX_PREFIX_LEN
-        || !prefix.bytes().all(|b| b.is_ascii_lowercase())
+    completions_from(prefix, en_dict, en_freq, min_len, max_rank, &[])
+}
+
+/// Explicitly saved exceptions also make useful completion vocabulary.
+fn saved_words() -> Vec<String> {
+    let mut words = crate::personal::completion_words();
+    if let Ok(list) = ignore_list().lock() {
+        words.extend(list.iter().cloned());
+    }
+    if let Ok(list) = learned_words().lock() {
+        words.extend(
+            list.iter()
+                .filter(|(_, count)| **count >= LEARNED_MIN)
+                .map(|(w, _)| w.clone()),
+        );
+    }
+    words.sort_unstable();
+    words.dedup();
+    words
+}
+
+fn completions_from(
+    prefix: &str,
+    dict: Dict,
+    freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    saved: &[String],
+) -> Vec<String> {
+    let len = prefix.chars().count();
+    let english = prefix.chars().all(|c| c.is_ascii_lowercase());
+    if len < min_len
+        || len > MAX_PREFIX_LEN
+        || !(english || prefix.chars().all(|c| ('א'..='ת').contains(&c)))
     {
         return Vec::new();
     }
-
-    // Kept sorted by descending `value`, truncated to length as it goes, so the
-    // scan never holds more than a handful of candidates however long the
-    // prefix run is.
+    let mut prefixes = HashSet::from([prefix.to_owned()]);
     let mut best: Vec<(f64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
-    en_freq.for_each_with_prefix(prefix, |word, rank| {
-        if rank > max_rank || word.len() <= prefix.len() {
-            return;
+    for attempt in 0..2 {
+        if attempt == 1 {
+            if !best.is_empty() {
+                break;
+            }
+            prefixes = edited_prefixes(prefix, english);
         }
-        let value = value(word.len() - prefix.len(), rank, word);
-        // Cheap rejection before the dictionary lookup: if the list is already
-        // full of better candidates this one can't get in.
-        if best.len() == MAX_CANDIDATES && best[MAX_CANDIDATES - 1].0 >= value {
-            return;
+        let mut consider = |word: &str, rank: u32, explicit: bool| {
+            let word_len = word.chars().count();
+            if word_len <= len
+                || word_len > crate::types::MAX_WORD_KEYS
+                || best.iter().any(|(_, _, existing)| existing == word)
+                || (!explicit && rank > max_rank)
+            {
+                return;
+            }
+            let value = value(word_len - len, rank, word);
+            if best.len() == MAX_CANDIDATES && best[MAX_CANDIDATES - 1].0 > value {
+                return;
+            }
+            if !explicit && !dict.contains(word) {
+                return;
+            }
+            let at = best.partition_point(|(v, r, w)| {
+                (*v, std::cmp::Reverse(*r), std::cmp::Reverse(w.as_str()))
+                    > (value, std::cmp::Reverse(rank), std::cmp::Reverse(word))
+            });
+            best.insert(at, (value, rank, word.to_owned()));
+            best.truncate(MAX_CANDIDATES);
+        };
+        for matching in &prefixes {
+            freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false));
         }
-        // Checked last: it is the only expensive test, and by here only a
-        // handful of candidates per prefix still survive.
-        if !en_dict.contains(word) {
-            return;
+        for word in saved {
+            // Saved names and identifiers are allowed; whitespace and mixed scripts are not.
+            let valid = word.chars().all(|c| {
+                if english {
+                    c.is_ascii_graphic()
+                } else {
+                    ('א'..='ת').contains(&c)
+                }
+            });
+            if valid && prefixes.iter().any(|p| word.starts_with(p)) {
+                // ponytail: fixed prior for unranked saved words; tune from completion feedback.
+                consider(word, freq.rank(word).unwrap_or(1_000), true);
+            }
         }
-        // Ties (same value, different words) go to the commoner word.
-        let at = best.partition_point(|(v, r, _)| {
-            (*v, std::cmp::Reverse(*r)) > (value, std::cmp::Reverse(rank))
-        });
-        best.insert(at, (value, rank, word.to_string()));
-        best.truncate(MAX_CANDIDATES);
-    });
+    }
     best.into_iter().map(|(_, _, word)| word).collect()
+}
+
+/// One edit of the prefix, consulted only when exact completion has no offers.
+fn edited_prefixes(prefix: &str, english: bool) -> HashSet<String> {
+    let chars: Vec<_> = prefix.chars().collect();
+    let alphabet = if english {
+        "abcdefghijklmnopqrstuvwxyz"
+    } else {
+        "אבגדהוזחטיךכלםמןנסעףפץצקרשת"
+    };
+    let mut variants = HashSet::new();
+    for i in 0..=chars.len() {
+        for c in alphabet.chars() {
+            let mut inserted = chars.clone();
+            inserted.insert(i, c);
+            variants.insert(inserted.iter().collect());
+            if i < chars.len() && c != chars[i] {
+                let mut replaced = chars.clone();
+                replaced[i] = c;
+                variants.insert(replaced.iter().collect());
+            }
+        }
+        if i < chars.len() {
+            let mut deleted = chars.clone();
+            deleted.remove(i);
+            variants.insert(deleted.iter().collect());
+        }
+        if i + 1 < chars.len() && chars[i] != chars[i + 1] {
+            let mut swapped = chars.clone();
+            swapped.swap(i, i + 1);
+            variants.insert(swapped.iter().collect());
+        }
+    }
+    variants.remove(prefix);
+    variants
 }
 
 /// The expansion configured for `word`, if the user defined one.
@@ -840,6 +935,58 @@ mod tests {
     }
 
     #[test]
+    fn completion_handles_hebrew_saved_words_and_single_prefix_typos() {
+        let d = dict(&["keyboard", "keynote"]);
+        let f = freq(&[("keyboard", 100), ("keynote", 500)]);
+        for prefix in ["keyb", "keyba", "keybo", "keyob", "keyxb", "kexb"] {
+            assert_eq!(
+                finish(prefix, d, f).as_deref(),
+                Some("keyboard"),
+                "{prefix}"
+            );
+        }
+        assert_eq!(finish("key", d, f).as_deref(), Some("keyboard"));
+        assert!(
+            offers("kxxb", d, f).is_empty(),
+            "two edits must not be offered"
+        );
+        let hebrew = dict(&["שלום", "שלומות"]);
+        let ranks = freq(&[("שלום", 100), ("שלומות", 500)]);
+        assert!(completions_with("של", hebrew, ranks, 3, 30_000).is_empty());
+        assert_eq!(finish("שלו", hebrew, ranks).as_deref(), Some("שלום"));
+        assert_eq!(finish("שול", hebrew, ranks).as_deref(), Some("שלום"));
+        let saved = [
+            "supino",
+            "api_v2",
+            "node.js",
+            "supino",
+            "supino name",
+            "supinoשלום",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            completions_from("sup", Dict::of(&[]), Freq::EMPTY, 3, 30_000, &saved),
+            ["supino"]
+        );
+        assert_eq!(
+            completions_from("api", Dict::of(&[]), Freq::EMPTY, 3, 30_000, &saved),
+            ["api_v2"]
+        );
+        assert_eq!(
+            completions_from("nod", Dict::of(&[]), Freq::EMPTY, 3, 30_000, &saved),
+            ["node.js"]
+        );
+        // Exact offers take precedence over any approximate prefix.
+        assert_eq!(offers("keyb", d, f), ["keyboard"]);
+        let d = dict(&["baked", "based"]);
+        let f = freq(&[("baked", 100), ("based", 100)]);
+        for _ in 0..10 {
+            assert_eq!(offers("baxed", d, f), Vec::<String>::new());
+            assert_eq!(offers("bax", d, f), ["baked", "based"]);
+        }
+    }
+
+    #[test]
     fn a_completion_must_be_a_dictionary_word() {
         // The frequency list is corpus-derived and full of junk tokens; a
         // completion has to be a word, not merely something people have typed.
@@ -1056,8 +1203,7 @@ mod real_data {
     #[test]
     fn gibberish_and_identifiers_are_left_alone() {
         assert!(offers("zqxj").is_empty());
-        // Wrong-layout Hebrew never reaches here (the completer is English-only
-        // by layout), but a prefix that spells nothing must still decline.
+        // A prefix more than one edit from any word must still decline.
         assert!(offers("qwrt").is_empty());
     }
 }

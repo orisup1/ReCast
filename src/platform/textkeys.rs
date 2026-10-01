@@ -99,11 +99,15 @@ pub fn retype_len(text: &str) -> usize {
 
 /// The word buffer that matches `text` now being on screen. Only the last word
 /// of it is still in progress — an abbreviation expansion may carry spaces —
-/// and anything the English layout can't type is dropped rather than guessed at.
+/// Hebrew is mapped back to the same physical keys used by the capture buffer.
 pub fn buffer_after(text: &str) -> Vec<Typed<Key>> {
-    text.rsplit(' ')
-        .next()
-        .unwrap_or_default()
+    let word = text.rsplit(' ').next().unwrap_or_default();
+    let physical = if word.chars().any(|c| ('א'..='ת').contains(&c)) {
+        crate::keymap::convert_selection(word)
+    } else {
+        word.to_owned()
+    };
+    physical
         .chars()
         .filter_map(|c| english_char_to_key(c).map(|(key, shift)| Typed { key, shift }))
         .collect()
@@ -116,3 +120,18 @@ pub const CTRL_LEFT: Key = Key::ControlLeft;
 pub const CTRL_RIGHT: Key = Key::ControlRight;
 pub const CAPS_LOCK: Key = Key::CapsLock;
 pub const BACKSPACE: Key = Key::Backspace;
+
+#[cfg(test)]
+#[test]
+fn hebrew_completion_buffer_preserves_physical_keys() {
+    let keys = buffer_after("שלום");
+    assert_eq!(keys.len(), 4);
+    let hebrew: String = keys.iter().filter_map(|t| hebrew_char(t.key)).collect();
+    assert_eq!(hebrew, "שלום");
+    assert!(keys.iter().all(|t| !t.shift));
+    let english: String = buffer_after("by the way")
+        .iter()
+        .filter_map(|t| english_char(t.key, t.shift))
+        .collect();
+    assert_eq!(english, "way");
+}
