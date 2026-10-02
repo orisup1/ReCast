@@ -326,7 +326,7 @@ pub fn record_confusion(typed: &str, corrected: &str) {
 }
 
 /// Look up the most common correction for `typed` from personal confusions.
-/// Returns the corrected word if there's a strong enough signal (count >= 2).
+/// Require two retained corrections and at least twice the runner-up's support.
 pub fn personal_correction(typed: &str) -> Option<String> {
     if !enabled() {
         return None;
@@ -334,9 +334,20 @@ pub fn personal_correction(typed: &str) -> Option<String> {
     let typed = typed.trim().to_lowercase();
     let map = confusions_map().lock().ok()?;
     let inner = map.get(&typed)?;
+    preferred_correction(inner).cloned()
+}
+
+fn preferred_correction(inner: &HashMap<String, u64>) -> Option<&String> {
     let (best, &count) = inner.iter().max_by_key(|(_, &c)| c)?;
-    if count >= 2 {
-        Some(best.clone())
+    let runner_up = inner
+        .iter()
+        .filter(|(word, _)| *word != best)
+        .map(|(_, count)| *count)
+        .max()
+        .unwrap_or(0);
+    // ponytail: a 2:1 lead is a fixed confidence gate; calibrate from conflicting feedback.
+    if count >= 2 && runner_up <= count / 2 {
+        Some(best)
     } else {
         None
     }
@@ -634,6 +645,22 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn learned_replacements_require_repetition_and_a_clear_lead() {
+        for (first, second, expected) in [
+            (1, 0, None),
+            (2, 0, Some("receive")),
+            (2, 2, None),
+            (3, 2, None),
+            (4, 2, Some("receive")),
+            (2, 4, Some("recipe")),
+            (u64::MAX, u64::MAX, None),
+        ] {
+            let counts = HashMap::from([("receive".into(), first), ("recipe".into(), second)]);
+            assert_eq!(preferred_correction(&counts).map(String::as_str), expected);
+        }
+    }
 
     #[test]
     fn rule_statistics_keep_only_fixed_tags_and_counts() {

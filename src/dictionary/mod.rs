@@ -648,12 +648,14 @@ fn decide_unknown(
 /// would quietly hand back a lowercase `hello`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Case {
-    /// No shift anywhere, or a mix too irregular to reproduce.
+    /// No shifted letters.
     Lower,
     /// First letter shifted, the rest not: a sentence opener or a name.
     Title,
     /// Every letter shifted: an acronym, or someone shouting.
     Upper,
+    /// Irregular capitals usually identify a name or an identifier.
+    Mixed,
 }
 
 impl Case {
@@ -662,13 +664,13 @@ impl Case {
     fn of(shifted: &[bool]) -> Case {
         match shifted.split_first() {
             None => Case::Lower,
-            Some((false, _)) => Case::Lower,
+            Some((false, rest)) if rest.iter().all(|&s| !s) => Case::Lower,
             // A single shifted letter reads as a capital, not as an acronym.
             Some((true, [])) => Case::Title,
             Some((true, rest)) if rest.iter().all(|&s| s) => Case::Upper,
             Some((true, rest)) if rest.iter().all(|&s| !s) => Case::Title,
-            // Anything else (sHiFtY) is not a pattern worth reproducing.
-            Some((true, _)) => Case::Lower,
+            // Preserve identifiers by declining automatic spelling.
+            Some(_) => Case::Mixed,
         }
     }
 
@@ -677,7 +679,7 @@ impl Case {
     /// unchanged, as does an expansion's punctuation.
     fn apply(self, text: &str) -> String {
         match self {
-            Case::Lower => text.to_string(),
+            Case::Lower | Case::Mixed => text.to_string(),
             Case::Upper => text.to_uppercase(),
             Case::Title => {
                 let mut out = String::with_capacity(text.len());
@@ -718,17 +720,13 @@ pub enum Fix {
         text: String,
         lang: Language,
     },
-    /// The same keystrokes are a plausible English misspelling under the other
-    /// layout. The layout has already been switched to `lang`; unlike a plain
-    /// layout fix, callers must type `text` rather than replaying the original
-    /// keys because those keys still spell the uncorrected word.
+    /// A layout change that inserts text rather than replaying the original
+    /// keys: spelling, a learned replacement, or preserved prose wrappers.
+    /// The layout has already been switched to `lang`.
     LayoutSpelling { text: String, lang: Language },
-    /// Rewrite in the current (English) layout, from the speller or from an
-    /// abbreviation expansion: the layout is untouched and the caller should
-    /// erase the whole word and type `text` instead. `text` is ASCII and
-    /// typeable through the English keymap, but — unlike before case tracking —
-    /// it may contain capitals, and an expansion may contain spaces.
-    Spelling { text: String },
+    /// Rewrite in the current layout, from spelling, a learned replacement,
+    /// or an abbreviation. The language also determines injection and undo.
+    Spelling { text: String, lang: Language },
 }
 
 /// A deliberate request may select a valid other-layout word even when the
@@ -788,10 +786,9 @@ fn observed(word_en: &str, word_he: &str, en_dict: Dict, he_dict: Dict) -> Optio
 /// be put back after whatever they answer, and `full` is the two together — the
 /// characters actually on screen, one per key.
 ///
-/// Only the *trailing* run is separated. Punctuation inside a word is part of it
-/// (`don't`), and a leading `(` is left in place because both readings have to
-/// keep agreeing character-for-character with the keys, which is what lets a
-/// correction be erased and put back by count.
+/// Prose wrappers are separated at key boundaries before building these readings.
+/// Here only the trailing run is separated; punctuation inside a word (`don't`)
+/// stays part of it. Offsets still correspond exactly to the remaining keys.
 #[derive(Clone, Copy)]
 struct Reading<'a> {
     /// Everything the keys spell in this layout.
@@ -867,15 +864,17 @@ fn respelled(fixed: &str, case: Case, tail: &str) -> String {
     out
 }
 
-/// Whether a learned replacement is English text (ignoring spaces and
-/// punctuation). This lets a remembered composed correction keep switching to
-/// English on later occurrences instead of replaying English letters through
-/// the still-active Hebrew layout.
-fn is_english_text(text: &str) -> bool {
+/// A learned replacement must have one supported alphabet before choosing a layout.
+fn text_language(text: &str) -> Option<Language> {
     let mut letters = text.chars().filter(|c| c.is_alphabetic());
-    letters.next().is_some_and(|first| {
-        first.is_ascii_alphabetic() && letters.all(|c| c.is_ascii_alphabetic())
-    })
+    let first = letters.next()?;
+    if first.is_ascii_alphabetic() && letters.clone().all(|c| c.is_ascii_alphabetic()) {
+        Some(Language::English)
+    } else if ('א'..='ת').contains(&first) && letters.all(|c| ('א'..='ת').contains(&c)) {
+        Some(Language::Hebrew)
+    } else {
+        None
+    }
 }
 
 fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: bool) {
@@ -952,22 +951,6 @@ fn plan(
         return None;
     }
 
-    // A personal replacement needs repeated retained corrections, not merely
-    // automatic rewrites or offers that were cycled past.
-    if let Some(correction) =
-        (!layout_only && !crate::complete::ignored(typed) && !crate::complete::learned(typed))
-            .then(|| crate::personal::personal_correction(typed))
-            .flatten()
-    {
-        if current == Some(Language::Hebrew) && is_english_text(&correction) {
-            return Some(Plan::SwitchAndSpell {
-                lang: Language::English,
-                text: correction,
-            });
-        }
-        return Some(Plan::Spell { text: correction });
-    }
-
     // An expansion the user configured by hand outranks everything we infer.
     if current == Some(Language::English) {
         if let Some(text) = (!layout_only)
@@ -976,11 +959,40 @@ fn plan(
         {
             return Some(Plan::Expand { text });
         }
+    }
+
+    // Learned replacements obey the spelling switch and case protections.
+    // Explicit abbreviations above always win over inferred preferences.
+    let cfg = Config::global();
+    if !layout_only
+        && cfg.spell_enabled
+        && cfg.spell_max_dist > 0
+        && !matches!(case, Case::Upper | Case::Mixed)
+        && !crate::complete::ignored(typed)
+        && !crate::complete::learned(typed)
+    {
+        if let Some((current, correction, target)) = current.and_then(|current| {
+            let correction = crate::personal::personal_correction(typed)?;
+            let target = text_language(&correction)?;
+            Some((current, correction, target))
+        }) {
+            return Some(if current == target {
+                Plan::Spell { text: correction }
+            } else {
+                Plan::SwitchAndSpell {
+                    lang: target,
+                    text: correction,
+                }
+            });
+        }
+    }
+
+    if current == Some(Language::English) {
         // In English this exact transposition beats an accidental Hebrew name.
         // The same keys in Hebrew retain the valid Hebrew reading.
         if word_en == "teh" {
             if layout_only
-                || case == Case::Upper
+                || matches!(case, Case::Upper | Case::Mixed)
                 || crate::complete::ignored(word_en)
                 || crate::complete::learned(word_en)
             {
@@ -1061,7 +1073,7 @@ fn plan_spelling(
     en_freq: Freq,
 ) -> Option<Plan> {
     let current = current?;
-    if case == Case::Upper {
+    if matches!(case, Case::Upper | Case::Mixed) {
         return None;
     }
     // A word the user has declared theirs is never second-guessed — whether
@@ -1175,6 +1187,34 @@ fn plan_split(
     None
 }
 
+/// Peel prose wrappers while leaving internal punctuation and identifiers intact.
+fn unwrap_word(text: &str) -> (&str, &str, &str) {
+    let (mut start, mut end) = (0, text.len());
+    while start < end {
+        let close = match text.as_bytes()[start] {
+            b'(' => ')',
+            b'[' => ']',
+            b'{' => '}',
+            b'"' => '"',
+            b'\'' => '\'',
+            _ => break,
+        };
+        let inner = text[start..end].trim_end_matches(['.', ',', '!', '?', ':', ';']);
+        if inner.len() < 2 {
+            break;
+        }
+        if inner.ends_with(close) {
+            end = start + inner.len() - 1;
+        } else if close == '\'' || inner.ends_with([')', ']', '}', '\'', '"']) {
+            break;
+        }
+        // A word can finish before its closing bracket/quote has been typed.
+        // An unmatched apostrophe can instead be part of a word, such as 'tis.
+        start += 1;
+    }
+    (&text[..start], &text[start..end], &text[end..])
+}
+
 /// Run both correction pipelines over a finished key sequence.
 ///
 /// The layout pipeline anchors on the live keyboard layout: a sequence that
@@ -1215,6 +1255,74 @@ pub fn check_and_correct<K: Copy>(
             fix: None,
             lang: None,
         };
+    }
+
+    // Preserve prose wrappers as visible text, not as wrong-layout key positions.
+    // Reuse the same planner on the inner keys so all protection and case gates apply.
+    let visible = |k: K| match current {
+        Some(Language::Hebrew) => crate::keymap::hebrew_symbol(to_en(k), to_he(k), shift_of(k)),
+        _ => to_en(k),
+    };
+    if keys
+        .first()
+        .and_then(|&k| visible(k))
+        .is_some_and(|c| "([{\"'".contains(c))
+    {
+        if let Some(text) = keys.iter().map(|&k| visible(k)).collect::<Option<String>>() {
+            let (head, word, tail) = unwrap_word(&text);
+            if !head.is_empty() && !word.is_empty() {
+                if crate::complete::suppressed(&text)
+                    || crate::complete::learned(&text)
+                    || crate::complete::ignored(&text)
+                {
+                    return Outcome {
+                        reason: "Protected word",
+                        rule: None,
+                        fix: None,
+                        lang: None,
+                    };
+                }
+                let start = head.chars().count();
+                let end = keys.len() - tail.chars().count();
+                let mut outcome = check_and_correct(
+                    &keys[start..end],
+                    to_en,
+                    to_he,
+                    shift_of,
+                    run,
+                    en_dict,
+                    he_dict,
+                    current,
+                    layout_only,
+                    switch_layout_to,
+                );
+                outcome.fix = outcome.fix.map(|fix| match fix {
+                    Fix::Layout {
+                        start: 0,
+                        text,
+                        lang,
+                    }
+                    | Fix::LayoutSpelling { text, lang } => Fix::LayoutSpelling {
+                        text: format!("{head}{text}{tail}"),
+                        lang,
+                    },
+                    Fix::Layout {
+                        start: split,
+                        text,
+                        lang,
+                    } => Fix::Layout {
+                        start: start + split,
+                        text: format!("{text}{tail}"),
+                        lang,
+                    },
+                    Fix::Spelling { text, lang } => Fix::Spelling {
+                        text: format!("{head}{text}{tail}"),
+                        lang,
+                    },
+                });
+                return outcome;
+            }
+        }
     }
 
     // Build the full English/Hebrew folds once and record where each key's
@@ -1361,17 +1469,25 @@ pub fn check_and_correct<K: Copy>(
             )
         }
         Plan::Spell { text } | Plan::Expand { text } => {
-            // No layout call at all — the word stays in English, only its
-            // letters change.
+            // The current layout is unchanged, including learned Hebrew replacements.
             debug_log(&full_en, &full_he, None, false);
             if debug_enabled() {
                 println!("spell: {} -> {}{}", full_en, text, en.tail);
             }
             (
                 Some(Fix::Spelling {
-                    text: respelled(&text, case, en.tail),
+                    text: respelled(
+                        &text,
+                        case,
+                        if current == Some(Language::Hebrew) {
+                            he.tail
+                        } else {
+                            en.tail
+                        },
+                    ),
+                    lang: current.unwrap_or(Language::English),
                 }),
-                Some(Language::English),
+                current,
             )
         }
         Plan::SwitchAndSpell { lang, text } => {
@@ -1434,15 +1550,33 @@ pub fn declined_by_list<K: Copy>(
                 word_end_en = full_en.len();
             }
         }
-        if let Some(c) = to_he(k) {
+        if let Some(c) = crate::keymap::hebrew_symbol(to_en(k), to_he(k), shift) {
             full_he.push(c);
             if in_word(c, shift, false) {
                 word_end_he = full_he.len();
             }
         }
     }
-    // The lists hold words, so they are asked about the word — the same reading
-    // `plan` would have checked them against, punctuation set aside.
+    let full = if current == Some(Language::Hebrew) {
+        &full_he
+    } else {
+        &full_en
+    };
+    let (head, word, tail) = unwrap_word(full);
+    if crate::complete::suppressed(full)
+        || (!head.is_empty() && (crate::complete::learned(full) || crate::complete::ignored(full)))
+    {
+        return Some(full.to_string());
+    }
+    if !head.is_empty() && !word.is_empty() {
+        return declined_by_list(
+            &keys[head.chars().count()..keys.len() - tail.chars().count()],
+            to_en,
+            to_he,
+            shift_of,
+            current,
+        );
+    }
     let typed = match current {
         Some(Language::Hebrew) => &full_he[..word_end_he],
         _ => &full_en[..word_end_en],
@@ -1835,6 +1969,110 @@ mod tests {
     }
 
     #[test]
+    fn learned_replacements_obey_settings_priorities_and_both_layouts() {
+        const CHILD: &str = "RECAST_LEARNED_PLANNER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dictionary::tests::learned_replacements_obey_settings_priorities_and_both_layouts", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        Config::update_live(|cfg| cfg.personal_enabled = true);
+        let dir = crate::complete::config_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("learned.txt"), "(recieve)\t2\n").unwrap();
+        for (from, to) in [
+            ("zzlearn", "world"),
+            ("akuo", "שלום"),
+            ("יקךךם", "hello"),
+            ("שלוממ", "שלום"),
+        ] {
+            for _ in 0..2 {
+                crate::personal::record_confusion(from, to);
+            }
+        }
+        let check = |en: &str, he: &str, current, layout_only, switched| {
+            let keys: Vec<_> = en.chars().zip(he.chars()).collect();
+            check_and_correct(
+                &keys,
+                |k| Some(k.0.to_ascii_lowercase()),
+                |k| Some(k.1),
+                |k| k.0.is_ascii_uppercase(),
+                Run::default(),
+                en_dict(),
+                he_dict(),
+                current,
+                layout_only,
+                |_| {
+                    if switched {
+                        crate::layout::LayoutSwitch::Switched
+                    } else {
+                        crate::layout::LayoutSwitch::Failed
+                    }
+                },
+            )
+        };
+        let en = Some(Language::English);
+        let he = Some(Language::Hebrew);
+        assert!(matches!(check("zzlearn", "זזזזזזז", en, false, true).fix,
+            Some(Fix::Spelling { text, lang: Language::English }) if text == "world"));
+        for spelling in [false, true] {
+            Config::update_live(|cfg| {
+                cfg.spell_enabled = spelling;
+                cfg.spell_max_dist = if spelling { 0 } else { 3 };
+            });
+            assert!(check("zzlearn", "זזזזזזז", en, false, true).fix.is_none());
+        }
+        Config::update_live(|cfg| {
+            cfg.spell_enabled = true;
+            cfg.spell_max_dist = 3;
+        });
+        assert!(check("zzlearn", "זזזזזזז", en, true, true).fix.is_none());
+        assert!(check("zzLearn", "זזזזזזז", en, false, true).fix.is_none());
+        assert!(check("ZZLEARN", "זזזזזזז", en, false, true).fix.is_none());
+        assert!(check("zzlearn", "זזזזזזז", None, false, true).fix.is_none());
+        let dir = crate::complete::config_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("abbrev.txt"), "zzlearn = explicit expansion\n").unwrap();
+        crate::complete::reload_user_files();
+        let result = check("zzlearn", "זזזזזזז", en, false, true);
+        assert_eq!(result.rule, Some("abbreviation"));
+        assert!(
+            matches!(result.fix, Some(Fix::Spelling { text, .. }) if text == "explicit expansion")
+        );
+        for (english, hebrew, current, expected, target) in [
+            ("akuo", "שלום", en, "שלום", Language::Hebrew),
+            ("hello", "יקךךם", he, "hello", Language::English),
+        ] {
+            let result = check(english, hebrew, current, false, true);
+            assert_eq!(result.lang, Some(target));
+            assert!(
+                matches!(result.fix, Some(Fix::LayoutSpelling { text, lang }) if text == expected && lang == target)
+            );
+            assert!(check(english, hebrew, current, false, false).fix.is_none());
+        }
+        let result = check("akunn", "שלוממ", he, false, true);
+        assert_eq!(result.lang, he);
+        assert!(
+            matches!(result.fix, Some(Fix::Spelling { text, lang: Language::Hebrew }) if text == "שלום")
+        );
+        // Persisted undo exceptions must still protect the wrapped spelling
+        // when no session suppression entry exists (as after a restart).
+        assert!(!crate::complete::suppressed("(recieve)"));
+        assert!(check("(recieve)", "9רקבןקהק0", en, false, true)
+            .fix
+            .is_none());
+        crate::complete::suppress("akuo");
+        assert!(check("akuo", "שלום", en, false, true).fix.is_none());
+    }
+
+    #[test]
     fn correction_accuracy_corpus() {
         // Exercise the planner with explicit layouts: this check never switches
         // the OS keyboard or depends on whichever layout the developer uses.
@@ -1880,11 +2118,6 @@ mod tests {
             }
             sequence = next_sequence;
             previous_mode = layout_only;
-            let before = if current == Language::English {
-                en_text
-            } else {
-                he_text
-            };
             assert_eq!(
                 en_text.chars().count(),
                 he_text.chars().count(),
@@ -1902,6 +2135,13 @@ mod tests {
                     )
                 })
                 .collect();
+            let before = if current == Language::English {
+                en_text.to_owned()
+            } else {
+                keys.iter()
+                    .filter_map(|k| crate::keymap::hebrew_symbol(Some(k.0), Some(k.1), k.2))
+                    .collect()
+            };
             let result = check_and_correct(
                 &keys,
                 |k| Some(k.0),
@@ -1927,7 +2167,7 @@ mod tests {
                 None => before.to_string(),
                 Some(
                     Fix::Layout { text, start: 0, .. }
-                    | Fix::Spelling { text }
+                    | Fix::Spelling { text, .. }
                     | Fix::LayoutSpelling { text, .. },
                 ) => text,
                 Some(Fix::Layout { start, .. }) => {
@@ -2809,7 +3049,7 @@ mod tests {
         assert_eq!(Case::of(&[true, false, false]), Case::Title);
         assert_eq!(Case::of(&[true, true, true]), Case::Upper);
         assert_eq!(Case::of(&[true]), Case::Title, "one letter is a capital");
-        assert_eq!(Case::of(&[true, false, true]), Case::Lower, "no pattern");
+        assert_eq!(Case::of(&[true, false, true]), Case::Mixed, "no pattern");
         assert_eq!(Case::of(&[]), Case::Lower);
     }
 

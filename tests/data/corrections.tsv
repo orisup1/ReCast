@@ -867,3 +867,33 @@ en	keyboard's	לקטנםשרג,ד	keyboard's			layout-only
 he	keyboard's	לקטנםשרג,ד	keyboard's			layout-only
 en	I'm	ן,צ	I'm			layout-only
 he	I'm	ן,צ	I'm			layout-only
+
+# Balanced wrappers, mixed-case identifiers, and protected syntax.
+en	(recieve)	9רקבןקהק0	(receive)
+en	"Recieve"	,רקבןקהק,	"Receive"
+en	'recieve'	תרקבןקהקת	'receive'
+en	[recieve]	]רקבןקהק[	[receive]
+en	{recieve}	]רקבןקהק[	{receive}
+en	([recieve]),	9]רקבןקהק[0ץ	([receive]),
+en	(recieve,)	9רקבןקהקץ0	(receive,)
+en	(akuo)	9שלום0	(שלום)
+en	"akuo"	,שלום,	"שלום"
+en	[akuo]	]שלום[	[שלום]
+en	(hello)	9יקךךם0	(hello)
+en	(keyBoardd)	9לקטנםשרגג0	(keyBoardd)
+en	keyBoardd	לקטנםשרגג	keyBoardd
+en	KeyBoardd	לקטנםשרגג	KeyBoardd
+en	reCieve	רקבןקהק	reCieve
+en	keyBoardd,	לקטנםשרגגץ	keyBoardd,
+en	(user_id)	9ודקר_ןג0	(user_id)
+en	(config.toml)	9בםמכןע.אםצך0	(config.toml)
+en	(recieve]	9רקבןקהק[	(recieve]
+he	(hello)	9יקךךם0	(hello)
+he	"hello"	,יקךךם,	"hello"
+he	(recieve)	9רקבןקהק0	(receive)
+he	(akuo)	9שלום0	(שלום)
+# A word may finish before the closing wrapper is typed.
+en	(recieve	9רקבןקהק	(receive
+en	"recieve	,רקבןקהק	"receive
+en	[akuo	]שלום	[שלום
+en	'recieve	,רקבןקהק	'recieve

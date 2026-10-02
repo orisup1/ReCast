@@ -39,6 +39,20 @@ fn completion_keys_match_the_active_language() {
         })
         .collect();
     assert_eq!(text, "Keyboard");
+    for text in ["(שלום)", "[שלום]", "\"שלום\"", "'שלום'", "שלום,"] {
+        let keys = Linux::retype_completion(text, Language::Hebrew).unwrap();
+        let actual: String = keys
+            .iter()
+            .filter_map(|(key, shift)| {
+                crate::keymap::hebrew_symbol(
+                    evkey_to_english_char_shifted(*key, *shift),
+                    evkey_to_hebrew_char(*key),
+                    *shift,
+                )
+            })
+            .collect();
+        assert_eq!(actual, text);
+    }
     assert!(Linux::retype_completion("🙂", Language::Hebrew).is_none());
 }
 
@@ -108,7 +122,15 @@ impl Platform for Linux {
     }
     fn retype_original(keys: &[Typed], lang: Language) -> Self::Retype {
         keys.iter()
-            .map(|t| (t.key, t.shift && lang == Language::English))
+            .map(|t| {
+                (
+                    t.key,
+                    t.shift
+                        && (lang == Language::English
+                            || Self::english_char(t.key, true)
+                                .is_some_and(|c| "(){}\"".contains(c))),
+                )
+            })
             .collect()
     }
     fn retype_layout(keys: &[Typed], _: &str, lang: Language) -> Option<Self::Retype> {

@@ -35,10 +35,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let key = match current {
                 Language::English => readings(c),
                 // Search unshifted US keys first: Hebrew letters have no case.
-                Language::Hebrew => (' '..='~')
-                    .filter(|c| !c.is_ascii_uppercase())
-                    .filter_map(readings)
-                    .find(|key| key.1 == c && !key.2),
+                Language::Hebrew => {
+                    let mut candidates = (' '..='~')
+                        .filter(|c| !c.is_ascii_uppercase())
+                        .filter_map(readings);
+                    candidates
+                        .clone()
+                        .find(|key| key.1 == c && !key.2)
+                        .or_else(|| {
+                            candidates.find(|key| {
+                                key.2
+                                    && crate::keymap::hebrew_symbol(Some(key.0), Some(key.1), true)
+                                        == Some(c)
+                            })
+                        })
+                }
             };
             key.ok_or_else(|| format!("Unsupported character {c:?} for this layout"))
         })
@@ -69,7 +80,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some(Fix::Layout { start, text, .. }) => {
             word.chars().take(start).collect::<String>() + &text
         }
-        Some(Fix::Spelling { text } | Fix::LayoutSpelling { text, .. }) => text,
+        Some(Fix::Spelling { text, .. } | Fix::LayoutSpelling { text, .. }) => text,
     };
     println!(
         "Input: {word:?}\nLayout: {}\nReplacement: {after:?}\nReason: {}",

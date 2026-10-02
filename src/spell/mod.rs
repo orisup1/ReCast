@@ -96,7 +96,7 @@ const MAX_LEN: usize = 24;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One plain edit: the unit the distance budget is denominated in.
-const COST_EDIT: u32 = 100;
+pub(crate) const COST_EDIT: u32 = 100;
 /// Substituting a key for the one **beside it in the same row** — the classic
 /// fat finger, and by far the most common wrong-letter typo. The hand is
 /// already on that row and the finger lands one key over.
@@ -118,7 +118,7 @@ const COST_ADJACENT_DIAG: u32 = 72;
 /// one.
 const COST_STRAY_KEY: u32 = 70;
 /// Two letters typed in the wrong order.
-const COST_TRANSPOSE: u32 = 60;
+pub(crate) const COST_TRANSPOSE: u32 = 60;
 /// Half of a double letter dropped (`hello` → `helo`) or a single letter typed
 /// twice (`help` → `hellp`). The most frequent real-world typo there is.
 const COST_DOUBLE: u32 = 55;
@@ -626,7 +626,7 @@ const CHEAPLY_EXPLAINED: u32 = 3 * COST_EDIT / 2;
 /// Rules are exempt — `ph` → `f` at the start of a word is not a slip, it is how
 /// the writer thinks the word is spelled — and so are transpositions, which keep
 /// every letter and only reorder them (`hte` → `the`).
-fn position_penalty(i: usize) -> u32 {
+pub(crate) fn position_penalty(i: usize) -> u32 {
     match i {
         0 => COST_INITIAL,
         1 => COST_SECOND,
@@ -806,7 +806,7 @@ fn sub_table() -> &'static [[u8; 26]; 26] {
 }
 
 /// Cost of typing `y` where `x` was meant.
-fn sub_cost(x: u8, y: u8) -> u32 {
+pub(crate) fn sub_cost(x: u8, y: u8) -> u32 {
     if !x.is_ascii_lowercase() || !y.is_ascii_lowercase() {
         return if x == y { 0 } else { COST_EDIT };
     }
@@ -820,7 +820,7 @@ fn sub_cost(x: u8, y: u8) -> u32 {
 /// Deliberately says nothing about the keyboard: adjacency explains keys that
 /// were *hit*, and there is no sense in which a letter is missing because of
 /// where its key sits.
-fn missing_cost(w: &[u8], i: usize) -> u32 {
+pub(crate) fn missing_cost(w: &[u8], i: usize) -> u32 {
     let c = w[i - 1];
     let doubled = (i >= 2 && w[i - 2] == c) || (i < w.len() && w[i] == c);
     if doubled {
@@ -840,7 +840,7 @@ fn missing_cost(w: &[u8], i: usize) -> u32 {
 /// and pays the full edit. Telling the three apart is most of the value of
 /// knowing where the keys are: `mnake` and `amke` are both one edit from
 /// `make` by letter count, but only one of them is a hand missing.
-fn extra_cost(w: &[u8], i: usize) -> u32 {
+pub(crate) fn extra_cost(w: &[u8], i: usize) -> u32 {
     let c = w[i - 1];
     let before = (i >= 2).then(|| w[i - 2]);
     let after = w.get(i).copied();

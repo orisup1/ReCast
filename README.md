@@ -15,7 +15,11 @@ clipboard is never touched.
 ReCast checks words when you finish them with Space, Enter, or punctuation. It
 uses the current keyboard layout, dictionary matches, and word frequency to decide
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
-the terminator are preserved. Same-layout corrections keep an unchanged prefix
+the terminator are preserved. Surrounding parentheses, brackets, braces, and straight quotes
+are preserved around corrected words, including during layout changes.
+Opening brackets and double quotes also work before their closing character
+is typed.
+Same-layout corrections keep an unchanged prefix
 on screen and rewrite only the remaining suffix, reducing visible deletion.
 A confident English spelling fix can also correct a
 wrong-layout word in the same replacement.
@@ -36,7 +40,7 @@ when the stem is a ranked dictionary word and the English reading is not a known
 Conservative spelling keeps its existing single-edit limit.
 
 Spelling correction protects frequency-attested dictionary words, curated
-technical terms, ALL CAPS, and tokens containing
+technical terms, ALL CAPS, mixed-case identifiers, and tokens containing
 digits or internal punctuation. It uses word frequency and weighted typo costs,
 without surrounding-sentence context, so unfamiliar names or jargon can still get
 unwanted fixes. When the two best spelling candidates have nearly equal scores,
@@ -306,8 +310,9 @@ Right Shift also offers an expansion. Capitalization follows your input:
 disables both abbreviations and word completion.
 
 Word completion uses the active English or Hebrew layout. It first offers exact
-prefix matches; if there are none, it tries one missing, extra, wrong, or swapped
-prefix letter. Cycling and undo always restore your original prefix. Prefix
+prefix matches; remaining cycle slots can offer one missing, extra, wrong, or
+swapped prefix letter. Likely slips rank ahead of equally frequent distant edits.
+Cycling and undo always restore your original prefix. Prefix
 length limits count characters in either language. Saved words in `ignore.txt`
 and persistent undo exceptions are also completion candidates, including names
 and technical terms absent from the bundled dictionary.
@@ -411,6 +416,10 @@ are user-only on Unix. Automatic corrections train word frequency and replacemen
 pairs only after subsequent typing retains the result; undo, deletion, and detected
 focus changes cancel pending learning. Completion offers do not train replacement
 pairs: only the chosen word, finished with Space or Enter, trains word frequency.
+Learned replacements require at least two retained corrections and twice the
+support of any competing replacement. They obey the spelling enable/disable
+setting (including distance zero), protect irregular capitals, and yield to explicit
+abbreviations. Learned language changes switch layouts in either direction.
 With personalization enabled, words retained at least twice also become completion
 candidates even when absent from the bundled dictionary. To clear these files,
 **stop ReCast first**, then run:

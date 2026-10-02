@@ -548,3 +548,13 @@ mod selection_tests {
         }
     }
 }
+
+/// Shifted symbol keys used by prose wrappers have no Hebrew letter to convert.
+/// Letter keys still use the Hebrew mapping rather than English capitalization.
+pub fn hebrew_symbol(english: Option<char>, hebrew: Option<char>, shift: bool) -> Option<char> {
+    if shift && english.is_some_and(|c| "(){}\"".contains(c)) {
+        english
+    } else {
+        hebrew
+    }
+}

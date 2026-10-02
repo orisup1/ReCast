@@ -150,16 +150,18 @@ fn completions_from(
     {
         return Vec::new();
     }
-    let mut prefixes = HashSet::from([prefix.to_owned()]);
+    let mut prefixes = vec![(prefix.to_owned(), 0)];
     let mut best: Vec<(f64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
     for attempt in 0..2 {
         if attempt == 1 {
-            if !best.is_empty() {
+            if best.len() == MAX_CANDIDATES {
                 break;
             }
-            prefixes = edited_prefixes(prefix, english);
+            prefixes = edited_prefixes(prefix, english).into_iter().collect();
+            prefixes.sort_unstable_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
         }
-        let mut consider = |word: &str, rank: u32, explicit: bool| {
+        let exact = if attempt == 0 { 0 } else { best.len() };
+        let mut consider = |word: &str, rank: u32, explicit: bool, cost: u32| {
             let word_len = word.chars().count();
             if word_len <= len
                 || word_len > crate::types::MAX_WORD_KEYS
@@ -168,22 +170,24 @@ fn completions_from(
             {
                 return;
             }
-            let value = value(word_len - len, rank, word);
+            let value = value(word_len - len, rank, word)
+                * (-(cost as f64) / crate::spell::COST_EDIT as f64).exp();
             if best.len() == MAX_CANDIDATES && best[MAX_CANDIDATES - 1].0 > value {
                 return;
             }
             if !explicit && !dict.contains(word) {
                 return;
             }
-            let at = best.partition_point(|(v, r, w)| {
-                (*v, std::cmp::Reverse(*r), std::cmp::Reverse(w.as_str()))
-                    > (value, std::cmp::Reverse(rank), std::cmp::Reverse(word))
-            });
+            let at = exact
+                + best[exact..].partition_point(|(v, r, w)| {
+                    (*v, std::cmp::Reverse(*r), std::cmp::Reverse(w.as_str()))
+                        > (value, std::cmp::Reverse(rank), std::cmp::Reverse(word))
+                });
             best.insert(at, (value, rank, word.to_owned()));
             best.truncate(MAX_CANDIDATES);
         };
-        for matching in &prefixes {
-            freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false));
+        for (matching, cost) in &prefixes {
+            freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false, *cost));
         }
         for word in saved {
             // Saved names and identifiers are allowed; whitespace and mixed scripts are not.
@@ -194,44 +198,68 @@ fn completions_from(
                     ('א'..='ת').contains(&c)
                 }
             });
-            if valid && prefixes.iter().any(|p| word.starts_with(p)) {
-                // ponytail: fixed prior for unranked saved words; tune from completion feedback.
-                consider(word, freq.rank(word).unwrap_or(1_000), true);
+            if valid {
+                if let Some((_, cost)) = prefixes.iter().find(|(p, _)| word.starts_with(p)) {
+                    // ponytail: fixed prior for unranked saved words; tune from completion feedback.
+                    consider(word, freq.rank(word).unwrap_or(1_000), true, *cost);
+                }
             }
         }
     }
     best.into_iter().map(|(_, _, word)| word).collect()
 }
 
-/// One edit of the prefix, consulted only when exact completion has no offers.
-fn edited_prefixes(prefix: &str, english: bool) -> HashSet<String> {
+/// One-edit prefixes fill unused cycle slots after all exact matches.
+fn edited_prefixes(prefix: &str, english: bool) -> HashMap<String, u32> {
     let chars: Vec<_> = prefix.chars().collect();
     let alphabet = if english {
         "abcdefghijklmnopqrstuvwxyz"
     } else {
         "אבגדהוזחטיךכלםמןנסעףפץצקרשת"
     };
-    let mut variants = HashSet::new();
+    let mut variants = HashMap::<String, u32>::new();
+    let mut add = |chars: Vec<char>, cost| {
+        variants
+            .entry(chars.iter().collect())
+            .and_modify(|old| *old = (*old).min(cost))
+            .or_insert(cost);
+    };
     for i in 0..=chars.len() {
+        let position = crate::spell::position_penalty(i);
         for c in alphabet.chars() {
             let mut inserted = chars.clone();
             inserted.insert(i, c);
-            variants.insert(inserted.iter().collect());
+            let cost = if english {
+                crate::spell::missing_cost(inserted.iter().collect::<String>().as_bytes(), i + 1)
+            } else {
+                crate::spell::COST_EDIT
+            };
+            add(inserted, cost + position);
             if i < chars.len() && c != chars[i] {
                 let mut replaced = chars.clone();
                 replaced[i] = c;
-                variants.insert(replaced.iter().collect());
+                let cost = if english {
+                    crate::spell::sub_cost(chars[i] as u8, c as u8)
+                } else {
+                    crate::spell::COST_EDIT
+                };
+                add(replaced, cost + position);
             }
         }
         if i < chars.len() {
             let mut deleted = chars.clone();
             deleted.remove(i);
-            variants.insert(deleted.iter().collect());
+            let cost = if english {
+                crate::spell::extra_cost(prefix.as_bytes(), i + 1)
+            } else {
+                crate::spell::COST_EDIT
+            };
+            add(deleted, cost + position);
         }
         if i + 1 < chars.len() && chars[i] != chars[i + 1] {
             let mut swapped = chars.clone();
             swapped.swap(i, i + 1);
-            variants.insert(swapped.iter().collect());
+            add(swapped, crate::spell::COST_TRANSPOSE);
         }
     }
     variants.remove(prefix);
@@ -976,14 +1004,42 @@ mod tests {
             completions_from("nod", Dict::of(&[]), Freq::EMPTY, 3, 30_000, &saved),
             ["node.js"]
         );
-        // Exact offers take precedence over any approximate prefix.
-        assert_eq!(offers("keyb", d, f), ["keyboard"]);
+        // Exact offers lead; approximate matches fill the remaining slots.
+        assert_eq!(offers("keyb", d, f), ["keyboard", "keynote"]);
         let d = dict(&["baked", "based"]);
         let f = freq(&[("baked", 100), ("based", 100)]);
         for _ in 0..10 {
             assert_eq!(offers("baxed", d, f), Vec::<String>::new());
-            assert_eq!(offers("bax", d, f), ["baked", "based"]);
+            // S is adjacent to X; K is not.
+            assert_eq!(offers("bax", d, f), ["based", "baked"]);
         }
+    }
+
+    #[test]
+    fn exact_completions_lead_and_typo_costs_rank_the_remaining_slots() {
+        let d = dict(&[
+            "baxter",
+            "based",
+            "baked",
+            "baxendale",
+            "baxters",
+            "baxterian",
+        ]);
+        let f = freq(&[("baxter", 30_000), ("based", 100), ("baked", 100)]);
+        assert_eq!(offers("bax", d, f), ["baxter", "based", "baked"]);
+        let f = freq(&[
+            ("baxter", 30_000),
+            ("baxendale", 20_000),
+            ("baxters", 10_000),
+            ("baxterian", 5_000),
+            ("based", 1),
+        ]);
+        let words = offers("bax", d, f);
+        assert_eq!(words.len(), MAX_CANDIDATES);
+        assert!(words.iter().all(|word| word.starts_with("bax")));
+        let d = dict(&["שלום", "שולם", "שולחן"]);
+        let f = freq(&[("שלום", 1), ("שולם", 200), ("שולחן", 100)]);
+        assert_eq!(offers("שול", d, f), ["שולחן", "שולם", "שלום"]);
     }
 
     #[test]

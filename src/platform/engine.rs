@@ -1755,6 +1755,8 @@ pub struct Replacement<P: Platform> {
     previous_layout: Option<Language>,
     /// Start of the original word for undo learning, before prefix trimming.
     original_start: usize,
+    /// Source language is captured before injection, including same-layout Hebrew rewrites.
+    original_lang: Language,
 }
 
 /// Turn a [`Fix`] into what the injection thread needs.
@@ -1768,17 +1770,19 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
             retype: P::retype_layout(&keys[start..], &text, lang)?,
             previous_layout: Some(lang.other()),
             original_start: start,
+            original_lang: lang.other(),
         }),
         Fix::LayoutSpelling { text, lang } => Some(Replacement {
             erase: keys.len(),
-            retype: P::retype_text(&text)?,
+            retype: P::retype_completion(&text, lang)?,
             previous_layout: Some(lang.other()),
             original_start: 0,
+            original_lang: lang.other(),
         }),
-        Fix::Spelling { text } => {
+        Fix::Spelling { text, lang } => {
             // Keep the identical prefix on screen. This saves paced backspaces
             // and focus queries on macOS, for corrections and their undo alike.
-            let original = reading::<P>(keys, Language::English);
+            let original = reading::<P>(keys, lang);
             let prefix = original
                 .chars()
                 .zip(text.chars())
@@ -1787,9 +1791,10 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
             let suffix: String = text.chars().skip(prefix).collect();
             Some(Replacement {
                 erase: keys.len() - prefix,
-                retype: P::retype_text(&suffix)?,
+                retype: P::retype_completion(&suffix, lang)?,
                 previous_layout: None,
                 original_start: 0,
+                original_lang: lang,
             })
         }
     }
@@ -1803,7 +1808,7 @@ fn undo_of<P: Platform>(
     terminator: Option<P::Key>,
 ) -> LastFix<P> {
     let original = &keys[keys.len() - rep.erase..];
-    let was = rep.previous_layout.unwrap_or(Language::English);
+    let was = rep.original_lang;
     LastFix {
         // Everything injected is one character per key, plus the terminator
         // that rides along after it.
@@ -1838,7 +1843,11 @@ pub fn reading<P: Platform>(keys: &[Typed<P::Key>], lang: Language) -> String {
                 }
             }),
             // Hebrew has no case, so the shift the user held says nothing.
-            Language::Hebrew => P::hebrew_char(t.key),
+            Language::Hebrew => crate::keymap::hebrew_symbol(
+                P::english_char(t.key, t.shift),
+                P::hebrew_char(t.key),
+                t.shift,
+            ),
         })
         .collect()
 }
@@ -1862,11 +1871,9 @@ fn note_of<P: Platform>(keys: &[Typed<P::Key>], fix: &Fix) -> (String, String, F
             text.clone(),
             FixKind::LayoutSpelling,
         ),
-        Fix::Spelling { text } => (
-            reading::<P>(keys, Language::English),
-            text.clone(),
-            FixKind::Spelling,
-        ),
+        Fix::Spelling { text, lang } => {
+            (reading::<P>(keys, *lang), text.clone(), FixKind::Spelling)
+        }
     }
 }
 
@@ -2183,8 +2190,14 @@ mod tests {
                 .chars()
                 .map(|key| Typed { key, shift: false })
                 .collect();
-            let rep = replacement::<Simulated>(&keys, Some(Fix::Spelling { text: after.into() }))
-                .unwrap();
+            let rep = replacement::<Simulated>(
+                &keys,
+                Some(Fix::Spelling {
+                    text: after.into(),
+                    lang: Language::English,
+                }),
+            )
+            .unwrap();
             assert_eq!(rep.erase, erase, "{before}");
             let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
             let prefix: String = before.chars().take(keys.len() - rep.erase).collect();
@@ -2411,6 +2424,68 @@ mod tests {
             crate::dictionary::en_freq(),
         );
         assert_eq!(words.iter().filter(|w| *w == "keyboard").count(), 1);
+    }
+
+    #[test]
+    fn wrapped_and_learned_corrections_restore_text_and_layout_on_undo() {
+        const CHILD: &str = "RECAST_WRAPPED_ENGINE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::engine::tests::wrapped_and_learned_corrections_restore_text_and_layout_on_undo", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|cfg| cfg.personal_enabled = true);
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for (from, to) in [("akuo", "שלום"), ("יקךךם", "hello"), ("שלוממ", "שלום")]
+        {
+            for _ in 0..2 {
+                crate::personal::record_confusion(from, to);
+            }
+        }
+        for (typed, before, after, source, target) in [
+            ("(recieve) ", "(recieve) ", "(receive) ", 0, 0),
+            ("[akuo] ", "[akuo] ", "[שלום] ", 0, 1),
+            ("hello ", "יקךךם ", "hello ", 1, 0),
+            ("akunn ", "שלוממ ", "שלום ", 1, 1),
+        ] {
+            SIMULATED_LAYOUT.store(source, Ordering::SeqCst);
+            let s = Session::new();
+            s.type_text(typed);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), after);
+            assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), target);
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), before);
+            assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), source);
+            // Repeating a wrapped undo must not provoke another correction.
+            let repeated = Session::new();
+            repeated.type_text(typed);
+            assert!(!repeated.engine.lock().is_replacing);
+        }
+        // Completion follows the live layout even when the physical prefix was
+        // intended as English. It must never silently switch layout on a tap.
+        SIMULATED_LAYOUT.store(1, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        let replacing = s.engine.lock().is_replacing;
+        if replacing {
+            s.pending();
+            s.finish();
+        }
+        assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), 1);
+        assert!(s.text().chars().all(|c| ('א'..='ת').contains(&c)));
     }
 
     #[test]
