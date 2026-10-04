@@ -24,7 +24,7 @@
 //!   offered as the first completion, since a rule the user wrote by hand
 //!   beats anything inferred from a corpus.
 //!
-//! It also owns the session [`suppress`] list: the words a Ctrl-double-tap undo
+//! It also owns the session [`suppress`] list: the words an undo
 //! has taken back, which nothing may correct again until restart.
 
 use std::collections::{HashMap, HashSet};

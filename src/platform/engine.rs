@@ -52,7 +52,7 @@ use crate::types::{
 /// on the OS for no reason anyone had decided on.
 pub const TAP_MAX: Duration = Duration::from_millis(300);
 
-/// Two action modifier taps inside this window are the undo gesture. Wide enough not to
+/// Two action modifier taps inside this window request layout conversion. Wide enough not to
 /// demand a drum roll, short enough that two unrelated taps a second apart are
 /// not read as one gesture.
 pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
@@ -273,10 +273,9 @@ pub struct Selection {
     pub text: String,
 }
 
-/// What the Ctrl double-tap would do to the word the cursor is sitting on.
-///
-/// Corrections can be undone; skipped words can be unlisted; unchanged words
-/// can be explicitly reconsidered. Cursor movement invalidates all three.
+/// Tracked text available to the conversion and optional undo gestures.
+/// Corrections carry both visible keys and undo data; skipped words can be
+/// unlisted by single-tap undo. Cursor movement invalidates every variant.
 pub enum LastAction<P: Platform> {
     /// A correction landed and the cursor is still on it.
     Fixed(LastFix<P>),
@@ -295,13 +294,16 @@ pub enum LastAction<P: Platform> {
 }
 
 /// A correction that is on screen right now, with the cursor still sitting
-/// immediately after it — everything the Ctrl double-tap needs to put back what
-/// the user actually typed.
+/// immediately after it, with both visible keys for conversion and the original
+/// text for the optional undo gesture.
 ///
 /// It is only kept for that moment. Undo erases backwards from the cursor, so
 /// once the user types anything else the correction is no longer what sits
 /// there and the payload is dropped (see [`Engine::key_press`]).
 pub struct LastFix<P: Platform> {
+    /// Physical keys of the visible final word, including any unchanged prefix.
+    visible: Vec<Typed<P::Key>>,
+    visible_layout: Language,
     /// Characters our injection put on screen, terminator included — what has
     /// to come back off.
     on_screen: usize,
@@ -328,7 +330,7 @@ pub struct LastFix<P: Platform> {
 }
 
 /// A word the pipelines passed over because the user had already told us to
-/// leave it alone — what the Ctrl double-tap needs to change its mind.
+/// leave it alone, ready for single-tap unlisting or double-tap conversion.
 ///
 /// The keys are kept rather than the decision, because there is no decision
 /// yet: the word was never put through the pipelines with the list out of the
@@ -424,8 +426,10 @@ pub struct AppState<P: Platform> {
     /// When the last completed action tap happened; a second one inside
     /// [`DOUBLE_TAP_WINDOW`] is the undo gesture.
     pub last_action_tap: Option<Instant>,
-    /// An undo gesture completed while the current correction was landing.
+    /// An action completed while the current correction was landing.
     pending_undo: bool,
+    /// Whether the queued action converts rather than undoes the visible word.
+    pending_conversion: bool,
     shortcut_bindings: Option<(String, String, String)>,
     /// A key combination shaped like a layout-switch hotkey has been pressed and
     /// the modifiers holding it have not all come back up yet. When they do, the
@@ -473,6 +477,7 @@ impl<P: Platform> AppState<P> {
             action_down: None,
             last_action_tap: None,
             pending_undo: false,
+            pending_conversion: false,
             shortcut_bindings: None,
             layout_hotkey: false,
             last_action: None,
@@ -504,6 +509,7 @@ impl<P: Platform> AppState<P> {
             self.completion_down = None;
             self.last_action_tap = None;
             self.pending_undo = false;
+            self.pending_conversion = false;
             self.shortcut_bindings = Some((
                 config.action_shortcut.clone(),
                 config.completion_shortcut.clone(),
@@ -586,6 +592,7 @@ impl<P: Platform> AppState<P> {
         self.cycle = None;
         self.last_action_tap = None;
         self.pending_undo = false;
+        self.pending_conversion = false;
     }
     fn invalidate_text(&mut self) {
         self.finish_completion_use(false);
@@ -1387,6 +1394,8 @@ impl<P: Platform> Engine<P> {
         // when it has just handed back the user's own text, which is nothing to
         // undo.
         let undo = (!back_to_typed).then(|| LastFix {
+            visible: keep.clone(),
+            visible_layout: target_lang,
             on_screen: P::retype_len(&retype) - prefix,
             restore: P::retype_original(&typed[prefix..], original_lang),
             terminator: None,
@@ -1421,17 +1430,9 @@ impl<P: Platform> Engine<P> {
         );
     }
 
-    /// An action modifier came back up. If it was a bare tap and the second one inside
-    /// [`DOUBLE_TAP_WINDOW`], act on the word the cursor is sitting on — take
-    /// back the correction that landed on it, or take it off the user's list
-    /// and correct it after all. Which of the two is decided by what happened
-    /// to the word, not by the gesture: see [`LastAction`].
-    ///
-    /// Either way it erases backwards from the cursor, so it is only ever
-    /// offered for a word nothing has been typed over yet
-    /// ([`AppState::last_action`], cleared by the next keystroke). That is the
-    /// same bargain every in-place autocorrect makes, and it is what keeps a
-    /// mistimed double-tap from eating text further back.
+    /// A bare double tap converts the visible last word to the other layout.
+    /// The optional single-tap binding undoes corrections or unlists words.
+    /// Both gestures require unchanged cursor and focus context.
     fn action_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, key: P::Key) {
         let Some(down) = st.action_down.take() else {
             return;
@@ -1451,25 +1452,49 @@ impl<P: Platform> Engine<P> {
                     st.last_action,
                     Some(LastAction::Fixed(_) | LastAction::Skipped(_))
                 ));
-        if !single && !shortcut_matches::<P>(&config.action_shortcut, key) {
+        let double = shortcut_matches::<P>(&config.action_shortcut, key);
+        if !double {
             st.last_action_tap = None;
+            if single {
+                self.perform_action(st, true);
+            }
             return;
         }
-        match st.last_action_tap.take() {
-            _ if single => {}
-            Some(prev) if now.duration_since(prev) <= DOUBLE_TAP_WINDOW => {}
-            // First tap of a possible pair: remember it and wait for the second.
-            _ => {
-                st.last_action_tap = Some(now);
-                return;
-            }
+        if st
+            .last_action_tap
+            .take()
+            .is_some_and(|prev| now.duration_since(prev) <= DOUBLE_TAP_WINDOW)
+        {
+            self.perform_action(st, false);
+            return;
         }
+        st.last_action_tap = Some(now);
+        if single {
+            // A shared key must wait long enough to distinguish undo from conversion.
+            let engine = Arc::clone(self);
+            let bindings = st.shortcut_bindings.clone();
+            thread::spawn(move || {
+                thread::sleep(DOUBLE_TAP_WINDOW);
+                let mut st = engine.lock();
+                st.sync_shortcuts(&crate::config::Config::global());
+                if st.last_action_tap == Some(now)
+                    && st.shortcut_bindings == bindings
+                    && st.held_keys.is_empty()
+                {
+                    st.last_action_tap = None;
+                    engine.perform_action(st, true);
+                }
+            });
+        }
+    }
 
+    fn perform_action(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, single: bool) {
         if !self.control.is_enabled() {
             return;
         }
         if st.is_replacing {
             st.pending_undo = P::QUEUE_UNDO_DURING_REPLACEMENT;
+            st.pending_conversion = !single;
             return;
         }
         let Some((mut st, focus)) = self.refresh_focus(st) else {
@@ -1496,7 +1521,13 @@ impl<P: Platform> Engine<P> {
             return;
         }
         match st.last_action.take() {
+            Some(LastAction::Fixed(fix)) if !single => self.convert_fixed(st, fix),
             Some(LastAction::Fixed(fix)) => self.undo_fix(st, fix),
+            Some(LastAction::Skipped(skip)) if !single => {
+                if let Some(layout) = P::current_layout() {
+                    self.manual_correct(st, skip.keys, skip.terminator, layout);
+                }
+            }
             Some(LastAction::Skipped(skip)) => self.unlist_and_correct(st, skip),
             Some(LastAction::Unchanged {
                 keys,
@@ -1561,7 +1592,14 @@ impl<P: Platform> Engine<P> {
         });
     }
 
-    /// Explicit intent overrides automatic ambiguity guards, never dictionary validity.
+    /// Convert the visible word rather than restoring an earlier spelling or prefix.
+    fn convert_fixed(self: &Arc<Self>, st: MutexGuard<'_, AppState<P>>, fix: LastFix<P>) {
+        if P::current_layout() == Some(fix.visible_layout) {
+            self.manual_correct(st, fix.visible, fix.terminator, fix.visible_layout);
+        }
+    }
+
+    /// Explicit intent overrides dictionary, frequency, and saved-word guards.
     fn manual_correct(
         self: &Arc<Self>,
         mut st: MutexGuard<'_, AppState<P>>,
@@ -1570,11 +1608,19 @@ impl<P: Platform> Engine<P> {
         layout: Language,
     ) {
         st.phrase.clear();
+        st.cycle = None;
+        st.finish_completion_use(false);
+        st.pending_learning = None;
         let text = reading::<P>(&keys, layout.other());
-        let manual =
-            crate::dictionary::manual_layout(&text, layout.other(), self.en_dict, self.he_dict);
-        let deferred_layout = manual.as_ref().map(|_| layout.other());
-        let fix = manual.or_else(|| self.check(&keys, st.history.run(), st.mode).fix);
+        if keys.is_empty() || text.chars().count() != keys.len() {
+            return;
+        }
+        let deferred_layout = Some(layout.other());
+        let fix = Some(Fix::Layout {
+            start: 0,
+            text,
+            lang: layout.other(),
+        });
         let note = fix.as_ref().map(|fix| note_of::<P>(&keys, fix));
         let Some(rep) = replacement::<P>(&keys, fix) else {
             return;
@@ -1650,11 +1696,7 @@ impl<P: Platform> Engine<P> {
         // rather than a second word.
         let result = self.check(&skip.keys, st.history.run(), st.mode).fix;
         let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
-        // An explicit request can also resolve ambiguity after unlisting.
         let Some(rep) = replacement::<P>(&skip.keys, result) else {
-            if let Some(layout) = P::current_layout() {
-                self.manual_correct(st, skip.keys, skip.terminator, layout);
-            }
             return;
         };
         st.cycle = None;
@@ -1722,7 +1764,7 @@ impl<P: Platform> Engine<P> {
     /// `keep` is the word buffer to leave behind — what is now on screen for
     /// the word still in progress, so a completion the user keeps typing over
     /// is checked as the word they can see rather than as the tail they added.
-    /// `undo` is the payload the Ctrl double-tap would put back, kept only if
+    /// `undo` carries visible keys and the original text, kept only if
     /// the user typed nothing while this was landing.
     fn replace_word(
         self: &Arc<Self>,
@@ -1804,7 +1846,10 @@ impl<P: Platform> Engine<P> {
                     if let Some(rule) = rule {
                         crate::personal::record_rule(rule, false);
                     }
-                    if mode == crate::config::AppMode::Full && kind != FixKind::Complete {
+                    if mode == crate::config::AppMode::Full
+                        && kind != FixKind::Complete
+                        && rule.is_some()
+                    {
                         pending_learning = Some(PendingLearning {
                             from: Some(from),
                             to,
@@ -1898,7 +1943,11 @@ impl<P: Platform> Engine<P> {
             .then(|| st.last_action.take())
             .flatten();
         if let Some(LastAction::Fixed(fix)) = pending {
-            self.undo_fix(st, fix);
+            if std::mem::take(&mut st.pending_conversion) {
+                self.convert_fixed(st, fix);
+            } else {
+                self.undo_fix(st, fix);
+            }
         } else {
             drop(st);
         }
@@ -2003,7 +2052,18 @@ fn undo_of<P: Platform>(
 ) -> LastFix<P> {
     let original = &keys[keys.len() - rep.erase..];
     let was = rep.previous_layout.unwrap_or(Language::English);
+    let suffix = P::buffer_after(&rep.retype);
+    let mut visible = if suffix.len() == P::retype_len(&rep.retype) {
+        keys[..keys.len() - rep.erase].to_vec()
+    } else {
+        Vec::new()
+    };
+    visible.extend(suffix);
     LastFix {
+        visible,
+        visible_layout: rep
+            .previous_layout
+            .map_or(Language::English, Language::other),
         // Everything injected is one character per key, plus the terminator
         // that rides along after it.
         on_screen: P::retype_len(&rep.retype) + usize::from(terminator.is_some()),
@@ -2156,10 +2216,11 @@ mod tests {
             text.chars().count()
         }
         fn buffer_after(text: &String) -> Vec<Typed<char>> {
+            let text = text.rsplit(char::is_whitespace).next().unwrap_or_default();
             let physical = if text.chars().any(|c| ('א'..='ת').contains(&c)) {
                 crate::keymap::convert_selection(text)
             } else {
-                text.clone()
+                text.to_owned()
             };
             physical
                 .chars()
@@ -2329,6 +2390,20 @@ mod tests {
         fn tap(&self, key: char) {
             self.engine.key_press(key);
             self.engine.key_release(key);
+        }
+        fn undo(&self) {
+            let config = crate::config::Config::global();
+            let action = config.action_shortcut.clone();
+            let undo = config.undo_shortcut.clone();
+            crate::config::Config::update_live(|cfg| {
+                cfg.action_shortcut = "left_ctrl".into();
+                cfg.undo_shortcut = "right_ctrl".into();
+            });
+            self.tap(Simulated::CTRL_RIGHT);
+            crate::config::Config::update_live(|cfg| {
+                cfg.action_shortcut = action;
+                cfg.undo_shortcut = undo;
+            });
         }
         fn backspace(&self) {
             self.engine.injector.text.lock().unwrap().pop();
@@ -2503,8 +2578,7 @@ mod tests {
             s.tap(Simulated::SHIFT_RIGHT);
             s.pending();
             s.finish();
-            s.tap(Simulated::CTRL_LEFT);
-            s.tap(Simulated::CTRL_LEFT);
+            s.undo();
             s.pending();
             s.finish();
             assert_eq!(s.text(), original);
@@ -2565,8 +2639,7 @@ mod tests {
         s.type_text("recieve ");
         s.pending();
         s.finish();
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "recieve ");
@@ -2615,8 +2688,7 @@ mod tests {
         s.pending();
         s.finish();
         assert_eq!(crate::personal::personal_count("receive"), None);
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "recieve ");
@@ -2701,8 +2773,7 @@ mod tests {
         s.pending();
         s.finish();
         assert_eq!(s.text(), "qzcustomname");
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "qzc");
@@ -2723,8 +2794,7 @@ mod tests {
             .candidates
             .iter()
             .any(|word| word == "keyboard"));
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "keyob");
@@ -2754,8 +2824,7 @@ mod tests {
         s.tap(Simulated::SHIFT_RIGHT);
         s.pending();
         s.finish();
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "שלו");
@@ -2799,8 +2868,7 @@ mod tests {
         s.finish();
         let offered = reading::<Simulated>(&s.engine.lock().keys, Language::English);
         assert!(s.engine.lock().phrase.boost(&offered) > 1.0);
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.engine.lock().phrase.boost(&offered), 1.0);
@@ -2915,7 +2983,8 @@ mod tests {
         assert_eq!(s.engine.control.undo_count(), 0);
         FOCUS.store(1, Ordering::SeqCst);
 
-        // A late second tap starts a new pair; a timely third tap completes it.
+        // A late second tap starts a new pair; a timely third tap converts.
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
         let s = Session::new();
         s.type_text("recieve ");
         s.pending();
@@ -2929,8 +2998,10 @@ mod tests {
         s.tap(Simulated::CTRL_LEFT);
         s.pending();
         s.finish();
-        assert_eq!(s.text(), "recieve ");
-        assert_eq!(s.engine.control.undo_count(), 1);
+        assert_eq!(s.text(), "רקבקןהק ");
+        assert_eq!(s.engine.control.undo_count(), 0);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
         crate::complete::unlist("recieve");
 
         let s = Session::new();
@@ -2939,8 +3010,7 @@ mod tests {
         s.finish();
         assert_eq!(s.text(), "keyboard ");
         assert_eq!(s.engine.control.fixed_count(), 1);
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "keyboad ");
@@ -2956,12 +3026,7 @@ mod tests {
             s.type_text("acheive ");
             s.pending();
             s.engine.injector.injecting.store(true, Ordering::SeqCst);
-            if shortcut == "right_ctrl" {
-                s.tap(Simulated::CTRL_RIGHT);
-            } else {
-                s.tap(Simulated::CTRL_LEFT);
-                s.tap(Simulated::CTRL_LEFT);
-            }
+            s.undo();
             assert!(s.engine.lock().pending_undo);
             s.proceed.send(()).unwrap();
             s.pending();
@@ -2982,8 +3047,7 @@ mod tests {
             let s = Session::new();
             s.type_text("recieve ");
             s.pending();
-            s.tap(Simulated::CTRL_LEFT);
-            s.tap(Simulated::CTRL_LEFT);
+            s.undo();
             assert!(s.engine.lock().pending_undo);
             if click {
                 s.engine.mouse_click();
@@ -3073,8 +3137,7 @@ mod tests {
         s.pending();
         s.type_text("next ");
         s.finish();
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         assert_eq!(s.text(), "receive next ");
         assert!(!s.engine.lock().is_replacing);
         assert_eq!(s.engine.control.undo_count(), 0);
@@ -3101,8 +3164,7 @@ mod tests {
         s.pending();
         s.finish();
         FOCUS.store(2, Ordering::SeqCst);
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         assert_eq!(s.text(), "receive ");
         assert!(!s.engine.lock().is_replacing);
         assert_eq!(s.engine.control.undo_count(), 0);
@@ -3252,8 +3314,7 @@ mod tests {
         assert_eq!(s.text(), completed);
         assert!(s.engine.lock().cycle.is_none());
         // Turning completion off must still let the user undo its last offer.
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "hel");
@@ -3281,8 +3342,7 @@ mod tests {
             s.finish();
             assert_eq!(s.text(), expected);
         }
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "btw");
@@ -3308,8 +3368,7 @@ mod tests {
             s.type_text("recieve hello akuo ");
             s.type_text("hel");
             s.tap(Simulated::SHIFT_RIGHT);
-            s.tap(Simulated::CTRL_LEFT);
-            s.tap(Simulated::CTRL_LEFT);
+            s.undo();
             let st = s.engine.lock();
             assert!(st.keys.is_empty() && st.buffered_keys.is_empty());
             assert!(!st.is_replacing && st.last_action.is_none());
@@ -3354,8 +3413,7 @@ mod tests {
             FOCUS.store(focus, Ordering::SeqCst);
             s.type_text("recieve hel");
             s.tap(Simulated::SHIFT_RIGHT);
-            s.tap(Simulated::CTRL_LEFT);
-            s.tap(Simulated::CTRL_LEFT);
+            s.undo();
             let st = s.engine.lock();
             assert!(st.keys.is_empty() && st.buffered_keys.is_empty());
             assert!(!st.is_replacing && st.last_action.is_none());
@@ -3552,8 +3610,7 @@ mod tests {
         s.finish();
         assert_eq!(s.text(), "שלום ");
         assert_eq!(s.engine.control.practice_stage.load(Ordering::Relaxed), 1);
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         s.pending();
         s.finish();
         assert_eq!(s.text(), "akuo ");
@@ -3587,8 +3644,7 @@ mod tests {
             ready,
             proceed: reply,
         });
-        s.tap(Simulated::CTRL_LEFT);
-        s.tap(Simulated::CTRL_LEFT);
+        s.undo();
         waiting.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(
             s.engine.state.try_lock().is_ok(),
@@ -3637,10 +3693,117 @@ mod tests {
         assert!(s.engine.lock().keys.is_empty());
         assert!(s.engine.lock().held_keys.is_empty());
 
+        // Conversion uses the full visible word, not an undo suffix or original typo.
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for completion in [false, true] {
+            SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+            let s = Session::new();
+            s.type_text(if completion { "keyb" } else { "recieve " });
+            if completion {
+                s.tap(Simulated::SHIFT_RIGHT);
+            }
+            s.pending();
+            s.finish();
+            let visible = s.text();
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), crate::keymap::convert_selection(&visible));
+            assert!(s.engine.lock().cycle.is_none());
+            assert!(s.engine.lock().pending_learning.is_none());
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), visible);
+            assert_eq!(s.engine.control.undo_count(), 0);
+        }
+        // A shared single-tap undo key must still honor double-tap conversion.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "left_ctrl".into());
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.tap(Simulated::CTRL_LEFT);
+        assert!(!s.engine.lock().is_replacing);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        thread::sleep(DOUBLE_TAP_WINDOW + Duration::from_millis(20));
+        assert_eq!(s.text(), "רקבקןהק ");
+        assert_eq!(s.engine.control.undo_count(), 0);
+        assert!(!s.engine.lock().is_replacing);
+        crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "none".into());
+
+        // Expansion conversion touches only the last word, preserving earlier text.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let abbrev = crate::complete::user_path("abbrev.txt").unwrap();
+        std::fs::write(&abbrev, "zzconvert = hello world\n").unwrap();
+        crate::complete::reload_user_files();
+        let s = Session::new();
+        s.type_text("zzconvert ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "hello world ");
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "hello 'םרךג ");
+        std::fs::remove_file(abbrev).unwrap();
+        crate::complete::reload_user_files();
+
+        // An eager double tap converts the correction after injection finishes.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        assert!(s.engine.lock().pending_conversion);
+        s.proceed.send(()).unwrap();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "רקבקןהק ");
+
+        // Manual conversion never removes an exception or needs a dictionary entry.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        crate::complete::suppress("qzxx");
+        let s = Session::new();
+        s.type_text("qzxx ");
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "/זסס ");
+        assert!(crate::complete::suppressed("qzxx"));
+
+        // A refused layout switch must not erase anything.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("qzxx ");
+        s.tap(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while s.engine.lock().is_replacing {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(s.text(), "qzxx ");
+        assert!(s.ready.try_recv().is_err());
+        REFUSE_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
         // All ambiguous words use the same explicit conversion rule, before
         // or after a terminator, and in either direction.
         ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
-        for (english, hebrew) in [("do", "גם"), ("go", "עם"), ("to", "אם")] {
+        for (english, hebrew) in [
+            ("do", "גם"),
+            ("go", "עם"),
+            ("to", "אם"),
+            ("zzzzqqqq", "זזזז////"),
+        ] {
             for reverse in [false, true] {
                 for suffix in ["", " "] {
                     SIMULATED_LAYOUT.store(usize::from(reverse), Ordering::SeqCst);
@@ -3682,7 +3845,7 @@ mod tests {
         s.finish();
         assert_eq!(s.text(), "do ");
         crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "none".into());
-        for interruption in ["none", "click", "focus", "disabled", "secure"] {
+        for interruption in ["click", "focus", "disabled", "secure"] {
             let s = Session::new();
             s.type_text(if interruption == "none" {
                 "zzzzqqqq "
@@ -3804,7 +3967,8 @@ mod tests {
             s.tap(action_key);
             s.pending();
             s.finish();
-            assert_eq!(s.text(), "keyb");
+            assert_eq!(s.text(), "לקטנםשרג");
+            SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
 
             let s = Session::new();
             s.type_text("do ");

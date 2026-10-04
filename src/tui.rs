@@ -389,13 +389,12 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
             crate::config::Config::global().completion_gesture()
         )),
         Line::from(format!(
-            "  {}: undo the correction the cursor is sitting on,",
+            "  {}: convert the visible last word to the other layout",
             crate::config::Config::global().action_gesture()
         )),
-        Line::from("                       and stop correcting that word. On a word that"),
-        Line::from("                       was skipped because it is listed, it does the"),
-        Line::from("                       opposite: unlists it and corrects it."),
-        Line::from("  Undo immediately: more typing or cursor movement ends the opportunity."),
+        Line::from("                       including unknown words; repeat to convert back."),
+        Line::from("  Enable single-Ctrl undo in Settings to undo or unlist words."),
+        Line::from("  More typing or cursor movement ends the opportunity."),
         Line::from("  One undo skips a word this session; two occasions remember it."),
         Line::from(""),
         Line::from("Your files (edits are picked up within ~2s, no restart):"),

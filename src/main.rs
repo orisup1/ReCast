@@ -136,15 +136,14 @@ Auto-complete:
   first tap too; define them one per line as `abbr = expansion` in
   <config dir>/recast/abbrev.txt.
 
-Undo and manual correction (Ctrl tapped twice, quickly):
-  After a correction, it puts back what you typed — the layout too, if the
-  correction changed it — and leaves that word alone from then on.
-  After a word that was left alone *because* you had listed it, the same
-  gesture takes it off the list (ignore.txt included) and corrects it.
-  For an unchanged word, a valid reading in the other layout takes priority,
-  even when both readings are words. This works before or after Space/Enter.
-  Undoing a manual conversion does not teach an exception.
+Manual layout conversion (Ctrl tapped twice within half a second):
+  Convert the visible last word to the other layout, even if neither reading
+  is a dictionary word. Works before or after Space/Enter and after correction
+  or completion. Repeat to convert back. Saved word exceptions are unchanged.
   Typing anything else or moving the cursor ends the word gesture.
+  Enable a single-Ctrl undo shortcut in Settings to restore a correction or
+  unlist a skipped word. If it shares the action key, undo waits half a second
+  so a double tap can convert instead.
   On macOS, select text in an editable field and double-tap Ctrl to convert
   its layout. Repeat to restore the original. Requires accessibility selection
   editing; the clipboard is untouched.

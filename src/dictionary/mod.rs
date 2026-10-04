@@ -731,17 +731,6 @@ pub enum Fix {
     Spelling { text: String },
 }
 
-/// A deliberate request may select a valid other-layout word even when the
-/// current reading is valid too. No frequency or word-specific exceptions.
-pub fn manual_layout(text: &str, lang: Language, en: Dict, he: Dict) -> Option<Fix> {
-    let word = text.trim_end_matches(|c: char| !c.is_alphanumeric());
-    valid_strict(&word.to_lowercase(), lang, en, he).then(|| Fix::Layout {
-        start: 0,
-        text: text.to_owned(),
-        lang,
-    })
-}
-
 /// Everything a finished word produced: what to do about it, and what language
 /// it turned out to be.
 ///
@@ -1400,11 +1389,8 @@ pub fn check_and_correct<K: Copy>(
 /// user has it on one of their lists — `ignore.txt` or the session list a
 /// previous undo put it on.
 ///
-/// Called by the platform listeners when [`check_and_correct`] declined, to
-/// decide whether the Ctrl double-tap has anything to offer. The gesture is a
-/// toggle: it takes back a correction that happened, and takes a word off the
-/// list when a correction *didn't* happen for that reason. Nothing else arms
-/// it, so a word that is simply spelled correctly is untouched by it.
+/// Called when [`check_and_correct`] declined, to arm the optional single-tap
+/// unlist gesture. Double-tap layout conversion does not consult these lists.
 ///
 /// The two lists are checked against different readings, and deliberately so.
 /// A session entry came from undoing what the user was looking at, so it

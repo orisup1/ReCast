@@ -153,21 +153,24 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 | Complete an English or Hebrew word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
 | Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space/Enter |
 | Rescue selected text (macOS) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
-| Undo the latest correction | Tap **Ctrl twice within half a second**, immediately after the correction |
-| Allow an ignored word again | Type that word and its space, then immediately double-tap Ctrl |
+| Convert the last word to the other layout | Tap **Ctrl twice within half a second**, even for unknown words |
+| Undo the latest correction | Enable a single-Ctrl undo shortcut in Settings, then tap it immediately |
+| Allow an ignored word again | Use the configured single-Ctrl undo shortcut after the word, or edit your word lists |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
 | Ignore a correction permanently | Click it in the tray's **Recent** menu, or add it to `ignore.txt` |
 | Inspect live activity | **Start live log…** in the tray/menubar, or **Live log…** in the Linux control window |
 | Review gestures | **Typing shortcuts** in the tray or Linux control window |
 
-Double-Ctrl gives an unchanged word a second look. A dictionary word in the other
-layout takes priority, even when the current reading is also a valid word. This
-rule applies to every word, in both directions; automatic correction keeps its
-usual conservative behavior. If no valid alternate reading exists, the normal
-correction pipeline is tried. A further double-Ctrl undoes a manual correction
-without teaching a word exception. Typing another character or moving the cursor
-ends the opportunity. The optional single-Ctrl shortcut remains for undo/unlisting;
-manual conversion still requires the configured double-tap action.
+Double-Ctrl converts the visible last word to the other keyboard layout, regardless
+of whether either reading is a dictionary word. It works before or after Space/Enter,
+including after autocorrection or completion, and preserves the separator. Repeating
+it converts the word back. Saved exceptions remain saved; manual conversions do not
+train spelling replacements. Typing another character or moving the cursor ends the
+opportunity to convert a finished word. Automatic correction remains conservative.
+
+The optional single-Ctrl shortcut handles undo/unlisting. If it shares the action
+key, undo waits half a second so a double tap can request conversion instead.
+The double-tap action can still be remapped or disabled in Settings.
 
 On macOS, selected-text rescue converts physical English/Hebrew key positions,
 without dictionary checks. The first English or Hebrew letter determines the

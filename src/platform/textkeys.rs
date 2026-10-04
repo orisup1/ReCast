@@ -101,7 +101,7 @@ pub fn retype_len(text: &str) -> usize {
 /// of it is still in progress — an abbreviation expansion may carry spaces —
 /// Hebrew is mapped back to the same physical keys used by the capture buffer.
 pub fn buffer_after(text: &str) -> Vec<Typed<Key>> {
-    let word = text.rsplit(' ').next().unwrap_or_default();
+    let word = text.rsplit(char::is_whitespace).next().unwrap_or_default();
     let physical = if word.chars().any(|c| ('א'..='ת').contains(&c)) {
         crate::keymap::convert_selection(word)
     } else {
@@ -109,8 +109,9 @@ pub fn buffer_after(text: &str) -> Vec<Typed<Key>> {
     };
     physical
         .chars()
-        .filter_map(|c| english_char_to_key(c).map(|(key, shift)| Typed { key, shift }))
-        .collect()
+        .map(|c| english_char_to_key(c).map(|(key, shift)| Typed { key, shift }))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// The keys the state machine names, in rdev's spelling.
@@ -134,4 +135,6 @@ fn hebrew_completion_buffer_preserves_physical_keys() {
         .filter_map(|t| english_char(t.key, t.shift))
         .collect();
     assert_eq!(english, "way");
+    assert_eq!(buffer_after("hello\nworld").len(), 5);
+    assert!(buffer_after("hello🙂").is_empty());
 }

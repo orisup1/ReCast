@@ -132,7 +132,12 @@ impl Platform for Linux {
     }
     fn buffer_after(retype: &Self::Retype) -> Vec<Typed> {
         retype
-            .rsplit(|(key, _)| *key == KeyCode::KEY_SPACE)
+            .rsplit(|(key, _)| {
+                matches!(
+                    *key,
+                    KeyCode::KEY_SPACE | KeyCode::KEY_ENTER | KeyCode::KEY_TAB
+                )
+            })
             .next()
             .unwrap_or_default()
             .iter()

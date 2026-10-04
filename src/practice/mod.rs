@@ -18,7 +18,7 @@ pub fn opened(control: &AppControl) {
     }
 }
 
-fn undo_instruction(config: &crate::config::Config) -> String {
+fn restore_instruction(config: &crate::config::Config) -> String {
     if config.action_shortcut != "none" {
         config.action_gesture()
     } else if config.undo_shortcut != "none" {
@@ -34,7 +34,7 @@ fn undo_instruction(config: &crate::config::Config) -> String {
 pub fn instructions() -> String {
     let config = crate::config::Config::global();
     format!(
-    "1. Select your English keyboard. In the field below, press Space, type akuo, then Space. Watch it become שלום.\n2. Immediately {} to restore akuo.\n3. Select all and delete. Press Space, type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", undo_instruction(&config), config.completion_gesture())
+    "1. Select your English keyboard. In the field below, press Space, type akuo, then Space. Watch it become שלום.\n2. Immediately {} to restore akuo.\n3. Select all and delete. Press Space, type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", restore_instruction(&config), config.completion_gesture())
 }
 
 pub fn shortcut_label(value: &str) -> &'static str {
@@ -49,30 +49,31 @@ pub fn feedback(control: &AppControl) -> String {
     let stage = control.practice_stage.load(Ordering::Relaxed);
     let config = crate::config::Config::global();
     let undo_step = format!(
-        "Correction worked. Now {} to undo, without clicking or typing first.",
-        undo_instruction(&config)
+        "Correction worked. Now {} to restore akuo, without clicking or typing first.",
+        restore_instruction(&config)
     );
     let completion_step = format!(
-        "Undo worked. Clear the field, press Space, type keyb, then {}.",
+        "Restoration worked. Clear the field, press Space, type keyb, then {}.",
         config.completion_gesture()
     );
     let step = match stage {
         0 if crate::complete::ignored("akuo") || crate::complete::learned("akuo") || crate::complete::suppressed("akuo") => "The practice word akuo is ignored. Allow it in your word lists before trying this exercise; practice will not change your exceptions.",
         0 => "Try step 1. If nothing changes, check the status below and enable both keyboards.",
-        1 if config.action_shortcut == "none" && config.undo_shortcut == "none" => "Enable a shortcut in Settings to practice undo.",
+        1 if config.action_shortcut == "none" && config.undo_shortcut == "none" => "Enable a shortcut in Settings to practice conversion.",
         1 => &undo_step,
-        2 if config.completion_shortcut == "none" => "Undo worked. Enable a completion shortcut in Settings to continue.",
-        2 if !config.complete_enabled => "Undo worked. Enable Word completion in Settings, then clear the field and continue step 3.",
-        2 if config.complete_min_len > 4 => "Undo worked. Your minimum completion prefix is longer than keyb. Set complete_min to 4 or less and reopen ReCast to finish this exercise.",
+        2 if config.completion_shortcut == "none" => "Restoration worked. Enable a completion shortcut in Settings to continue.",
+        2 if !config.complete_enabled => "Restoration worked. Enable Word completion in Settings, then clear the field and continue step 3.",
+        2 if config.complete_min_len > 4 => "Restoration worked. Your minimum completion prefix is longer than keyb. Set complete_min to 4 or less and reopen ReCast to finish this exercise.",
         2 => &completion_step,
-        _ => "You did it: correction, undo, and completion. Close this window and keep typing anywhere.",
+        _ => "You did it: correction, layout conversion, and completion. Close this window and keep typing anywhere.",
     };
-    format!("{step}\n{}\nOutside practice, one undo creates a session exception; two occasions save it across restarts.", shortcut_label(&config.undo_shortcut))
+    format!("{step}\n{}\nDouble-tap conversion preserves word exceptions. The optional single-tap undo can teach exceptions.", shortcut_label(&config.undo_shortcut))
 }
 
 pub fn fixed(control: &AppControl, from: &str, to: &str, kind: FixKind) {
     let (old, next) = match (from, to, kind) {
         ("akuo", "שלום", FixKind::Layout) => (0, 1),
+        ("שלום", "akuo", FixKind::Layout) => (1, 2),
         ("keyb", "keyboard", FixKind::Complete) => (2, 3),
         _ => return,
     };
@@ -95,7 +96,8 @@ mod tests {
         assert_eq!(control.practice_stage.load(Ordering::Relaxed), 0);
         fixed(&control, "akuo", "שלום", FixKind::Layout);
         assert_eq!(control.practice_stage.load(Ordering::Relaxed), 1);
-        control.practice_stage.store(2, Ordering::Relaxed);
+        fixed(&control, "שלום", "akuo", FixKind::Layout);
+        assert_eq!(control.practice_stage.load(Ordering::Relaxed), 2);
         fixed(&control, "keyb", "keyboard", FixKind::Complete);
         assert_eq!(control.practice_stage.load(Ordering::Relaxed), 3);
         assert_eq!(control.fixed_count(), 0);

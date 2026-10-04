@@ -1,8 +1,8 @@
 //! The one time ReCast interrupts you.
 //!
 //! Everything this program does happens inside other people's text fields, with
-//! no window of its own, which makes its two gestures (double-tap Ctrl to take
-//! a correction back, tap Right Shift to finish a word) invisible: they are in
+//! no window of its own, which makes its two gestures (double-tap Ctrl to convert
+//! a word, tap Right Shift to finish a word) invisible: they are in
 //! the README, and the README is not where anyone is when their word is
 //! silently rewritten for the first time. So the first correction — ever, not
 //! per run — says so once, and then never again.
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn shortcuts() -> String {
     let config = crate::config::Config::global();
-    format!("Undo / convert: {} within half a second. Undo immediately after a correction; typing or cursor movement ends the opportunity. On an unchanged word, this gesture requests manual conversion. Repeat to undo. On macOS, it also rescues selected text in supported editable fields.\n\nCompletion: {} mid-word; repeat to cycle suggestions and back to your prefix.\n\nExtra undo: {}.\n\nChoose keys in Settings. Only bare taps count; holding a modifier or using it in a chord does not trigger a gesture. Completion must use a different key from action/undo.\n\nOne undo leaves that word alone for this session; two occasions save the exception. To allow it again, type the ignored word and its space, then use the action gesture immediately.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.", config.action_gesture(), config.completion_gesture(), crate::practice::shortcut_label(&config.undo_shortcut))
+    format!("Convert layout: {} within half a second. Converts the visible last word even if it is unknown, including after correction or completion. Repeat to convert back. Typing or cursor movement ends the opportunity. On macOS, it also rescues selected text in supported editable fields.\n\nCompletion: {} mid-word; repeat to cycle suggestions and back to your prefix.\n\nSingle-tap undo: {}. Enable it in Settings to undo corrections or unlist skipped words. When it shares the action key, undo waits half a second so double taps can convert instead.\n\nOnly bare taps count; holding a modifier or using a chord does not trigger a gesture. Completion must use a different key from action/undo.\n\nOne undo leaves that word alone for this session; two occasions save the exception. Manual layout conversion does not change saved exceptions.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.", config.action_gesture(), config.completion_gesture(), crate::practice::shortcut_label(&config.undo_shortcut))
 }
 
 /// Explicitly requested help may use a dialog; typing notifications must not.
@@ -141,7 +141,7 @@ pub fn first_correction_hint() {
         notify(
             "ReCast just corrected a word",
             &format!(
-                "Undo: {} immediately. Completion: {}. See Typing shortcuts for help.",
+                "Convert layout: {}. Completion: {}. Enable single-Ctrl undo in Settings. See Typing shortcuts for help.",
                 crate::config::Config::global().action_gesture(),
                 crate::config::Config::global().completion_gesture()
             ),
