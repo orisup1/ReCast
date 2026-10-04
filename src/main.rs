@@ -88,12 +88,12 @@ Settings:
   RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
   RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 50000)
   RECAST_SPELL_DIST=n Maximum edit distance, 0 to 3 (0 disables; default 3)
-  RECAST_COMPLETE=0   Disable auto-complete (word completion + abbreviations)
+  RECAST_COMPLETE=0   Disable completion, spelling offers, and abbreviations
   RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)
   RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
   RECAST_PERSONAL=1   Opt in to local word/correction/timing personalization;
                       off by default because its files can contain typed words
-  RECAST_RULE_STATS=1 Save local automatic correction/undo counts by rule;
+  RECAST_RULE_STATS=1 Save aggregate correction, undo, and completion-use counts;
                       off by default; no typed words or app names stored
   RECAST_EXCLUDE_APPS=  Comma-separated exact application IDs to leave alone:
                       Linux app_id/WM_CLASS, macOS bundle ID, Windows exe name.

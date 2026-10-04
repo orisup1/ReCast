@@ -61,6 +61,9 @@ impl Platform for Linux {
             KeyCode::KEY_SPACE | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER
         )
     }
+    fn is_line_break(key: KeyCode) -> bool {
+        matches!(key, KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER)
+    }
     fn is_reset(key: KeyCode) -> bool {
         use KeyCode as K;
         matches!(

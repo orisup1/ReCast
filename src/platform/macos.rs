@@ -25,6 +25,9 @@ impl Platform for Mac {
     fn is_terminator(key: Key) -> bool {
         textkeys::is_terminator(key)
     }
+    fn is_line_break(key: Key) -> bool {
+        key == Key::Return
+    }
     fn is_reset(key: Key) -> bool {
         textkeys::is_reset(key)
     }

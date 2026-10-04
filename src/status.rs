@@ -341,6 +341,15 @@ fn diagnostics(control: Option<&AppControl>) -> String {
     )
     .unwrap();
 
+    if cfg.rule_stats_enabled {
+        writeln!(
+            out,
+            "    saved usefulness     {}",
+            personal::usefulness_summary()
+        )
+        .unwrap();
+    }
+
     for complaint in
         settings::complaints(config::NUMERIC_KEYS, config::BOOLEAN_KEYS, config::ALL_KEYS)
     {

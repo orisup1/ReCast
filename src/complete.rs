@@ -43,36 +43,135 @@ const MAX_PREFIX_LEN: usize = 20;
 /// word than the one before it.
 pub const MAX_CANDIDATES: usize = 4;
 
-/// Scale for [`value`], kept as f64 to allow personal frequency boost.
-const VALUE_SCALE: f64 = (1 << 20) as f64;
+/// Phrase evidence is local to one uninterrupted typing context, never persisted.
+/// Two observations are required before a pair influences completion ranking.
+#[derive(Default)]
+pub(crate) struct PhraseContext {
+    previous: Option<String>,
+    pairs: HashMap<(String, String), u16>,
+}
 
-/// How good a completion is: the keystrokes it would save, weighted by how
-/// likely it is to be the word meant, boosted by personal frequency.
-///
-/// Ranking candidates by raw frequency — the obvious thing, and what this did
-/// at first — quietly optimises the wrong quantity. The user pressed a key to
-/// save typing, and a completion that adds one letter to a five-letter prefix
-/// has saved them nothing for that press; one that adds six has saved six. So
-/// the offer is worth `letters saved × P(this is the word)`, and with rank as
-/// a Zipfian stand-in for the probability (`P ∝ 1/rank`) that is this ratio.
-///
-/// It only reorders candidates that are already close in frequency: a word ten
-/// times commoner than its neighbour still wins on frequency alone, which is
-/// why `hel` still completes to `help` rather than to a longer, rarer word.
-///
-/// Personal frequency boosts candidates the user actually types, making their
-/// vocabulary win over generic corpus rankings.
-fn value(saved: usize, rank: u32, word: &str) -> f64 {
-    let base = saved as f64 * VALUE_SCALE / (rank as f64 + 1.0);
-    let boost = crate::personal::personal_boost(word) as f64;
-    base * boost
+impl PhraseContext {
+    pub(crate) fn clear(&mut self) {
+        self.previous = None;
+        self.pairs.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain(&mut self, word: &str) {
+        self.observe(word, true);
+    }
+
+    pub(crate) fn forget_learning(&mut self) {
+        self.pairs.clear();
+    }
+
+    pub(crate) fn observe(&mut self, word: &str, learn: bool) {
+        if !learn {
+            self.pairs.clear();
+        }
+        let word = word.to_lowercase();
+        if word.is_empty()
+            || word.chars().count() > MAX_PREFIX_LEN
+            || !(word.chars().all(|c| c.is_ascii_lowercase())
+                || word.chars().all(|c| ('א'..='ת').contains(&c)))
+        {
+            self.previous = None;
+            return;
+        }
+        if let Some(previous) = self.previous.take().filter(|_| learn) {
+            let pair = (previous, word.clone());
+            if self.pairs.len() < 256 || self.pairs.contains_key(&pair) {
+                let count = self.pairs.entry(pair).or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+        self.previous = Some(word);
+    }
+
+    pub(crate) fn boost(&self, word: &str) -> f64 {
+        let count = self
+            .previous
+            .as_ref()
+            .and_then(|previous| self.pairs.get(&(previous.clone(), word.to_owned())))
+            .copied()
+            .unwrap_or(0);
+        let personal = if count < 2 {
+            1.0
+        } else {
+            1.0 + f64::from(count.min(4)) / 2.0
+        };
+        let bundled = self
+            .previous
+            .as_deref()
+            .map_or(1.0, |previous| phrase_boost(previous, word));
+        personal.max(bundled)
+    }
+}
+
+/// Hand-curated relative phrase weights, not measured corpus counts. Public
+/// language priors work immediately without collecting personal word pairs.
+fn phrase_boost(previous: &str, word: &str) -> f64 {
+    static PHRASES: OnceLock<HashMap<&'static str, Vec<(&'static str, f64)>>> = OnceLock::new();
+    let phrases = PHRASES.get_or_init(|| {
+        let mut map: HashMap<_, Vec<_>> = HashMap::new();
+        for line in include_str!("phrases.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            if let [previous, next, weight] = fields.as_slice() {
+                if let Ok(weight) = weight.parse::<f64>() {
+                    map.entry(*previous).or_default().push((*next, weight));
+                }
+            }
+        }
+        map
+    });
+    phrases
+        .get(previous)
+        .and_then(|entries| entries.iter().find(|(next, _)| *next == word))
+        .map_or(1.0, |(_, weight)| *weight)
+}
+
+#[derive(Default)]
+struct Ranking<'a> {
+    context: Option<&'a PhraseContext>,
+    offset: usize,
+    exclude: Option<&'a str>,
+}
+
+/// Frequency and retained personal evidence estimate likelihood. Prefix edits
+/// receive a tenfold penalty. Each cycle slot subtracts all taps needed to reach
+/// it from the letters saved; zero-saving offers remain available as fallbacks.
+struct Candidate {
+    word: String,
+    saved: usize,
+    weight: f64,
+    rank: u32,
+}
+
+impl Candidate {
+    fn value(&self, taps: usize) -> f64 {
+        self.saved.saturating_sub(taps) as f64 * self.weight
+    }
 }
 
 /// Completions to offer for the partial word `prefix`, best first.
 ///
 /// Empty when there is nothing worth offering. The user's own abbreviation for
 /// the prefix, if they defined one, always comes first.
+#[cfg(test)]
 pub fn completions(prefix: &str, dict: Dict, freq: Freq) -> Vec<String> {
+    completions_in_context(prefix, dict, freq, None)
+}
+
+pub(crate) fn completions_in_context(
+    prefix: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+) -> Vec<String> {
     let cfg = Config::global();
     if !cfg.complete_enabled {
         return Vec::new();
@@ -90,6 +189,11 @@ pub fn completions(prefix: &str, dict: Dict, freq: Freq) -> Vec<String> {
         cfg.complete_min_len,
         cfg.complete_max_rank,
         &saved_words(),
+        Ranking {
+            context,
+            offset: out.len(),
+            exclude: out.first().map(String::as_str),
+        },
     ) {
         if !out.contains(&word) {
             out.push(word);
@@ -113,7 +217,15 @@ pub fn completions_with(
     min_len: usize,
     max_rank: u32,
 ) -> Vec<String> {
-    completions_from(prefix, en_dict, en_freq, min_len, max_rank, &[])
+    completions_from(
+        prefix,
+        en_dict,
+        en_freq,
+        min_len,
+        max_rank,
+        &[],
+        Ranking::default(),
+    )
 }
 
 /// Explicitly saved exceptions also make useful completion vocabulary.
@@ -141,6 +253,7 @@ fn completions_from(
     min_len: usize,
     max_rank: u32,
     saved: &[String],
+    ranking: Ranking<'_>,
 ) -> Vec<String> {
     let len = prefix.chars().count();
     let english = prefix.chars().all(|c| c.is_ascii_lowercase());
@@ -150,60 +263,84 @@ fn completions_from(
     {
         return Vec::new();
     }
-    let mut prefixes = HashSet::from([prefix.to_owned()]);
-    let mut best: Vec<(f64, u32, String)> = Vec::with_capacity(MAX_CANDIDATES + 1);
-    for attempt in 0..2 {
-        if attempt == 1 {
-            if !best.is_empty() {
-                break;
-            }
-            prefixes = edited_prefixes(prefix, english);
-        }
-        let mut consider = |word: &str, rank: u32, explicit: bool| {
-            let word_len = word.chars().count();
-            if word_len <= len
-                || word_len > crate::types::MAX_WORD_KEYS
-                || best.iter().any(|(_, _, existing)| existing == word)
-                || (!explicit && rank > max_rank)
-            {
-                return;
-            }
-            let value = value(word_len - len, rank, word);
-            if best.len() == MAX_CANDIDATES && best[MAX_CANDIDATES - 1].0 > value {
-                return;
-            }
-            if !explicit && !dict.contains(word) {
-                return;
-            }
-            let at = best.partition_point(|(v, r, w)| {
-                (*v, std::cmp::Reverse(*r), std::cmp::Reverse(w.as_str()))
-                    > (value, std::cmp::Reverse(rank), std::cmp::Reverse(word))
-            });
-            best.insert(at, (value, rank, word.to_owned()));
-            best.truncate(MAX_CANDIDATES);
-        };
-        for matching in &prefixes {
-            freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false));
-        }
-        for word in saved {
-            // Saved names and identifiers are allowed; whitespace and mixed scripts are not.
-            let valid = word.chars().all(|c| {
-                if english {
-                    c.is_ascii_graphic()
-                } else {
-                    ('א'..='ת').contains(&c)
-                }
-            });
-            if valid && prefixes.iter().any(|p| word.starts_with(p)) {
-                // ponytail: fixed prior for unranked saved words; tune from completion feedback.
-                consider(word, freq.rank(word).unwrap_or(1_000), true);
-            }
+    let mut candidates: HashMap<String, Candidate> = HashMap::new();
+    // Exact and one-edit matches compete in the same pool. A typo needs much
+    // stronger frequency evidence to beat an equally useful exact match.
+    let mut prefixes = edited_prefixes(prefix, english);
+    // Editing a three-letter prefix is too ambiguous to compete with an exact
+    // offer. Keep short-prefix recovery only when there is no exact candidate.
+    if len < 4 {
+        let mut exact = false;
+        freq.for_each_with_prefix(prefix, |word, rank| {
+            exact |= word.chars().count() > len && rank <= max_rank && dict.contains(word);
+        });
+        exact |= saved
+            .iter()
+            .any(|word| word.starts_with(prefix) && word.chars().count() > len);
+        if exact {
+            prefixes.clear();
         }
     }
-    best.into_iter().map(|(_, _, word)| word).collect()
+    prefixes.insert(prefix.to_owned());
+    let mut consider = |word: &str, rank: u32, explicit: bool| {
+        let word_len = word.chars().count();
+        if word_len <= len
+            || word_len > crate::types::MAX_WORD_KEYS
+            || ranking.exclude == Some(word)
+            || candidates.contains_key(word)
+            || (!explicit && (rank > max_rank || !dict.contains(word)))
+        {
+            return;
+        }
+        let penalty = if word.starts_with(prefix) { 1.0 } else { 0.1 };
+        let weight = penalty
+            * f64::from(crate::personal::personal_boost(word))
+            * ranking.context.map_or(1.0, |context| context.boost(word))
+            / (f64::from(rank) + 1.0);
+        candidates.insert(
+            word.to_owned(),
+            Candidate {
+                word: word.to_owned(),
+                saved: word_len - len,
+                weight,
+                rank,
+            },
+        );
+    };
+    for matching in &prefixes {
+        freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false));
+    }
+    for word in saved {
+        let valid = word.chars().all(|c| {
+            if english {
+                c.is_ascii_graphic()
+            } else {
+                ('א'..='ת').contains(&c)
+            }
+        });
+        if valid && prefixes.iter().any(|p| word.starts_with(p)) {
+            consider(word, freq.rank(word).unwrap_or(1_000), true);
+        }
+    }
+    let mut candidates: Vec<_> = candidates.into_values().collect();
+    let mut out = Vec::with_capacity(MAX_CANDIDATES);
+    for slot in 0..MAX_CANDIDATES {
+        let taps = ranking.offset + slot + 1;
+        let Some((index, _)) = candidates.iter().enumerate().max_by(|(_, a), (_, b)| {
+            a.value(taps)
+                .total_cmp(&b.value(taps))
+                .then_with(|| a.weight.total_cmp(&b.weight))
+                .then_with(|| b.rank.cmp(&a.rank))
+                .then_with(|| b.word.cmp(&a.word))
+        }) else {
+            break;
+        };
+        out.push(candidates.swap_remove(index).word);
+    }
+    out
 }
 
-/// One edit of the prefix, consulted only when exact completion has no offers.
+/// Prefix variants within one edit, for both supported alphabets.
 fn edited_prefixes(prefix: &str, english: bool) -> HashSet<String> {
     let chars: Vec<_> = prefix.chars().collect();
     let alphabet = if english {
@@ -928,10 +1065,10 @@ mod tests {
     }
 
     #[test]
-    fn completes_to_the_most_common_word_with_that_prefix() {
+    fn completion_accounts_for_the_acceptance_tap() {
         let d = dict(&["hello", "help", "helmet"]);
         let f = freq(&[("hello", 500), ("help", 140), ("helmet", 9_000)]);
-        assert_eq!(finish("hel", d, f).as_deref(), Some("help"));
+        assert_eq!(finish("hel", d, f).as_deref(), Some("hello"));
     }
 
     #[test]
@@ -953,8 +1090,8 @@ mod tests {
         let hebrew = dict(&["שלום", "שלומות"]);
         let ranks = freq(&[("שלום", 100), ("שלומות", 500)]);
         assert!(completions_with("של", hebrew, ranks, 3, 30_000).is_empty());
-        assert_eq!(finish("שלו", hebrew, ranks).as_deref(), Some("שלום"));
-        assert_eq!(finish("שול", hebrew, ranks).as_deref(), Some("שלום"));
+        assert_eq!(finish("שלו", hebrew, ranks).as_deref(), Some("שלומות"));
+        assert_eq!(finish("שול", hebrew, ranks).as_deref(), Some("שלומות"));
         let saved = [
             "supino",
             "api_v2",
@@ -965,25 +1102,165 @@ mod tests {
         ]
         .map(str::to_owned);
         assert_eq!(
-            completions_from("sup", Dict::of(&[]), Freq::EMPTY, 3, 30_000, &saved),
+            completions_from(
+                "sup",
+                Dict::of(&[]),
+                Freq::EMPTY,
+                3,
+                30_000,
+                &saved,
+                Ranking::default()
+            ),
             ["supino"]
         );
         assert_eq!(
-            completions_from("api", Dict::of(&[]), Freq::EMPTY, 3, 30_000, &saved),
+            completions_from(
+                "api",
+                Dict::of(&[]),
+                Freq::EMPTY,
+                3,
+                30_000,
+                &saved,
+                Ranking::default()
+            ),
             ["api_v2"]
         );
         assert_eq!(
-            completions_from("nod", Dict::of(&[]), Freq::EMPTY, 3, 30_000, &saved),
+            completions_from(
+                "nod",
+                Dict::of(&[]),
+                Freq::EMPTY,
+                3,
+                30_000,
+                &saved,
+                Ranking::default()
+            ),
             ["node.js"]
         );
-        // Exact offers take precedence over any approximate prefix.
-        assert_eq!(offers("keyb", d, f), ["keyboard"]);
+        // Strong exact offers still lead penalized approximate matches.
+        assert_eq!(
+            offers("keyb", d, f).first().map(String::as_str),
+            Some("keyboard")
+        );
         let d = dict(&["baked", "based"]);
         let f = freq(&[("baked", 100), ("based", 100)]);
         for _ in 0..10 {
             assert_eq!(offers("baxed", d, f), Vec::<String>::new());
             assert_eq!(offers("bax", d, f), ["baked", "based"]);
         }
+    }
+
+    #[test]
+    fn bundled_phrases_work_without_learning_in_both_languages() {
+        let mut context = PhraseContext::default();
+        context.observe("good", false);
+        assert_eq!(context.boost("morning"), 4.0);
+        assert_eq!(context.boost("mourning"), 1.0);
+        context.observe("תודה", false);
+        assert_eq!(context.boost("רבה"), 4.0);
+        assert!(context.pairs.is_empty());
+        context.clear();
+        assert_eq!(context.boost("רבה"), 1.0);
+        let mut seen = HashSet::new();
+        for line in include_str!("phrases.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 3);
+            assert!(seen.insert((fields[0], fields[1])));
+            assert!((1.0..=4.0).contains(&fields[2].parse::<f64>().unwrap()));
+            assert!(fields[..2]
+                .iter()
+                .all(|word| !word.is_empty() && word.chars().all(char::is_alphabetic)));
+        }
+    }
+
+    #[test]
+    fn strong_typo_matches_compete_with_weak_exact_matches() {
+        let d = dict(&["keyvine", "keyboard"]);
+        let f = freq(&[("keyvine", 10_000), ("keyboard", 100)]);
+        assert_eq!(offers("keyv", d, f), ["keyboard", "keyvine"]);
+        let f = freq(&[("keyvine", 100), ("keyboard", 100)]);
+        assert_eq!(
+            offers("keyv", d, f).first().map(String::as_str),
+            Some("keyvine")
+        );
+    }
+
+    #[test]
+    fn later_slots_account_for_all_cycle_taps() {
+        let d = dict(&["abcde", "abcdefg", "abcdefghijk"]);
+        let f = freq(&[("abcde", 10), ("abcdefg", 40), ("abcdefghijk", 100)]);
+        assert_eq!(offers("abc", d, f), ["abcde", "abcdefghijk", "abcdefg"]);
+    }
+
+    #[test]
+    fn repeated_phrase_evidence_breaks_completion_ambiguity() {
+        let d = dict(&["keyboard", "keyboards"]);
+        let f = freq(&[("keyboard", 100), ("keyboards", 180)]);
+        let mut context = PhraseContext::default();
+        let choices = |context: &PhraseContext| {
+            completions_from(
+                "keyb",
+                d,
+                f,
+                3,
+                30_000,
+                &[],
+                Ranking {
+                    context: Some(context),
+                    ..Ranking::default()
+                },
+            )
+        };
+        for word in ["my", "keyboards", "my"] {
+            context.retain(word);
+        }
+        assert_eq!(
+            choices(&context)[0],
+            "keyboard",
+            "one observation is insufficient"
+        );
+        for word in ["keyboards", "my"] {
+            context.retain(word);
+        }
+        assert_eq!(choices(&context)[0], "keyboards");
+        context.retain("period.");
+        assert_eq!(
+            choices(&context)[0],
+            "keyboard",
+            "punctuation ends the phrase"
+        );
+        context.retain("my");
+        context.clear();
+        context.retain("my");
+        assert_eq!(
+            choices(&context)[0],
+            "keyboard",
+            "reset forgets pair counts too"
+        );
+        for word in ["שלום", "עולם", "שלום", "עולם", "שלום"] {
+            context.retain(word);
+        }
+        assert_eq!(context.boost("עולם"), 2.0);
+    }
+
+    #[test]
+    fn phrase_memory_and_weights_are_bounded() {
+        let mut context = PhraseContext::default();
+        for _ in 0..100_000 {
+            context.retain("my");
+            context.retain("keyboard");
+        }
+        context.retain("my");
+        assert_eq!(context.boost("keyboard"), 3.0);
+        for a in 'a'..='z' {
+            for b in 'a'..='z' {
+                context.retain(&format!("word{a}{b}"));
+            }
+        }
+        assert_eq!(context.pairs.len(), 256);
     }
 
     #[test]
@@ -1037,7 +1314,7 @@ mod tests {
             ("helpless", 25_000),
         ]);
         let offers = offers("hel", d, f);
-        assert_eq!(offers.first().map(String::as_str), Some("help"));
+        assert_eq!(offers.first().map(String::as_str), Some("hello"));
         assert!(offers.len() <= MAX_CANDIDATES);
         // A tap must never offer the same word twice, or the cycle stalls.
         let unique: std::collections::HashSet<&String> = offers.iter().collect();
@@ -1180,7 +1457,7 @@ mod real_data {
         // guess being wrong has to be cheap rather than unlikely.
         let offers = offers("hel");
         assert_eq!(offers.len(), MAX_CANDIDATES);
-        for word in ["hello", "help"] {
+        for word in ["hello", "helping"] {
             assert!(
                 offers.iter().any(|w| w == word),
                 "{word} missing: {offers:?}"
@@ -1195,7 +1472,13 @@ mod real_data {
         for prefix in ["hel", "com", "dev", "imp", "thr", "abo"] {
             for word in offers(prefix) {
                 assert!(word.len() > prefix.len(), "{prefix} -> {word}");
-                assert!(word.starts_with(prefix), "{prefix} -> {word}");
+                assert!(
+                    word.starts_with(prefix)
+                        || super::edited_prefixes(prefix, true)
+                            .iter()
+                            .any(|p| word.starts_with(p)),
+                    "{prefix} -> {word}"
+                );
             }
         }
     }

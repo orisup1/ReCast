@@ -187,6 +187,72 @@ fn score(cost: u32, rank: u32, word: &str) -> f32 {
     base - (boost - 1.0) * MAX_PERSONAL_DISCOUNT
 }
 
+/// Classify only unambiguous single slips: transposition, adjacent substitution,
+/// or a missing letter. Multi-edit and non-English pairs never train these costs.
+pub(crate) fn typo_class(typed: &str, corrected: &str) -> Option<usize> {
+    if typed.is_empty()
+        || corrected.is_empty()
+        || !typed.bytes().all(|c| c.is_ascii_lowercase())
+        || !corrected.bytes().all(|c| c.is_ascii_lowercase())
+    {
+        return None;
+    }
+    let (a, b) = (typed.as_bytes(), corrected.as_bytes());
+    let prefix = a.iter().zip(b).take_while(|(a, b)| a == b).count();
+    let (a, b) = (&a[prefix..], &b[prefix..]);
+    if a.len() == b.len() {
+        if a.len() >= 2 && a[0] == b[1] && a[1] == b[0] && a[2..] == b[2..] {
+            return Some(0);
+        }
+        if !a.is_empty() && adjacent_cost(a[0], b[0]).is_some() && a[1..] == b[1..] {
+            return Some(1);
+        }
+    } else if b.len() == a.len() + 1 && a == &b[1..] {
+        return Some(2);
+    }
+    None
+}
+
+const MAX_TYPO_DISCOUNT: f32 = 15.0;
+
+fn typo_discount(typed: &str, corrected: &str, counts: [u64; 3]) -> f32 {
+    typo_class(typed, corrected).map_or(0.0, |class| {
+        if counts[class] < 2 {
+            0.0
+        } else {
+            (counts[class] as f32 * 2.0).min(MAX_TYPO_DISCOUNT)
+        }
+    })
+}
+
+/// Explicit spelling offers share automatic edit/rank gates, but expose close
+/// alternatives instead of silently deciding an ambiguous case. Phrase evidence
+/// only orders this manually requested list; it never changes automatic spelling.
+pub(crate) fn suggestions(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Vec<String> {
+    let cfg = Config::global();
+    if !cfg.spell_enabled || dict.contains(word) {
+        return Vec::new();
+    }
+    let Some(budget) = budget_for(word, cfg.spell_min_len, cfg.spell_max_dist) else {
+        return Vec::new();
+    };
+    let mut search = Search::new(word, budget, cfg.spell_max_rank.min(20_000));
+    search.offers = Some(Vec::new());
+    search.context = context;
+    search.run(word, dict, freq);
+    search
+        .offers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, _, word)| word)
+        .collect()
+}
+
 /// Best English correction for `word`, or `None` to leave it alone.
 ///
 /// Thresholds come from the global config (`RECAST_SPELL*`); the actual work is
@@ -262,32 +328,8 @@ pub fn correct_with(
         return None;
     }
 
-    let typed = word.as_bytes();
-    let mut search = Search {
-        typed,
-        typed_letters: letter_counts(typed),
-        budget,
-        max_rank,
-        dp: Dp::default(),
-        best: None,
-        runner_up: None,
-    };
-
-    for opening in openings(word) {
-        let prefix = [opening.letter];
-        let Ok(prefix) = std::str::from_utf8(&prefix) else {
-            continue;
-        };
-        en_freq.for_each_with_prefix(prefix, |cand, rank| {
-            // The one gate that belongs to the scan rather than to the
-            // candidate: this run was opened for a particular kind of word, and
-            // everything else in it is passed over without being scored.
-            if opening.admits(typed, cand.as_bytes()) {
-                search.consider(cand, rank, en_dict);
-            }
-        });
-    }
-    search.consider_edited_openings(en_dict, en_freq);
+    let mut search = Search::new(word, budget, max_rank);
+    search.run(word, en_dict, en_freq);
 
     search.best.and_then(|(score, _, _, fixed)| {
         search
@@ -317,14 +359,62 @@ struct Search<'a> {
     /// deterministic.
     best: Option<(f32, u32, u32, String)>,
     runner_up: Option<f32>,
+    offers: Option<Vec<(f32, u32, String)>>,
+    context: Option<&'a crate::complete::PhraseContext>,
+    typo_counts: [u64; 3],
 }
 
-impl Search<'_> {
+impl<'a> Search<'a> {
+    fn new(word: &'a str, budget: u32, max_rank: u32) -> Self {
+        Self {
+            typed: word.as_bytes(),
+            typed_letters: letter_counts(word.as_bytes()),
+            budget,
+            max_rank,
+            dp: Dp::default(),
+            best: None,
+            runner_up: None,
+            offers: None,
+            context: None,
+            typo_counts: crate::personal::typo_counts(),
+        }
+    }
+
+    fn run(&mut self, word: &str, dict: Dict, freq: Freq) {
+        for opening in openings(word) {
+            let prefix = [opening.letter];
+            let Ok(prefix) = std::str::from_utf8(&prefix) else {
+                continue;
+            };
+            freq.for_each_with_prefix(prefix, |cand, rank| {
+                if opening.admits(self.typed, cand.as_bytes()) {
+                    self.consider(cand, rank, dict);
+                }
+            });
+        }
+        self.consider_edited_openings(dict, freq);
+    }
+
+    fn discount(&self, cand: &str) -> f32 {
+        typo_discount(
+            std::str::from_utf8(self.typed).unwrap_or_default(),
+            cand,
+            self.typo_counts,
+        )
+    }
+
     /// Score one candidate and keep it if it beats what is already held.
     fn consider(&mut self, cand: &str, rank: u32, en_dict: Dict) {
         // Cheap gates first: the whole point of scanning the list is that almost
         // every entry is thrown out before the matrix is touched.
         let cb = cand.as_bytes();
+        if self
+            .offers
+            .as_ref()
+            .is_some_and(|offers| offers.iter().any(|(_, _, word)| word == cand))
+        {
+            return;
+        }
         if self
             .best
             .as_ref()
@@ -337,10 +427,16 @@ impl Search<'_> {
         }
         // Keep candidates close enough to the winner to establish ambiguity,
         // even when they cannot win themselves.
-        let budget = self.best.as_ref().map_or(self.budget, |(best, ..)| {
+        let budget = if self.offers.is_some() {
             self.budget
-                .min((best + MIN_SCORE_GAP - score(0, rank, cand)).ceil() as u32)
-        });
+        } else {
+            self.best.as_ref().map_or(self.budget, |(best, ..)| {
+                self.budget.min(
+                    (best + MIN_SCORE_GAP - score(0, rank, cand) + self.discount(cand)).ceil()
+                        as u32,
+                )
+            })
+        };
         let len_gap = cb.len().abs_diff(self.typed.len()) as u32 * COST_DOUBLE;
         if len_gap > budget || bag_bound(&self.typed_letters, cb) > budget {
             return;
@@ -351,7 +447,23 @@ impl Search<'_> {
         if cost == 0 || rank > rank_budget(cost, self.max_rank, self.typed.len()) {
             return;
         }
-        let candidate = score(cost, rank, cand);
+        let candidate = score(cost, rank, cand)
+            - self.discount(cand)
+            - self
+                .context
+                .map_or(0.0, |context| 20.0 * context.boost(cand).ln() as f32);
+        if let Some(offers) = &mut self.offers {
+            if en_dict.contains(cand) {
+                offers.push((candidate, rank, cand.to_owned()));
+                offers.sort_by(|a, b| {
+                    a.0.total_cmp(&b.0)
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+                offers.truncate(crate::complete::MAX_CANDIDATES);
+            }
+            return;
+        }
         let better = self
             .best
             .as_ref()
@@ -379,7 +491,7 @@ impl Search<'_> {
             return;
         }
         let discount = if Config::global().personal_enabled {
-            MAX_PERSONAL_DISCOUNT
+            MAX_PERSONAL_DISCOUNT + MAX_TYPO_DISCOUNT
         } else {
             0.0
         };
@@ -1050,6 +1162,37 @@ mod tests {
             crate::config::DEFAULT_SPELL_MAX_RANK,
             crate::config::DEFAULT_SPELL_MAX_DIST,
         )
+    }
+
+    #[test]
+    fn manual_phrase_ranking_resolves_an_automatic_abstention() {
+        let d = Dict::of(&["cafe", "cake"]);
+        let f = Freq::of(&[("cafe", 100), ("cake", 100)]);
+        assert_eq!(correct_with("caxe", d, f, 4, 20_000, 1), None);
+        assert_eq!(suggestions("caxe", d, f, None)[0], "cafe");
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        assert_eq!(suggestions("caxe", d, f, Some(&context))[0], "cake");
+        assert!(suggestions("cake", d, f, Some(&context)).is_empty());
+        assert!(suggestions("c4xe", d, f, Some(&context)).is_empty());
+        assert_eq!(correct_with("caxe", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn adaptive_typo_classes_require_repetition_and_have_a_small_cap() {
+        assert_eq!(typo_class("watre", "water"), Some(0));
+        assert_eq!(typo_class("gello", "hello"), Some(1));
+        assert_eq!(typo_class("helo", "hello"), Some(2));
+        for (typed, fixed) in [("hello", "hello"), ("xxllo", "hello"), ("שלום", "hello")] {
+            assert_eq!(typo_class(typed, fixed), None);
+        }
+        assert_eq!(typo_discount("watre", "water", [1, 0, 0]), 0.0);
+        assert_eq!(typo_discount("watre", "water", [2, 0, 0]), 4.0);
+        assert_eq!(
+            typo_discount("watre", "water", [u64::MAX, 0, 0]),
+            MAX_TYPO_DISCOUNT
+        );
+        assert_eq!(typo_discount("gello", "hello", [100, 0, 0]), 0.0);
     }
 
     #[test]

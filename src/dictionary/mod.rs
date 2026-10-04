@@ -1475,6 +1475,7 @@ pub fn complete_candidates<K: Copy>(
     shift_of: impl Fn(K) -> bool,
     dict: Dict,
     current: Option<Language>,
+    context: Option<&crate::complete::PhraseContext>,
 ) -> Vec<String> {
     if keys.is_empty() || current.is_none() {
         return Vec::new();
@@ -1494,7 +1495,23 @@ pub fn complete_candidates<K: Copy>(
     } else {
         en_freq()
     };
-    let words = crate::complete::completions(&prefix, dict, freq);
+    let mut words = crate::complete::completions_in_context(&prefix, dict, freq, context);
+    if current == Some(Language::English)
+        && crate::complete::expand(&prefix).is_none()
+        && !words.iter().any(|word| word.starts_with(&prefix))
+    {
+        let suggestions = crate::spell::suggestions(&prefix, dict, freq, context);
+        if !suggestions.is_empty() {
+            let mut combined = suggestions;
+            for word in words {
+                if !combined.contains(&word) {
+                    combined.push(word);
+                }
+            }
+            combined.truncate(crate::complete::MAX_CANDIDATES);
+            words = combined;
+        }
+    }
     if debug_enabled() && !words.is_empty() {
         println!("complete: {} -> {}", prefix, words.join(" | "));
     }

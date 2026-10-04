@@ -287,7 +287,7 @@ an unreadable config stops startup so exclusions are not silently discarded.
 | `welcomed` | Marker for the one-time correction hint |
 | `setup-complete` | macOS setup marker; missing requirements still reopen setup |
 | `practice-offered` | Marker for the optional first-run practice window |
-| `personal/` | Opt-in personalization files and `rules.txt` rule statistics |
+| `personal/` | Opt-in personalization files, `rules.txt` rule counts, and `usefulness.txt` usage counts |
 
 `abbrev.txt` and `ignore.txt` reload within about two seconds of edits. The tray's
 **Advanced settings** and **Open ignored words** open files in your editor, creating
@@ -405,12 +405,60 @@ timings. Manual conversions and completion taps are excluded. Counts update on
 successful text replacements and flush about every 30 seconds. This setting is
 independent of personalization and is off by default.
 
+The same setting saves aggregate usefulness counters in `personal/usefulness.txt`:
+completion sessions, extra cycling taps, accepted choices, first-choice acceptance,
+abandoned offers, automatic corrections, and correction undos. One session begins
+with a successfully inserted offer; acceptance requires finishing the chosen word.
+Returning to the original prefix, continuing to edit, undo, or losing context ends
+an offer as abandoned. Unresolved offers are not counted as accepted or abandoned.
+These counters contain no words or application IDs, flush about every 30 seconds,
+and appear in `recast --status`. The counts support acceptance and undo ratios;
+they do not automatically retune ranking. `--clear-personal-data` removes them.
+
 `RECAST_PERSONAL=1` saves word/correction data and aggregate key timings under
 `personal/`; on Linux/Windows, this may include password-field text. Personal files
 are user-only on Unix. Automatic corrections train word frequency and replacement
 pairs only after subsequent typing retains the result; undo, deletion, and detected
 focus changes cancel pending learning. Completion offers do not train replacement
-pairs: only the chosen word, finished with Space or Enter, trains word frequency.
+pairs merely by being displayed: only a retained choice, finished with Space or
+Enter, can train word frequency or a manual spelling repair.
+Completion ranks exact and single-typo prefix matches together, penalizing edits
+and accounting for the taps needed to reach each choice. For three-letter prefixes,
+typo recovery runs only when no exact offer exists. Configured abbreviations still
+come first. Retained word frequency influences ranking when personalization is on.
+
+Completion and manually requested spelling offers use small bundled English and
+Hebrew phrase priors immediately, even with personalization off. These are curated
+relative weights, not measured corpus frequencies. Only the previous finished word
+is needed. Personalization additionally boosts pairs retained at least twice in the
+current typing context; these pair counts remain in memory. Focus changes, cursor
+moves, deletion, undo, and Enter clear phrase context; punctuation ends the
+previous-word link. Disabling personalization discards learned pair counts while
+keeping the public phrase priors available.
+
+Tap the completion shortcut (Right Shift by default) before Space to request an
+English spelling suggestion when the prefix has no exact completion. Repeated taps
+cycle alternatives and return to the original text. Phrase context ranks these
+manual offers; automatic spelling retains its confidence gates. Existing words
+are not reconsidered by the manual spelling list. Explicit abbreviations retain
+priority. Finishing a selected spelling repair of the same or shorter length can
+train its correction pair when personalization is enabled; unaccepted offers and
+longer prefix completions do not.
+
+When the current layout has no exact completion, known word, or explicit
+abbreviation, the completion gesture also checks the other layout. An exact
+alternate-layout prefix match can replace weak current-layout offers. Acceptance
+by the completion tap switches layout and inserts the completion together. Cycling
+back or undo restores the original text and requests the original layout. A refused
+initial layout switch cancels insertion. No automatic layout change happens from
+these completion suggestions before the gesture.
+
+With personalization enabled, repeatedly retained English correction pairs also
+adjust the ranking cost of transpositions, neighboring-key substitutions, and
+missing letters. The discount is capped, does not widen edit-distance or frequency
+limits, and never trains from a single observation. Undo withdraws one vote for the
+rejected correction, weakening its learned edit-class evidence.
+
 With personalization enabled, words retained at least twice also become completion
 candidates even when absent from the bundled dictionary. To clear these files,
 **stop ReCast first**, then run:

@@ -36,6 +36,95 @@ const RULES: [&str; 5] = [
     "layout+spelling",
 ];
 
+const USEFULNESS_FILE: &str = "usefulness.txt";
+const USE_NAMES: [&str; 7] = [
+    "completion_sessions",
+    "completion_cycle_taps",
+    "completion_accepted",
+    "completion_first_choice",
+    "completion_abandoned",
+    "automatic_corrections",
+    "correction_undos",
+];
+static USE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+pub(crate) enum UseEvent {
+    Session,
+    CycleTap,
+    Accepted,
+    FirstChoice,
+    Abandoned,
+    Correction,
+    Undo,
+}
+
+fn usefulness() -> &'static Mutex<[u64; 7]> {
+    static COUNTS: OnceLock<Mutex<[u64; 7]>> = OnceLock::new();
+    COUNTS.get_or_init(|| {
+        let text = personal_path(USEFULNESS_FILE)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        Mutex::new(parse_usefulness(&text))
+    })
+}
+
+fn parse_usefulness(text: &str) -> [u64; 7] {
+    let mut counts = [0; 7];
+    for line in text.lines() {
+        if let Some((name, count)) = line.split_once('\t') {
+            if let (Some(index), Ok(count)) = (
+                USE_NAMES.iter().position(|known| *known == name),
+                count.parse(),
+            ) {
+                counts[index] = count;
+            }
+        }
+    }
+    counts
+}
+
+pub(crate) fn record_use(event: UseEvent) {
+    if !Config::global().rule_stats_enabled {
+        return;
+    }
+    if let Ok(mut counts) = usefulness().lock() {
+        increment(&mut counts[event as usize]);
+        USE_DIRTY.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn usefulness_counts() -> [u64; 7] {
+    *usefulness().lock().unwrap()
+}
+
+pub(crate) fn usefulness_summary() -> String {
+    let counts = usefulness()
+        .lock()
+        .map(|counts| *counts)
+        .unwrap_or_default();
+    format!("{} accepted / {} offers, {} first choice, {} cycle taps, {} abandoned; {} correction undos / {} corrections",
+        counts[2], counts[0], counts[3], counts[1], counts[4], counts[6], counts[5])
+}
+
+fn flush_usefulness() -> std::io::Result<()> {
+    let Some(path) = personal_path(USEFULNESS_FILE) else {
+        return Ok(());
+    };
+    let counts = *usefulness()
+        .lock()
+        .map_err(|_| std::io::Error::other("usefulness statistics lock poisoned"))?;
+    let mut text =
+        String::from("# Aggregate usefulness counts; no typed text or application identities.\n");
+    for (name, count) in USE_NAMES.iter().zip(counts) {
+        text.push_str(&format!("{name}\t{count}\n"));
+    }
+    let tmp = path.with_extension("txt.tmp");
+    write_private(&tmp, &text)?;
+    std::fs::rename(tmp, path)
+}
+
 /// Max entries kept in each file. Kept bounded so a long-running daemon
 /// doesn't accumulate unbounded memory/disk.
 const MAX_PERSONAL_ENTRIES: usize = 5000;
@@ -101,6 +190,11 @@ pub fn record_rule(tag: &str, undone: bool) {
     let Some(index) = RULES.iter().position(|known| *known == tag) else {
         return;
     };
+    record_use(if undone {
+        UseEvent::Undo
+    } else {
+        UseEvent::Correction
+    });
     if let Ok(mut counts) = rule_stats().lock() {
         increment(&mut counts[index][usize::from(undone)]);
         RULE_STATS_DIRTY.store(true, Ordering::Relaxed);
@@ -325,6 +419,42 @@ pub fn record_confusion(typed: &str, corrected: &str) {
     }
 }
 
+/// A snapshot keeps locks and file reads out of the spelling candidate loop.
+/// Only repeatedly retained pairs contribute; a single observation is not evidence.
+pub(crate) fn typo_counts() -> [u64; 3] {
+    let mut counts = [0u64; 3];
+    if !enabled() {
+        return counts;
+    }
+    if let Ok(map) = confusions_map().lock() {
+        for (typed, corrections) in map.iter() {
+            for (corrected, count) in corrections.iter().filter(|(_, count)| **count >= 2) {
+                if let Some(class) = crate::spell::typo_class(typed, corrected) {
+                    counts[class] = counts[class].saturating_add(*count);
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Undo withdraws one retained vote for this replacement. Deriving typo weights
+/// from these counts means rejection also weakens the corresponding edit class.
+pub(crate) fn reject_confusion(typed: &str, corrected: &str) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut map) = confusions_map().lock() {
+        if let Some(count) = map
+            .get_mut(&typed.to_lowercase())
+            .and_then(|inner| inner.get_mut(&corrected.to_lowercase()))
+        {
+            *count = count.saturating_sub(1);
+            CONFUSIONS_DIRTY.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Look up the most common correction for `typed` from personal confusions.
 /// Returns the corrected word if there's a strong enough signal (count >= 2).
 pub fn personal_correction(typed: &str) -> Option<String> {
@@ -524,6 +654,7 @@ fn spawn_periodic_flusher() {
             flush_if_dirty(&CONFUSIONS_DIRTY, flush_confusions);
             flush_if_dirty(&PROFILE_DIRTY, flush_profile);
             flush_if_dirty(&RULE_STATS_DIRTY, flush_rule_stats);
+            flush_if_dirty(&USE_DIRTY, flush_usefulness);
         })
         .ok();
 }
@@ -547,6 +678,7 @@ pub fn init() {
         }
         if Config::global().rule_stats_enabled {
             rule_stats();
+            usefulness();
         }
         spawn_periodic_flusher();
     });
@@ -577,6 +709,7 @@ fn clear_dir(dir: &std::path::Path) -> Result<(), String> {
         CONFUSIONS_FILE,
         PROFILE_FILE,
         RULE_STATS_FILE,
+        USEFULNESS_FILE,
     ] {
         let path = dir.join(name);
         if let Err(error) = std::fs::remove_file(&path) {
@@ -634,6 +767,11 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usefulness_counts_accept_only_known_aggregate_fields() {
+        assert_eq!(parse_usefulness("completion_sessions\t8\ncompletion_accepted\t3\nprivateword\t999\ncompletion_cycle_taps\tinvalid\n"), [8, 0, 3, 0, 0, 0, 0]);
+    }
 
     #[test]
     fn rule_statistics_keep_only_fixed_tags_and_counts() {
@@ -721,6 +859,7 @@ mod tests {
             CONFUSIONS_FILE,
             PROFILE_FILE,
             RULE_STATS_FILE,
+            USEFULNESS_FILE,
         ] {
             write_private(&dir.join(name), "sensitive\n").expect("write owned file");
         }
@@ -734,6 +873,7 @@ mod tests {
             CONFUSIONS_FILE,
             PROFILE_FILE,
             RULE_STATS_FILE,
+            USEFULNESS_FILE,
         ] {
             assert!(!dir.join(name).exists(), "{name} was not removed");
         }
