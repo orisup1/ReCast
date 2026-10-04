@@ -437,13 +437,19 @@ previous-word link. Disabling personalization discards learned pair counts while
 keeping the public phrase priors available.
 
 Tap the completion shortcut (Right Shift by default) before Space to request an
-English spelling suggestion when the prefix has no exact completion. Repeated taps
+English or Hebrew spelling suggestion when the prefix has no exact completion. Repeated taps
 cycle alternatives and return to the original text. Phrase context ranks these
 manual offers; automatic spelling retains its confidence gates. Existing words
 are not reconsidered by the manual spelling list. Explicit abbreviations retain
 priority. Finishing a selected spelling repair of the same or shorter length can
 train its correction pair when personalization is enabled; unaccepted offers and
 longer prefix completions do not.
+
+Hebrew spelling offers are manual only. They search one letter insertion, deletion,
+substitution, or transposition, favor missing/extra ו and י, enforce final-letter
+positions, and recognize the layout planner's supported prefix stacks. Candidates
+need a ranked dictionary word or stem. Existing words and saved exceptions are
+preserved; the spelling enable, minimum-length, and rank settings still apply.
 
 When the current layout has no exact completion, known word, or explicit
 abbreviation, the completion gesture also checks the other layout. An exact

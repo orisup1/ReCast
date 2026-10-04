@@ -71,6 +71,7 @@
 //! Everything here is pure and dictionary-driven, so it is unit testable and
 //! never touches the OS.
 
+pub(crate) mod hebrew;
 mod rules;
 
 use std::sync::OnceLock;

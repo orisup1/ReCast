@@ -327,7 +327,7 @@ fn matches_hebrew(word: &str, dict: Dict) -> bool {
     dict.contains(word) || hebrew_stem(word, dict).is_some()
 }
 
-fn hebrew_stem(word: &str, dict: Dict) -> Option<&str> {
+pub(crate) fn hebrew_stem(word: &str, dict: Dict) -> Option<&str> {
     let mut chars = word.chars();
     let first = chars.next()?;
     if !HE_PREFIXES.contains(&first) {
@@ -1496,11 +1496,14 @@ pub fn complete_candidates<K: Copy>(
         en_freq()
     };
     let mut words = crate::complete::completions_in_context(&prefix, dict, freq, context);
-    if current == Some(Language::English)
-        && crate::complete::expand(&prefix).is_none()
+    if crate::complete::expand(&prefix).is_none()
         && !words.iter().any(|word| word.starts_with(&prefix))
     {
-        let suggestions = crate::spell::suggestions(&prefix, dict, freq, context);
+        let suggestions = if current == Some(Language::Hebrew) {
+            crate::spell::hebrew::suggestions(&prefix, dict, freq, context)
+        } else {
+            crate::spell::suggestions(&prefix, dict, freq, context)
+        };
         if !suggestions.is_empty() {
             let mut combined = suggestions;
             for word in words {
