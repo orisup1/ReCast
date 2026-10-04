@@ -65,9 +65,9 @@ pub fn feedback(control: &AppControl) -> String {
         2 if !config.complete_enabled => "Restoration worked. Enable Word completion in Settings, then clear the field and continue step 3.",
         2 if config.complete_min_len > 4 => "Restoration worked. Your minimum completion prefix is longer than keyb. Set complete_min to 4 or less and reopen ReCast to finish this exercise.",
         2 => &completion_step,
-        _ => "You did it: correction, layout conversion, and completion. Close this window and keep typing anywhere.",
+        _ => "You did it: correction, undo, and completion. Close this window and keep typing anywhere.",
     };
-    format!("{step}\n{}\nDouble-tap conversion preserves word exceptions. The optional single-tap undo can teach exceptions.", shortcut_label(&config.undo_shortcut))
+    format!("{step}\n{}\nDouble taps undo corrections or convert unchanged words. Undo can teach exceptions; manual conversion preserves them.", shortcut_label(&config.undo_shortcut))
 }
 
 pub fn fixed(control: &AppControl, from: &str, to: &str, kind: FixKind) {

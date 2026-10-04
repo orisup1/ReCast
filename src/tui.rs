@@ -389,10 +389,12 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
             crate::config::Config::global().completion_gesture()
         )),
         Line::from(format!(
-            "  {}: convert the visible last word to the other layout",
+            "  {}: undo correction/completion; otherwise convert layout",
             crate::config::Config::global().action_gesture()
         )),
-        Line::from("                       including unknown words; repeat to convert back."),
+        Line::from(
+            "                       conversion includes unknown words; repeat to convert back.",
+        ),
         Line::from("  Enable single-Ctrl undo in Settings to undo or unlist words."),
         Line::from("  More typing or cursor movement ends the opportunity."),
         Line::from("  One undo skips a word this session; two occasions remember it."),
