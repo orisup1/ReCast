@@ -76,6 +76,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         layout.unwrap(),
         result.reason
     );
+    println!("Details:\n{}", result.details);
     println!("Preview uses this invocation's settings and saved lists, without prior words or live app checks.");
     Ok(())
 }

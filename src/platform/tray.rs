@@ -60,25 +60,38 @@ pub fn run(control: Arc<AppControl>) {
         .append(&app_pause_item)
         .expect("append app pause");
 
-    // The recent-corrections list. Silent text replacement is the whole
-    // premise of this app, so "what did it just change?" needs an answer that
-    // isn't a counter — and the answer is only useful if you can act on it,
-    // which is what clicking one does: that word goes into `ignore.txt` and is
-    // never corrected again.
+    // Each recent correction exposes the captured decision evidence and a
+    // separate ignore action, so inspecting a change never creates a word rule.
     //
     // The rows are added as corrections happen rather than sitting there
     // empty: five blank lines in a native menu read as something broken, and
     // the submenu stays greyed out until there is a first one to show.
-    let recent_menu = Submenu::new("Recent — click one to stop correcting it", false);
-    let recent_items: Vec<MenuItem> = (0..RECENT_SLOTS)
-        .map(|_| MenuItem::new("", true, None))
+    let recent_menu = Submenu::new("Recent corrections", false);
+    let recent_items: Vec<Submenu> = (0..RECENT_SLOTS).map(|_| Submenu::new("", true)).collect();
+    let inspect_items: Vec<_> = recent_items
+        .iter()
+        .map(|menu| {
+            let item = MenuItem::new("Why this correction…", true, None);
+            menu.append(&item).expect("append correction inspector");
+            item
+        })
+        .collect();
+    let ignore_items: Vec<_> = recent_items
+        .iter()
+        .map(|menu| {
+            let item = MenuItem::new("Ignore this word", true, None);
+            menu.append(&item).expect("append ignore action");
+            item
+        })
         .collect();
     // How many of `recent_items` have been put into the submenu so far.
     let mut recent_shown = 0usize;
-    let recent_ids: Vec<_> = recent_items.iter().map(|i| i.id().clone()).collect();
+    let recent_ids: Vec<_> = ignore_items.iter().map(|i| i.id().clone()).collect();
+    let inspect_ids: Vec<_> = inspect_items.iter().map(|i| i.id().clone()).collect();
     // What each slot currently refers to, so a click knows which word it is
     // about. Rebuilt with the labels on every refresh.
     let mut recent_words: Vec<String> = vec![String::new(); RECENT_SLOTS];
+    let mut recent_corrections = vec![None; RECENT_SLOTS];
 
     let settings_item = MenuItem::new("Open settings", true, None);
     let settings_menu = Submenu::new("Settings", true);
@@ -352,6 +365,10 @@ pub fn run(control: Arc<AppControl>) {
                 last_recent[slot] = label;
             }
             recent_words[slot] = history.get(slot).map(|c| c.from.clone()).unwrap_or_default();
+            recent_corrections[slot] = history.get(slot).cloned();
+            let ignored = crate::complete::ignored(&recent_words[slot]);
+            ignore_items[slot].set_enabled(!ignored);
+            ignore_items[slot].set_text(if ignored { "Already ignored" } else { "Ignore this word" });
         }
 
         if let Event::NewEvents(StartCause::Init) = event {
@@ -539,6 +556,14 @@ pub fn run(control: Arc<AppControl>) {
                     let wanted = item.is_checked();
                     if !crate::prefs::set_autostart(wanted) {
                         item.set_checked(!wanted);
+                    }
+                }
+            } else if inspect_ids.contains(&event.id) {
+                if let Some(correction) = inspect_ids.iter().position(|id| *id == event.id).and_then(|slot| recent_corrections[slot].as_ref()) {
+                    match super::inspection::show(correction) {
+                        Ok(true) => crate::complete::ignore_word(&correction.from),
+                        Ok(false) => {},
+                        Err(error) => crate::notify::notify("Could not open correction details", &error),
                     }
                 }
             } else if recent_ids.contains(&event.id) {

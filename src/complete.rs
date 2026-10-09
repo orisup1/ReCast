@@ -142,8 +142,9 @@ struct Ranking<'a> {
 }
 
 /// Frequency and retained personal evidence estimate likelihood. Prefix edits
-/// receive a tenfold penalty. Each cycle slot subtracts all taps needed to reach
-/// it from the letters saved; zero-saving offers remain available as fallbacks.
+/// receive a tenfold penalty. Letters saved give a small, bounded benefit after
+/// accounting for cycle taps. Even one-letter completions retain their frequency
+/// weight, so long suffixes cannot overwhelm common short words.
 struct Candidate {
     word: String,
     saved: usize,
@@ -153,7 +154,8 @@ struct Candidate {
 
 impl Candidate {
     fn value(&self, taps: usize) -> f64 {
-        self.saved.saturating_sub(taps) as f64 * self.weight
+        let benefit = self.saved.saturating_sub(taps).min(4) as f64;
+        (1.0 + 0.15 * benefit) * self.weight
     }
 }
 
@@ -331,6 +333,7 @@ fn completions_from(
                 .total_cmp(&b.value(taps))
                 .then_with(|| a.weight.total_cmp(&b.weight))
                 .then_with(|| b.rank.cmp(&a.rank))
+                .then_with(|| b.saved.cmp(&a.saved))
                 .then_with(|| b.word.cmp(&a.word))
         }) else {
             break;
@@ -1065,10 +1068,24 @@ mod tests {
     }
 
     #[test]
-    fn completion_accounts_for_the_acceptance_tap() {
+    fn common_short_completions_keep_their_frequency_weight() {
         let d = dict(&["hello", "help", "helmet"]);
         let f = freq(&[("hello", 500), ("help", 140), ("helmet", 9_000)]);
-        assert_eq!(finish("hel", d, f).as_deref(), Some("hello"));
+        assert_eq!(finish("hel", d, f).as_deref(), Some("help"));
+        assert_eq!(offers("hel", d, f), ["help", "hello", "helmet"]);
+    }
+
+    #[test]
+    fn long_suffixes_have_a_bounded_benefit() {
+        let d = dict(&["compute", "computer", "computationally"]);
+        let f = freq(&[("compute", 100), ("computer", 80), ("computationally", 250)]);
+        assert_eq!(
+            offers("comp", d, f),
+            ["computer", "compute", "computationally"]
+        );
+        let d = dict(&["abcdefgh", "abcdefghijklmnop"]);
+        let f = freq(&[("abcdefgh", 100), ("abcdefghijklmnop", 100)]);
+        assert_eq!(finish("abc", d, f).as_deref(), Some("abcdefgh"));
     }
 
     #[test]
@@ -1090,8 +1107,8 @@ mod tests {
         let hebrew = dict(&["שלום", "שלומות"]);
         let ranks = freq(&[("שלום", 100), ("שלומות", 500)]);
         assert!(completions_with("של", hebrew, ranks, 3, 30_000).is_empty());
-        assert_eq!(finish("שלו", hebrew, ranks).as_deref(), Some("שלומות"));
-        assert_eq!(finish("שול", hebrew, ranks).as_deref(), Some("שלומות"));
+        assert_eq!(finish("שלו", hebrew, ranks).as_deref(), Some("שלום"));
+        assert_eq!(finish("שול", hebrew, ranks).as_deref(), Some("שלום"));
         let saved = [
             "supino",
             "api_v2",
@@ -1192,7 +1209,7 @@ mod tests {
     fn later_slots_account_for_all_cycle_taps() {
         let d = dict(&["abcde", "abcdefg", "abcdefghijk"]);
         let f = freq(&[("abcde", 10), ("abcdefg", 40), ("abcdefghijk", 100)]);
-        assert_eq!(offers("abc", d, f), ["abcde", "abcdefghijk", "abcdefg"]);
+        assert_eq!(offers("abc", d, f), ["abcde", "abcdefg", "abcdefghijk"]);
     }
 
     #[test]
@@ -1314,7 +1331,7 @@ mod tests {
             ("helpless", 25_000),
         ]);
         let offers = offers("hel", d, f);
-        assert_eq!(offers.first().map(String::as_str), Some("hello"));
+        assert_eq!(offers.first().map(String::as_str), Some("help"));
         assert!(offers.len() <= MAX_CANDIDATES);
         // A tap must never offer the same word twice, or the cycle stalls.
         let unique: std::collections::HashSet<&String> = offers.iter().collect();
@@ -1323,9 +1340,8 @@ mod tests {
 
     #[test]
     fn a_longer_completion_beats_an_equally_common_short_one() {
-        // Same frequency, so the tie-break is what the completion is *for*:
-        // `tomorrow` saves four keystrokes for the tap, `tomb` saves none worth
-        // having. Ranking by frequency alone could not tell these apart.
+        // Equal frequency still gives a bounded advantage to useful savings;
+        // this does not remove the short candidate's frequency weight.
         let d = dict(&["tomorrow", "tome"]);
         let f = freq(&[("tomorrow", 900), ("tome", 900)]);
         assert_eq!(finish("tom", d, f).as_deref(), Some("tomorrow"));
@@ -1436,6 +1452,16 @@ mod real_data {
 
     #[test]
     fn finishes_everyday_words() {
+        assert_eq!(offers("hel").first().map(String::as_str), Some("help"));
+        assert_eq!(offers("typ").first().map(String::as_str), Some("type"));
+        let hebrew = completions_with(
+            "שלו",
+            crate::dictionary::he_dict(),
+            crate::dictionary::he_freq(),
+            3,
+            30_000,
+        );
+        assert_eq!(hebrew.first().map(String::as_str), Some("שלום"));
         assert_eq!(offers("tomo").first().map(String::as_str), Some("tomorrow"));
         assert_eq!(
             offers("gove").first().map(String::as_str),

@@ -157,7 +157,7 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 | Undo the latest correction or completion | Tap **Ctrl twice** immediately, or use the optional single-Ctrl undo shortcut |
 | Allow an ignored word again | Use the configured single-Ctrl undo shortcut after the word, or edit your word lists |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
-| Ignore a correction permanently | Click it in the tray's **Recent** menu, or add it to `ignore.txt` |
+| Inspect or ignore a correction | Open **Recent corrections → Why this correction…** in the tray, or expand it in the Linux window; choose **Ignore this word** to save an exception |
 | Inspect live activity | **Start live log…** in the tray/menubar, or **Live log…** in the Linux control window |
 | Review gestures | **Typing shortcuts** in the tray or Linux control window |
 
@@ -225,11 +225,17 @@ early. Unknown focus and ReCast's own controls preserve the pause. Saved app mod
 remain unchanged and apply when correction resumes.
 
 The Linux control window offers **Pause for 30 minutes** / **Resume** and
-**Recent corrections**. Click a recent correction to ignore its original word;
-undone corrections remain visible and marked.
+**Recent corrections**. Expand a correction to see its captured decision evidence,
+then choose **Ignore this word** to save an exception. The tray offers the same
+details and ignore action. Undone corrections remain visible and marked. Details
+include both layout readings, dictionary/form matches, frequency ranks, and spelling
+scores and competing candidates when spelling was evaluated. Evidence is captured
+when the decision is made, stays in the bounded in-memory history, and is not
+recomputed using later settings. Inspecting a correction does not add a word rule.
 
 `--explain` accepts one visible word with optional trailing punctuation and requires
-an explicit `en` or `he` layout. It reports the replacement and planner operation,
+an explicit `en` or `he` layout. It reports the replacement, planner operation,
+layout evidence, spelling candidates, and protection or rejection reasons,
 using this invocation's settings and saved lists. It never captures keys, changes
 the OS layout, types text, or stops a running instance. It has no prior-word
 history or live application checks; unsupported characters produce an error.
@@ -427,7 +433,11 @@ focus changes cancel pending learning. Completion offers do not train replacemen
 pairs merely by being displayed: only a retained choice, finished with Space or
 Enter, can train word frequency or a manual spelling repair.
 Completion ranks exact and single-typo prefix matches together, penalizing edits
-and accounting for the taps needed to reach each choice. For three-letter prefixes,
+and accounting for the taps needed to reach each choice. Frequency and context
+lead; saved keystrokes add at most a 60% ranking benefit, so long words cannot
+dominate merely by having a long suffix. One-letter completions retain their
+frequency weight. Otherwise equal capped scores prefer the shorter word.
+For three-letter prefixes,
 typo recovery runs only when no exact offer exists. Configured abbreviations still
 come first. Retained word frequency influences ranking when personalization is on.
 

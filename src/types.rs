@@ -291,12 +291,24 @@ pub struct Correction {
     /// What replaced it.
     pub to: String,
     pub kind: FixKind,
+    /// Decision evidence retained only with the bounded in-memory history.
+    pub details: String,
     /// Wall-clock time, for the log line. Read by the TUI, which macOS does
     /// not build (the event tap owns the main run loop there).
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub at: chrono::DateTime<chrono::Local>,
     /// Set when the undo gesture took this one back.
     pub undone: bool,
+}
+
+impl Correction {
+    pub fn inspection(&self) -> String {
+        format!(
+            "Original: {:?}\nReplacement: {:?}\nOperation: {}\nStatus: {}\n\n{}\n\nEvidence was captured when this replacement was applied. It stays in memory with Recent corrections.",
+            self.from, self.to, self.kind.tag(),
+            if self.undone { "Undone" } else { "Applied" }, self.details
+        )
+    }
 }
 
 /// How many corrections are kept. Long enough to answer "what did it just
@@ -611,7 +623,12 @@ impl AppControl {
         self.undo_count.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn record_fix(&self, from: &str, to: &str, kind: FixKind) {
+        self.record_fix_with_details(from, to, kind, String::new());
+    }
+
+    pub fn record_fix_with_details(&self, from: &str, to: &str, kind: FixKind, details: String) {
         self.fixed_count.fetch_add(1, Ordering::Relaxed);
         self.live_log.correction(from, to, kind);
         if let Ok(mut log) = self.history.lock() {
@@ -622,6 +639,7 @@ impl AppControl {
                 from: from.to_string(),
                 to: to.to_string(),
                 kind,
+                details,
                 at: chrono::Local::now(),
                 undone: false,
             });

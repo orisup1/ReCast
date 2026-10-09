@@ -254,17 +254,32 @@ pub(crate) fn suggestions(
         .collect()
 }
 
-/// Best English correction for `word`, or `None` to leave it alone.
-///
-/// Thresholds come from the global config (`RECAST_SPELL*`); the actual work is
-/// in [`correct_with`], which takes them explicitly so tests don't depend on
-/// the environment.
+/// Result and evidence from one spelling search. No diagnostic replay is needed.
+pub(crate) struct Assessment {
+    pub correction: Option<String>,
+    pub details: String,
+}
+
+impl Assessment {
+    fn unchanged(reason: &str) -> Self {
+        Self {
+            correction: None,
+            details: reason.into(),
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn correct(word: &str, en_dict: Dict, en_freq: Freq) -> Option<String> {
+    assess(word, en_dict, en_freq).correction
+}
+
+pub(crate) fn assess(word: &str, en_dict: Dict, en_freq: Freq) -> Assessment {
     let cfg = Config::global();
     if !cfg.spell_enabled {
-        return None;
+        return Assessment::unchanged("English spelling is disabled.");
     }
-    correct_with(
+    assess_with(
         word,
         en_dict,
         en_freq,
@@ -278,6 +293,7 @@ pub fn correct(word: &str, en_dict: Dict, en_freq: Freq) -> Option<String> {
 ///
 /// `max_dist` is an upper bound in whole edits (0 disables correction entirely);
 /// the word's own length can lower it further — see [`budget_for`].
+#[cfg(test)]
 pub fn correct_with(
     word: &str,
     en_dict: Dict,
@@ -286,6 +302,17 @@ pub fn correct_with(
     max_rank: u32,
     max_dist: u8,
 ) -> Option<String> {
+    assess_with(word, en_dict, en_freq, min_len, max_rank, max_dist).correction
+}
+
+fn assess_with(
+    word: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    max_dist: u8,
+) -> Assessment {
     // A curated transposition, not permission to guess at other three-letter tokens.
     if word == "teh"
         && !en_dict.contains(word)
@@ -294,9 +321,22 @@ pub fn correct_with(
         && en_dict.contains("the")
         && en_freq.rank("the").is_some_and(|rank| rank <= max_rank)
     {
-        return Some("the".into());
+        return Assessment {
+            correction: Some("the".into()),
+            details: "Recognized the curated transposition teh / the.".into(),
+        };
     }
-    let mut budget = budget_for(word, min_len, max_dist)?;
+    let Some(mut budget) = budget_for(word, min_len, max_dist) else {
+        return Assessment::unchanged(if max_dist == 0 {
+            "English spelling is disabled by the edit-distance limit."
+        } else if word.len() < min_len {
+            "The word is shorter than the configured spelling minimum."
+        } else if word.len() > MAX_LEN {
+            "The word exceeds the spelling length limit."
+        } else {
+            "Spelling requires lowercase English letters; digits and internal punctuation are protected."
+        });
+    };
     let mut max_rank = if word.len() < DIST3_MIN_LEN {
         max_rank.min(20_000)
     } else {
@@ -310,7 +350,9 @@ pub fn correct_with(
         if en_freq.rank(word).is_some()
             || Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_tech.blob"))).contains(word)
         {
-            return None;
+            return Assessment::unchanged(
+                "Protected dictionary word: attested frequency or curated technical term.",
+            );
         }
         budget = budget.min(COST_VOWEL);
         max_rank = max_rank.min(1_000);
@@ -326,18 +368,42 @@ pub fn correct_with(
         .rank(word)
         .is_some_and(|rank| rank <= max_rank.min(20_000))
     {
-        return None;
+        return Assessment::unchanged(
+            "Protected frequent word or name, even though it is absent from the dictionary.",
+        );
     }
 
     let mut search = Search::new(word, budget, max_rank);
     search.run(word, en_dict, en_freq);
 
-    search.best.and_then(|(score, _, _, fixed)| {
-        search
-            .runner_up
-            .is_none_or(|second| second - score >= MIN_SCORE_GAP)
-            .then_some(fixed)
-    })
+    let Some((best_score, cost, rank, fixed)) = search.best else {
+        return Assessment::unchanged(&format!(
+            "No candidate passed the spelling gates (weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits)."
+        ));
+    };
+    let confident = search
+        .runner_up
+        .as_ref()
+        .is_none_or(|(second, ..)| second - best_score >= MIN_SCORE_GAP);
+    let mut details = format!(
+        "Spelling candidates (lower score is better; scores are not confidence percentages):\n  {fixed}: score {best_score:.2}, edit cost {cost}, frequency rank {rank}\nLimits: weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits."
+    );
+    if let Some((second, second_cost, second_rank, word)) = search.runner_up {
+        details.push_str(&format!(
+            "\nOther evaluated candidate: {word}: score {second:.2}, edit cost {second_cost}, frequency rank {second_rank}\nScore gap: {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", second - best_score
+        ));
+    } else {
+        details.push_str("\nNo competing candidate was found within the confidence window.");
+    }
+    details.push_str(if confident {
+        "\nAccepted the best spelling candidate."
+    } else {
+        "\nLeft unchanged: the leading candidates are too close in score."
+    });
+    Assessment {
+        correction: confident.then_some(fixed),
+        details,
+    }
 }
 
 /// The best correction found so far, and everything needed to judge the next
@@ -359,7 +425,7 @@ struct Search<'a> {
     /// (score, cost, rank, word) — the score decides, the rest only makes ties
     /// deterministic.
     best: Option<(f32, u32, u32, String)>,
-    runner_up: Option<f32>,
+    runner_up: Option<(f32, u32, u32, String)>,
     offers: Option<Vec<(f32, u32, String)>>,
     context: Option<&'a crate::complete::PhraseContext>,
     typo_counts: [u64; 3],
@@ -474,13 +540,22 @@ impl<'a> Search<'a> {
         // Only dictionary words may win or provide evidence of ambiguity.
         if en_dict.contains(cand) {
             if better {
-                if let Some((score, ..)) = self.best.take() {
-                    self.runner_up = Some(self.runner_up.map_or(score, |cur| cur.min(score)));
+                if let Some(previous) = self.best.take() {
+                    self.consider_runner_up(previous);
                 }
                 self.best = Some((candidate, cost, rank, cand.to_string()));
             } else {
-                self.runner_up = Some(self.runner_up.map_or(candidate, |cur| cur.min(candidate)));
+                self.consider_runner_up((candidate, cost, rank, cand.to_string()));
             }
+        }
+    }
+
+    fn consider_runner_up(&mut self, candidate: (f32, u32, u32, String)) {
+        if self.runner_up.as_ref().is_none_or(|current| {
+            (candidate.0, candidate.1, candidate.2, &candidate.3)
+                < (current.0, current.1, current.2, &current.3)
+        }) {
+            self.runner_up = Some(candidate);
         }
     }
 
@@ -1177,6 +1252,33 @@ mod tests {
         assert!(suggestions("cake", d, f, Some(&context)).is_empty());
         assert!(suggestions("c4xe", d, f, Some(&context)).is_empty());
         assert_eq!(correct_with("caxe", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn spelling_evidence_explains_ambiguity_protection_and_limits() {
+        let d = Dict::of(&["cafe", "cake"]);
+        let f = Freq::of(&[("cafe", 100), ("cake", 100)]);
+        let ambiguous = assess_with("caxe", d, f, 4, 20_000, 1);
+        assert!(ambiguous.correction.is_none());
+        assert!(ambiguous.details.contains("cafe: score"));
+        assert!(ambiguous.details.contains("cake: score"));
+        assert!(ambiguous.details.contains("candidates are too close"));
+        assert!(ambiguous.details.contains("required minimum: 4.00"));
+        assert!(assess_with("cake", d, f, 4, 20_000, 1)
+            .details
+            .contains("Protected dictionary word"));
+        assert!(assess_with("cat", d, f, 4, 20_000, 1)
+            .details
+            .contains("shorter than"));
+        assert!(assess_with("caxe", d, f, 4, 20_000, 0)
+            .details
+            .contains("disabled"));
+        assert!(assess_with("ca4e", d, f, 4, 20_000, 1)
+            .details
+            .contains("internal punctuation"));
+        assert!(assess_with("zzzz", d, f, 4, 20_000, 1)
+            .details
+            .contains("No candidate passed"));
     }
 
     #[test]

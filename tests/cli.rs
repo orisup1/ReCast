@@ -117,6 +117,18 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
             "{text}"
         );
         assert!(text.contains(reason), "{text}");
+        assert!(text.contains("English reading:"), "{text}");
+        assert!(text.contains("Hebrew reading:"), "{text}");
+        if word == "recieve" {
+            assert!(text.contains("receive: score"), "{text}");
+            assert!(text.contains("frequency rank"), "{text}");
+        }
+        if word == "keyboad" {
+            assert!(text.contains("ignored word"), "{text}");
+        }
+        if word == "hello" {
+            assert!(text.contains("Protected dictionary word"), "{text}");
+        }
     }
     for args in [
         vec!["--explain"],
@@ -139,6 +151,9 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
             assert!(output.status.success());
             assert!(
                 String::from_utf8_lossy(&output.stdout).contains(&format!("Replacement: {word:?}"))
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("English spelling is disabled")
             );
         }
         std::fs::remove_file(config.join("config.toml")).unwrap();

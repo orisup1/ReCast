@@ -219,7 +219,7 @@ impl eframe::App for App {
                 ui.separator();
                 let history = self.control.history();
                 ui.collapsing(format!("Recent corrections ({})", history.len()), |ui| {
-                    ui.label("Click a correction to stop correcting that word.");
+                    ui.label("Expand a correction to inspect why it changed.");
                     if history.is_empty() {
                         ui.label("No corrections yet.");
                     }
@@ -229,9 +229,12 @@ impl eframe::App for App {
                             if correction.undone { "Undone: " } else { "" },
                             correction.from, correction.to, correction.kind.tag(),
                             if ignored { " — ignored" } else { "" });
-                        if ui.add_enabled(!ignored, egui::Button::new(label)).clicked() {
-                            crate::complete::ignore_word(&correction.from);
-                        }
+                        ui.collapsing(label, |ui| {
+                            ui.label(correction.inspection());
+                            if ui.add_enabled(!ignored, egui::Button::new(if ignored { "Already ignored" } else { "Ignore this word" })).clicked() {
+                                crate::complete::ignore_word(&correction.from);
+                            }
+                        });
                     }
                 });
                 ui.separator();

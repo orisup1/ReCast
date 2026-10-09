@@ -741,6 +741,8 @@ pub enum Fix {
 pub struct Outcome {
     /// The selected planner operation, also shown by the offline preview.
     pub reason: &'static str,
+    /// Evidence captured by this decision, without replaying it after settings change.
+    pub details: String,
     /// Stable aggregate statistics tag, only for an applied correction.
     pub rule: Option<&'static str>,
     /// The correction to apply, or `None` to leave the word alone.
@@ -923,6 +925,7 @@ fn plan(
     en_freq: Freq,
     he_freq: Freq,
     layout_only: bool,
+    details: &mut String,
 ) -> Option<Plan> {
     // Every pipeline below asks about the *word* — the punctuation the user
     // finished it with is set aside by `Reading` and put back by the caller.
@@ -938,6 +941,7 @@ fn plan(
         _ => word_en,
     };
     if crate::complete::suppressed(typed) {
+        details.push_str("\nProtected by an undo exception for this session.");
         return None;
     }
 
@@ -948,6 +952,9 @@ fn plan(
             .then(|| crate::personal::personal_correction(typed))
             .flatten()
     {
+        details.push_str(
+            "\nApplied a personal replacement learned from repeatedly retained corrections.",
+        );
         if current == Some(Language::Hebrew) && is_english_text(&correction) {
             return Some(Plan::SwitchAndSpell {
                 lang: Language::English,
@@ -963,6 +970,7 @@ fn plan(
             .then(|| crate::complete::expand(word_en))
             .flatten()
         {
+            details.push_str("\nApplied the configured abbreviation before inferred corrections.");
             return Some(Plan::Expand { text });
         }
         // In English this exact transposition beats an accidental Hebrew name.
@@ -973,10 +981,12 @@ fn plan(
                 || crate::complete::ignored(word_en)
                 || crate::complete::learned(word_en)
             {
+                details.push_str("\nThe curated transposition is protected by the application mode, capitalization, or a saved word rule.");
                 return None;
             }
-            return crate::spell::correct(word_en, en_dict, en_freq)
-                .map(|text| Plan::Spell { text });
+            let assessment = crate::spell::assess(word_en, en_dict, en_freq);
+            details.push_str(&format!("\n{}", assessment.details));
+            return assessment.correction.map(|text| Plan::Spell { text });
         }
     }
 
@@ -986,6 +996,7 @@ fn plan(
     if word_en.chars().count() < MIN_AUTOMATIC_WORD_CHARS
         || word_he.chars().count() < MIN_AUTOMATIC_WORD_CHARS
     {
+        details.push_str("\nSingle-letter words are not corrected automatically.");
         return None;
     }
 
@@ -997,13 +1008,43 @@ fn plan(
         ),
         None => decide_unknown(word_en, word_he, run, en_dict, he_dict, en_freq, he_freq),
     };
+    if let Some(current) = current {
+        let (typed, alternate) = if current == Language::English {
+            (word_en, word_he)
+        } else {
+            (word_he, word_en)
+        };
+        let current_word = valid_strict(typed, current, en_dict, he_dict);
+        if current_word {
+            details.push_str(if whole.is_some() {
+                "\nBoth readings are words; the alternate won the decisive frequency and language-history comparison."
+            } else {
+                "\nLayout preserved: the current reading is a dictionary word; the alternate did not win the decisive frequency and language-history comparison."
+            });
+        } else if whole.is_none()
+            && too_short_to_trigger(
+                alternate,
+                current.other(),
+                Config::global().short_enabled,
+                en_freq,
+                he_freq,
+            )
+        {
+            details.push_str(
+                "\nLayout preserved: the alternate reading failed the short-word frequency gate.",
+            );
+        } else if whole.is_none() && valid_loose(typed, current, en_dict, he_dict) {
+            details.push_str("\nLayout preserved: the current reading is a recognized form; no alternate reading overcame its protection.");
+        }
+    }
     if let Some(lang) = whole {
+        details.push_str("\nThe alternate reading passed layout confidence checks.");
         // A layout hit may itself be a rare dictionary spelling of a typo.
         // Compose both changes before injection, preserving one-step undo.
         if lang == Language::English && !layout_only {
-            if let Some(spelling) =
-                plan_spelling(word_en, word_he, current, case, en_dict, he_dict, en_freq)
-            {
+            if let Some(spelling) = plan_spelling(
+                word_en, word_he, current, case, en_dict, he_dict, en_freq, details,
+            ) {
                 return Some(spelling);
             }
         }
@@ -1014,13 +1055,18 @@ fn plan(
         en.full, he.full, offsets_en, offsets_he, keys_len, current, run, en_dict, he_dict,
         en_freq, he_freq,
     ) {
+        details.push_str("\nThe enabled missing-space rule found a valid prefix and a confident alternate-layout suffix.");
         return Some(split);
     }
 
     if layout_only {
+        details.push_str("\nApplication mode allows layout correction only; no layout candidate passed its confidence checks.");
         None
     } else {
-        plan_spelling(word_en, word_he, current, case, en_dict, he_dict, en_freq)
+        details.push_str("\nNo layout change passed its confidence checks (word protection, short-word frequency, and language history).");
+        plan_spelling(
+            word_en, word_he, current, case, en_dict, he_dict, en_freq, details,
+        )
     }
 }
 
@@ -1040,6 +1086,7 @@ fn plan(
 /// a misspelling — the dictionary has no opinion on it and the speller would
 /// happily turn it into the nearest common word. Case tracking is what makes
 /// this distinction visible at all.
+#[allow(clippy::too_many_arguments)]
 fn plan_spelling(
     full_en: &str,
     full_he: &str,
@@ -1048,21 +1095,32 @@ fn plan_spelling(
     en_dict: Dict,
     he_dict: Dict,
     en_freq: Freq,
+    details: &mut String,
 ) -> Option<Plan> {
-    let current = current?;
+    let Some(current) = current else {
+        details.push_str("\nSpelling skipped: the current keyboard layout is unknown.");
+        return None;
+    };
     if case == Case::Upper {
+        details.push_str("\nALL CAPS tokens are protected from spelling changes.");
         return None;
     }
     // A word the user has declared theirs is never second-guessed — whether
     // they declared it by writing it in `ignore.txt` or by taking the same
     // correction back twice.
     if crate::complete::ignored(full_en) || crate::complete::learned(full_en) {
+        details.push_str("\nSpelling skipped: the English reading is an ignored word or a learned undo exception.");
         return None;
     }
     if valid_loose(full_he, Language::Hebrew, en_dict, he_dict) {
+        details.push_str(
+            "\nSpelling skipped: the Hebrew reading is a recognized word or prefixed form.",
+        );
         return None;
     }
-    let text = crate::spell::correct(full_en, en_dict, en_freq)?;
+    let assessment = crate::spell::assess(full_en, en_dict, en_freq);
+    details.push_str(&format!("\n{}", assessment.details));
+    let text = assessment.correction?;
     Some(compose_spelling(current, text))
 }
 
@@ -1200,6 +1258,7 @@ pub fn check_and_correct<K: Copy>(
     if keys.is_empty() {
         return Outcome {
             reason: "Empty input",
+            details: "There is no word to inspect.".into(),
             rule: None,
             fix: None,
             lang: None,
@@ -1276,6 +1335,23 @@ pub fn check_and_correct<K: Copy>(
     // — that decision is the better answer — but for every word the pipelines
     // leave alone, this is the only answer there is.
     let seen = observed(en.word, he.word, en_dict, he_dict);
+    let rank_label =
+        |rank: Option<u32>| rank.map_or_else(|| "unranked".into(), |rank| rank.to_string());
+    let mut details = format!(
+        "English reading: {:?}; recognized word/form: {}; frequency rank: {}\nHebrew reading: {:?}; recognized word/form: {}; frequency rank: {}\nCurrent layout: {}. Frequency rank is lower for more common words.",
+        en.word, valid_loose(en.word, Language::English, en_dict, he_dict), rank_label(freq_rank(en.word, Language::English, en_freq(), he_freq())),
+        he.word, valid_loose(he.word, Language::Hebrew, en_dict, he_dict), rank_label(freq_rank(he.word, Language::Hebrew, en_freq(), he_freq())),
+        match current { Some(Language::English) => "English", Some(Language::Hebrew) => "Hebrew", None => "unknown" }
+    );
+    details.push_str(&format!(
+        "\nRecent language history: {}, {} word(s).",
+        match run.lang {
+            Some(Language::English) => "English",
+            Some(Language::Hebrew) => "Hebrew",
+            None => "no established language",
+        },
+        run.len
+    ));
     let Some(plan) = plan(
         en,
         he,
@@ -1290,10 +1366,12 @@ pub fn check_and_correct<K: Copy>(
         en_freq(),
         he_freq(),
         layout_only,
+        &mut details,
     ) else {
         debug_log(&full_en, &full_he, None, false);
         return Outcome {
             reason: "Protected word or no confident correction under these settings",
+            details,
             rule: None,
             fix: None,
             lang: seen,
@@ -1382,6 +1460,7 @@ pub fn check_and_correct<K: Copy>(
         fix,
         lang,
         reason,
+        details,
     }
 }
 
@@ -2640,6 +2719,7 @@ mod tests {
             en_f,
             nofreq(),
             false,
+            &mut String::new(),
         )
     }
 
@@ -2946,6 +3026,7 @@ mod tests {
             nofreq(),
             nofreq(),
             false,
+            &mut String::new(),
         );
         assert_eq!(
             plan,
@@ -2987,6 +3068,7 @@ mod tests {
                 en_f,
                 nofreq(),
                 false,
+                &mut String::new(),
             ),
             Some(Plan::Spell {
                 text: "hello".to_string()

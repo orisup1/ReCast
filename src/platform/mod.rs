@@ -41,6 +41,9 @@ mod log_viewer;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod word_rules;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod inspection;
+
 /// Friendly label plus the exact identifier used by the exclusion engine.
 pub fn active_application() -> Option<(String, String)> {
     #[cfg(target_os = "macos")]

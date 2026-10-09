@@ -1058,6 +1058,7 @@ impl<P: Platform> Engine<P> {
         if let Some(lang) = outcome.lang {
             st.history.push(lang);
         }
+        let details = format!("Reason: {}\n{}", outcome.reason, outcome.details);
         let result = outcome.fix;
         let rule = outcome.rule;
         // Describe the fix for the history before `replacement` consumes it.
@@ -1086,6 +1087,7 @@ impl<P: Platform> Engine<P> {
                     to,
                     kind,
                     rule,
+                    details,
                     deferred_layout: None,
                 }),
             );
@@ -1360,6 +1362,7 @@ impl<P: Platform> Engine<P> {
                 to: candidates[index].clone(),
                 kind: FixKind::Complete,
                 rule: None,
+                details: format!("Requested completion. Choices in order: {}.\nRanking balances frequency, a bounded letters-saved benefit, context, and prefix-edit penalties. Configured abbreviations take priority.", candidates.join(", ")),
                 deferred_layout: (lang != target_lang).then_some(target_lang),
             })
         } else {
@@ -1653,6 +1656,7 @@ impl<P: Platform> Engine<P> {
                 to,
                 kind,
                 rule: None,
+                details: "Manual layout conversion requested by the shortcut. Dictionary and spelling confidence checks do not apply.".into(),
                 deferred_layout,
             }),
         );
@@ -1700,7 +1704,9 @@ impl<P: Platform> Engine<P> {
         // The run is read but not added to: this word was already recorded when
         // it was first finished, and the gesture is a second opinion about it
         // rather than a second word.
-        let result = self.check(&skip.keys, st.history.run(), st.mode).fix;
+        let outcome = self.check(&skip.keys, st.history.run(), st.mode);
+        let details = format!("Reason: {}\n{}", outcome.reason, outcome.details);
+        let result = outcome.fix;
         let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
         let Some(rep) = replacement::<P>(&skip.keys, result) else {
             return;
@@ -1721,6 +1727,7 @@ impl<P: Platform> Engine<P> {
                 to,
                 kind,
                 rule: None,
+                details,
                 deferred_layout: None,
             }),
         );
@@ -1842,13 +1849,15 @@ impl<P: Platform> Engine<P> {
                 to,
                 kind,
                 rule,
+                details,
                 ..
             }) => {
                 if practice {
                     crate::practice::fixed(&self.control, &from, &to, kind);
                 }
                 if !practice {
-                    self.control.record_fix(&from, &to, kind);
+                    self.control
+                        .record_fix_with_details(&from, &to, kind, details);
                     if let Some(rule) = rule {
                         crate::personal::record_rule(rule, false);
                     }
@@ -1971,6 +1980,7 @@ enum Commit {
         to: String,
         kind: FixKind,
         rule: Option<&'static str>,
+        details: String,
         deferred_layout: Option<Language>,
     },
     Undo {
@@ -2976,6 +2986,19 @@ mod tests {
         s.pending();
         s.finish();
         assert_eq!(s.text(), "recieve keyboad  receive ");
+        let evidence = s.engine.control.history()[0].inspection();
+        assert!(evidence.contains("receive: score"), "{evidence}");
+        assert!(
+            evidence.contains("English reading: \"recieve\""),
+            "{evidence}"
+        );
+        crate::config::Config::update_live(|cfg| cfg.spell_enabled = false);
+        assert_eq!(
+            s.engine.control.history()[0].inspection(),
+            evidence,
+            "inspecting an applied correction must not recompute it with current settings"
+        );
+        crate::config::Config::update_live(|cfg| cfg.spell_enabled = true);
 
         // Focus changes between the two undo taps cannot act on another field.
         let s = Session::new();
@@ -3101,6 +3124,10 @@ mod tests {
                 "interruption {interrupt}"
             );
             assert_eq!(s.engine.control.fixed_count(), 0);
+            assert!(
+                s.engine.control.history().is_empty(),
+                "canceled injections must not leave correction evidence"
+            );
             assert!(s.engine.lock().last_action.is_none());
             if interrupt == 3 {
                 assert!(!s.engine.lock().no_fix);
