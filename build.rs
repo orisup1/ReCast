@@ -15,6 +15,8 @@
 //   *_dict.blob   one word per line
 //   *_freq.blob   `word\trank` per line, rank = 0-based line index in the
 //                 source file (lower = more common)
+//   *.prefix      little-endian u32 start/end offsets for one- and two-letter
+//                 runs; these indexes remain read-only executable data
 //
 // ── Windows resources ───────────────────────────────────────────────────────
 // Turns the Windows binary into a "full app": the executable carries the ReCast
@@ -72,7 +74,7 @@ fn prepare_dictionaries() {
         }
         words.sort_unstable();
         words.dedup();
-        write(&out_dir.join(dst), &words.join("\n"));
+        write_blob(&out_dir.join(dst), &words.join("\n"), src);
     }
 
     // Frequency lists: the rank *is* the line index, so sorting by word means
@@ -113,7 +115,7 @@ fn prepare_dictionaries() {
             blob.push('\n');
         }
         blob.pop(); // no trailing newline: every line is a real entry
-        write(&out_dir.join(dst), &blob);
+        write_blob(&out_dir.join(dst), &blob, src);
     }
 }
 
@@ -133,6 +135,53 @@ fn read(path: &str) -> String {
 
 fn write(path: &PathBuf, content: &str) {
     std::fs::write(path, content).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// Index the supported alphabets without changing the sorted text or folding.
+/// Each row contains the whole first-letter run, then its second-letter runs.
+fn write_blob(path: &PathBuf, content: &str, source: &str) {
+    write(path, content);
+    if source == "en_tech.txt" {
+        return;
+    }
+    let (first, letters) = if source.starts_with("en_") {
+        ('a', 26usize)
+    } else {
+        ('א', 27usize)
+    };
+    let letter_index = |letter: char| {
+        (letter as u32)
+            .checked_sub(first as u32)
+            .map(|index| index as usize)
+            .filter(|&index| index < letters)
+    };
+    let mut ranges = vec![(0u32, 0u32); letters * (letters + 1)];
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let mut chars = line.chars();
+        if let Some(row) = chars.next().and_then(letter_index) {
+            let start = u32::try_from(offset).expect("dictionary exceeds 4 GiB");
+            let end = u32::try_from(offset + line.len()).expect("dictionary exceeds 4 GiB");
+            let mut extend = |slot: usize| {
+                let range = &mut ranges[row * (letters + 1) + slot];
+                if range.1 == 0 {
+                    range.0 = start;
+                }
+                range.1 = end;
+            };
+            extend(0);
+            if let Some(column) = chars.next().and_then(letter_index) {
+                extend(column + 1);
+            }
+        }
+        offset += line.len();
+    }
+    let bytes: Vec<u8> = ranges
+        .into_iter()
+        .flat_map(|(start, end)| start.to_le_bytes().into_iter().chain(end.to_le_bytes()))
+        .collect();
+    std::fs::write(path.with_extension("prefix"), bytes)
+        .unwrap_or_else(|e| panic!("writing prefix index for {}: {e}", path.display()));
 }
 
 fn embed_windows_resources() {

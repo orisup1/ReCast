@@ -6,7 +6,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use crate::dictionary::{en_dict, en_freq, he_dict};
+use crate::dictionary::{en_dict, en_freq, he_dict, Dict};
 
 fn report(name: &str, iterations: usize, started: Instant) {
     let elapsed = started.elapsed();
@@ -30,6 +30,82 @@ fn benchmark_dictionary_lookup() {
         black_box(he.contains(word));
     }
     report("dictionary lookup pair", iterations, started);
+}
+
+#[test]
+#[ignore = "microbenchmark; run with `make bench`"]
+fn benchmark_dictionary_lookup_mixed() {
+    // Sample both corpora outside the timed loop, rather than repeatedly
+    // touching only the few cache-hot words in the smaller benchmark.
+    let (en, he) = (en_dict(), he_dict());
+    let en_blob = include_str!(concat!(env!("OUT_DIR"), "/en_dict.blob"));
+    let he_blob = include_str!(concat!(env!("OUT_DIR"), "/he_dict.blob"));
+    let words: Vec<_> = en_blob
+        .lines()
+        .step_by(97)
+        .chain(he_blob.lines().step_by(97))
+        .collect();
+    let iterations = 500_000;
+    for (name, en, he) in [
+        (
+            "dictionary lookup pair, mixed, unindexed",
+            Dict::new(en_blob),
+            Dict::new(he_blob),
+        ),
+        ("dictionary lookup pair, mixed, indexed", en, he),
+    ] {
+        let mut position = 0usize;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            position = (position + 7919) % words.len();
+            let word = black_box(words[position]);
+            black_box(en.contains(word));
+            black_box(he.contains(word));
+        }
+        report(name, iterations, started);
+    }
+}
+
+#[test]
+#[ignore = "microbenchmark; run with `make bench`"]
+fn benchmark_spelling_latency_distribution() {
+    let (dict, freq) = (en_dict(), en_freq());
+    let words = [
+        "recieve",
+        "keyboad",
+        "restaraunt",
+        "supino",
+        "correct",
+        "xomputer",
+        "zeceive",
+        "independance",
+        "zzzzzzzzzzzzzzzzzzzzzzzz",
+        "communication",
+    ];
+    let mut samples = Vec::with_capacity(1_000);
+    for word in words {
+        black_box(crate::spell::correct_with(word, dict, freq, 4, 50_000, 3));
+    }
+    for i in 0..1_000 {
+        let started = Instant::now();
+        black_box(crate::spell::correct_with(
+            black_box(words[i % words.len()]),
+            dict,
+            freq,
+            crate::config::DEFAULT_SPELL_MIN_LEN,
+            crate::config::DEFAULT_SPELL_MAX_RANK,
+            crate::config::DEFAULT_SPELL_MAX_DIST,
+        ));
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    eprintln!(
+        "spelling latency: p50 {:?}, p95 {:?}, max {:?} ({} samples)",
+        samples[499],
+        samples[949],
+        samples[999],
+        samples.len()
+    );
 }
 
 #[test]

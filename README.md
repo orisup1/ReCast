@@ -534,6 +534,9 @@ cargo test correction_accuracy_corpus -- --nocapture
 make bench
 ```
 
+See [PERFORMANCE.md](PERFORMANCE.md) for search optimizations, benchmark scope,
+and further latency opportunities.
+
 The shared correction planner is in [src/dictionary/mod.rs](src/dictionary/mod.rs), with
 spelling in [src/spell/mod.rs](src/spell/mod.rs) and completion/lists in
 [src/complete.rs](src/complete.rs). [src/platform/engine.rs](src/platform/engine.rs)

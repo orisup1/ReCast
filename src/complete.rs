@@ -18,7 +18,8 @@
 //!   and it is why the completer is allowed to guess at all. The frequency list
 //!   is sorted, so "every common word starting with `hel`" is one contiguous
 //!   run of it (see `Freq::for_each_with_prefix`) and ranking them is a short
-//!   walk, no index and no allocation per rejected candidate.
+//!   walk using a small embedded prefix index, with no allocation per rejected
+//!   candidate.
 //! * [`expand`] — abbreviations the user wrote down themselves in
 //!   `<config>/recast/abbrev.txt`, expanded when the word is finished — or
 //!   offered as the first completion, since a rule the user wrote by hand
@@ -272,10 +273,9 @@ fn completions_from(
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
     // Exact and one-edit matches compete in the same pool. A typo needs much
     // stronger frequency evidence to beat an equally useful exact match.
-    let mut prefixes = edited_prefixes(prefix, english);
     // Editing a three-letter prefix is too ambiguous to compete with an exact
     // offer. Keep short-prefix recovery only when there is no exact candidate.
-    if len < 4 {
+    let exact = if len < 4 {
         let mut exact = false;
         freq.for_each_with_prefix(prefix, |word, rank| {
             exact |= word.chars().count() > len && rank <= max_rank && dict.contains(word);
@@ -283,10 +283,15 @@ fn completions_from(
         exact |= saved
             .iter()
             .any(|word| word.starts_with(prefix) && word.chars().count() > len);
-        if exact {
-            prefixes.clear();
-        }
-    }
+        exact
+    } else {
+        false
+    };
+    let mut prefixes = if exact {
+        HashSet::new()
+    } else {
+        edited_prefixes(prefix, english)
+    };
     prefixes.insert(prefix.to_owned());
     let mut consider = |word: &str, rank: u32, explicit: bool| {
         let word_len = word.chars().count();

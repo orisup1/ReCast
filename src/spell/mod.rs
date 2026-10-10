@@ -1119,14 +1119,46 @@ fn extra_cost(w: &[u8], i: usize) -> u32 {
 struct Dp {
     cells: Vec<u32>,
     /// `extra_cost` for each position of the typed word, computed once per
-    /// candidate instead of once per cell. It depends only on the typed word,
+    /// search instead of once per candidate. It depends only on the typed word,
     /// which is the same for every one of the thousands of candidates in a
     /// scan — and the deletion cell is on the hot path, where two adjacency
     /// lookups per cell were costing ~10% of the whole correction.
     extra: Vec<u32>,
+    typed: Vec<u8>,
+    /// Rules whose typed side actually matches at each row, cached with `extra`.
+    row_rules: Vec<&'static rules::Rule>,
+    rule_ends: Vec<usize>,
 }
 
 impl Dp {
+    fn prepare(&mut self, typed: &[u8]) {
+        if self.typed == typed {
+            return;
+        }
+        self.typed.clear();
+        self.typed.extend_from_slice(typed);
+        self.extra.clear();
+        self.extra.push(0); // unused: positions are 1-based here
+        self.extra
+            .extend((1..=typed.len()).map(|i| extra_cost(typed, i)));
+        self.row_rules.clear();
+        self.rule_ends.clear();
+        self.rule_ends.push(0);
+        let index = rules_by_last_byte();
+        for i in 1..=typed.len() {
+            self.row_rules.extend(
+                index[(typed[i - 1] - b'a') as usize]
+                    .iter()
+                    .copied()
+                    .filter(|rule| {
+                        i >= rule.from.len()
+                            && &typed[i - rule.from.len()..i] == rule.from.as_bytes()
+                    }),
+            );
+            self.rule_ends.push(self.row_rules.len());
+        }
+    }
+
     /// Channel cost of the typed word `a` having come out of the intended word
     /// `b` — a weighted Damerau-Levenshtein alignment extended with the
     /// [`RULES`] block edits and [`position_penalty`] — or `None` once every
@@ -1169,9 +1201,7 @@ impl Dp {
         }
         let at = |i: usize, j: usize| i * width + j;
 
-        self.extra.clear();
-        self.extra.push(0); // unused: positions are 1-based here
-        self.extra.extend((1..=n).map(|i| extra_cost(a, i)));
+        self.prepare(a);
 
         self.cells[0] = 0;
         for j in 1..=m {
@@ -1190,7 +1220,6 @@ impl Dp {
             return Some(self.cells[m]);
         }
 
-        let index = rules_by_last_byte();
         // Minima of the last few rows. Bailing on a single over-budget row
         // would be wrong: a transposition reaches back two rows and a rule up
         // to `MAX_RULE_LEN`, so a row that looks hopeless can still be jumped
@@ -1246,13 +1275,10 @@ impl Dp {
                 };
 
                 // Brill–Moore block edits: one event covering several letters
-                // on each side. Indexed by the typed letter this cell ends on,
-                // so only a couple of rules are ever tested here.
-                for rule in &index[(a[i - 1] - b'a') as usize] {
+                // on each side. The matching typed sides were prepared once
+                // for this word; only the candidate side varies between cells.
+                for rule in &self.row_rules[self.rule_ends[i - 1]..self.rule_ends[i]] {
                     let (fl, tl) = (rule.from.len(), rule.to.len());
-                    if i < fl || &a[i - fl..i] != rule.from.as_bytes() {
-                        continue;
-                    }
                     let lengths = if prefix && j == m {
                         1..=tl.min(j)
                     } else {

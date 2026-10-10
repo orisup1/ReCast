@@ -3,7 +3,8 @@
 //! The four lists (English/Hebrew dictionaries and frequency lists) are
 //! embedded in the binary in the *prepared* form `build.rs` writes: folded,
 //! deduplicated and **sorted**, one entry per line. Sorted is the whole point —
-//! it means a lookup is a binary search straight over the embedded bytes
+//! it means a lookup is a binary search straight over the embedded bytes,
+//! narrowed by small build-time indexes of one- and two-letter prefixes
 //! ([`Dict`] / [`Freq`]), so the program never allocates a hash table, never
 //! parses anything at startup, and the ~11 MB of word data stays as read-only
 //! pages of the executable that the OS can drop under memory pressure rather
