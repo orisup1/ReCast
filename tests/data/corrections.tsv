@@ -707,6 +707,15 @@ en	release_v2	רקךקשדק_ה2	release_v2
 en	helloשלום	helloשלום	helloשלום
 en	שלוםworld	שלוםworld	שלוםworld
 
+# Phrase disambiguation requires the preceding word in the same field.
+en	data	גשאש	data		phrase-base	full
+en	baye	נשטק	base		phrase-base	full
+en	baye	נשטק	baye
+en	data	גשאש	data		phrase-layout-only	layout-only
+en	baye	נשטק	baye		phrase-layout-only	layout-only
+en	data	גשאש	data		phrase-wrong-layout	full
+he	baye	נשטק	base		phrase-wrong-layout	full
+
 # Multiple typos including an edited opening; shared spelling/layout recovery.
 en	ommunicaton	םצצומןבשאםמ	communication
 he	ommunicaton	םצצומןבשאםמ	communication

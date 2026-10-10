@@ -925,6 +925,7 @@ fn plan(
     en_freq: Freq,
     he_freq: Freq,
     layout_only: bool,
+    context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
 ) -> Option<Plan> {
     // Every pipeline below asks about the *word* — the punctuation the user
@@ -984,7 +985,7 @@ fn plan(
                 details.push_str("\nThe curated transposition is protected by the application mode, capitalization, or a saved word rule.");
                 return None;
             }
-            let assessment = crate::spell::assess(word_en, en_dict, en_freq);
+            let assessment = crate::spell::assess(word_en, en_dict, en_freq, context);
             details.push_str(&format!("\n{}", assessment.details));
             return assessment.correction.map(|text| Plan::Spell { text });
         }
@@ -1043,7 +1044,7 @@ fn plan(
         // Compose both changes before injection, preserving one-step undo.
         if lang == Language::English && !layout_only {
             if let Some(spelling) = plan_spelling(
-                word_en, word_he, current, case, en_dict, he_dict, en_freq, details,
+                word_en, word_he, current, case, en_dict, he_dict, en_freq, context, details,
             ) {
                 return Some(spelling);
             }
@@ -1065,7 +1066,7 @@ fn plan(
     } else {
         details.push_str("\nNo layout change passed its confidence checks (word protection, short-word frequency, and language history).");
         plan_spelling(
-            word_en, word_he, current, case, en_dict, he_dict, en_freq, details,
+            word_en, word_he, current, case, en_dict, he_dict, en_freq, context, details,
         )
     }
 }
@@ -1095,6 +1096,7 @@ fn plan_spelling(
     en_dict: Dict,
     he_dict: Dict,
     en_freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
 ) -> Option<Plan> {
     let Some(current) = current else {
@@ -1118,7 +1120,7 @@ fn plan_spelling(
         );
         return None;
     }
-    let assessment = crate::spell::assess(full_en, en_dict, en_freq);
+    let assessment = crate::spell::assess(full_en, en_dict, en_freq, context);
     details.push_str(&format!("\n{}", assessment.details));
     let text = assessment.correction?;
     Some(compose_spelling(current, text))
@@ -1255,6 +1257,36 @@ pub fn check_and_correct<K: Copy>(
     layout_only: bool,
     switch_layout_to: impl Fn(Language) -> crate::layout::LayoutSwitch,
 ) -> Outcome {
+    check_and_correct_in_context(
+        keys,
+        to_en,
+        to_he,
+        shift_of,
+        run,
+        en_dict,
+        he_dict,
+        current,
+        layout_only,
+        None,
+        switch_layout_to,
+    )
+}
+
+/// The live engine supplies phrase evidence from the same uninterrupted field.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_and_correct_in_context<K: Copy>(
+    keys: &[K],
+    to_en: impl Fn(K) -> Option<char>,
+    to_he: impl Fn(K) -> Option<char>,
+    shift_of: impl Fn(K) -> bool,
+    run: Run,
+    en_dict: Dict,
+    he_dict: Dict,
+    current: Option<Language>,
+    layout_only: bool,
+    context: Option<&crate::complete::PhraseContext>,
+    switch_layout_to: impl Fn(Language) -> crate::layout::LayoutSwitch,
+) -> Outcome {
     if keys.is_empty() {
         return Outcome {
             reason: "Empty input",
@@ -1366,6 +1398,7 @@ pub fn check_and_correct<K: Copy>(
         en_freq(),
         he_freq(),
         layout_only,
+        context,
         &mut details,
     ) else {
         debug_log(&full_en, &full_he, None, false);
@@ -1930,6 +1963,7 @@ mod tests {
         let mut wrong = Vec::new();
         let mut regressions = Vec::new();
         let mut history = History::default();
+        let mut phrase = crate::complete::PhraseContext::default();
         let mut sequence = "";
         let mut previous_mode = false;
         for (line, row) in include_str!("../../tests/data/corrections.tsv")
@@ -1962,6 +1996,7 @@ mod tests {
             if next_sequence.is_empty() || next_sequence != sequence || layout_only != previous_mode
             {
                 history.clear();
+                phrase.clear();
             }
             sequence = next_sequence;
             previous_mode = layout_only;
@@ -1987,7 +2022,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let result = check_and_correct(
+            let result = check_and_correct_in_context(
                 &keys,
                 |k| Some(k.0),
                 |k| Some(k.1),
@@ -1997,6 +2032,7 @@ mod tests {
                 he_dict(),
                 Some(current),
                 layout_only,
+                Some(&phrase),
                 |_| crate::layout::LayoutSwitch::Switched,
             );
             assert_eq!(
@@ -2019,6 +2055,11 @@ mod tests {
                     panic!("unexpected split at {start}: splitting is disabled")
                 }
             };
+            if layout_only {
+                phrase.clear();
+            } else {
+                phrase.observe(&after, false);
+            }
             let detail = format!(
                 "line {}: {before:?} -> {after:?}; expected {expected:?}",
                 line + 1
@@ -2719,8 +2760,74 @@ mod tests {
             en_f,
             nofreq(),
             false,
+            None,
             &mut String::new(),
         )
+    }
+
+    #[test]
+    fn phrase_disambiguation_composes_with_layout_and_respects_planner_guards() {
+        let en = dict(&["cafe", "cake"]);
+        let en_f = freq(&[("cafe", 100), ("cake", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        let check = |current, case, he, layout_only, context| {
+            plan(
+                Reading::of("caxe"),
+                Reading::of("בשסק"),
+                &[],
+                &[],
+                0,
+                current,
+                Run::default(),
+                case,
+                en,
+                he,
+                en_f,
+                nofreq(),
+                layout_only,
+                context,
+                &mut String::new(),
+            )
+        };
+        let empty_he = dict(&[]);
+        assert_eq!(
+            check(Some(Language::English), Case::Lower, empty_he, false, None),
+            None
+        );
+        assert_eq!(
+            check(
+                Some(Language::English),
+                Case::Lower,
+                empty_he,
+                false,
+                Some(&context)
+            ),
+            Some(Plan::Spell {
+                text: "cake".into()
+            })
+        );
+        assert_eq!(
+            check(
+                Some(Language::Hebrew),
+                Case::Lower,
+                empty_he,
+                false,
+                Some(&context)
+            ),
+            Some(Plan::SwitchAndSpell {
+                lang: Language::English,
+                text: "cake".into()
+            })
+        );
+        for (current, case, he, layout_only) in [
+            (None, Case::Lower, empty_he, false),
+            (Some(Language::English), Case::Upper, empty_he, false),
+            (Some(Language::English), Case::Lower, empty_he, true),
+            (Some(Language::Hebrew), Case::Lower, dict(&["בשסק"]), false),
+        ] {
+            assert_eq!(check(current, case, he, layout_only, Some(&context)), None);
+        }
     }
 
     #[test]
@@ -3026,6 +3133,7 @@ mod tests {
             nofreq(),
             nofreq(),
             false,
+            None,
             &mut String::new(),
         );
         assert_eq!(
@@ -3068,6 +3176,7 @@ mod tests {
                 en_f,
                 nofreq(),
                 false,
+                None,
                 &mut String::new(),
             ),
             Some(Plan::Spell {

@@ -37,7 +37,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::dictionary::{
-    check_and_correct, complete_candidates, declined_by_list, Dict, Fix, History, Outcome, Run,
+    check_and_correct_in_context, complete_candidates, declined_by_list, Dict, Fix, History,
+    Outcome, Run,
 };
 use crate::types::{
     lock_forgiving, AppControl, FixKind, Language, ReplaceGuard, Replaceable, WordBuffer,
@@ -1050,7 +1051,7 @@ impl<P: Platform> Engine<P> {
         }
 
         st.finish_completion_use(false);
-        let outcome = self.check(&st.keys, st.history.run(), st.mode);
+        let outcome = self.check(&st.keys, st.history.run(), st.mode, &st.phrase);
         // Record what this word turned out to be before anything else happens
         // to it: the next word is decided with this one behind it. A word whose
         // language could not be told is not recorded at all — see
@@ -1704,7 +1705,7 @@ impl<P: Platform> Engine<P> {
         // The run is read but not added to: this word was already recorded when
         // it was first finished, and the gesture is a second opinion about it
         // rather than a second word.
-        let outcome = self.check(&skip.keys, st.history.run(), st.mode);
+        let outcome = self.check(&skip.keys, st.history.run(), st.mode, &st.phrase);
         let details = format!("Reason: {}\n{}", outcome.reason, outcome.details);
         let result = outcome.fix;
         let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
@@ -1736,8 +1737,14 @@ impl<P: Platform> Engine<P> {
     /// Run the pipelines over a finished word. `run` is the language of the
     /// words before it, which the caller reads off [`AppState::history`] while
     /// it still holds the lock.
-    fn check(&self, keys: &[Typed<P::Key>], run: Run, mode: crate::config::AppMode) -> Outcome {
-        check_and_correct(
+    fn check(
+        &self,
+        keys: &[Typed<P::Key>],
+        run: Run,
+        mode: crate::config::AppMode,
+        context: &crate::complete::PhraseContext,
+    ) -> Outcome {
+        check_and_correct_in_context(
             keys,
             |t: Typed<P::Key>| P::english_char(t.key, t.shift),
             |t: Typed<P::Key>| P::hebrew_char(t.key),
@@ -1747,6 +1754,7 @@ impl<P: Platform> Engine<P> {
             self.he_dict,
             P::current_layout(),
             mode == crate::config::AppMode::LayoutOnly,
+            Some(context),
             P::switch_layout_to,
         )
     }
@@ -2560,6 +2568,39 @@ mod tests {
         assert_eq!(s.engine.lock().phrase.boost("morning"), 4.0);
         s.engine.mouse_click();
         assert_eq!(s.engine.lock().phrase.boost("morning"), 1.0);
+
+        // Automatic phrase disambiguation uses the previous visible word, even
+        // with personalization off. The embedded dictionary leaves baye tied.
+        let s = Session::new();
+        s.type_text("data baye ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "data base ");
+        let recent = s.engine.control.history();
+        assert!(recent[0].details.contains("Phrase context reconsidered"));
+        assert!(recent[0].details.contains("Previous word: \"data\""));
+        for reset in ["enter", "click", "focus"] {
+            let s = Session::new();
+            s.type_text("data ");
+            match reset {
+                "enter" => s.type_text("\n"),
+                "click" => s.engine.mouse_click(),
+                _ => FOCUS.store(2, Ordering::SeqCst),
+            }
+            s.type_text("baye ");
+            assert!(s.text().ends_with("baye "), "{reset}: {}", s.text());
+            assert!(!s.engine.lock().is_replacing);
+            FOCUS.store(1, Ordering::SeqCst);
+        }
+        let s = Session::new();
+        s.type_text("data baye ");
+        s.pending();
+        s.finish();
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "data baye ");
+        assert_eq!(s.engine.lock().phrase.boost("base"), 1.0);
 
         // Spelling offers are explicit, cycleable, and retained on a terminator.
         let s = Session::new();

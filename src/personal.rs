@@ -22,7 +22,7 @@ const PERSONAL_DIR: &str = "personal";
 /// Personal frequency file: `word<TAB>count` per line, most frequent first.
 const PERSONAL_FREQ_FILE: &str = "freq.txt";
 
-/// Confusion pairs file: `typed<TAB>corrected<TAB>count` per line.
+/// Confusion pairs file: `typed<TAB>corrected<TAB>count<TAB>decayed_at` per line.
 const CONFUSIONS_FILE: &str = "confusions.txt";
 
 /// Typing pattern profile: aggregated statistics, JSON-ish text for readability.
@@ -346,27 +346,66 @@ fn flush_personal_freq() -> std::io::Result<()> {
 // Confusion pairs (typed -> corrected)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Retained votes halve every 30 days, independently of new observations.
+const CONFUSION_HALF_LIFE: u64 = 30 * 24 * 60 * 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Confusion {
+    count: u64,
+    decayed_at: u64,
+}
+
+impl Confusion {
+    fn count_at(self, now: u64) -> u64 {
+        let periods = now.saturating_sub(self.decayed_at) / CONFUSION_HALF_LIFE;
+        self.count.checked_shr(periods.min(64) as u32).unwrap_or(0)
+    }
+
+    fn decay(&mut self, now: u64) {
+        self.count = self.count_at(now);
+        let periods = now.saturating_sub(self.decayed_at) / CONFUSION_HALF_LIFE;
+        self.decayed_at += periods * CONFUSION_HALF_LIFE;
+    }
+}
+
+type Confusions = HashMap<String, HashMap<String, Confusion>>;
+
+fn confusion_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// In-memory confusion map: what the user typed -> what it was corrected to.
-fn confusions_map() -> &'static Mutex<HashMap<String, HashMap<String, u64>>> {
-    static MAP: OnceLock<Mutex<HashMap<String, HashMap<String, u64>>>> = OnceLock::new();
+fn confusions_map() -> &'static Mutex<Confusions> {
+    static MAP: OnceLock<Mutex<Confusions>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(load_confusions()))
 }
 
 /// Load confusions file.
-fn load_confusions() -> HashMap<String, HashMap<String, u64>> {
+fn load_confusions() -> Confusions {
     let Some(path) = personal_path(CONFUSIONS_FILE) else {
         return HashMap::new();
     };
-    std::fs::read_to_string(&path)
-        .ok()
-        .as_deref()
-        .map(parse_confusions_file)
-        .unwrap_or_default()
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let map = parse_confusions_file(&text);
+    // Save timestamps for legacy entries so their age survives the next restart.
+    if !map.is_empty() {
+        CONFUSIONS_DIRTY.store(true, Ordering::Relaxed);
+    }
+    map
 }
 
-/// Parse `typed<TAB>corrected<TAB>count` lines.
-fn parse_confusions_file(text: &str) -> HashMap<String, HashMap<String, u64>> {
-    let mut outer: HashMap<String, HashMap<String, u64>> = HashMap::new();
+/// Legacy three-column entries start aging when first loaded by this version.
+fn parse_confusions_file(text: &str) -> Confusions {
+    parse_confusions_at(text, confusion_time())
+}
+
+fn parse_confusions_at(text: &str, now: u64) -> Confusions {
+    let mut outer: Confusions = HashMap::new();
     let mut entries = 0;
     for line in text.lines() {
         let line = line.trim();
@@ -374,8 +413,15 @@ fn parse_confusions_file(text: &str) -> HashMap<String, HashMap<String, u64>> {
             continue;
         }
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() == 3 {
+        if matches!(parts.len(), 3 | 4) {
             if let Ok(count) = parts[2].trim().parse::<u64>() {
+                let decayed_at = match parts.get(3) {
+                    Some(timestamp) => match timestamp.trim().parse::<u64>() {
+                        Ok(timestamp) => timestamp.min(now),
+                        Err(_) => continue,
+                    },
+                    None => now,
+                };
                 let typed = parts[0].trim().to_lowercase();
                 let corrected = parts[1].trim().to_lowercase();
                 if !typed.is_empty() && !corrected.is_empty() {
@@ -384,7 +430,10 @@ fn parse_confusions_file(text: &str) -> HashMap<String, HashMap<String, u64>> {
                         .is_some_and(|corrections| corrections.contains_key(&corrected));
                     if known || entries < MAX_PERSONAL_ENTRIES {
                         let corrections = outer.entry(typed).or_default();
-                        if corrections.insert(corrected, count).is_none() {
+                        if corrections
+                            .insert(corrected, Confusion { count, decayed_at })
+                            .is_none()
+                        {
                             entries += 1;
                         }
                     }
@@ -414,7 +463,17 @@ pub fn record_confusion(typed: &str, corrected: &str) {
         if !known && map.values().map(HashMap::len).sum::<usize>() >= MAX_PERSONAL_ENTRIES {
             return;
         }
-        increment(map.entry(typed).or_default().entry(corrected).or_insert(0));
+        let now = confusion_time();
+        let evidence = map
+            .entry(typed)
+            .or_default()
+            .entry(corrected)
+            .or_insert(Confusion {
+                count: 0,
+                decayed_at: now,
+            });
+        evidence.decay(now);
+        increment(&mut evidence.count);
         CONFUSIONS_DIRTY.store(true, Ordering::Relaxed);
     }
 }
@@ -427,10 +486,14 @@ pub(crate) fn typo_counts() -> [u64; 3] {
         return counts;
     }
     if let Ok(map) = confusions_map().lock() {
+        let now = confusion_time();
         for (typed, corrections) in map.iter() {
-            for (corrected, count) in corrections.iter().filter(|(_, count)| **count >= 2) {
-                if let Some(class) = crate::spell::typo_class(typed, corrected) {
-                    counts[class] = counts[class].saturating_add(*count);
+            for (corrected, evidence) in corrections {
+                let count = evidence.count_at(now);
+                if count >= 2 {
+                    if let Some(class) = crate::spell::typo_class(typed, corrected) {
+                        counts[class] = counts[class].saturating_add(count);
+                    }
                 }
             }
         }
@@ -445,18 +508,19 @@ pub(crate) fn reject_confusion(typed: &str, corrected: &str) {
         return;
     }
     if let Ok(mut map) = confusions_map().lock() {
-        if let Some(count) = map
+        if let Some(evidence) = map
             .get_mut(&typed.to_lowercase())
             .and_then(|inner| inner.get_mut(&corrected.to_lowercase()))
         {
-            *count = count.saturating_sub(1);
+            evidence.decay(confusion_time());
+            evidence.count = evidence.count.saturating_sub(1);
             CONFUSIONS_DIRTY.store(true, Ordering::Relaxed);
         }
     }
 }
 
 /// Look up the most common correction for `typed` from personal confusions.
-/// Returns the corrected word if there's a strong enough signal (count >= 2).
+/// Require two votes, twice all competing votes, and a lead of at least two.
 pub fn personal_correction(typed: &str) -> Option<String> {
     if !enabled() {
         return None;
@@ -464,12 +528,21 @@ pub fn personal_correction(typed: &str) -> Option<String> {
     let typed = typed.trim().to_lowercase();
     let map = confusions_map().lock().ok()?;
     let inner = map.get(&typed)?;
-    let (best, &count) = inner.iter().max_by_key(|(_, &c)| c)?;
-    if count >= 2 {
-        Some(best.clone())
-    } else {
-        None
-    }
+    preferred_confusion(inner, confusion_time()).cloned()
+}
+
+fn preferred_confusion(inner: &HashMap<String, Confusion>, now: u64) -> Option<&String> {
+    let (best, count) = inner
+        .iter()
+        .map(|(word, evidence)| (word, evidence.count_at(now)))
+        .max_by_key(|(_, count)| *count)?;
+    let competing = inner
+        .iter()
+        .filter(|(word, _)| *word != best)
+        .fold(0u64, |sum, (_, evidence)| {
+            sum.saturating_add(evidence.count_at(now))
+        });
+    (count >= 2 && count / 2 >= competing && count.saturating_sub(competing) >= 2).then_some(best)
 }
 
 /// Write confusions to disk atomically.
@@ -478,34 +551,43 @@ fn flush_confusions() -> std::io::Result<()> {
         return Ok(());
     };
     // Clone the map while holding the lock, then release it before writing.
-    let map: HashMap<String, HashMap<String, u64>> = match confusions_map().lock() {
+    let map = match confusions_map().lock() {
         Ok(m) => m.clone(),
         Err(_) => return Err(std::io::Error::other("personal confusions lock poisoned")),
     };
+    let out = confusions_text(&map);
+    let tmp = path.with_extension("txt.tmp");
+    write_private(&tmp, &out)?;
+    std::fs::rename(&tmp, &path)
+}
+
+fn confusions_text(map: &Confusions) -> String {
     let mut total_entries = 0;
-    let mut out = String::from("# Personal confusion pairs — written by ReCast, safe to edit\n");
+    let mut out = String::from(
+        "# Personal confusion pairs: typed\\tcorrected\\tcount\\tdecayed_at (Unix seconds)\n",
+    );
     for (typed, inner) in map {
         if total_entries >= MAX_PERSONAL_ENTRIES {
             break;
         }
         let mut entries: Vec<_> = inner.iter().collect();
-        entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        for (corrected, &count) in entries {
+        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        for (corrected, evidence) in entries {
             if total_entries >= MAX_PERSONAL_ENTRIES {
                 break;
             }
-            out.push_str(&typed);
+            out.push_str(typed);
             out.push('\t');
             out.push_str(corrected);
             out.push('\t');
-            out.push_str(&count.to_string());
+            out.push_str(&evidence.count.to_string());
+            out.push('\t');
+            out.push_str(&evidence.decayed_at.to_string());
             out.push('\n');
             total_entries += 1;
         }
     }
-    let tmp = path.with_extension("txt.tmp");
-    write_private(&tmp, &out)?;
-    std::fs::rename(&tmp, &path)
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -833,6 +915,76 @@ mod tests {
         let mut count = u64::MAX;
         increment(&mut count);
         assert_eq!(count, u64::MAX, "hand-edited counters must not wrap");
+    }
+
+    #[test]
+    fn learned_replacements_require_a_clear_lead_over_all_alternatives() {
+        let now = 100 * CONFUSION_HALF_LIFE;
+        let preferred = |votes: &[(&str, u64)]| {
+            let inner: HashMap<_, _> = votes
+                .iter()
+                .map(|(word, count)| {
+                    (
+                        (*word).to_owned(),
+                        Confusion {
+                            count: *count,
+                            decayed_at: now,
+                        },
+                    )
+                })
+                .collect();
+            preferred_confusion(&inner, now).cloned()
+        };
+        assert_eq!(preferred(&[("cake", 1)]), None);
+        assert_eq!(preferred(&[("cake", 2)]), Some("cake".into()));
+        for votes in [
+            vec![("cake", 2), ("cafe", 2)],
+            vec![("cake", 2), ("cafe", 1)],
+            vec![("cake", 5), ("cafe", 2), ("case", 1)],
+            vec![("cake", u64::MAX), ("cafe", u64::MAX)],
+        ] {
+            assert_eq!(preferred(&votes), None);
+        }
+        assert_eq!(preferred(&[("cake", 3), ("cafe", 1)]), Some("cake".into()));
+        assert_eq!(preferred(&[("cake", 4), ("cafe", 2)]), Some("cake".into()));
+    }
+
+    #[test]
+    fn confusion_age_survives_restarts_and_new_votes() {
+        let now = 100 * CONFUSION_HALF_LIFE;
+        let mut evidence = Confusion {
+            count: 8,
+            decayed_at: now,
+        };
+        assert_eq!(evidence.count_at(now - 1), 8);
+        assert_eq!(evidence.count_at(now + CONFUSION_HALF_LIFE - 1), 8);
+        evidence.decay(now + CONFUSION_HALF_LIFE + 10);
+        assert_eq!(evidence.count, 4);
+        increment(&mut evidence.count);
+        assert_eq!(evidence.count_at(now + 2 * CONFUSION_HALF_LIFE), 2);
+        assert_eq!(evidence.count_at(u64::MAX), 0);
+
+        let text = format!("typo\tcake\t8\t{now}\nlegacy\tcafe\t2\ninvalid\tcafe\t2\tbad\n");
+        let parsed = parse_confusions_at(&text, now + CONFUSION_HALF_LIFE);
+        assert_eq!(
+            parsed["legacy"]["cafe"].decayed_at,
+            now + CONFUSION_HALF_LIFE
+        );
+        assert!(!parsed.contains_key("invalid"));
+        let saved = confusions_text(&parsed);
+        let reloaded = parse_confusions_at(&saved, now + 3 * CONFUSION_HALF_LIFE);
+        assert_eq!(parsed, reloaded);
+        assert_eq!(
+            preferred_confusion(&reloaded["typo"], now + 2 * CONFUSION_HALF_LIFE)
+                .map(String::as_str),
+            Some("cake")
+        );
+        assert_eq!(
+            preferred_confusion(&reloaded["typo"], now + 3 * CONFUSION_HALF_LIFE),
+            None
+        );
+        let future = parse_confusions_at("typo\tcake\t2\t18446744073709551615", now);
+        assert_eq!(future["typo"]["cake"].decayed_at, now);
     }
 
     #[test]

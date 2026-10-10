@@ -37,11 +37,11 @@ Conservative spelling keeps its existing single-edit limit.
 
 Spelling correction protects frequency-attested dictionary words, curated
 technical terms, ALL CAPS, and tokens containing
-digits or internal punctuation. It uses word frequency and weighted typo costs,
-without surrounding-sentence context, so unfamiliar names or jargon can still get
-unwanted fixes. When the two best spelling candidates have nearly equal scores,
-ReCast leaves the word unchanged. Undo, ignored words, and Conservative spelling
-give you control.
+digits or internal punctuation. It uses word frequency and weighted typo costs;
+the previous finished word can resolve close candidates using bounded phrase
+evidence. Unfamiliar names or jargon can still get unwanted fixes. When competing
+candidates remain too close, ReCast leaves the word unchanged. Undo, ignored words,
+and Conservative spelling give you control.
 Navigation, mouse clicks, and focus changes cancel stale corrections where detected.
 
 ## Install
@@ -459,6 +459,15 @@ priority. Finishing a selected spelling repair of the same or shorter length can
 train its correction pair when personalization is enabled; unaccepted offers and
 longer prefix completions do not.
 
+Automatic English spelling also uses phrase evidence when it would otherwise
+abstain because candidates are too close. Only candidates within four score units
+of the original best are reconsidered; a phrase weight of at least two can lower
+a candidate's score by at most eight units. The winner must still lead by at least
+four units. Phrase context never changes an already confident spelling decision
+or widens edit-distance and frequency limits. Word protection, ALL CAPS, ignored
+words, and undo exceptions still apply. This also supports a combined layout and
+spelling repair. Recent correction details include the phrase weight and discount.
+
 Hebrew spelling offers are manual only. They search one letter insertion, deletion,
 substitution, or transposition, favor missing/extra ו and י, enforce final-letter
 positions, and recognize the layout planner's supported prefix stacks. Candidates
@@ -478,6 +487,14 @@ adjust the ranking cost of transpositions, neighboring-key substitutions, and
 missing letters. The discount is capped, does not widen edit-distance or frequency
 limits, and never trains from a single observation. Undo withdraws one vote for the
 rejected correction, weakening its learned edit-class evidence.
+
+Learned replacements require at least two retained votes, twice the votes for all
+competing replacements combined, and a lead of at least two votes. Ties and weak
+leads do not trigger a learned replacement. Correction-pair votes halve every
+30 days, including their contribution to learned typo costs. New observations do
+not reset the aging period. The local `personal/confusions.txt` file stores the
+decay timestamp in a fourth column; existing three-column files remain readable
+and start aging when first loaded by this version.
 
 With personalization enabled, words retained at least twice also become completion
 candidates even when absent from the bundled dictionary. To clear these files,

@@ -175,6 +175,8 @@ const MAX_PERSONAL_DISCOUNT: f32 = 50.0;
 /// Abstain when two distinct words have almost the same posterior score.
 // ponytail: fixed score margin; recalibrate from ambiguity reports if recall suffers.
 const MIN_SCORE_GAP: f32 = 4.0;
+/// Automatic context can resolve a near tie, never rescue a distant candidate.
+const MAX_AUTOMATIC_CONTEXT_DISCOUNT: f32 = 8.0;
 
 /// Posterior score of a candidate: the channel cost of the slip plus the
 /// improbability of the word, both as negative log probabilities, so lower is
@@ -228,7 +230,7 @@ fn typo_discount(typed: &str, corrected: &str, counts: [u64; 3]) -> f32 {
 
 /// Explicit spelling offers share automatic edit/rank gates, but expose close
 /// alternatives instead of silently deciding an ambiguous case. Phrase evidence
-/// only orders this manually requested list; it never changes automatic spelling.
+/// orders this manually requested list without the automatic near-tie restriction.
 pub(crate) fn suggestions(
     word: &str,
     dict: Dict,
@@ -271,21 +273,27 @@ impl Assessment {
 
 #[cfg(test)]
 pub fn correct(word: &str, en_dict: Dict, en_freq: Freq) -> Option<String> {
-    assess(word, en_dict, en_freq).correction
+    assess(word, en_dict, en_freq, None).correction
 }
 
-pub(crate) fn assess(word: &str, en_dict: Dict, en_freq: Freq) -> Assessment {
+pub(crate) fn assess(
+    word: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Assessment {
     let cfg = Config::global();
     if !cfg.spell_enabled {
         return Assessment::unchanged("English spelling is disabled.");
     }
-    assess_with(
+    assess_with_context(
         word,
         en_dict,
         en_freq,
         cfg.spell_min_len,
         cfg.spell_max_rank,
         cfg.spell_max_dist,
+        context,
     )
 }
 
@@ -305,6 +313,7 @@ pub fn correct_with(
     assess_with(word, en_dict, en_freq, min_len, max_rank, max_dist).correction
 }
 
+#[cfg(test)]
 fn assess_with(
     word: &str,
     en_dict: Dict,
@@ -312,6 +321,19 @@ fn assess_with(
     min_len: usize,
     max_rank: u32,
     max_dist: u8,
+) -> Assessment {
+    assess_with_context(word, en_dict, en_freq, min_len, max_rank, max_dist, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assess_with_context(
+    word: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    max_dist: u8,
+    context: Option<&crate::complete::PhraseContext>,
 ) -> Assessment {
     // A curated transposition, not permission to guess at other three-letter tokens.
     if word == "teh"
@@ -376,6 +398,30 @@ fn assess_with(
     let mut search = Search::new(word, budget, max_rank);
     search.run(word, en_dict, en_freq);
 
+    // Context only reconsiders an abstention. Restrict the second search to the
+    // original confidence window, keeping all edit/rank and protection gates.
+    let mut context_details = String::new();
+    if let (Some(context), Some((best, ..)), Some((second, ..))) = (
+        context.filter(|context| context.previous_word().is_some()),
+        search.best.as_ref(),
+        search.runner_up.as_ref(),
+    ) {
+        if second - best < MIN_SCORE_GAP {
+            let mut contextual = Search::new(word, budget, max_rank);
+            contextual.typo_counts = search.typo_counts;
+            contextual.context = Some(context);
+            contextual.base_ceiling = Some(best + MIN_SCORE_GAP);
+            contextual.run(word, en_dict, en_freq);
+            if let Some((_, _, _, winner)) = &contextual.best {
+                context_details = format!(
+                    "\nPhrase context reconsidered only candidates within {MIN_SCORE_GAP:.2} of the original best score; maximum discount {MAX_AUTOMATIC_CONTEXT_DISCOUNT:.2}.\nPrevious word: {:?}; context weight for {winner}: {:.2}; score discount: {:.2}.",
+                    context.previous_word().unwrap_or_default(), context.boost(winner), contextual.context_discount(winner)
+                );
+            }
+            search = contextual;
+        }
+    }
+
     let Some((best_score, cost, rank, fixed)) = search.best else {
         return Assessment::unchanged(&format!(
             "No candidate passed the spelling gates (weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits)."
@@ -395,6 +441,7 @@ fn assess_with(
     } else {
         details.push_str("\nNo competing candidate was found within the confidence window.");
     }
+    details.push_str(&context_details);
     details.push_str(if confident {
         "\nAccepted the best spelling candidate."
     } else {
@@ -428,6 +475,8 @@ struct Search<'a> {
     runner_up: Option<(f32, u32, u32, String)>,
     offers: Option<Vec<(f32, u32, String)>>,
     context: Option<&'a crate::complete::PhraseContext>,
+    /// Only automatic contextual retries restrict the pre-context score.
+    base_ceiling: Option<f32>,
     typo_counts: [u64; 3],
 }
 
@@ -443,6 +492,7 @@ impl<'a> Search<'a> {
             runner_up: None,
             offers: None,
             context: None,
+            base_ceiling: None,
             typo_counts: crate::personal::typo_counts(),
         }
     }
@@ -467,7 +517,19 @@ impl<'a> Search<'a> {
             std::str::from_utf8(self.typed).unwrap_or_default(),
             cand,
             self.typo_counts,
-        )
+        ) + self.context_discount(cand)
+    }
+
+    fn context_discount(&self, cand: &str) -> f32 {
+        let boost = self.context.map_or(1.0, |context| context.boost(cand));
+        let discount = 20.0 * boost.ln() as f32;
+        if self.offers.is_some() {
+            discount
+        } else if boost >= 2.0 {
+            discount.min(MAX_AUTOMATIC_CONTEXT_DISCOUNT)
+        } else {
+            0.0
+        }
     }
 
     /// Score one candidate and keep it if it beats what is already held.
@@ -514,11 +576,13 @@ impl<'a> Search<'a> {
         if cost == 0 || rank > rank_budget(cost, self.max_rank, self.typed.len()) {
             return;
         }
-        let candidate = score(cost, rank, cand)
-            - self.discount(cand)
-            - self
-                .context
-                .map_or(0.0, |context| 20.0 * context.boost(cand).ln() as f32);
+        let candidate = score(cost, rank, cand) - self.discount(cand);
+        if self
+            .base_ceiling
+            .is_some_and(|ceiling| candidate + self.context_discount(cand) > ceiling)
+        {
+            return;
+        }
         if let Some(offers) = &mut self.offers {
             if en_dict.contains(cand) {
                 offers.push((candidate, rank, cand.to_owned()));
@@ -568,6 +632,10 @@ impl<'a> Search<'a> {
         }
         let discount = if Config::global().personal_enabled {
             MAX_PERSONAL_DISCOUNT + MAX_TYPO_DISCOUNT
+        } else {
+            0.0
+        } + if self.context.is_some() {
+            MAX_AUTOMATIC_CONTEXT_DISCOUNT
         } else {
             0.0
         };
@@ -1252,6 +1320,86 @@ mod tests {
         assert!(suggestions("cake", d, f, Some(&context)).is_empty());
         assert!(suggestions("c4xe", d, f, Some(&context)).is_empty());
         assert_eq!(correct_with("caxe", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn automatic_phrase_context_resolves_only_close_candidates() {
+        let d = dict(&["cafe", "cake", "cane"]);
+        let f = freq(&[("cafe", 100), ("cake", 100), ("cane", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        let assess = |d: Dict, f: Freq, context: Option<&crate::complete::PhraseContext>| {
+            assess_with_context("caxe", d, f, 4, 20_000, 1, context)
+        };
+        assert_eq!(assess(d, f, None).correction, None);
+        let resolved = assess(d, f, Some(&context));
+        assert_eq!(resolved.correction.as_deref(), Some("cake"));
+        assert!(resolved.details.contains("Phrase context reconsidered"));
+        assert!(resolved.details.contains("score discount: 8.00"));
+        context.clear();
+        assert_eq!(assess(d, f, Some(&context)).correction, None);
+
+        // Even strong context cannot pull a weaker candidate into the original
+        // confidence window or change an already confident decision.
+        context.observe("birthday", false);
+        let f = freq(&[("cafe", 100), ("cake", 200), ("cane", 100)]);
+        assert_eq!(assess(d, f, Some(&context)).correction, None);
+        let f = freq(&[("cafe", 100), ("cake", 110), ("cane", 100)]);
+        assert_eq!(
+            assess(d, f, Some(&context)).correction.as_deref(),
+            Some("cake")
+        );
+        let f = freq(&[("cafe", 100), ("cake", 110)]);
+        let d = dict(&["cafe", "cake"]);
+        assert_eq!(
+            assess(d, f, Some(&context)).correction.as_deref(),
+            Some("cake")
+        );
+        let f = freq(&[("cafe", 100), ("cake", 1_000)]);
+        assert_eq!(
+            assess(d, f, Some(&context)).correction.as_deref(),
+            Some("cafe")
+        );
+    }
+
+    #[test]
+    fn automatic_context_keeps_spelling_protections_and_limits() {
+        let d = dict(&["cafe", "cake"]);
+        let f = freq(&[("cafe", 100), ("cake", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        for (word, min_len, max_rank, max_dist) in [
+            ("cake", 4, 20_000, 1),
+            ("ca4e", 4, 20_000, 1),
+            ("caxe", 4, 20_000, 0),
+            ("caxe", 5, 20_000, 1),
+            ("caxe", 4, 99, 1),
+            ("caxx", 4, 20_000, 1),
+        ] {
+            assert_eq!(
+                assess_with_context(word, d, f, min_len, max_rank, max_dist, Some(&context))
+                    .correction,
+                None,
+                "{word}"
+            );
+        }
+        let f = freq(&[("caxe", 50), ("cafe", 100), ("cake", 100)]);
+        assert_eq!(
+            assess_with_context("caxe", d, f, 4, 20_000, 1, Some(&context)).correction,
+            None
+        );
+
+        // Two equally supported alternatives must still abstain.
+        for _ in 0..2 {
+            context.retain("birthday");
+            context.retain("cafe");
+        }
+        context.retain("birthday");
+        let f = freq(&[("cafe", 100), ("cake", 100)]);
+        assert_eq!(
+            assess_with_context("caxe", d, f, 4, 20_000, 1, Some(&context)).correction,
+            None
+        );
     }
 
     #[test]

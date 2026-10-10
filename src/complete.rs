@@ -44,7 +44,7 @@ const MAX_PREFIX_LEN: usize = 20;
 pub const MAX_CANDIDATES: usize = 4;
 
 /// Phrase evidence is local to one uninterrupted typing context, never persisted.
-/// Two observations are required before a pair influences completion ranking.
+/// Two observations are required before a learned pair influences ranking.
 #[derive(Default)]
 pub(crate) struct PhraseContext {
     previous: Option<String>,
@@ -52,6 +52,10 @@ pub(crate) struct PhraseContext {
 }
 
 impl PhraseContext {
+    pub(crate) fn previous_word(&self) -> Option<&str> {
+        self.previous.as_deref()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.previous = None;
         self.pairs.clear();
