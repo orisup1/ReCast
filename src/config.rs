@@ -21,9 +21,8 @@ pub struct Config {
     /// real word in *both* layouts, switch to the reading that is decisively more
     /// common instead of always keeping the current layout.
     pub freq_enabled: bool,
-    /// Enable the English in-language spelling autocorrect: when a word is not
-    /// a wrong-layout mistype but *is* a near-miss of a common English word,
-    /// retype it as that word.
+    /// Enable English and Hebrew spelling autocorrect for confident near-misses
+    /// of common words after the layout correction pipeline.
     pub spell_enabled: bool,
     /// Shortest word the spelling autocorrect will touch. Below this, unknown
     /// tokens are overwhelmingly initialisms and names ("btw", "ori"), and a
@@ -67,7 +66,7 @@ impl Config {
     ///                split fallback (default: disabled).
     /// RECAST_FREQ  – set to `0` to disable the homograph frequency tie-break
     ///                (default: enabled).
-    /// RECAST_SPELL – set to `0` to disable the English spelling autocorrect
+    /// RECAST_SPELL – set to `0` to disable English and Hebrew spelling autocorrect
     ///                (default: enabled).
     /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
     /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have

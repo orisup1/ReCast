@@ -465,7 +465,7 @@ pub fn sample() -> String {
 #short = true          # short switches: rank <= 30000; false restricts to <= 500
 #split = false         # missing-space split fallback (opt-in; can mis-split)
 #freq = true           # homograph frequency tie-break
-#spell = true          # English spelling autocorrect
+#spell = true          # English and Hebrew spelling autocorrect
 #spell_min = {spell_min}           # shortest word the speller may fix
 #spell_rank = {spell_rank}      # worst frequency rank a suggestion may have
 #spell_dist = {spell_dist}          # maximum edit distance, 0 to 3 (0 disables)

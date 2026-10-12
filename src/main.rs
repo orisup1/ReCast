@@ -84,7 +84,7 @@ Settings:
   RECAST_SPLIT=1      Enable the opt-in missing-space split fallback
   RECAST_SHORT=0      Restrict short (≤3 char) switches to very common words
   RECAST_FREQ=0       Disable the homograph frequency tie-break
-  RECAST_SPELL=0      Disable the English spelling autocorrect
+  RECAST_SPELL=0      Disable English and Hebrew spelling autocorrect
   RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
   RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 50000)
   RECAST_SPELL_DIST=n Maximum edit distance, 0 to 3 (0 disables; default 3)

@@ -194,7 +194,8 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// reason to drop the fix rather than inject half a word.
     fn retype_text(text: &str) -> Option<Self::Retype>;
 
-    /// Completion stays in the active layout, including Hebrew on keycode injectors.
+    /// Completion and in-language spelling stay in the supplied layout,
+    /// including Hebrew on keycode injectors.
     fn retype_completion(text: &str, _lang: Language) -> Option<Self::Retype> {
         Self::retype_text(text)
     }
@@ -2025,6 +2026,7 @@ pub struct Replacement<P: Platform> {
     /// The layout that was live before the fix, when the fix changed it — what
     /// undo has to switch back to.
     previous_layout: Option<Language>,
+    target_layout: Language,
     /// Start of the original word for undo learning, before prefix trimming.
     original_start: usize,
 }
@@ -2039,18 +2041,20 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
             erase: keys.len() - start,
             retype: P::retype_layout(&keys[start..], &text, lang)?,
             previous_layout: Some(lang.other()),
+            target_layout: lang,
             original_start: start,
         }),
         Fix::LayoutSpelling { text, lang } => Some(Replacement {
             erase: keys.len(),
             retype: P::retype_text(&text)?,
             previous_layout: Some(lang.other()),
+            target_layout: lang,
             original_start: 0,
         }),
-        Fix::Spelling { text } => {
+        Fix::Spelling { text, lang } => {
             // Keep the identical prefix on screen. This saves paced backspaces
             // and focus queries on macOS, for corrections and their undo alike.
-            let original = reading::<P>(keys, Language::English);
+            let original = reading::<P>(keys, lang);
             let prefix = original
                 .chars()
                 .zip(text.chars())
@@ -2059,8 +2063,9 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
             let suffix: String = text.chars().skip(prefix).collect();
             Some(Replacement {
                 erase: keys.len() - prefix,
-                retype: P::retype_text(&suffix)?,
+                retype: P::retype_completion(&suffix, lang)?,
                 previous_layout: None,
+                target_layout: lang,
                 original_start: 0,
             })
         }
@@ -2075,7 +2080,7 @@ fn undo_of<P: Platform>(
     terminator: Option<P::Key>,
 ) -> LastFix<P> {
     let original = &keys[keys.len() - rep.erase..];
-    let was = rep.previous_layout.unwrap_or(Language::English);
+    let was = rep.previous_layout.unwrap_or(rep.target_layout);
     let suffix = P::buffer_after(&rep.retype);
     let mut visible = if suffix.len() == P::retype_len(&rep.retype) {
         keys[..keys.len() - rep.erase].to_vec()
@@ -2086,9 +2091,7 @@ fn undo_of<P: Platform>(
     LastFix {
         visible,
         manual_conversion: false,
-        visible_layout: rep
-            .previous_layout
-            .map_or(Language::English, Language::other),
+        visible_layout: rep.target_layout,
         // Everything injected is one character per key, plus the terminator
         // that rides along after it.
         on_screen: P::retype_len(&rep.retype) + usize::from(terminator.is_some()),
@@ -2134,7 +2137,7 @@ pub fn reading<P: Platform>(keys: &[Typed<P::Key>], lang: Language) -> String {
 /// The "before" side is what was on screen, which is not the same reading in
 /// each case: layout-based fixes have already switched to `lang`, so what the
 /// user was looking at is the *other* layout's reading, while a spelling fix or
-/// an expansion never left English.
+/// an expansion stays in the original layout.
 fn note_of<P: Platform>(keys: &[Typed<P::Key>], fix: &Fix) -> (String, String, FixKind) {
     match fix {
         Fix::Layout { start, text, lang } => (
@@ -2147,11 +2150,9 @@ fn note_of<P: Platform>(keys: &[Typed<P::Key>], fix: &Fix) -> (String, String, F
             text.clone(),
             FixKind::LayoutSpelling,
         ),
-        Fix::Spelling { text } => (
-            reading::<P>(keys, Language::English),
-            text.clone(),
-            FixKind::Spelling,
-        ),
+        Fix::Spelling { text, lang } => {
+            (reading::<P>(keys, *lang), text.clone(), FixKind::Spelling)
+        }
     }
 }
 
@@ -2491,8 +2492,14 @@ mod tests {
                 .chars()
                 .map(|key| Typed { key, shift: false })
                 .collect();
-            let rep = replacement::<Simulated>(&keys, Some(Fix::Spelling { text: after.into() }))
-                .unwrap();
+            let rep = replacement::<Simulated>(
+                &keys,
+                Some(Fix::Spelling {
+                    text: after.into(),
+                    lang: Language::English,
+                }),
+            )
+            .unwrap();
             assert_eq!(rep.erase, erase, "{before}");
             let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
             let prefix: String = before.chars().take(keys.len() - rep.erase).collect();
@@ -2500,6 +2507,89 @@ mod tests {
             assert_eq!(format!("{prefix}{}", undo.restore), before);
             assert_eq!(undo.suppress.as_deref(), Some(before));
             assert_eq!(undo.on_screen, rep.retype.chars().count() + 1);
+        }
+    }
+
+    #[test]
+    fn hebrew_spelling_preserves_prefix_language_and_undo() {
+        let before = "שלומ";
+        let keys: Vec<_> = crate::keymap::convert_selection(before)
+            .chars()
+            .map(|key| Typed { key, shift: false })
+            .collect();
+        let fix = Fix::Spelling {
+            text: "שלום".into(),
+            lang: Language::Hebrew,
+        };
+        assert_eq!(note_of::<Simulated>(&keys, &fix).0, before);
+        let rep = replacement::<Simulated>(&keys, Some(fix)).unwrap();
+        assert_eq!(rep.erase, 1);
+        assert_eq!(rep.retype, "ם");
+        let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
+        assert_eq!(undo.restore, "מ");
+        assert_eq!(undo.on_screen, 2);
+        assert_eq!(undo.visible_layout, Language::Hebrew);
+        assert_eq!(undo.layout, None);
+        assert_eq!(undo.suppress.as_deref(), Some(before));
+    }
+
+    #[test]
+    fn retained_bilingual_repairs_keep_their_layout_and_undo() {
+        const CHILD: &str = "RECAST_BILINGUAL_REPAIR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::engine::tests::retained_bilingual_repairs_keep_their_layout_and_undo", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|cfg| cfg.personal_enabled = true);
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+            let s = Session::new();
+            s.type_text("akuo ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "שלום ");
+            assert_eq!(Simulated::current_layout(), Some(Language::Hebrew));
+            s.type_text("x");
+        }
+        assert_eq!(
+            crate::personal::personal_correction("akuo").as_deref(),
+            Some("שלום")
+        );
+
+        // Repeated Hebrew spelling corrections stay in Hebrew, including the
+        // learned fast path. Undo restores the entire original word and language.
+        ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        for iteration in 0..3 {
+            let s = Session::new();
+            s.type_text(&format!("{} ", crate::keymap::convert_selection("תודדה")));
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "תודה ");
+            assert_eq!(Simulated::current_layout(), Some(Language::Hebrew));
+            if iteration < 2 {
+                s.type_text("x");
+            } else {
+                assert!(s.engine.control.history()[0]
+                    .details
+                    .contains("repeatedly retained"));
+                s.undo();
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), "תודדה ");
+                assert_eq!(Simulated::current_layout(), Some(Language::Hebrew));
+                assert_eq!(crate::personal::personal_correction("תודדה"), None);
+            }
         }
     }
 

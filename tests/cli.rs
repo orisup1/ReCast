@@ -3,14 +3,21 @@ use std::process::Command;
 // A unique executable name keeps status tests from discovering a developer's
 // actual ReCast instance or another CLI test running in parallel.
 fn isolated_binary(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("recast-{name}-{}", std::process::id()));
+    // Keep the link on the binary's filesystem. A hard link gives the process a
+    // distinct name without opening an executable for writing while other
+    // tests spawn children, which can intermittently cause ETXTBSY on Linux.
+    let source = std::path::Path::new(env!("CARGO_BIN_EXE_recast"));
+    let dir = source
+        .parent()
+        .unwrap()
+        .join(format!("recast-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!(
         "rc-{}-{name}{}",
         std::process::id(),
         std::env::consts::EXE_SUFFIX
     ));
-    std::fs::copy(env!("CARGO_BIN_EXE_recast"), &path).unwrap();
+    std::fs::hard_link(source, &path).unwrap();
     path
 }
 
@@ -69,6 +76,12 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
         ("Recieve!", "en", "Receive!", "English spelling"),
         ("akuo", "en", "שלום", "Keyboard-layout correction"),
         ("יקךךם", "he", "hello", "Keyboard-layout correction"),
+        (
+            "תודדה.",
+            "he",
+            "תודה.",
+            "Hebrew spelling or learned replacement",
+        ),
         (
             "רקבןקהק",
             "he",

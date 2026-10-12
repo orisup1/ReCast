@@ -468,11 +468,16 @@ or widens edit-distance and frequency limits. Word protection, ALL CAPS, ignored
 words, and undo exceptions still apply. This also supports a combined layout and
 spelling repair. Recent correction details include the phrase weight and discount.
 
-Hebrew spelling offers are manual only. They search one letter insertion, deletion,
+Hebrew spelling corrections and manual offers search one letter insertion, deletion,
 substitution, or transposition, favor missing/extra ו and י, enforce final-letter
 positions, and recognize the layout planner's supported prefix stacks. Candidates
 need a ranked dictionary word or stem. Existing words and saved exceptions are
 preserved; the spelling enable, minimum-length, and rank settings still apply.
+Automatic Hebrew corrections require at least four letters and a 20-point lead
+over the next candidate; phrase context contributes at most eight points.
+Ambiguous candidates remain available through the completion gesture. Hebrew
+repairs preserve the current layout and punctuation, replace only the changed
+suffix, and support the same undo and retained-correction learning as English.
 
 When the current layout has no exact completion, known word, or explicit
 abbreviation, the completion gesture also checks the other layout. An exact
@@ -487,6 +492,11 @@ adjust the ranking cost of transpositions, neighboring-key substitutions, and
 missing letters. The discount is capped, does not widen edit-distance or frequency
 limits, and never trains from a single observation. Undo withdraws one vote for the
 rejected correction, weakening its learned edit-class evidence.
+
+Learned exact layout pairs switch in either direction, including in layout-only
+mode, and skip spelling search. Configured abbreviations take precedence, unknown
+layouts remain untouched, and single-letter inputs never trigger learned repairs.
+Repeated Hebrew spelling pairs stay in Hebrew. Learning requires `personal = true`.
 
 Learned replacements require at least two retained votes, twice the votes for all
 competing replacements combined, and a lead of at least two votes. Ties and weak

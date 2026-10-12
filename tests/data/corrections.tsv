@@ -876,3 +876,10 @@ en	keyboard's	לקטנםשרג,ד	keyboard's			layout-only
 he	keyboard's	לקטנםשרג,ד	keyboard's			layout-only
 en	I'm	ן,צ	I'm			layout-only
 he	I'm	ן,צ	I'm			layout-only
+
+# Automatic Hebrew spelling: clear repairs and protected real words.
+he	,ussv	תודדה	תודה
+he	gcussv	עבודדה	עבודה
+he	tbaaho	אנששים	אנשים
+he	njacho	מחשבים	מחשבים
+he	xpur	ספור	ספור

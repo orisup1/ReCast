@@ -724,12 +724,10 @@ pub enum Fix {
     /// layout fix, callers must type `text` rather than replaying the original
     /// keys because those keys still spell the uncorrected word.
     LayoutSpelling { text: String, lang: Language },
-    /// Rewrite in the current (English) layout, from the speller or from an
-    /// abbreviation expansion: the layout is untouched and the caller should
-    /// erase the whole word and type `text` instead. `text` is ASCII and
-    /// typeable through the English keymap, but — unlike before case tracking —
-    /// it may contain capitals, and an expansion may contain spaces.
-    Spelling { text: String },
+    /// Rewrite in the current layout, from either speller or an English
+    /// abbreviation expansion. The layout is untouched; `lang` selects the
+    /// keymap for injection, history, and undo.
+    Spelling { text: String, lang: Language },
 }
 
 /// Everything a finished word produced: what to do about it, and what language
@@ -840,6 +838,9 @@ enum Plan {
         lang: Language,
         text: String,
     },
+    HebrewSpell {
+        text: String,
+    },
     /// A user-configured abbreviation was typed out in full.
     Expand {
         text: String,
@@ -947,25 +948,6 @@ fn plan(
         return None;
     }
 
-    // A personal replacement needs repeated retained corrections, not merely
-    // automatic rewrites or offers that were cycled past.
-    if let Some(correction) =
-        (!layout_only && !crate::complete::ignored(typed) && !crate::complete::learned(typed))
-            .then(|| crate::personal::personal_correction(typed))
-            .flatten()
-    {
-        details.push_str(
-            "\nApplied a personal replacement learned from repeatedly retained corrections.",
-        );
-        if current == Some(Language::Hebrew) && is_english_text(&correction) {
-            return Some(Plan::SwitchAndSpell {
-                lang: Language::English,
-                text: correction,
-            });
-        }
-        return Some(Plan::Spell { text: correction });
-    }
-
     // An expansion the user configured by hand outranks everything we infer.
     if current == Some(Language::English) {
         if let Some(text) = (!layout_only)
@@ -1000,6 +982,20 @@ fn plan(
     {
         details.push_str("\nSingle-letter words are not corrected automatically.");
         return None;
+    }
+
+    // Repeated retained pairs use a bounded lookup before dictionary and edit search.
+    // Explicit abbreviations and the single-letter guard above still take precedence.
+    if !crate::complete::ignored(typed) && !crate::complete::learned(typed) {
+        if let Some(correction) = crate::personal::personal_correction(typed) {
+            if let Some(learned) = learned_plan(&correction, word_en, word_he, current, layout_only)
+            {
+                details.push_str(
+                    "\nApplied a replacement learned from repeatedly retained corrections.",
+                );
+                return Some(learned);
+            }
+        }
     }
 
     // Whole-buffer decision first — this is what fires for virtually every real
@@ -1066,10 +1062,51 @@ fn plan(
         None
     } else {
         details.push_str("\nNo layout change passed its confidence checks (word protection, short-word frequency, and language history).");
+        if current == Some(Language::Hebrew) {
+            if let Some(text) = crate::spell::hebrew::correct(word_he, he_dict, he_freq, context) {
+                details.push_str("\nHebrew spelling passed the candidate confidence margin.");
+                return Some(Plan::HebrewSpell { text });
+            }
+        }
         plan_spelling(
             word_en, word_he, current, case, en_dict, he_dict, en_freq, context, details,
         )
     }
+}
+
+/// Route learned pairs through the correct layout and injection path. Exact
+/// alternate readings need no spelling search and remain valid in layout-only mode.
+fn learned_plan(
+    correction: &str,
+    word_en: &str,
+    word_he: &str,
+    current: Option<Language>,
+    layout_only: bool,
+) -> Option<Plan> {
+    let current = current?;
+    let alternate = if current == Language::English {
+        word_he
+    } else {
+        word_en
+    };
+    if correction == alternate {
+        return Some(Plan::Switch {
+            lang: current.other(),
+            start: 0,
+        });
+    }
+    if layout_only {
+        return None;
+    }
+    if is_english_text(correction) {
+        return Some(compose_spelling(current, correction.to_owned()));
+    }
+    if current == Language::Hebrew && correction.chars().all(|c| ('א'..='ת').contains(&c)) {
+        return Some(Plan::HebrewSpell {
+            text: correction.to_owned(),
+        });
+    }
+    None
 }
 
 /// Second pipeline: neither exact layout reading matched, but the English
@@ -1416,6 +1453,7 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
         Plan::Switch { start: 0, .. } => ("Keyboard-layout correction", "layout"),
         Plan::Switch { .. } => ("Missing-space layout correction", "split"),
         Plan::Spell { .. } => ("English spelling or learned replacement", "spelling"),
+        Plan::HebrewSpell { .. } => ("Hebrew spelling or learned replacement", "spelling"),
         Plan::Expand { .. } => ("Configured abbreviation", "abbreviation"),
         Plan::SwitchAndSpell { .. } => (
             "Keyboard-layout correction with spelling or learned replacement",
@@ -1461,6 +1499,13 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
                 Some(lang),
             )
         }
+        Plan::HebrewSpell { text } => (
+            Some(Fix::Spelling {
+                text: respelled(&text, Case::Lower, he.tail),
+                lang: Language::Hebrew,
+            }),
+            Some(Language::Hebrew),
+        ),
         Plan::Spell { text } | Plan::Expand { text } => {
             // No layout call at all — the word stays in English, only its
             // letters change.
@@ -1471,6 +1516,7 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
             (
                 Some(Fix::Spelling {
                     text: respelled(&text, case, en.tail),
+                    lang: Language::English,
                 }),
                 Some(Language::English),
             )
@@ -2049,7 +2095,7 @@ mod tests {
                 None => before.to_string(),
                 Some(
                     Fix::Layout { text, start: 0, .. }
-                    | Fix::Spelling { text }
+                    | Fix::Spelling { text, .. }
                     | Fix::LayoutSpelling { text, .. },
                 ) => text,
                 Some(Fix::Layout { start, .. }) => {
@@ -2764,6 +2810,86 @@ mod tests {
             None,
             &mut String::new(),
         )
+    }
+
+    #[test]
+    fn learned_pairs_keep_layout_and_spelling_separate() {
+        for layout_only in [false, true] {
+            assert_eq!(
+                learned_plan("שלום", "akuo", "שלום", Some(Language::English), layout_only),
+                Some(Plan::Switch {
+                    lang: Language::Hebrew,
+                    start: 0
+                })
+            );
+            assert_eq!(
+                learned_plan(
+                    "hello",
+                    "hello",
+                    "יקךךם",
+                    Some(Language::Hebrew),
+                    layout_only
+                ),
+                Some(Plan::Switch {
+                    lang: Language::English,
+                    start: 0
+                })
+            );
+            assert_eq!(
+                learned_plan("hello", "hello", "יקךךם", None, layout_only),
+                None
+            );
+        }
+        assert_eq!(
+            learned_plan("שלום", "akuf", "שלומ", Some(Language::Hebrew), false),
+            Some(Plan::HebrewSpell {
+                text: "שלום".into()
+            })
+        );
+        assert_eq!(
+            learned_plan("שלום", "akuf", "שלומ", Some(Language::Hebrew), true),
+            None
+        );
+        assert_eq!(
+            learned_plan("שלום", "unknown", "לאמוכר", Some(Language::English), false),
+            None
+        );
+    }
+
+    #[test]
+    fn hebrew_spelling_obeys_layout_only_and_unknown_layout_guards() {
+        for (current, layout_only, expected) in [
+            (
+                Some(Language::Hebrew),
+                false,
+                Some(Plan::HebrewSpell {
+                    text: "שלום".into(),
+                }),
+            ),
+            (Some(Language::Hebrew), true, None),
+            (None, false, None),
+        ] {
+            assert_eq!(
+                plan(
+                    Reading::new("akuf,", 4),
+                    Reading::new("שלומ,", "שלומ".len()),
+                    &[],
+                    &[],
+                    5,
+                    current,
+                    Run::default(),
+                    Case::Lower,
+                    dict(&[]),
+                    dict(&["שלום"]),
+                    nofreq(),
+                    freq(&[("שלום", 10)]),
+                    layout_only,
+                    None,
+                    &mut String::new(),
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

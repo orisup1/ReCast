@@ -1,4 +1,4 @@
-//! Conservative, explicitly requested Hebrew spelling offers. No automatic rewrites.
+//! Conservative Hebrew spelling with stricter confidence for automatic rewrites.
 
 use crate::complete::{PhraseContext, MAX_CANDIDATES};
 use crate::config::Config;
@@ -13,11 +13,44 @@ pub(crate) fn suggestions(
     freq: Freq,
     context: Option<&PhraseContext>,
 ) -> Vec<String> {
+    ranked_candidates(word, dict, freq, context, false)
+        .into_iter()
+        .take(MAX_CANDIDATES)
+        .map(|(word, _)| word)
+        .collect()
+}
+
+/// Automatic repairs require a clear score lead; ambiguous offers remain manual.
+/// Bound phrase influence so context cannot manufacture a confident correction.
+pub(crate) fn correct(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+) -> Option<String> {
+    let mut candidates = ranked_candidates(word, dict, freq, context, true).into_iter();
+    let (best, score) = candidates.next()?;
+    if candidates
+        .next()
+        .is_some_and(|(_, runner_up)| runner_up - score < 20.0)
+    {
+        return None;
+    }
+    Some(best)
+}
+
+fn ranked_candidates(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+    automatic: bool,
+) -> Vec<(String, f32)> {
     let config = Config::global();
     let letters: Vec<char> = word.chars().collect();
     if !config.spell_enabled
         || config.spell_max_dist == 0
-        || !(config.spell_min_len.max(3)..=24).contains(&letters.len())
+        || !(config.spell_min_len.max(if automatic { 4 } else { 3 })..=24).contains(&letters.len())
         || !letters.iter().all(|c| ('א'..='ת').contains(c))
         || dict.contains(word)
         || hebrew_stem(word, dict).is_some()
@@ -41,8 +74,13 @@ pub(crate) fn suggestions(
         let Some(rank) = rank.filter(|rank| *rank <= config.spell_max_rank.min(20_000)) else {
             return;
         };
+        let discount = context.map_or(0.0, |context| 20.0 * context.boost(&text).ln() as f32);
         let score = super::score(cost, rank, &text)
-            - context.map_or(0.0, |context| 20.0 * context.boost(&text).ln() as f32);
+            - if automatic {
+                discount.min(super::MAX_AUTOMATIC_CONTEXT_DISCOUNT)
+            } else {
+                discount
+            };
         candidates
             .entry(text)
             .and_modify(|old| *old = old.min(score))
@@ -78,10 +116,6 @@ pub(crate) fn suggestions(
     let mut candidates: Vec<_> = candidates.into_iter().collect();
     candidates.sort_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| a.cmp(b)));
     candidates
-        .into_iter()
-        .take(MAX_CANDIDATES)
-        .map(|(word, _)| word)
-        .collect()
 }
 
 fn vowel_cost(letter: char) -> u32 {
@@ -116,6 +150,24 @@ fn valid_finals(word: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_repairs_require_a_clear_winner() {
+        let dict = Dict::of(&["שלום", "מחשב", "סיפור"]);
+        let freq = Freq::of(&[("שלום", 10), ("מחשב", 20), ("סיפור", 30)]);
+        for (typed, expected) in [("שלומ", "שלום"), ("מחבש", "מחשב"), ("ספור", "סיפור")]
+        {
+            assert_eq!(correct(typed, dict, freq, None).as_deref(), Some(expected));
+        }
+        for typed in ["שלום", "בשלום", "של", "שלומ!", "של1מ"] {
+            assert_eq!(correct(typed, dict, freq, None), None, "{typed}");
+        }
+        let tied = Dict::of(&["שלום", "שלוש"]);
+        let ranks = Freq::of(&[("שלום", 100), ("שלוש", 100)]);
+        assert_eq!(suggestions("שלוב", tied, ranks, None).len(), 2);
+        assert_eq!(correct("שלוב", tied, ranks, None), None);
+        assert_eq!(correct("שלומ", dict, Freq::EMPTY, None), None);
+    }
 
     #[test]
     fn repairs_hebrew_letters_and_supported_prefixes() {

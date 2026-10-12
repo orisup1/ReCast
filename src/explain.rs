@@ -69,7 +69,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some(Fix::Layout { start, text, .. }) => {
             word.chars().take(start).collect::<String>() + &text
         }
-        Some(Fix::Spelling { text } | Fix::LayoutSpelling { text, .. }) => text,
+        Some(Fix::Spelling { text, .. } | Fix::LayoutSpelling { text, .. }) => text,
     };
     println!(
         "Input: {word:?}\nLayout: {}\nReplacement: {after:?}\nReason: {}",

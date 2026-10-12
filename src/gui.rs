@@ -255,7 +255,7 @@ impl eframe::App for App {
                 });
                 let cfg = crate::config::Config::global();
                 for (label, key, mut checked) in [
-                    ("Correct English spelling", "spell", cfg.spell_enabled),
+                    ("Correct English/Hebrew spelling", "spell", cfg.spell_enabled),
                     ("Word completion and abbreviations", "complete", cfg.complete_enabled),
                     ("Conservative spelling (single-typo fixes)", "spell_dist", cfg.spell_max_dist == 1),
                 ] {

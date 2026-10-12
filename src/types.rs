@@ -653,11 +653,18 @@ impl AppControl {
     /// when they go looking. Saturates at zero rather than wrapping: the
     /// counter is a tally the user reads, not an audit trail.
     pub fn record_undo(&self) {
-        let _ = self
-            .fixed_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
+        let mut count = self.fixed_count.load(Ordering::Relaxed);
+        while count != 0 {
+            match self.fixed_count.compare_exchange_weak(
+                count,
+                count - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => count = actual,
+            }
+        }
         self.undo_count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut log) = self.history.lock() {
             if let Some(last) = log.iter_mut().find(|c| !c.undone) {

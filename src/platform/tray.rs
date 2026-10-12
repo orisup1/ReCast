@@ -108,8 +108,12 @@ pub fn run(control: Arc<AppControl>) {
         .append(&rules_menu)
         .expect("append word rules menu");
     let config = crate::config::Config::global();
-    let spell_item =
-        CheckMenuItem::new("Correct English spelling", true, config.spell_enabled, None);
+    let spell_item = CheckMenuItem::new(
+        "Correct English/Hebrew spelling",
+        true,
+        config.spell_enabled,
+        None,
+    );
     let complete_item = CheckMenuItem::new(
         "Word completion and abbreviations",
         true,

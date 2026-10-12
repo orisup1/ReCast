@@ -180,7 +180,9 @@ pub fn show(correction: &Correction) -> Result<bool, String> {
         0,
     ];
     let template: Vec<u32> = words
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|w| u32::from(w[0]) | (u32::from(w[1]) << 16))
         .collect();
     let response = unsafe {
