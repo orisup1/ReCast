@@ -3,9 +3,10 @@ use super::textkeys;
 use crate::dictionary::Dict;
 use crate::types::{AppControl, Language};
 use rdev::Key;
+use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 type Typed = engine::Typed<Key>;
 
 pub struct Mac;
@@ -60,6 +61,15 @@ impl Platform for Mac {
     }
     fn injecting_flag(injector: &AtomicBool) -> Option<&AtomicBool> {
         Some(injector)
+    }
+    fn injection_finished() -> bool {
+        // Reserved before deletion starts, so releasing input cannot fail to allocate.
+        let input = crate::types::lock_forgiving(deferred_input());
+        let invalidates = unsafe { !deferred_gestures_only(&input.input.events) };
+        if let Some(marker) = &input.finish {
+            unsafe { CGEventPost(KCG_HID_EVENT_TAP, marker.event) };
+        }
+        invalidates
     }
     fn input_allowed() -> bool {
         !secure_input_active()
@@ -169,11 +179,15 @@ const KCG_HID_EVENT_TAP: u32 = 0;
 const KCG_SESSION_EVENT_TAP: u32 = 1;
 const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 // Active taps use Accessibility authorization. Listen-only taps use Input
-// Monitoring. Our callback still returns every event unchanged.
+// Monitoring. Physical events are deferred briefly while a replacement lands.
 const KCG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
 const KCG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+const KCG_EVENT_LEFT_MOUSE_UP: u32 = 2;
 const KCG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
+const KCG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
+const KCG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
+const KCG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
 const KCG_EVENT_KEY_DOWN: u32 = 10;
 const KCG_EVENT_KEY_UP: u32 = 11;
 /// Modifier keys — Shift, Ctrl, Caps Lock — are *not* delivered as key-down and
@@ -183,6 +197,8 @@ const KCG_EVENT_KEY_UP: u32 = 11;
 /// to undo) can fire at all.
 const KCG_EVENT_FLAGS_CHANGED: u32 = 12;
 const KCG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+const KCG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+const KCG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
 
 /// Caps Lock's flag. Unlike the others it is a latch: the bit *is* the state,
 /// rather than saying whether a key is being held.
@@ -196,15 +212,23 @@ const KCG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const KCG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 
 const EVENT_MASK: u64 = (1u64 << KCG_EVENT_LEFT_MOUSE_DOWN)
+    | (1u64 << KCG_EVENT_LEFT_MOUSE_UP)
     | (1u64 << KCG_EVENT_RIGHT_MOUSE_DOWN)
+    | (1u64 << KCG_EVENT_RIGHT_MOUSE_UP)
+    | (1u64 << KCG_EVENT_LEFT_MOUSE_DRAGGED)
+    | (1u64 << KCG_EVENT_RIGHT_MOUSE_DRAGGED)
     | (1u64 << KCG_EVENT_KEY_DOWN)
     | (1u64 << KCG_EVENT_KEY_UP)
     | (1u64 << KCG_EVENT_FLAGS_CHANGED)
-    | (1u64 << KCG_EVENT_OTHER_MOUSE_DOWN);
+    | (1u64 << KCG_EVENT_OTHER_MOUSE_DOWN)
+    | (1u64 << KCG_EVENT_OTHER_MOUSE_UP)
+    | (1u64 << KCG_EVENT_OTHER_MOUSE_DRAGGED);
 
 const KCG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 const EVENT_USER_DATA: u32 = 42;
 const RECAST_EVENT: i64 = 0x5245_4341_5354;
+const FINISH_EVENT: i64 = 0x5245_0000_0000_0000;
+const FINISH_MASK: i64 = !0xffff_ffff;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -218,6 +242,11 @@ extern "C" {
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventGetTimestamp(event: CGEventRef) -> u64;
+    #[cfg(test)]
+    fn CGEventGetType(event: CGEventRef) -> u32;
+    fn CGEventCreateCopy(event: CGEventRef) -> CGEventRef;
+    fn CGEventTapPostEvent(proxy: CGEventTapProxy, event: CGEventRef);
     /// Which modifiers are down *after* the event. A `flagsChanged` event says
     /// which key changed but not in which direction, so this is what turns it
     /// back into a press or a release.
@@ -392,8 +421,203 @@ unsafe impl Send for TapPort {}
 unsafe impl Sync for TapPort {}
 static TAP_PORT: OnceLock<TapPort> = OnceLock::new();
 
+struct DeferredEvent {
+    kind: u32,
+    event: CGEventRef,
+}
+// Copies are owned here and read only on the main thread; workers only post markers.
+unsafe impl Send for DeferredEvent {}
+impl Drop for DeferredEvent {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.event.cast()) };
+    }
+}
+
+struct DeferredInput<T> {
+    ticket: u32,
+    active: bool,
+    events: Vec<T>,
+}
+impl<T> Default for DeferredInput<T> {
+    fn default() -> Self {
+        Self {
+            ticket: 0,
+            active: false,
+            events: Vec::new(),
+        }
+    }
+}
+impl<T> DeferredInput<T> {
+    fn begin(&mut self) -> u32 {
+        self.ticket = self.ticket.wrapping_add(1).max(1);
+        self.active = true;
+        self.ticket
+    }
+    fn finish(&mut self, ticket: u32) -> Option<Vec<T>> {
+        if !self.active || ticket != self.ticket {
+            return None;
+        }
+        self.active = false;
+        Some(std::mem::take(&mut self.events))
+    }
+}
+#[derive(Default)]
+struct NativeDeferredInput {
+    input: DeferredInput<DeferredEvent>,
+    finish: Option<DeferredEvent>,
+}
+fn deferred_input() -> &'static Mutex<NativeDeferredInput> {
+    static INPUT: OnceLock<Mutex<NativeDeferredInput>> = OnceLock::new();
+    INPUT.get_or_init(|| Mutex::new(NativeDeferredInput::default()))
+}
+
+fn begin_injection(engine: &Engine<Mac>, generation: u64) -> Option<()> {
+    // Serialize validation and gating with capture; never dispatch with the state locked.
+    dispatch::Queue::main().exec_sync(|| {
+        let event = keyboard_event(0, false, false)?;
+        let marker = DeferredEvent { kind: 0, event };
+        if !engine.replacement_valid(generation) {
+            return None;
+        }
+        let mut input = crate::types::lock_forgiving(deferred_input());
+        let ticket = input.input.begin();
+        unsafe {
+            CGEventSetIntegerValueField(event, EVENT_USER_DATA, FINISH_EVENT | i64::from(ticket));
+        }
+        input.finish = Some(marker);
+        engine.injector.store(true, Ordering::Relaxed);
+        Some(())
+    })
+}
+
+fn gesture_input(kind: u32, key: Key, flags: u64) -> bool {
+    match kind {
+        KCG_EVENT_FLAGS_CHANGED => Mac::is_modifier(key),
+        KCG_EVENT_KEY_UP => true,
+        KCG_EVENT_KEY_DOWN => key == Key::Space && flags & 0x001d_0000 == 0,
+        _ => false,
+    }
+}
+
+unsafe fn deferred_gestures_only(events: &[DeferredEvent]) -> bool {
+    queued_gestures(events.iter().map(|event| {
+        let key = key_from_code(
+            CGEventGetIntegerValueField(event.event, KCG_KEYBOARD_EVENT_KEYCODE) as u16,
+        );
+        (event.kind, key, CGEventGetFlags(event.event))
+    }))
+}
+
+fn queued_gestures(events: impl Iterator<Item = (u32, Key, u64)>) -> bool {
+    let mut held = HashMap::new();
+    for (kind, key, flags) in events {
+        if !gesture_input(kind, key, flags) {
+            return false;
+        }
+        if kind == KCG_EVENT_FLAGS_CHANGED {
+            if let Some(bit) = device_flag(key) {
+                if flags & bit != 0 {
+                    held.insert(key, ());
+                } else {
+                    held.remove(&key);
+                }
+            }
+        }
+    }
+    // An unfinished hold must not acquire a fresh tap timestamp at replay time.
+    held.is_empty()
+}
+
+fn within_gesture_window(pressed: u64, released: u64, ceiling: std::time::Duration) -> bool {
+    released >= pressed && u128::from(released - pressed) <= ceiling.as_nanos()
+}
+
+unsafe fn replay_deferred(
+    ctx: &Arc<Engine<Mac>>,
+    proxy: CGEventTapProxy,
+    events: Vec<DeferredEvent>,
+) {
+    let gestures_only = deferred_gestures_only(&events);
+    let mut modifier_down = HashMap::new();
+    let mut action_released = None;
+    if !gestures_only {
+        ctx.forget_everything();
+    }
+    for event in events {
+        if gestures_only {
+            if event.kind == KCG_EVENT_FLAGS_CHANGED {
+                let key = key_from_code(CGEventGetIntegerValueField(
+                    event.event,
+                    KCG_KEYBOARD_EVENT_KEYCODE,
+                ) as u16);
+                let timestamp = CGEventGetTimestamp(event.event);
+                if let Some(bit) = device_flag(key) {
+                    if CGEventGetFlags(event.event) & bit != 0 {
+                        modifier_down.insert(key, timestamp);
+                    } else {
+                        let mut state = crate::types::lock_forgiving(&ctx.state);
+                        let action = state.action_down.is_some();
+                        if modifier_down.remove(&key).is_some_and(|pressed| {
+                            !within_gesture_window(pressed, timestamp, engine::TAP_MAX)
+                        }) {
+                            state.action_down = None;
+                            state.completion_down = None;
+                        }
+                        if action {
+                            if action_released.is_some_and(|previous| {
+                                !within_gesture_window(
+                                    previous,
+                                    timestamp,
+                                    engine::DOUBLE_TAP_WINDOW,
+                                )
+                            }) {
+                                state.last_action_tap = None;
+                            }
+                            action_released = Some(timestamp);
+                        }
+                    }
+                }
+            }
+            capture_event(ctx, event.kind, event.event);
+        } else {
+            let key = key_from_code(CGEventGetIntegerValueField(
+                event.event,
+                KCG_KEYBOARD_EVENT_KEYCODE,
+            ) as u16);
+            let mut state = crate::types::lock_forgiving(&ctx.state);
+            match event.kind {
+                KCG_EVENT_KEY_DOWN => {
+                    state.held_keys.insert(key);
+                }
+                KCG_EVENT_KEY_UP => {
+                    state.held_keys.remove(&key);
+                }
+                KCG_EVENT_FLAGS_CHANGED if key == Key::CapsLock => {
+                    state.caps_lock = CGEventGetFlags(event.event) & FLAG_ALPHA_SHIFT != 0;
+                    crate::layout::invalidate();
+                }
+                KCG_EVENT_FLAGS_CHANGED => {
+                    if let Some(bit) = device_flag(key) {
+                        if CGEventGetFlags(event.event) & bit != 0 {
+                            state.held_keys.insert(key);
+                        } else {
+                            state.held_keys.remove(&key);
+                        }
+                        crate::layout::invalidate();
+                    }
+                }
+                _ => {}
+            }
+            state.completion_down = None;
+            state.action_down = None;
+        }
+        // Posts downstream before the next physical event; copies keep flags and releases.
+        CGEventTapPostEvent(proxy, event.event);
+    }
+}
+
 unsafe extern "C" fn tap_callback(
-    _proxy: CGEventTapProxy,
+    proxy: CGEventTapProxy,
     event_type: u32,
     cg_event: CGEventRef,
     _user_info: *mut c_void,
@@ -408,6 +632,13 @@ unsafe extern "C" fn tap_callback(
         if let Some(port) = TAP_PORT.get() {
             CGEventTapEnable(port.0, true);
         }
+        if let Some(ctx) = CTX.get() {
+            ctx.forget_everything();
+            if !ctx.injector.load(Ordering::Relaxed) {
+                // A finish posted while the tap was disabled may have been missed.
+                Mac::injection_finished();
+            }
+        }
         return cg_event;
     }
 
@@ -416,22 +647,53 @@ unsafe extern "C" fn tap_callback(
         None => return cg_event,
     };
 
-    // Only our marked events are ignored. Real arrows, clicks, and shortcut
-    // keys must still cancel a rewrite while its paced events are going out.
-    if CGEventGetIntegerValueField(cg_event, EVENT_USER_DATA) == RECAST_EVENT {
+    let marker = CGEventGetIntegerValueField(cg_event, EVENT_USER_DATA);
+    if marker & FINISH_MASK == FINISH_EVENT {
+        let events = {
+            let mut input = crate::types::lock_forgiving(deferred_input());
+            let events = input.input.finish(marker as u32);
+            if events.is_some() {
+                input.finish.take();
+            }
+            events
+        };
+        if let Some(events) = events {
+            replay_deferred(ctx, proxy, events);
+        }
+        // Even stale markers must never reach the application as keyboard input.
+        return std::ptr::null_mut();
+    }
+    if marker == RECAST_EVENT {
         return cg_event;
     }
 
-    // A password field has focus: drop whatever is buffered and look away until
-    // it doesn't. Clearing rather than merely skipping matters — the buffer may
-    // hold the start of a word typed a moment before the field took focus, and
-    // that half-word must not be joined to what is typed into it, nor still be
-    // sitting there to be corrected when focus comes back.
+    // Secure input must never be copied into the deferred queue.
     if secure_input_active() {
         ctx.forget_everything();
         return cg_event;
     }
 
+    {
+        let mut input = crate::types::lock_forgiving(deferred_input());
+        if input.input.active {
+            let mut event = CGEventCreateCopy(cg_event);
+            if event.is_null() {
+                // Suppressed originals have no downstream writer; retaining is a lossless fallback.
+                event = core_foundation_sys::base::CFRetain(cg_event.cast()).cast_mut();
+            }
+            input.input.events.push(DeferredEvent {
+                kind: event_type,
+                event,
+            });
+            return std::ptr::null_mut();
+        }
+    }
+
+    capture_event(ctx, event_type, cg_event);
+    cg_event
+}
+
+unsafe fn capture_event(ctx: &Arc<Engine<Mac>>, event_type: u32, cg_event: CGEventRef) {
     match event_type {
         KCG_EVENT_KEY_DOWN => {
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
@@ -445,13 +707,16 @@ unsafe extern "C" fn tap_callback(
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
             handle_flags_changed(ctx, key_from_code(code), CGEventGetFlags(cg_event));
         }
-        KCG_EVENT_LEFT_MOUSE_DOWN | KCG_EVENT_RIGHT_MOUSE_DOWN | KCG_EVENT_OTHER_MOUSE_DOWN => {
+        KCG_EVENT_LEFT_MOUSE_DOWN
+        | KCG_EVENT_RIGHT_MOUSE_DOWN
+        | KCG_EVENT_OTHER_MOUSE_DOWN
+        | KCG_EVENT_LEFT_MOUSE_DRAGGED
+        | KCG_EVENT_RIGHT_MOUSE_DRAGGED
+        | KCG_EVENT_OTHER_MOUSE_DRAGGED => {
             ctx.mouse_click();
         }
         _ => {}
     }
-
-    cg_event
 }
 
 /// A modifier changed state. macOS never delivers these as key-down / key-up
@@ -790,12 +1055,12 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     } = plan;
     let gaps = crate::timing::injection();
     if terminator == Some(Key::Return) {
-        engine.wait_for_release(&[Key::Return], gaps.held_release_timeout);
+        return None;
     }
     if !engine.replacement_valid(generation) {
         return None;
     }
-    engine.injector.store(true, Ordering::Relaxed);
+    begin_injection(engine, generation)?;
     let buf = engine.buffered();
     // Press + release a single key with pacing that macOS won't drop. Only the
     // backspaces and the odd replayed key go through this now; the word itself
@@ -819,13 +1084,6 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         return None;
     }
     match terminator {
-        Some(Key::Return) => {
-            paste_text(&text)?;
-            if !engine.replacement_valid(generation) {
-                return None;
-            }
-            tap_key(Key::Return, false)?;
-        }
         // The trailing space is part of the same paste, so nothing has to be
         // pressed at all.
         Some(_) => {
@@ -1059,6 +1317,106 @@ mod setup_tests {
     use std::path::Path;
 
     #[test]
+    fn deferred_input_waits_for_the_latest_replacement_and_keeps_event_order() {
+        let mut input = DeferredInput::<&str>::default();
+        let first = input.begin();
+        input.events.extend(["shift down", "key down", "key up"]);
+        let second = input.begin();
+        input.events.extend(["shift up", "mouse down", "mouse up"]);
+        assert!(input.finish(first).is_none());
+        assert!(input.active);
+        assert_eq!(
+            input.finish(second).unwrap(),
+            [
+                "shift down",
+                "key down",
+                "key up",
+                "shift up",
+                "mouse down",
+                "mouse up"
+            ]
+        );
+        assert!(!input.active);
+        assert!(input.finish(second).is_none());
+    }
+
+    #[test]
+    fn typing_during_each_erasure_waits_until_the_corrected_word_is_complete() {
+        for arrival in 0..=8 {
+            let mut input = DeferredInput::<char>::default();
+            let ticket = input.begin();
+            let mut screen = String::from("recieve ");
+            for erased in 0..=8 {
+                if erased == arrival {
+                    input.events.extend("next".chars());
+                }
+                if erased < 8 {
+                    screen.pop();
+                }
+            }
+            screen.push_str("receive ");
+            screen.extend(input.finish(ticket).unwrap());
+            assert_eq!(screen, "receive next", "typing after {arrival} erasures");
+        }
+    }
+
+    #[test]
+    fn canceled_injection_releases_every_deferred_press_and_release() {
+        let mut input = DeferredInput::<&str>::default();
+        let ticket = input.begin();
+        input
+            .events
+            .extend(["ctrl down", "v down", "v up", "ctrl up"]);
+        assert_eq!(
+            input.finish(ticket).unwrap(),
+            ["ctrl down", "v down", "v up", "ctrl up"]
+        );
+        assert!(!input.active);
+    }
+
+    #[test]
+    fn only_modifier_taps_and_plain_spaces_keep_correction_gestures() {
+        for key in [Key::ControlLeft, Key::ShiftRight, Key::CapsLock] {
+            assert!(gesture_input(KCG_EVENT_FLAGS_CHANGED, key, 0));
+        }
+        assert!(gesture_input(KCG_EVENT_KEY_DOWN, Key::Space, 0));
+        assert!(gesture_input(KCG_EVENT_KEY_UP, Key::Space, 0x0002_0000));
+        assert!(gesture_input(KCG_EVENT_KEY_UP, Key::KeyA, 0));
+        assert!(!gesture_input(KCG_EVENT_KEY_DOWN, Key::KeyA, 0));
+        for flags in [0x0001_0000, 0x0004_0000, 0x0008_0000, 0x0010_0000] {
+            assert!(!gesture_input(KCG_EVENT_KEY_DOWN, Key::Space, flags));
+        }
+        for key in [Key::KeyA, Key::Return, Key::Backspace, Key::LeftArrow] {
+            assert!(!gesture_input(KCG_EVENT_KEY_DOWN, key, 0));
+        }
+        assert!(!gesture_input(KCG_EVENT_LEFT_MOUSE_DOWN, Key::KeyA, 0));
+        assert!(!gesture_input(KCG_EVENT_LEFT_MOUSE_UP, Key::KeyA, 0));
+        assert!(!gesture_input(KCG_EVENT_LEFT_MOUSE_DRAGGED, Key::KeyA, 0));
+    }
+
+    #[test]
+    fn replay_preserves_physical_hold_and_double_tap_limits() {
+        assert!(within_gesture_window(10, 300_000_010, engine::TAP_MAX));
+        assert!(!within_gesture_window(10, 300_000_011, engine::TAP_MAX));
+        assert!(within_gesture_window(
+            10,
+            500_000_010,
+            engine::DOUBLE_TAP_WINDOW
+        ));
+        assert!(!within_gesture_window(
+            10,
+            500_000_011,
+            engine::DOUBLE_TAP_WINDOW
+        ));
+        assert!(!within_gesture_window(10, 9, engine::TAP_MAX));
+        let down = (KCG_EVENT_FLAGS_CHANGED, Key::ControlLeft, 0x0000_0001);
+        let up = (KCG_EVENT_FLAGS_CHANGED, Key::ControlLeft, 0);
+        assert!(queued_gestures([down, up].into_iter()));
+        assert!(queued_gestures([up].into_iter()));
+        assert!(!queued_gestures([down].into_iter()));
+    }
+
+    #[test]
     #[ignore = "requires an unsandboxed macOS WindowServer; constructs events without posting"]
     fn injected_events_have_only_the_requested_modifiers() {
         // Construct events without posting them or capturing any real typing.
@@ -1075,6 +1433,16 @@ mod setup_tests {
                         CFRelease(event as _);
                     }
                 }
+            }
+        }
+        for ticket in [1, u32::MAX] {
+            let marker = keyboard_event(0, false, false).unwrap();
+            unsafe {
+                let value = FINISH_EVENT | i64::from(ticket);
+                CGEventSetIntegerValueField(marker, EVENT_USER_DATA, value);
+                assert_eq!(CGEventGetIntegerValueField(marker, EVENT_USER_DATA), value);
+                assert_eq!(CGEventGetType(marker), KCG_EVENT_KEY_UP);
+                CFRelease(marker.cast());
             }
         }
     }

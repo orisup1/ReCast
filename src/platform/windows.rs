@@ -301,10 +301,10 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
         retype: text,
         terminator,
     } = plan;
-    let gaps = crate::timing::injection();
     if terminator == Some(Key::Return) {
-        engine.wait_for_release(&[Key::Return], gaps.held_release_timeout);
+        return None;
     }
+    let gaps = crate::timing::injection();
     if !engine.replacement_valid(generation) {
         return None;
     }
@@ -317,7 +317,6 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
     }
     type_text(&text, &mut inputs);
     match terminator {
-        Some(Key::Return) => press(VK_RETURN as u16, &mut inputs),
         Some(_) => type_text(" ", &mut inputs),
         // A completion ends mid-word: no terminator, no trailing space.
         None => {}

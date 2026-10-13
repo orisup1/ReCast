@@ -232,8 +232,10 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// name instead and has nothing here.
     fn injecting_flag(injector: &Self::Injector) -> Option<&std::sync::atomic::AtomicBool>;
 
-    /// Release any deferred native input after the engine's replacement gate clears.
-    fn injection_finished() {}
+    /// Release deferred native input. True means later input made text context stale.
+    fn injection_finished() -> bool {
+        false
+    }
 
     // ── platform safety differences ────────────────────────────────────────
 
@@ -622,7 +624,9 @@ impl<P: Platform> Replaceable for AppState<P> {
         self.is_replacing = replacing;
         if !replacing {
             self.selection_replacing = false;
-            P::injection_finished();
+            if P::injection_finished() {
+                self.invalidate_text();
+            }
         }
     }
     fn clear_buffered(&mut self) {
@@ -732,6 +736,7 @@ impl<P: Platform> Engine<P> {
     /// tracked per input device and this device never pressed the key. Only the
     /// user's own finger clears it, which leaves waiting as the only thing that
     /// works.
+    #[cfg(target_os = "linux")]
     pub fn wait_for_release(&self, keys: &[P::Key], ceiling: Duration) {
         if keys.is_empty() {
             return;

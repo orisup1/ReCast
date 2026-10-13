@@ -465,6 +465,9 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
         retype,
         terminator,
     } = plan;
+    if terminator.is_some_and(Linux::is_line_break) {
+        return None;
+    }
     let syn = || {
         InputEvent::new(
             EventType::SYNCHRONIZATION.0,
