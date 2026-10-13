@@ -12,11 +12,14 @@ clipboard is never touched.
 
 ## How it works
 
-ReCast checks words when you finish them with Space, Enter, or punctuation. It
+ReCast checks words when you finish them with Space, preserving trailing punctuation. It
 uses the current keyboard layout, dictionary matches, and word frequency to decide
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
 the terminator are preserved. Same-layout corrections keep an unchanged prefix
 on screen and rewrite only the remaining suffix, reducing visible deletion.
+Enter accepts an already selected suggestion and clears typing context. It never
+starts an automatic rewrite or replays Enter, because that key may send a message
+or execute a command instead of inserting a line break.
 A confident English spelling fix can also correct a
 wrong-layout word in the same replacement.
 
@@ -151,7 +154,7 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 | Action | Gesture or control |
 | --- | --- |
 | Complete an English or Hebrew word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
-| Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space/Enter |
+| Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space |
 | Rescue selected text (macOS) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Convert an unchanged last word to the other layout | Tap **Ctrl twice within half a second**, even for unknown words |
 | Undo the latest correction or completion | Tap **Ctrl twice** immediately, or use the optional single-Ctrl undo shortcut |
@@ -164,9 +167,10 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 Double-Ctrl undoes the latest automatic correction, abbreviation expansion, or
 completion, restoring the original text or prefix. If the last word was unchanged,
 it converts the word to the other keyboard layout, even if neither reading is a
-dictionary word. Conversion works before or after Space/Enter and preserves the
+dictionary word. Conversion works before or after Space and preserves the
 separator. Repeating a manual conversion converts the word back without changing
-saved exceptions or training spelling replacements. Typing another character or
+saved exceptions or training spelling replacements. Up to 32 extra spaces preserve
+correction undo and are restored with the original word. Other typing, Enter, or
 moving the cursor ends the opportunity to act on a finished word.
 
 The optional single-Ctrl shortcut handles undo/unlisting. If it shares the action
@@ -190,7 +194,7 @@ Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures
 Left Ctrl or Right Ctrl. The configured double-tap action remains available unless disabled. Holding Ctrl or using
 it in a chord never triggers the extra shortcut; the same cursor/focus safeguards
 apply to both gestures.
-Further typing or cursor movement ends the undo opportunity. Undo restores the
+Extra spaces preserve undo. Other typing, Enter, or cursor movement ends the undo opportunity. Undo restores the
 original text and, when changed, the previous layout. One undo suppresses that word
 for the session; undo counts are saved in `learned.txt`, and two occasions make the
 exception survive restarts. Allowing the word again clears its saved exception.

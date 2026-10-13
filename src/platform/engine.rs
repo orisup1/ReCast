@@ -61,6 +61,9 @@ pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
 /// Keep explicit accessibility edits and their undo payload bounded.
 pub const MAX_SELECTION_BYTES: usize = 64 * 1024;
 
+/// Keep correction undo bounded while the cursor advances through spaces.
+const MAX_UNDO_SPACES: usize = 32;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // What a platform supplies
 // ─────────────────────────────────────────────────────────────────────────────
@@ -134,8 +137,7 @@ pub trait Platform: Sized + Send + Sync + 'static {
     const CAPS_LOCK: Self::Key;
     const BACKSPACE: Self::Key;
 
-    /// Space or Enter — the keys that finish a word and ask for it to be
-    /// checked.
+    /// Space or Enter — the keys that finish a word. Enter is never replayed.
     fn is_terminator(key: Self::Key) -> bool;
 
     /// Enter ends phrase context even when a correction is still pending.
@@ -230,6 +232,9 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// name instead and has nothing here.
     fn injecting_flag(injector: &Self::Injector) -> Option<&std::sync::atomic::AtomicBool>;
 
+    /// Release any deferred native input after the engine's replacement gate clears.
+    fn injection_finished() {}
+
     // ── platform safety differences ────────────────────────────────────────
 
     /// Only safe when injected events explicitly ignore physical Ctrl flags.
@@ -299,9 +304,8 @@ pub enum LastAction<P: Platform> {
 /// immediately after it, with both visible keys for conversion and the original
 /// text for the optional undo gesture.
 ///
-/// It is only kept for that moment. Undo erases backwards from the cursor, so
-/// once the user types anything else the correction is no longer what sits
-/// there and the payload is dropped (see [`Engine::key_press`]).
+/// It survives bounded trailing spaces. Other text or cursor movement drops it
+/// because undo erases backwards from the cursor (see [`Engine::key_press`]).
 pub struct LastFix<P: Platform> {
     /// Physical keys of the visible final word, including any unchanged prefix.
     visible: Vec<Typed<P::Key>>,
@@ -311,9 +315,10 @@ pub struct LastFix<P: Platform> {
     /// Characters our injection put on screen, terminator included — what has
     /// to come back off.
     on_screen: usize,
-    /// What was there before, ready to go back: the user's own keys on Linux,
-    /// the text they spelled elsewhere.
-    restore: P::Retype,
+    /// Original keys let undo reproduce the corrected suffix and trailing spaces.
+    restore: Vec<Typed<P::Key>>,
+    restore_layout: Language,
+    trailing_spaces: Vec<Typed<P::Key>>,
     /// Terminator to press again afterwards; `None` for a completion, which
     /// interrupted a word rather than finishing one.
     terminator: Option<P::Key>,
@@ -617,6 +622,7 @@ impl<P: Platform> Replaceable for AppState<P> {
         self.is_replacing = replacing;
         if !replacing {
             self.selection_replacing = false;
+            P::injection_finished();
         }
     }
     fn clear_buffered(&mut self) {
@@ -862,8 +868,22 @@ impl<P: Platform> Engine<P> {
         if !is_action {
             st.last_action_tap = None;
         }
-        if !is_action && !is_completion {
+        let preserve_spaces = P::is_terminator(key)
+            && !P::is_line_break(key)
+            && !chorded_shortcut
+            && (matches!(
+                &st.last_action,
+                Some(LastAction::Fixed(fix)) if fix.trailing_spaces.len() < MAX_UNDO_SPACES
+            ) || (st.is_replacing
+                && st.buffered_keys.len() < MAX_UNDO_SPACES
+                && st
+                    .buffered_keys
+                    .iter()
+                    .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))));
+        if !is_action && !is_completion && !preserve_spaces {
             st.forget_gestures();
+        } else if preserve_spaces {
+            st.cycle = None;
         }
         let shift = st.shift_active();
         if st.selection_replacing && !is_action {
@@ -878,14 +898,19 @@ impl<P: Platform> Engine<P> {
             return;
         }
 
+        // Enter may submit or focus another field before a worker can edit it.
+        if P::is_line_break(key) && st.is_replacing {
+            st.invalidate_text();
+            st.no_fix = false;
+            return;
+        }
+
         // Cancel before any OS query: the worker must see a shortcut/deletion
         // immediately, even while the compositor is slow to answer focus.
         let during_injection = P::injecting_flag(&self.injector)
             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
         if key == P::BACKSPACE && (during_injection || st.is_replacing || chorded_shortcut) {
-            let no_fix = st.no_fix;
             st.invalidate_text();
-            st.no_fix = no_fix;
             return;
         }
         if during_injection
@@ -904,6 +929,7 @@ impl<P: Platform> Engine<P> {
                 .practice_open
                 .load(std::sync::atomic::Ordering::Relaxed)
             || key == P::BACKSPACE
+            || preserve_spaces
             || (st.pending_learning.is_some() && !is_modifier_key)
             || (P::is_terminator(key) && !st.keys.is_empty() && !st.is_replacing)
             || (is_text && st.keys.is_empty() && !st.is_replacing);
@@ -957,11 +983,9 @@ impl<P: Platform> Engine<P> {
         }
 
         if key == P::BACKSPACE {
-            // Deletion cancels a stale rewrite, but never starts suppression.
-            if st.focus != focus {
-                let no_fix = st.no_fix;
+            // Beyond the tracked word, its unknown prefix may still be on screen.
+            if st.focus != focus || st.keys.is_empty() {
                 st.invalidate_text();
-                st.no_fix = no_fix;
             } else {
                 st.keys.pop();
             }
@@ -996,8 +1020,7 @@ impl<P: Platform> Engine<P> {
         }
     }
 
-    /// A word was ended by Space or Enter: check it, and either correct it or
-    /// arm the gesture that would un-list it.
+    /// Space checks a finished word; Enter accepts an offer and clears context.
     fn word_finished(
         self: &Arc<Self>,
         mut st: MutexGuard<'_, AppState<P>>,
@@ -1012,11 +1035,23 @@ impl<P: Platform> Engine<P> {
         if std::mem::take(&mut st.no_fix) || !self.control.is_enabled() {
             st.keys.clear();
             st.phrase.clear();
+            if P::is_line_break(key) {
+                st.invalidate_text();
+                st.no_fix = false;
+            }
             return;
         }
         if st.keys.is_empty() {
             if P::is_line_break(key) {
-                st.phrase.clear();
+                st.invalidate_text();
+                st.no_fix = false;
+            } else if matches!(st.last_action, Some(LastAction::Fixed(_))) {
+                if st.focus != focus || !P::input_allowed() {
+                    st.invalidate_text();
+                    st.no_fix = false;
+                } else if let Some(LastAction::Fixed(fix)) = &mut st.last_action {
+                    fix.trailing_spaces.push(Typed { key, shift });
+                }
             }
             return;
         }
@@ -1042,13 +1077,24 @@ impl<P: Platform> Engine<P> {
                         st.finish_completion_use(true);
                         st.retain_phrase_word(&pending.to);
                         if P::is_line_break(key) {
-                            st.phrase.clear();
+                            st.invalidate_text();
+                            st.no_fix = false;
+                        } else if let Some(LastAction::Fixed(fix)) = &mut st.last_action {
+                            fix.trailing_spaces.push(Typed { key, shift });
+                            fix.keep.clear();
                         }
                         st.keys.clear();
                         return;
                     }
                 }
             }
+        }
+
+        // The physical Enter already reached the app; never erase or replay it.
+        if P::is_line_break(key) {
+            st.invalidate_text();
+            st.no_fix = false;
+            return;
         }
 
         st.finish_completion_use(false);
@@ -1405,7 +1451,9 @@ impl<P: Platform> Engine<P> {
             visible_layout: target_lang,
             manual_conversion: false,
             on_screen: P::retype_len(&retype) - prefix,
-            restore: P::retype_original(&typed[prefix..], original_lang),
+            restore: typed[prefix..].to_vec(),
+            restore_layout: original_lang,
+            trailing_spaces: Vec::new(),
             terminator: None,
             layout: (candidate_lang != original_lang).then_some(original_lang),
             keep: typed.clone(),
@@ -1602,7 +1650,7 @@ impl<P: Platform> Engine<P> {
 
     /// Undo normal corrections; only repeat conversions explicitly requested by the user.
     fn double_tap_fixed(self: &Arc<Self>, st: MutexGuard<'_, AppState<P>>, fix: LastFix<P>) {
-        if !fix.manual_conversion {
+        if !fix.manual_conversion || !fix.trailing_spaces.is_empty() {
             self.undo_fix(st, fix);
         } else if P::current_layout() == Some(fix.visible_layout) {
             self.manual_correct(st, fix.visible, fix.terminator, fix.visible_layout);
@@ -1669,12 +1717,17 @@ impl<P: Platform> Engine<P> {
         st.cycle = None;
         st.finish_completion_use(false);
         st.phrase.clear();
+        let mut restore = fix.restore;
+        if let Some(key) = fix.terminator {
+            restore.push(Typed { key, shift: false });
+        }
+        restore.extend(fix.trailing_spaces.iter().copied());
         self.start_replacement(
             st,
             Plan {
-                erase: fix.on_screen,
-                retype: fix.restore,
-                terminator: fix.terminator,
+                erase: fix.on_screen + fix.trailing_spaces.len(),
+                retype: P::retype_original(&restore, fix.restore_layout),
+                terminator: None,
             },
             fix.keep,
             // Undoing an undo would be a redo, which is a different gesture.
@@ -1786,13 +1839,12 @@ impl<P: Platform> Engine<P> {
     /// `keep` is the word buffer to leave behind — what is now on screen for
     /// the word still in progress, so a completion the user keeps typing over
     /// is checked as the word they can see rather than as the tail they added.
-    /// `undo` carries visible keys and the original text, kept only if
-    /// the user typed nothing while this was landing.
+    /// `undo` carries visible keys and the original text, kept through bounded spaces.
     fn replace_word(
         self: &Arc<Self>,
         plan: Plan<P>,
         keep: Vec<Typed<P::Key>>,
-        undo: Option<LastFix<P>>,
+        mut undo: Option<LastFix<P>>,
         generation: u64,
         commit: Option<Commit>,
     ) {
@@ -1949,10 +2001,22 @@ impl<P: Platform> Engine<P> {
             } else {
                 pending_learning
             };
-            st.keys.replace_with(keep);
-            st.keys.extend(buffered.iter().copied());
-            // Undo is only safe while no later text follows the replacement.
-            st.last_action = if buffered.is_empty() {
+            let only_spaces = buffered.len() <= MAX_UNDO_SPACES
+                && buffered
+                    .iter()
+                    .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key));
+            if only_spaces && !buffered.is_empty() {
+                st.keys.clear();
+                if let Some(fix) = &mut undo {
+                    fix.trailing_spaces.extend(buffered.iter().copied());
+                    fix.keep.clear();
+                }
+            } else {
+                st.keys.replace_with(keep);
+                st.keys.extend(buffered.iter().copied());
+            }
+            // Only tracked spaces may follow a correction that can still be undone.
+            st.last_action = if only_spaces {
                 undo.map(LastAction::Fixed)
             } else {
                 None
@@ -2095,7 +2159,9 @@ fn undo_of<P: Platform>(
         // Everything injected is one character per key, plus the terminator
         // that rides along after it.
         on_screen: P::retype_len(&rep.retype) + usize::from(terminator.is_some()),
-        restore: P::retype_original(original, was),
+        restore: original.to_vec(),
+        restore_layout: was,
+        trailing_spaces: Vec::new(),
         terminator,
         layout: rep.previous_layout,
         // The terminator has already finished this word, so nothing carries
@@ -2118,6 +2184,7 @@ fn undo_of<P: Platform>(
 pub fn reading<P: Platform>(keys: &[Typed<P::Key>], lang: Language) -> String {
     keys.iter()
         .filter_map(|t| match lang {
+            _ if P::is_terminator(t.key) => Some(if P::is_line_break(t.key) { '\n' } else { ' ' }),
             Language::English => P::english_char(t.key, t.shift).map(|c| {
                 if t.shift {
                     c.to_ascii_uppercase()
@@ -2504,7 +2571,13 @@ mod tests {
             let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
             let prefix: String = before.chars().take(keys.len() - rep.erase).collect();
             assert_eq!(format!("{prefix}{}", rep.retype), after);
-            assert_eq!(format!("{prefix}{}", undo.restore), before);
+            assert_eq!(
+                format!(
+                    "{prefix}{}",
+                    Simulated::retype_original(&undo.restore, undo.restore_layout)
+                ),
+                before
+            );
             assert_eq!(undo.suppress.as_deref(), Some(before));
             assert_eq!(undo.on_screen, rep.retype.chars().count() + 1);
         }
@@ -2526,7 +2599,10 @@ mod tests {
         assert_eq!(rep.erase, 1);
         assert_eq!(rep.retype, "ם");
         let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
-        assert_eq!(undo.restore, "מ");
+        assert_eq!(
+            Simulated::retype_original(&undo.restore, undo.restore_layout),
+            "מ"
+        );
         assert_eq!(undo.on_screen, 2);
         assert_eq!(undo.visible_layout, Language::Hebrew);
         assert_eq!(undo.layout, None);
@@ -3095,6 +3171,33 @@ mod tests {
             );
             return;
         }
+        // Physical Enter may submit, move focus, or end a line. Never replay it.
+        for text in ["recieve\n", "akuo\n", "old\n"] {
+            let s = Session::new();
+            s.type_text(text);
+            assert_eq!(s.text(), text);
+            assert!(!s.engine.lock().is_replacing);
+            assert!(s.engine.lock().keys.is_empty());
+            assert!(s.engine.lock().last_action.is_none());
+            assert_eq!(s.engine.lock().history.run(), Run::default());
+            assert_eq!(s.engine.control.fixed_count(), 0);
+            s.undo();
+            assert!(!s.engine.lock().is_replacing);
+            assert!(s.ready.try_recv().is_err());
+        }
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.type_text("\n");
+        s.finish();
+        assert_eq!(s.text(), "recieve \n");
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        assert!(s.engine.lock().last_action.is_none());
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve \nreceive ");
+
         // Editing rules cancels work already queued and never corrects the editor itself.
         let s = Session::new();
         s.type_text("recieve ");
@@ -3179,6 +3282,66 @@ mod tests {
         assert!(crate::complete::suppressed("keyboad"));
         assert!(s.engine.lock().last_action.is_none());
 
+        // Undo preserves spaces typed after a correction or while it is pending.
+        for buffered in [false, true] {
+            let s = Session::new();
+            s.type_text("recieve ");
+            s.pending();
+            if !buffered {
+                s.finish();
+            }
+            s.type_text("  ");
+            s.undo();
+            if buffered {
+                assert!(s.engine.lock().pending_undo);
+                s.proceed.send(()).unwrap();
+            }
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "recieve   ");
+            assert!(s.engine.lock().keys.is_empty());
+            assert_eq!(s.engine.control.undo_count(), 1);
+            crate::complete::unlist("recieve");
+        }
+        let s = Session::new();
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        s.type_text("  ");
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyb  ");
+        assert!(s.engine.lock().keys.is_empty());
+        crate::complete::unlist("keyb");
+
+        // Cursor/focus changes, Enter, and the space bound still invalidate undo.
+        for interrupt in ["typing", "enter", "click", "focus", "bound"] {
+            let s = Session::new();
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            s.type_text("  ");
+            match interrupt {
+                "typing" => s.type_text("x"),
+                "enter" => s.type_text("\n"),
+                "click" => s.engine.mouse_click(),
+                "focus" => {
+                    FOCUS.store(2, Ordering::SeqCst);
+                    s.type_text(" ");
+                }
+                _ => s.type_text(&" ".repeat(MAX_UNDO_SPACES)),
+            }
+            let text = s.text();
+            s.undo();
+            assert_eq!(s.text(), text, "{interrupt}");
+            assert!(!s.engine.lock().is_replacing, "{interrupt}");
+            assert!(s.engine.lock().last_action.is_none(), "{interrupt}");
+            assert_eq!(s.engine.control.undo_count(), 0);
+            FOCUS.store(1, Ordering::SeqCst);
+        }
+
         // An eager undo during injection waits for the correction to finish;
         // neither Ctrl tap may invalidate a partly written word.
         for shortcut in ["none", "right_ctrl"] {
@@ -3261,11 +3424,11 @@ mod tests {
             );
             assert!(s.engine.lock().last_action.is_none());
             if interrupt == 3 {
-                assert!(!s.engine.lock().no_fix);
-                s.type_text("recieve ");
+                assert!(s.engine.lock().no_fix);
+                s.type_text(" recieve ");
                 s.pending();
                 s.finish();
-                assert_eq!(s.text(), "recieve receive ");
+                assert_eq!(s.text(), "recieve  receive ");
             }
             FOCUS.store(1, Ordering::SeqCst);
         }
@@ -3430,18 +3593,18 @@ mod tests {
             assert_eq!(s.text(), "old recieve receive ");
         }
 
-        // Backspacing into a finished word does not suspend subsequent typing.
+        // Backspacing into an unknown prefix suspends correction until a boundary.
         let s = Session::new();
         s.type_text("old ");
         s.backspace();
         s.backspace();
         s.type_text("recieve ");
-        s.pending();
-        s.finish();
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.text(), "olrecieve ");
         s.type_text("recieve ");
         s.pending();
         s.finish();
-        assert_eq!(s.text(), "olreceive receive ");
+        assert_eq!(s.text(), "olrecieve receive ");
 
         // Explicit completion still works on a fully tracked, edited prefix.
         let s = Session::new();
@@ -3863,9 +4026,7 @@ mod tests {
         ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
         for (typed, completion, corrected) in [
             ("recieve ", false, "receive "),
-            ("recieve\n", false, "receive\n"),
             ("akuo ", false, "שלום "),
-            ("akuo\n", false, "שלום\n"),
             ("keyb", true, "keyboard"),
         ] {
             for queued in [false, true] {
@@ -4045,7 +4206,7 @@ mod tests {
             ("zzzzqqqq", "זזזז////"),
         ] {
             for reverse in [false, true] {
-                for suffix in ["", " ", "\n"] {
+                for suffix in ["", " "] {
                     SIMULATED_LAYOUT.store(usize::from(reverse), Ordering::SeqCst);
                     let s = Session::new();
                     s.type_text(&format!("{english}{suffix}"));
@@ -4184,6 +4345,7 @@ mod tests {
                 cfg.action_shortcut = binding.into();
                 cfg.completion_shortcut = completion_binding.into();
                 cfg.undo_shortcut = "none".into();
+                cfg.correction_shortcut = "none".into();
             });
             SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
             let s = Session::new();
