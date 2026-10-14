@@ -740,7 +740,7 @@ pub enum Fix {
         text: String,
         lang: Language,
     },
-    /// The same keystrokes are a plausible English misspelling under the other
+    /// The same keystrokes are a plausible misspelling under the other
     /// layout. The layout has already been switched to `lang`; unlike a plain
     /// layout fix, callers must type `text` rather than replaying the original
     /// keys because those keys still spell the uncorrected word.
@@ -1089,9 +1089,34 @@ fn plan(
                 return Some(Plan::HebrewSpell { text });
             }
         }
-        plan_spelling(
+        let english = plan_spelling(
             word_en, word_he, current, case, en_dict, he_dict, en_freq, context, details,
-        )
+        );
+        if english.is_some() {
+            return english;
+        }
+        if current == Some(Language::English)
+            && case != Case::Upper
+            && !valid_loose(word_en, Language::English, en_dict, he_dict)
+            && en_freq.rank(word_en).is_none_or(|rank| rank > 20_000)
+            && !crate::complete::ignored(word_en)
+            && !crate::complete::learned(word_en)
+            && en.full.chars().count() == he.full.chars().count()
+        {
+            // Source punctuation may occupy a Hebrew letter key (period = ץ).
+            let end = he
+                .full
+                .char_indices()
+                .nth(en.word.chars().count())
+                .map_or(he.full.len(), |(index, _)| index);
+            if let Some(text) =
+                crate::spell::hebrew::correct(&he.full[..end], he_dict, he_freq, context)
+            {
+                details.push_str("\nThe English reading is unprotected and no confident English repair won; Hebrew spelling passed its existing confidence gates.");
+                return Some(compose_spelling(Language::English, Language::Hebrew, text));
+            }
+        }
+        None
     }
 }
 
@@ -1120,12 +1145,18 @@ fn learned_plan(
         return None;
     }
     if is_english_text(correction) {
-        return Some(compose_spelling(current, correction.to_owned()));
+        return Some(compose_spelling(
+            current,
+            Language::English,
+            correction.to_owned(),
+        ));
     }
-    if current == Language::Hebrew && correction.chars().all(|c| ('א'..='ת').contains(&c)) {
-        return Some(Plan::HebrewSpell {
-            text: correction.to_owned(),
-        });
+    if correction.chars().all(|c| ('א'..='ת').contains(&c)) {
+        return Some(compose_spelling(
+            current,
+            Language::Hebrew,
+            correction.to_owned(),
+        ));
     }
     None
 }
@@ -1182,20 +1213,20 @@ fn plan_spelling(
     let assessment = crate::spell::assess(full_en, en_dict, en_freq, context);
     details.push_str(&format!("\n{}", assessment.details));
     let text = assessment.correction?;
-    Some(compose_spelling(current, text))
+    Some(compose_spelling(current, Language::English, text))
 }
 
-/// Turn any accepted English spelling result into the action required by the
+/// Turn any accepted spelling result into the action required by the
 /// live layout. This step deliberately has no access to the typed word: once
 /// the speller accepts a candidate, composition is a rule of layout context and
 /// cannot grow per-word exceptions.
-fn compose_spelling(current: Language, text: String) -> Plan {
-    match current {
-        Language::English => Plan::Spell { text },
-        Language::Hebrew => Plan::SwitchAndSpell {
-            lang: Language::English,
-            text,
-        },
+fn compose_spelling(current: Language, target: Language, text: String) -> Plan {
+    if current != target {
+        Plan::SwitchAndSpell { lang: target, text }
+    } else if target == Language::English {
+        Plan::Spell { text }
+    } else {
+        Plan::HebrewSpell { text }
     }
 }
 
@@ -1545,7 +1576,15 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
         Plan::SwitchAndSpell { lang, text } => {
             let switched = switch_layout_to(lang).changed();
             debug_log(&full_en, &full_he, Some(lang), switched);
-            let text = respelled(&text, case, en.tail);
+            let text = respelled(
+                &text,
+                if lang == Language::English {
+                    case
+                } else {
+                    Case::Lower
+                },
+                en.tail,
+            );
             if debug_enabled() {
                 println!("layout+spell: {} -> {}", full_he, text);
             }
@@ -1716,7 +1755,8 @@ pub fn correction_candidates<K: Copy>(
             return Vec::new();
         };
         full.push(c);
-        if c.is_alphanumeric() {
+        if c.is_alphanumeric() || (current == Language::Hebrew && crate::spell::hebrew::is_mark(c))
+        {
             word_end = full.len();
         }
         if c.is_ascii_alphabetic() {
@@ -2144,6 +2184,21 @@ mod tests {
 
     #[test]
     fn correction_accuracy_corpus() {
+        accuracy_corpus(
+            "regression",
+            include_str!("../../tests/data/corrections.tsv"),
+        );
+    }
+
+    #[test]
+    fn independent_correction_evaluation() {
+        accuracy_corpus(
+            "independent",
+            include_str!("../../tests/data/evaluation.tsv"),
+        );
+    }
+
+    fn accuracy_corpus(name: &str, corpus: &str) {
         // Exercise the planner with explicit layouts: this check never switches
         // the OS keyboard or depends on whichever layout the developer uses.
         let mut unchanged = 0;
@@ -2156,10 +2211,7 @@ mod tests {
         let mut phrase = crate::complete::PhraseContext::default();
         let mut sequence = "";
         let mut previous_mode = false;
-        for (line, row) in include_str!("../../tests/data/corrections.tsv")
-            .lines()
-            .enumerate()
-        {
+        for (line, row) in corpus.lines().enumerate() {
             if row.is_empty() || row.starts_with('#') {
                 continue;
             }
@@ -2285,12 +2337,20 @@ mod tests {
             "the corpus must test both protection and correction"
         );
         eprintln!(
-            "Accuracy: unwanted {}/{unchanged}; missed {}/{wanted}; wrong {}/{wanted}",
+            "Accuracy ({name}): unwanted {}/{unchanged}; missed {}/{wanted}; wrong {}/{wanted}",
             unwanted.len(),
             missed.len(),
             wrong.len()
         );
         eprintln!("unwanted changes: {unwanted:#?}\nmissed corrections: {missed:#?}\nwrong corrections: {wrong:#?}");
+        let correct = wanted - missed.len() - wrong.len();
+        let applied = correct + wrong.len() + unwanted.len();
+        eprintln!(
+            "Precision: {:.1}%; recall: {:.1}%; unwanted change rate: {:.1}%",
+            100.0 * correct as f64 / applied.max(1) as f64,
+            100.0 * correct as f64 / wanted as f64,
+            100.0 * unwanted.len() as f64 / unchanged as f64
+        );
         assert!(
             regressions.is_empty(),
             "accuracy regressions or resolved baselines: {regressions:#?}"
@@ -2995,7 +3055,10 @@ mod tests {
         );
         assert_eq!(
             learned_plan("שלום", "unknown", "לאמוכר", Some(Language::English), false),
-            None
+            Some(Plan::SwitchAndSpell {
+                lang: Language::Hebrew,
+                text: "שלום".into()
+            })
         );
     }
 
@@ -3032,6 +3095,117 @@ mod tests {
                 ),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn combined_hebrew_repair_keeps_source_guards_and_punctuation() {
+        let check = |en, en_f, current, case, layout_only| {
+            plan(
+                Reading::new("akuf.", 4),
+                Reading::of("שלומץ"),
+                &[],
+                &[],
+                5,
+                current,
+                Run::default(),
+                case,
+                en,
+                dict(&["שלום"]),
+                en_f,
+                freq(&[("שלום", 10)]),
+                layout_only,
+                None,
+                &mut String::new(),
+            )
+        };
+        assert_eq!(
+            check(
+                dict(&[]),
+                nofreq(),
+                Some(Language::English),
+                Case::Lower,
+                false
+            ),
+            Some(Plan::SwitchAndSpell {
+                lang: Language::Hebrew,
+                text: "שלום".into()
+            })
+        );
+        for (en, en_f, current, case, layout_only) in [
+            (
+                dict(&["akuf"]),
+                nofreq(),
+                Some(Language::English),
+                Case::Lower,
+                false,
+            ),
+            (
+                dict(&[]),
+                freq(&[("akuf", 100)]),
+                Some(Language::English),
+                Case::Lower,
+                false,
+            ),
+            (
+                dict(&[]),
+                nofreq(),
+                Some(Language::English),
+                Case::Upper,
+                false,
+            ),
+            (
+                dict(&[]),
+                nofreq(),
+                Some(Language::English),
+                Case::Lower,
+                true,
+            ),
+            (dict(&[]), nofreq(), None, Case::Lower, false),
+        ] {
+            assert_eq!(check(en, en_f, current, case, layout_only), None);
+        }
+        let keys: Vec<_> = "akuf."
+            .chars()
+            .map(|c| {
+                (
+                    c,
+                    crate::keymap::convert_selection(&c.to_string())
+                        .chars()
+                        .next()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        for outcome in [
+            crate::layout::LayoutSwitch::Switched,
+            crate::layout::LayoutSwitch::Failed,
+        ] {
+            let result = check_and_correct(
+                &keys,
+                |key| Some(key.0),
+                |key| Some(key.1),
+                |_| false,
+                Run::default(),
+                dict(&[]),
+                dict(&["שלום"]),
+                Some(Language::English),
+                false,
+                |_| outcome,
+            );
+            if outcome.changed() {
+                assert_eq!(
+                    result.fix,
+                    Some(Fix::LayoutSpelling {
+                        text: "שלום.".into(),
+                        lang: Language::Hebrew
+                    })
+                );
+                assert_eq!(result.rule, Some("layout+spelling"));
+            } else {
+                assert_eq!(result.fix, None);
+                assert_eq!(result.rule, None);
+            }
         }
     }
 
@@ -3202,7 +3376,11 @@ mod tests {
             for current in [Language::English, Language::Hebrew] {
                 assert_eq!(
                     plan_for(&typed, "טקסט", Some(current), en, he, en_f),
-                    Some(compose_spelling(current, corrected.clone())),
+                    Some(compose_spelling(
+                        current,
+                        Language::English,
+                        corrected.clone()
+                    )),
                     "{typed} in {current:?}"
                 );
             }
@@ -3216,13 +3394,13 @@ mod tests {
                 .map(|index| char::from(b'a' + (index % 26) as u8))
                 .collect();
             assert_eq!(
-                compose_spelling(Language::English, candidate.clone()),
+                compose_spelling(Language::English, Language::English, candidate.clone()),
                 Plan::Spell {
                     text: candidate.clone(),
                 }
             );
             assert_eq!(
-                compose_spelling(Language::Hebrew, candidate.clone()),
+                compose_spelling(Language::Hebrew, Language::English, candidate.clone()),
                 Plan::SwitchAndSpell {
                     lang: Language::English,
                     text: candidate,

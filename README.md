@@ -20,8 +20,10 @@ on screen and rewrite only the remaining suffix, reducing visible deletion.
 Enter accepts an already selected suggestion and clears typing context. It never
 starts an automatic rewrite or replays Enter, because that key may send a message
 or execute a command instead of inserting a line break.
-A confident English spelling fix can also correct a
-wrong-layout word in the same replacement.
+A confident English or Hebrew spelling fix can also correct a
+wrong-layout word in the same replacement. Combined Hebrew repairs preserve
+source punctuation and protect known English words, common names, ALL CAPS,
+and saved exceptions. A confident English spelling repair takes precedence.
 
 Spelling also checks missing, extra, or wrong first letters in longer words,
 including combined opening mistakes (`xocmputer` → `computer`) and additional
@@ -468,9 +470,13 @@ For three-letter prefixes,
 typo recovery runs only when no exact offer exists. Configured abbreviations still
 come first. Retained word frequency influences ranking when personalization is on.
 
-Completion and manually requested spelling offers use small bundled English and
-Hebrew phrase priors immediately, even with personalization off. These are curated
-relative weights, not measured corpus frequencies. Only the previous finished word
+Completion and manually requested spelling offers use bundled English and
+Hebrew phrase priors immediately, even with personalization off. Curated weights
+are supplemented by 994 measured pairs from two public Leipzig news samples,
+each containing 10,000 sentences. Measured pairs require at least five occurrences,
+conditional frequency of 5%, and association of at least three times the independent
+word-frequency expectation. Weights remain bounded to four; counts and pinned source
+checksums are in `src/phrase_counts.tsv`. Only the previous finished word
 is needed. Personalization additionally boosts pairs retained at least twice in the
 current typing context; these pair counts remain in memory. Focus changes, cursor
 moves, deletion, undo, and Enter clear phrase context; punctuation ends the
@@ -502,6 +508,13 @@ need a ranked dictionary word or stem. Existing words and saved exceptions are
 preserved; the spelling enable, minimum-length, and rank settings still apply.
 Automatic Hebrew corrections require at least four letters and a 20-point lead
 over the next candidate; phrase context contributes at most eight points.
+Manual Hebrew offers additionally favor neighboring physical keys, including
+letters on punctuation keys. Manual spelling search normalizes niqqud and Hebrew
+or ASCII quotes for lookup, preserving them attached to their original letters
+in offered repairs. A decorated letter cannot be deleted. Automatic Hebrew spelling
+keeps its original edit costs and accepts plain letters only. Live keyboard capture
+still supports the existing unshifted Hebrew keymap; this does not add niqqud input
+capture or new Linux injection mappings.
 Ambiguous candidates remain available through the completion gesture. Hebrew
 repairs preserve the current layout and punctuation, replace only the changed
 suffix, and support the same undo and retained-correction learning as English.
@@ -560,6 +573,27 @@ words or undo exceptions.
   Conservative spelling, or disable spelling in Settings.
 
 ## Development
+
+`cargo test independent_correction_evaluation -- --nocapture` reports unwanted
+changes, missed fixes, wrong fixes, precision, and recall on independently authored
+evaluation cases in `tests/data/evaluation.tsv`. Standalone cases were frozen before
+the Hebrew and phrase changes, with exact baselines for existing failures. Expected
+results still count toward accuracy; a passing baseline test does not imply perfect
+correction. These synthetic cases are not a random sample of real user typing and
+must not be used to tune thresholds. The original regression corpus remains separate.
+
+Regenerate the measured phrase priors by downloading the two public archives named
+in `src/phrase_counts.tsv`, then running:
+
+```bash
+python3 scripts/build_phrases.py /path/to/eng_news_2020_10K.tar.gz /path/to/heb_news_2020_10K.tar.gz
+python3 -m unittest discover -s scripts -p 'test_*.py'
+```
+
+The builder verifies pinned SHA256 checksums, respects sentence and punctuation
+boundaries, and keeps at most 512 pairs per language. Add `--check` to verify the
+committed output without changing it. Only aggregate phrase counts are bundled;
+the app never downloads corpora or sends typed text to a server.
 
 ```bash
 cargo build --locked --release

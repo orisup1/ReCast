@@ -114,18 +114,18 @@ impl PhraseContext {
     }
 }
 
-/// Hand-curated relative phrase weights, not measured corpus counts. Public
-/// language priors work immediately without collecting personal word pairs.
+/// Curated and measured public phrase priors require no personal word pairs.
 fn phrase_boost(previous: &str, word: &str) -> f64 {
     static PHRASES: OnceLock<HashMap<&'static str, Vec<(&'static str, f64)>>> = OnceLock::new();
     let phrases = PHRASES.get_or_init(|| {
         let mut map: HashMap<_, Vec<_>> = HashMap::new();
         for line in include_str!("phrases.tsv")
             .lines()
+            .chain(include_str!("phrase_counts.tsv").lines())
             .filter(|line| !line.starts_with('#'))
         {
             let fields: Vec<_> = line.split('\t').collect();
-            if let [previous, next, weight] = fields.as_slice() {
+            if let [previous, next, weight, ..] = fields.as_slice() {
                 if let Ok(weight) = weight.parse::<f64>() {
                     map.entry(*previous).or_default().push((*next, weight));
                 }
@@ -133,10 +133,13 @@ fn phrase_boost(previous: &str, word: &str) -> f64 {
         }
         map
     });
-    phrases
-        .get(previous)
-        .and_then(|entries| entries.iter().find(|(next, _)| *next == word))
-        .map_or(1.0, |(_, weight)| *weight)
+    phrases.get(previous).map_or(1.0, |entries| {
+        entries
+            .iter()
+            .filter(|(next, _)| *next == word)
+            .map(|(_, weight)| *weight)
+            .fold(1.0, f64::max)
+    })
 }
 
 #[derive(Default)]
@@ -1385,6 +1388,50 @@ mod tests {
                 .iter()
                 .all(|word| !word.is_empty() && word.chars().all(char::is_alphabetic)));
         }
+    }
+
+    #[test]
+    fn measured_phrases_are_attested_bounded_and_work_without_learning() {
+        let mut seen = HashSet::new();
+        for line in include_str!("phrase_counts.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 6);
+            assert!(seen.insert((fields[0], fields[1])));
+            let weight = fields[2].parse::<f64>().unwrap();
+            let count = fields[3].parse::<u32>().unwrap();
+            let previous = fields[4].parse::<u32>().unwrap();
+            let next = fields[5].parse::<u32>().unwrap();
+            assert!((2.0..=4.0).contains(&weight));
+            assert!(count >= 5 && count <= previous && count <= next);
+            assert!(count as f64 / previous as f64 >= 0.05);
+            assert!(fields[..2]
+                .iter()
+                .all(|word| (2..=20).contains(&word.chars().count())
+                    && (word.chars().all(|c| c.is_ascii_lowercase())
+                        || word.chars().all(|c| ('א'..='ת').contains(&c)))));
+        }
+        assert!(seen.len() > 500);
+        let mut context = PhraseContext::default();
+        context.observe("prime", false);
+        assert_eq!(context.boost("minister"), 4.0);
+        let dict = dict(&["minimal", "minister"]);
+        let freq = freq(&[("minimal", 100), ("minister", 180)]);
+        assert_eq!(
+            completions_in_context("min", dict, freq, None)[0],
+            "minimal"
+        );
+        assert_eq!(
+            completions_in_context("min", dict, freq, Some(&context))[0],
+            "minister"
+        );
+        context.observe("ראש", false);
+        assert_eq!(context.boost("הממשלה"), 4.0);
+        assert!(context.pairs.is_empty());
+        context.clear();
+        assert_eq!(context.boost("הממשלה"), 1.0);
     }
 
     #[test]

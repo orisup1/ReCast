@@ -78,6 +78,7 @@ BIN_DST  := $(BINDIR)/$(BIN_NAME)
 # the cargo invocation when nothing has changed.
 SRC := Cargo.toml Cargo.lock build.rs \
         en_dict.txt he_dict.txt en_freq.txt he_freq.txt \
+        src/phrases.tsv src/phrase_counts.tsv \
         assets/tray-icon.rgba assets/recast.ico \
         $(shell find src -type f -name '*.rs' 2>/dev/null)
 

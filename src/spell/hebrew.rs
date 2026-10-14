@@ -4,6 +4,7 @@ use crate::complete::{PhraseContext, MAX_CANDIDATES};
 use crate::config::Config;
 use crate::dictionary::{hebrew_stem, Dict, Freq};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 enum Request {
     Automatic,
@@ -92,7 +93,10 @@ fn ranked_candidates(
 ) -> Vec<(String, f32)> {
     let automatic = matches!(request, Request::Automatic);
     let explicit = matches!(request, Request::Correction);
-    let letters: Vec<char> = word.chars().collect();
+    let Some(letters) = spelling_letters(word, !automatic) else {
+        return Vec::new();
+    };
+    let plain: String = letters.iter().map(|(letter, _)| letter).collect();
     let min_len = if explicit {
         2
     } else {
@@ -105,10 +109,10 @@ fn ranked_candidates(
     };
     if (!explicit && (!config.spell_enabled || config.spell_max_dist == 0))
         || !(min_len..=24).contains(&letters.len())
-        || !letters.iter().all(|c| ('א'..='ת').contains(c))
         || (!explicit
             && (dict.contains(word)
-                || hebrew_stem(word, dict).is_some()
+                || dict.contains(&plain)
+                || hebrew_stem(&plain, dict).is_some()
                 || crate::complete::ignored(word)
                 || crate::complete::learned(word)
                 || crate::complete::suppressed(word)))
@@ -116,9 +120,10 @@ fn ranked_candidates(
         return Vec::new();
     }
     let mut candidates = HashMap::<String, f32>::new();
-    let mut consider = |candidate: Vec<char>, cost: u32| {
-        let text: String = candidate.iter().collect();
-        if text == word || !valid_finals(&candidate) {
+    let mut consider = |candidate: Vec<(char, String)>, cost: u32| {
+        let chars: Vec<char> = candidate.iter().map(|(letter, _)| *letter).collect();
+        let text: String = chars.iter().collect();
+        if text == plain || !valid_finals(&chars) {
             return;
         }
         let rank = if dict.contains(&text) {
@@ -136,22 +141,30 @@ fn ranked_candidates(
             } else {
                 discount
             };
+        let visible: String = candidate
+            .into_iter()
+            .map(|(letter, marks)| format!("{letter}{marks}"))
+            .collect();
         candidates
-            .entry(text)
+            .entry(visible)
             .and_modify(|old| *old = old.min(score))
             .or_insert(score);
     };
     for index in 0..letters.len() {
-        let mut deleted = letters.clone();
-        deleted.remove(index);
-        consider(deleted, vowel_cost(letters[index]));
+        // Never delete an attached mark or quote along with its letter.
+        if letters[index].1.is_empty() {
+            let mut deleted = letters.clone();
+            deleted.remove(index);
+            consider(deleted, vowel_cost(letters[index].0));
+        }
         for letter in 'א'..='ת' {
             let mut replaced = letters.clone();
-            replaced[index] = letter;
-            let cost = if medial(letter) == medial(letters[index]) {
-                30
-            } else {
+            replaced[index].0 = letter;
+            // Neighbor weighting starts in manual offers; automatic costs stay calibrated.
+            let cost = if automatic && medial(letters[index].0) != medial(letter) {
                 100
+            } else {
+                substitution_cost(letters[index].0, letter)
             };
             consider(replaced, cost);
         }
@@ -164,13 +177,60 @@ fn ranked_candidates(
     for index in 0..=letters.len() {
         for letter in 'א'..='ת' {
             let mut inserted = letters.clone();
-            inserted.insert(index, letter);
+            inserted.insert(index, (letter, String::new()));
             consider(inserted, vowel_cost(letter));
         }
     }
     let mut candidates: Vec<_> = candidates.into_iter().collect();
     candidates.sort_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| a.cmp(b)));
     candidates
+}
+
+pub(crate) fn is_mark(letter: char) -> bool {
+    matches!(letter, '\u{0591}'..='\u{05bd}' | '\u{05bf}' | '\u{05c1}'..='\u{05c2}' | '\u{05c4}'..='\u{05c5}' | '\u{05c7}')
+}
+
+fn spelling_letters(word: &str, decorated: bool) -> Option<Vec<(char, String)>> {
+    let mut letters: Vec<(char, String)> = Vec::new();
+    for letter in word.chars() {
+        if ('א'..='ת').contains(&letter) {
+            letters.push((letter, String::new()));
+        } else if decorated
+            && (is_mark(letter) || matches!(letter, '\u{05f3}' | '\u{05f4}' | '\'' | '"'))
+        {
+            letters.last_mut()?.1.push(letter);
+        } else {
+            return None;
+        }
+    }
+    Some(letters)
+}
+
+fn substitution_cost(a: char, b: char) -> u32 {
+    if medial(a) == medial(b) {
+        return 30;
+    }
+    static POSITIONS: OnceLock<[Option<(i32, i32)>; 27]> = OnceLock::new();
+    let positions = POSITIONS.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let letter = char::from_u32('א' as u32 + index as u32).unwrap();
+            let key = crate::keymap::convert_selection(&letter.to_string());
+            super::qwerty_pos(key.as_bytes()[0])
+        })
+    });
+    if let (Some((row_a, col_a)), Some((row_b, col_b))) = (
+        positions[(a as u32 - 'א' as u32) as usize],
+        positions[(b as u32 - 'א' as u32) as usize],
+    ) {
+        if (row_a - row_b).abs() <= 1 && (col_a - col_b).abs() <= 2 {
+            return if row_a == row_b {
+                super::COST_ADJACENT_ROW
+            } else {
+                super::COST_ADJACENT_DIAG
+            };
+        }
+    }
+    100
 }
 
 fn vowel_cost(letter: char) -> u32 {
@@ -205,6 +265,58 @@ fn valid_finals(word: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_neighbors_rank_ahead_of_distant_substitutions() {
+        assert_eq!(substitution_cost('מ', 'ם'), 30);
+        assert_eq!(substitution_cost('פ', 'ם'), super::super::COST_ADJACENT_ROW);
+        assert_eq!(substitution_cost('ת', 'ץ'), super::super::COST_ADJACENT_ROW);
+        assert_eq!(
+            substitution_cost('ש', 'ז'),
+            super::super::COST_ADJACENT_DIAG
+        );
+        assert_eq!(substitution_cost('פ', 'ש'), 100);
+        let dict = Dict::of(&["שלום", "שלוש"]);
+        let freq = Freq::of(&[("שלום", 100), ("שלוש", 100)]);
+        assert_eq!(correction_suggestions("שלופ", dict, freq, None)[0], "שלום");
+    }
+
+    #[test]
+    fn manual_repairs_keep_attached_marks_and_quotes() {
+        let dict = Dict::of(&["שלום", "מחשב"]);
+        let freq = Freq::of(&[("שלום", 10), ("מחשב", 20)]);
+        for (typed, expected) in [
+            ("שָׁלוֹמ", "שָׁלוֹם"),
+            ("שלו״מ", "שלו״ם"),
+            ("שלו׳מ", "שלו׳ם"),
+            ("שלו'מ", "שלו'ם"),
+            ("שלו\"מ", "שלו\"ם"),
+            ("שָׁלוֹום", "שָׁלוֹם"),
+            ("מחַבש", "מחַשב"),
+        ] {
+            assert_eq!(
+                correction_suggestions(typed, dict, freq, None)[0],
+                expected,
+                "{typed}"
+            );
+            assert_eq!(correct(typed, dict, freq, None), None, "{typed}");
+        }
+        assert!(suggestions("שָׁלוֹם", dict, freq, None).is_empty());
+        assert!(correction_suggestions("שָׁלוֹםזַ", dict, freq, None).is_empty());
+        for malformed in ["ָשלום", "׳שלום", "שלום-ם", "שלום1", "שלוםx"] {
+            assert!(correction_suggestions(malformed, dict, freq, None).is_empty());
+        }
+        let keys: Vec<_> = "שָׁלוֹמַ!".chars().collect();
+        let offers = crate::dictionary::correction_candidates(
+            &keys,
+            Some,
+            |_| false,
+            dict,
+            Some(crate::types::Language::Hebrew),
+            None,
+        );
+        assert_eq!(offers[0], "שָׁלוֹםַ!");
+    }
 
     #[test]
     fn explicit_correction_ignores_automatic_spelling_settings() {

@@ -1,0 +1,165 @@
+# Independently authored evaluation cases, frozen before the Hebrew/phrase changes.
+# These are synthetic examples, not a random sample of real user typing.
+# Same columns as corrections.tsv. Fifth column pins a pre-existing error;
+# desired outcomes still count as errors. Do not tune thresholds to this file.
+# Added 2026-10-14. Names, jargon, identifiers, mixed scripts, English/Hebrew typos.
+en	aditya	שגןאטש	aditya
+en	aoife	שםןכק	aoife
+en	dmitri	גצןארן	dmitri
+en	elodie	קךםגןק	elodie
+en	fatima	כשאןצש	fatima
+en	hiram	יןרשצ	hiram
+en	ines	ןמקד	ines	inez
+en	jules	חוךקד	jules
+en	leandro	ךקשמגרם	leandro
+en	maeve	צשקהק	maeve
+en	nour	מםור	nour	nor
+en	saoirse	דשםןרדק	saoirse
+en	soren	דםרקמ	soren	sore
+en	yusuf	טודוכ	yusuf
+en	zainab	זשןמשנ	zainab
+en	polars	פםךשרד	polars
+en	uvicorn	והןבםרמ	uvicorn
+en	wasmtime	'שדצאןצק	wasmtime	wasting
+en	otel	םאקך	otel
+en	k8s	ל8ד	k8s
+en	v2ray	ה2רשט	v2ray
+en	fooBar	כםםנשר	fooBar
+en	/usr/local/bin	.ודר.ךםבשך.נןמ	/usr/local/bin
+en	git@host	עןא@יםדא	git@host
+en	0xdeadbeef	0סגקשגנקקכ	0xdeadbeef
+en	Rustעברית	רודאעברית	Rustעברית
+en	שלוםRust	שלוםרודא	שלוםRust
+he	tchdhk	אביגיל	אביגיל
+he	thhk,	איילת	איילת
+he	tkhbur	אלינור	אלינור
+he	trhtk	אריאל	אריאל
+he	hub,i	יונתן	יונתן
+he	khturv	ליאורה	ליאורה
+he	bgnh	נעמי	נעמי
+he	ghsh,	עידית	עידית
+he	eucrbyhx	קוברנטיס	קוברנטיס
+he	puxydrx	פוסטגרס	פוסטגרס
+he	rhtey	ריאקט	ריאקט
+he	dhyvtc	גיטהאב	גיטהאב
+he	ctkdurh,nho	באלגוריתמים	באלגוריתמים
+he	uvnp,jho	והמפתחים	והמפתחים
+he	ufakngrfu,	וכשלמערכות	וכשלמערכות
+he	favnjacho	כשהמחשבים	כשהמחשבים
+he	akuoRust	שלוםRust	שלוםRust
+en	enviroment	קמהןרםצקמא	environment	enviroment
+he	enviroment	קמהןרםצקמא	environment	enviroment
+en	accomodation	שבבםצםגשאןםמ	accommodation
+he	accomodation	שבבםצםגשאןםמ	accommodation
+en	arguement	שרעוקצקמא	argument
+he	arguement	שרעוקצקמא	argument
+en	calender	בשךקמגקר	calendar	calender
+he	calender	בשךקמגקר	calendar	calender
+en	cemetry	בקצקארט	cemetery
+he	cemetry	בקצקארט	cemetery
+en	harrassment	ישררשדדצקמא	harassment
+he	harrassment	ישררשדדצקמא	harassment
+en	occassion	םבבשדדןםמ	occasion
+he	occassion	םבבשדדןםמ	occasion
+en	perserverance	פקרדקרהקרשמבק	perseverance
+he	perserverance	פקרדקרהקרשמבק	perseverance
+en	priviledge	פרןהןךקגעק	privilege	priviledge
+he	priviledge	פרןהןךקגעק	privilege	priviledge
+en	recomend	רקבםצקמג	recommend
+he	recomend	רקבםצקמג	recommend
+en	resistence	רקדןדאקמבק	resistance	resistence
+he	resistence	רקדןדאקמבק	resistance	resistence
+en	succesful	דובבקדכוך	successful	succesful
+he	succesful	דובבקדכוך	successful	succesful
+en	tommorow	אםצצםרם'	tomorrow
+he	tommorow	אםצצםרם'	tomorrow
+en	unfortunatly	ומכםראומשאךט	unfortunately
+he	unfortunatly	ומכםראומשאךט	unfortunately
+en	availble	שהשןךנךק	available
+he	availble	שהשןךנךק	available
+en	descripton	גקדברןפאםמ	description
+he	descripton	גקדברןפאםמ	description
+en	explanaton	קספךשמשאםמ	explanation
+he	explanaton	קספךשמשאםמ	explanation
+en	opertion	םפקראןםמ	operation
+he	opertion	םפקראןםמ	operation
+en	verison	הקרןדםמ	version
+he	verison	הקרןדםמ	version
+en	funciton	כומבןאםמ	function
+he	funciton	כומבןאםמ	function
+en	mesage	צקדשעק	message
+he	mesage	צקדשעק	message
+en	alogrithm	שךםערןאיצ	algorithm
+he	alogrithm	שךםערןאיצ	algorithm
+en	relatoinship	רקךשאםןמדיןפ	relationship
+he	relatoinship	רקךשאםןמדיןפ	relationship
+he	njaca	מחשבש	מחשב	מחשבש
+en	njaca	מחשבש	מחשב	njaca
+he	neks,,	מקלדתת	מקלדת	necks,,
+en	neks,,	מקלדתת	מקלדת	necks,,
+he	ykpu	טלפו	טלפון	טלפו
+en	ykpu	טלפו	טלפון	טלפו
+he	thbyrbhy	אינטרניט	אינטרנט
+en	thbyrbhy	אינטרניט	אינטרנט
+he	,fbuv	תכנוה	תוכנה	תכנוה
+en	,fbuv	תכנוה	תוכנה	תכנוה
+he	vmkjj	הצלחח	הצלחה	הצלחח
+en	vmkjj	הצלחח	הצלחה	vmkjj
+he	cnjaca	במחשבש	במחשב	במחשבש
+en	cnjaca	במחשבש	במחשב	cnjaca
+he	ufaneks,,	וכשמקלדתת	וכשמקלדת	וכשמקלדתת
+en	ufaneks,,	וכשמקלדתת	וכשמקלדת	ufaneks,,
+
+# Code-switching sentences added without tuning; repeated words share context.
+en	please	פךקשדק	please		code-switch-full-0	full
+en	review	רקהןק'	review		code-switch-full-0	full
+en	this	איןד	this		code-switch-full-0	full
+en	change	בישמעק	change		code-switch-full-0	full
+he	,usv	תודה	תודה		code-switch-full-0	full
+he	rcv	רבה	רבה		code-switch-full-0	full
+he	vngrf,	המערכת	המערכת		code-switch-full-1	full
+he	gucs,	עובדת	עובדת		code-switch-full-1	full
+he	go	עם	עם		code-switch-full-1	full
+en	Rust	רודא	Rust		code-switch-full-1	full
+he	unxsh	ומסדי	ומסדי		code-switch-full-1	full
+he	b,ubho	נתונים	נתונים		code-switch-full-1	full
+en	release	רקךקשדק	release		code-switch-full-2	full
+en	version	הקרדןםמ	version		code-switch-full-2	full
+en	supports	דופפםראד	supports		code-switch-full-2	full
+he	gcrh,	עברית	עברית		code-switch-full-2	full
+en	and	שמג	and		code-switch-full-2	full
+en	English	קמעךןדי	English		code-switch-full-2	full
+en	prime	פרןצק	prime		code-switch-full-3	full
+en	minister	צןמןדאקר	minister		code-switch-full-3	full
+he	rta	ראש	ראש		code-switch-full-3	full
+he	vnnakv	הממשלה	הממשלה		code-switch-full-3	full
+en	we	'ק	we		code-switch-full-4	full
+en	met	צקא	met		code-switch-full-4	full
+he	si	דן	דן		code-switch-full-4	full
+en	yesterday	טקדאקרגשט	yesterday		code-switch-full-4	full
+en	please	פךקשדק	please		code-switch-layout-only-0	layout-only
+en	review	רקהןק'	review		code-switch-layout-only-0	layout-only
+en	this	איןד	this		code-switch-layout-only-0	layout-only
+en	change	בישמעק	change		code-switch-layout-only-0	layout-only
+he	,usv	תודה	תודה		code-switch-layout-only-0	layout-only
+he	rcv	רבה	רבה		code-switch-layout-only-0	layout-only
+he	vngrf,	המערכת	המערכת		code-switch-layout-only-1	layout-only
+he	gucs,	עובדת	עובדת		code-switch-layout-only-1	layout-only
+he	go	עם	עם		code-switch-layout-only-1	layout-only
+en	Rust	רודא	Rust		code-switch-layout-only-1	layout-only
+he	unxsh	ומסדי	ומסדי		code-switch-layout-only-1	layout-only
+he	b,ubho	נתונים	נתונים		code-switch-layout-only-1	layout-only
+en	release	רקךקשדק	release		code-switch-layout-only-2	layout-only
+en	version	הקרדןםמ	version		code-switch-layout-only-2	layout-only
+en	supports	דופפםראד	supports		code-switch-layout-only-2	layout-only
+he	gcrh,	עברית	עברית		code-switch-layout-only-2	layout-only
+en	and	שמג	and		code-switch-layout-only-2	layout-only
+en	English	קמעךןדי	English		code-switch-layout-only-2	layout-only
+en	prime	פרןצק	prime		code-switch-layout-only-3	layout-only
+en	minister	צןמןדאקר	minister		code-switch-layout-only-3	layout-only
+he	rta	ראש	ראש		code-switch-layout-only-3	layout-only
+he	vnnakv	הממשלה	הממשלה		code-switch-layout-only-3	layout-only
+en	we	'ק	we		code-switch-layout-only-4	layout-only
+en	met	צקא	met		code-switch-layout-only-4	layout-only
+he	si	דן	דן		code-switch-layout-only-4	layout-only
+en	yesterday	טקדאקרגשט	yesterday		code-switch-layout-only-4	layout-only

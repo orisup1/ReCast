@@ -1046,7 +1046,7 @@ fn is_vowel(c: u8) -> bool {
 /// Position of `c` on a QWERTY keyboard as `(row, 2×column)`. The doubled
 /// column lets the half-key stagger between rows be expressed in integers.
 fn qwerty_pos(c: u8) -> Option<(i32, i32)> {
-    const ROWS: [&[u8]; 3] = [b"qwertyuiop", b"asdfghjkl", b"zxcvbnm"];
+    const ROWS: [&[u8]; 3] = [b"qwertyuiop", b"asdfghjkl;'", b"zxcvbnm,./"];
     for (row, keys) in ROWS.iter().enumerate() {
         if let Some(col) = keys.iter().position(|&k| k == c) {
             // Each row sits half a key to the right of the one above it.

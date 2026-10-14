@@ -75,6 +75,12 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
         ),
         ("Recieve!", "en", "Receive!", "English spelling"),
         ("akuo", "en", "שלום", "Keyboard-layout correction"),
+        (
+            "thbyrbhy.",
+            "en",
+            "אינטרנט.",
+            "Keyboard-layout correction with spelling",
+        ),
         ("יקךךם", "he", "hello", "Keyboard-layout correction"),
         (
             "תודדה.",

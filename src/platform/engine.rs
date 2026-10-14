@@ -2178,7 +2178,7 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
         }),
         Fix::LayoutSpelling { text, lang } => Some(Replacement {
             erase: keys.len(),
-            retype: P::retype_text(&text)?,
+            retype: P::retype_completion(&text, lang)?,
             previous_layout: Some(lang.other()),
             target_layout: lang,
             original_start: 0,
@@ -2678,6 +2678,56 @@ mod tests {
     }
 
     #[test]
+    fn combined_hebrew_repair_and_undo_use_target_language() {
+        let keys: Vec<_> = "akuf."
+            .chars()
+            .map(|key| Typed { key, shift: false })
+            .collect();
+        let fix = Fix::LayoutSpelling {
+            text: "שלום.".into(),
+            lang: Language::Hebrew,
+        };
+        let note = note_of::<Simulated>(&keys, &fix);
+        assert_eq!((note.0.as_str(), note.1.as_str()), ("akuf.", "שלום."));
+        let rep = replacement::<Simulated>(&keys, Some(fix)).unwrap();
+        assert_eq!(rep.erase, 5);
+        assert_eq!(rep.retype, "שלום.");
+        let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
+        assert_eq!(
+            Simulated::retype_original(&undo.restore, undo.restore_layout),
+            "akuf."
+        );
+        assert_eq!(undo.layout, Some(Language::English));
+        assert_eq!(undo.visible_layout, Language::Hebrew);
+        assert_eq!(undo.on_screen, 6);
+        #[cfg(target_os = "linux")]
+        {
+            use crate::platform::linux::Linux;
+            let keys: Vec<_> = "akuf"
+                .chars()
+                .map(|c| Typed {
+                    key: crate::keymap::english_char_to_evkey_shifted(c).unwrap().0,
+                    shift: false,
+                })
+                .collect();
+            let rep = replacement::<Linux>(
+                &keys,
+                Some(Fix::LayoutSpelling {
+                    text: "שלום".into(),
+                    lang: Language::Hebrew,
+                }),
+            )
+            .unwrap();
+            let visible: String = rep
+                .retype
+                .iter()
+                .filter_map(|(key, _)| crate::keymap::evkey_to_hebrew_char(*key))
+                .collect();
+            assert_eq!(visible, "שלום");
+        }
+    }
+
+    #[test]
     fn retained_bilingual_repairs_keep_their_layout_and_undo() {
         const CHILD: &str = "RECAST_BILINGUAL_REPAIR_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -2733,6 +2783,31 @@ mod tests {
                 assert_eq!(s.text(), "תודדה ");
                 assert_eq!(Simulated::current_layout(), Some(Language::Hebrew));
                 assert_eq!(crate::personal::personal_correction("תודדה"), None);
+            }
+        }
+
+        // Combined Hebrew repairs train one pair and restore the original layout on undo.
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for iteration in 0..3 {
+            SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+            let s = Session::new();
+            s.type_text("thbyrbhy ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "אינטרנט ");
+            assert_eq!(Simulated::current_layout(), Some(Language::Hebrew));
+            if iteration < 2 {
+                s.type_text("x");
+            } else {
+                assert!(s.engine.control.history()[0]
+                    .details
+                    .contains("repeatedly retained"));
+                s.undo();
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), "thbyrbhy ");
+                assert_eq!(Simulated::current_layout(), Some(Language::English));
+                assert_eq!(crate::personal::personal_correction("thbyrbhy"), None);
             }
         }
     }
