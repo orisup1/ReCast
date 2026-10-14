@@ -448,8 +448,11 @@ impl<T> Default for DeferredInput<T> {
     }
 }
 impl<T> DeferredInput<T> {
+    fn next_ticket(&self) -> u32 {
+        self.ticket.wrapping_add(1).max(1)
+    }
     fn begin(&mut self) -> u32 {
-        self.ticket = self.ticket.wrapping_add(1).max(1);
+        self.ticket = self.next_ticket();
         self.active = true;
         self.ticket
     }
@@ -474,17 +477,14 @@ fn deferred_input() -> &'static Mutex<NativeDeferredInput> {
 fn begin_injection(engine: &Engine<Mac>, generation: u64) -> Option<()> {
     // Serialize validation and gating with capture; never dispatch with the state locked.
     dispatch::Queue::main().exec_sync(|| {
-        let event = keyboard_event(0, false, false)?;
-        let marker = DeferredEvent { kind: 0, event };
         if !engine.replacement_valid(generation) {
             return None;
         }
         let mut input = crate::types::lock_forgiving(deferred_input());
-        let ticket = input.input.begin();
-        unsafe {
-            CGEventSetIntegerValueField(event, EVENT_USER_DATA, FINISH_EVENT | i64::from(ticket));
-        }
-        input.finish = Some(marker);
+        let tag = FINISH_EVENT | i64::from(input.input.next_ticket());
+        let event = keyboard_event_with_tag(0, false, false, tag)?;
+        input.input.begin();
+        input.finish = Some(DeferredEvent { kind: 0, event });
         engine.injector.store(true, Ordering::Relaxed);
         Some(())
     })
@@ -1006,12 +1006,17 @@ pub fn setup_event_tap(
 }
 
 fn keyboard_event(code: u16, down: bool, shift: bool) -> Option<CGEventRef> {
+    keyboard_event_with_tag(code, down, shift, RECAST_EVENT)
+}
+
+fn keyboard_event_with_tag(code: u16, down: bool, shift: bool, tag: i64) -> Option<CGEventRef> {
     unsafe {
         let event = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, down);
         if event.is_null() {
             return None;
         }
-        CGEventSetIntegerValueField(event, EVENT_USER_DATA, RECAST_EVENT);
+        // Quartz ignores retagging an event; assign its final tag at construction.
+        CGEventSetIntegerValueField(event, EVENT_USER_DATA, tag);
         // Do not inherit a physical Ctrl/Shift pressed during the correction.
         // Inherited flags can turn a backspace into a shortcut or select text.
         CGEventSetFlags(event, if shift { 0x0002_0000 } else { 0 });
@@ -1436,11 +1441,12 @@ mod setup_tests {
             }
         }
         for ticket in [1, u32::MAX] {
-            let marker = keyboard_event(0, false, false).unwrap();
+            let value = FINISH_EVENT | i64::from(ticket);
+            let marker = keyboard_event_with_tag(0, false, false, value).unwrap();
             unsafe {
-                let value = FINISH_EVENT | i64::from(ticket);
-                CGEventSetIntegerValueField(marker, EVENT_USER_DATA, value);
                 assert_eq!(CGEventGetIntegerValueField(marker, EVENT_USER_DATA), value);
+                assert_eq!(value & FINISH_MASK, FINISH_EVENT);
+                assert_ne!(RECAST_EVENT & FINISH_MASK, FINISH_EVENT);
                 assert_eq!(CGEventGetType(marker), KCG_EVENT_KEY_UP);
                 CFRelease(marker.cast());
             }
