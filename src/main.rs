@@ -88,7 +88,7 @@ Settings:
   RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
   RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 50000)
   RECAST_SPELL_DIST=n Maximum edit distance, 0 to 3 (0 disables; default 3)
-  RECAST_COMPLETE=0   Disable completion, spelling offers, and abbreviations
+  RECAST_COMPLETE=0   Disable completion and abbreviations
   RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)
   RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
   RECAST_PERSONAL=1   Opt in to local word/correction/timing personalization;
@@ -105,7 +105,9 @@ Settings:
   RECAST_ACTION_SHORTCUT=  Double-tap key: ctrl (default), left_ctrl, right_ctrl,
                       left_shift, right_shift, or none.
   RECAST_COMPLETION_SHORTCUT=  Single-tap key: right_shift (default), left_shift,
-                      left_ctrl, right_ctrl, or none. Must not share an action/undo key.
+                      left_ctrl, right_ctrl, or none. Must not share another gesture.
+  RECAST_CORRECTION_SHORTCUT=  Spelling suggestions: left_shift (default), right_shift,
+                      left_ctrl, right_ctrl, or none. Must not share another gesture.
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.
@@ -136,11 +138,17 @@ Auto-complete:
   first tap too; define them one per line as `abbr = expansion` in
   <config dir>/recast/abbrev.txt.
 
+Spelling suggestions:
+  Tap Left Shift mid-word to request alternatives; tap again to cycle and
+  return to your original text. Includes short and already valid words.
+  This explicit gesture works when automatic spelling or completion is off.
+
 Undo or convert (Ctrl tapped twice within half a second):
   Undo the latest correction, abbreviation expansion, or completion. If the last
   word was unchanged, convert it to the other layout, even for unknown words.
-  Conversion works before or after Space/Enter; repeat to convert back without
-  changing saved word exceptions. Typing or cursor movement ends the gesture.
+  Conversion works before or after Space; repeat to convert back without
+  changing saved word exceptions. Extra spaces preserve undo. Other typing,
+  Enter, or cursor movement ends the gesture. Enter never triggers a rewrite.
   The optional single-Ctrl undo shortcut also restores corrections or unlists
   skipped words. Shared bindings wait half a second so double taps take priority.
   On macOS, select text in an editable field and double-tap Ctrl to convert

@@ -304,15 +304,36 @@ const INFERRED_STEM_MAX_RANK: u32 = 50_000;
 
 /// A single English apostrophe joining a productive possessive or contraction.
 /// Reject other punctuation, digits, and multiple apostrophes before lookup.
-fn english_stem(text: &str) -> Option<&str> {
+pub(crate) fn english_form(text: &str) -> Option<(&str, &str)> {
     ["n't", "'s", "'ll", "'re", "'ve", "'d", "'m"]
         .iter()
         .find_map(|suffix| {
             let stem = text.strip_suffix(suffix)?;
             let enough_letters =
                 stem.len() >= 2 || (stem == "i" && matches!(*suffix, "'m" | "'d" | "'ll" | "'ve"));
-            (enough_letters && stem.bytes().all(|b| b.is_ascii_lowercase())).then_some(stem)
+            (enough_letters && stem.bytes().all(|b| b.is_ascii_lowercase()))
+                .then_some((stem, *suffix))
         })
+}
+
+fn english_stem(text: &str) -> Option<&str> {
+    english_form(text).map(|(stem, _)| stem)
+}
+
+/// Canonical apostrophe forms need a ranked folded entry or possessive stem.
+pub(crate) fn english_form_rank(text: &str, dict: Dict, freq: Freq) -> Option<u32> {
+    let (stem, suffix) = english_form(text)?;
+    let folded = text.replace('\'', "");
+    if suffix == "'s" {
+        if !dict.contains(stem) {
+            return None;
+        }
+        freq.rank(&folded).or_else(|| freq.rank(stem))
+    } else if dict.contains(&folded) || dict.contains(stem) {
+        freq.rank(&folded)
+    } else {
+        None
+    }
 }
 
 /// Hebrew lookup with a prefix fallback: if the word is not in the dict
@@ -1630,7 +1651,9 @@ pub fn complete_candidates<K: Copy>(
     for &k in keys {
         if let Some(c) = to_char(k) {
             prefix.push(c);
-            shifted.push(shift_of(k));
+            if c.is_ascii_alphabetic() {
+                shifted.push(shift_of(k));
+            }
         } else {
             return Vec::new();
         }
@@ -1669,6 +1692,52 @@ pub fn complete_candidates<K: Copy>(
         Case::of(&shifted)
     };
     words.into_iter().map(|w| case.apply(&w)).collect()
+}
+
+/// Offer spelling alternatives only when the user requests correction. Unlike
+/// completion, this may reconsider valid English words and short misspellings;
+/// automatic spelling settings and dictionary protection remain unchanged.
+pub fn correction_candidates<K: Copy>(
+    keys: &[K],
+    to_char: impl Fn(K) -> Option<char>,
+    shift_of: impl Fn(K) -> bool,
+    dict: Dict,
+    current: Option<Language>,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Vec<String> {
+    let Some(current) = current.filter(|_| !keys.is_empty()) else {
+        return Vec::new();
+    };
+    let mut full = String::with_capacity(keys.len());
+    let mut shifted = Vec::with_capacity(keys.len());
+    let mut word_end = 0;
+    for &key in keys {
+        let Some(c) = to_char(key) else {
+            return Vec::new();
+        };
+        full.push(c);
+        if c.is_alphanumeric() {
+            word_end = full.len();
+        }
+        if c.is_ascii_alphabetic() {
+            shifted.push(shift_of(key));
+        }
+    }
+    let reading = Reading::new(&full, word_end);
+    let (words, case) = match current {
+        Language::English => (
+            crate::spell::correction_suggestions(reading.word, dict, en_freq(), context),
+            Case::of(&shifted),
+        ),
+        Language::Hebrew => (
+            crate::spell::hebrew::correction_suggestions(reading.word, dict, he_freq(), context),
+            Case::Lower,
+        ),
+    };
+    words
+        .into_iter()
+        .map(|word| respelled(&word, case, reading.tail))
+        .collect()
 }
 
 /// Test-only builders: assemble the same sorted-blob layout `build.rs` writes,
@@ -1714,6 +1783,80 @@ mod tests {
     /// Frequency list from `(word, rank)` pairs (rank 0 = most common).
     fn freq(entries: &[(&str, u32)]) -> Freq {
         Freq::of(entries)
+    }
+
+    #[test]
+    fn correction_gesture_preserves_case_suffixes_and_trailing_punctuation() {
+        for (typed, expected) in [
+            ("form", "from"),
+            ("Form,", "From,"),
+            ("FORM!", "FROM!"),
+            ("hte", "the"),
+            ("Recieve's!", "Receive's!"),
+        ] {
+            let keys: Vec<_> = typed
+                .chars()
+                .map(|c| (c.to_ascii_lowercase(), c.is_ascii_uppercase() || c == '!'))
+                .collect();
+            let offers = correction_candidates(
+                &keys,
+                |key| Some(key.0),
+                |key| key.1,
+                en_dict(),
+                Some(Language::English),
+                None,
+            );
+            assert_eq!(
+                offers.first().map(String::as_str),
+                Some(expected),
+                "{typed}: {offers:?}"
+            );
+            assert!(offers.len() <= crate::complete::MAX_CANDIDATES);
+            assert!(!offers.iter().any(|word| word == typed));
+        }
+        let keys: Vec<_> = "תודדה!".chars().collect();
+        let offers = correction_candidates(
+            &keys,
+            Some,
+            |_| false,
+            he_dict(),
+            Some(Language::Hebrew),
+            None,
+        );
+        assert_eq!(offers.first().map(String::as_str), Some("תודה!"));
+        assert!(correction_candidates(&keys, Some, |_| false, he_dict(), None, None).is_empty());
+        assert!(correction_candidates(
+            &keys,
+            |_| None,
+            |_| false,
+            he_dict(),
+            Some(Language::Hebrew),
+            None,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn apostrophe_completion_case_comes_only_from_letters() {
+        for (typed, expected) in [("Don'", "Don't"), ("DON'", "DON'T")] {
+            let keys: Vec<_> = typed
+                .chars()
+                .map(|c| (c.to_ascii_lowercase(), c.is_ascii_uppercase()))
+                .collect();
+            let offers = complete_candidates(
+                &keys,
+                |key| Some(key.0),
+                |key| key.1,
+                en_dict(),
+                Some(Language::English),
+                None,
+            );
+            assert_eq!(
+                offers.first().map(String::as_str),
+                Some(expected),
+                "{typed}"
+            );
+        }
     }
 
     #[test]

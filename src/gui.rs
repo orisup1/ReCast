@@ -268,6 +268,7 @@ impl eframe::App for App {
                 for (label, key, current, choices) in [
                     ("Double-tap action (undo / convert)", "action_shortcut", &cfg.action_shortcut, crate::config::ACTION_SHORTCUTS),
                     ("Completion (single tap)", "completion_shortcut", &cfg.completion_shortcut, crate::config::MODIFIER_SHORTCUTS),
+                    ("Spelling suggestions (single tap)", "correction_shortcut", &cfg.correction_shortcut, crate::config::MODIFIER_SHORTCUTS),
                 ] {
                     let mut selected = current.clone();
                     egui::ComboBox::from_id_source(key).selected_text(crate::config::modifier_label(&selected)).show_ui(ui, |ui| {

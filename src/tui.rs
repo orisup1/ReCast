@@ -392,11 +392,15 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
             "  {}: undo correction/completion; otherwise convert layout",
             crate::config::Config::global().action_gesture()
         )),
+        Line::from(format!(
+            "  {}: request spelling alternatives; repeat to cycle",
+            crate::config::Config::global().correction_gesture()
+        )),
         Line::from(
             "                       conversion includes unknown words; repeat to convert back.",
         ),
         Line::from("  Enable single-Ctrl undo in Settings to undo or unlist words."),
-        Line::from("  More typing or cursor movement ends the opportunity."),
+        Line::from("  Extra spaces preserve undo; other typing or cursor movement ends it."),
         Line::from("  One undo skips a word this session; two occasions remember it."),
         Line::from(""),
         Line::from("Your files (edits are picked up within ~2s, no restart):"),

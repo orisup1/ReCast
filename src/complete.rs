@@ -263,6 +263,9 @@ fn completions_from(
     ranking: Ranking<'_>,
 ) -> Vec<String> {
     let len = prefix.chars().count();
+    if prefix.contains('\'') {
+        return apostrophe_completions(prefix, dict, freq, min_len, max_rank, saved, ranking);
+    }
     let english = prefix.chars().all(|c| c.is_ascii_lowercase());
     if len < min_len
         || len > MAX_PREFIX_LEN
@@ -333,10 +336,91 @@ fn completions_from(
             consider(word, freq.rank(word).unwrap_or(1_000), true);
         }
     }
-    let mut candidates: Vec<_> = candidates.into_values().collect();
+    ranked_completions(candidates.into_values().collect(), ranking.offset)
+}
+
+/// Complete supported English suffixes and explicitly saved apostrophe names.
+/// Dictionary and frequency evidence validate inferred forms.
+fn apostrophe_completions(
+    prefix: &str,
+    dict: Dict,
+    freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    saved: &[String],
+    ranking: Ranking<'_>,
+) -> Vec<String> {
+    let Some((stem, partial)) = prefix.split_once('\'') else {
+        return Vec::new();
+    };
+    if !(min_len..=MAX_PREFIX_LEN).contains(&prefix.len())
+        || stem.is_empty()
+        || !stem.bytes().all(|c| c.is_ascii_lowercase())
+        || !partial.bytes().all(|c| c.is_ascii_lowercase())
+    {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    for suffix in ["t", "s", "ll", "re", "ve", "d", "m"] {
+        if !suffix.starts_with(partial) || suffix.len() == partial.len() {
+            continue;
+        }
+        let word = format!("{stem}'{suffix}");
+        if ranking.exclude == Some(word.as_str()) {
+            continue;
+        }
+        let Some(rank) = crate::dictionary::english_form_rank(&word, dict, freq)
+            .filter(|rank| *rank <= max_rank)
+        else {
+            continue;
+        };
+        let weight = f64::from(crate::personal::personal_boost(&word))
+            * ranking.context.map_or(1.0, |context| context.boost(&word))
+            / (f64::from(rank) + 1.0);
+        candidates.push(Candidate {
+            saved: word.len() - prefix.len(),
+            word,
+            weight,
+            rank,
+        });
+    }
+    for word in saved {
+        let Some((first, last)) = word.split_once('\'') else {
+            continue;
+        };
+        if word.len() <= prefix.len()
+            || word.len() > crate::types::MAX_WORD_KEYS
+            || !word.starts_with(prefix)
+            || first.is_empty()
+            || last.is_empty()
+            || !first
+                .bytes()
+                .chain(last.bytes())
+                .all(|c| c.is_ascii_lowercase())
+            || ranking.exclude == Some(word.as_str())
+            || candidates.iter().any(|candidate| candidate.word == *word)
+        {
+            continue;
+        }
+        let rank = crate::dictionary::english_form_rank(word, dict, freq)
+            .or_else(|| freq.rank(word))
+            .unwrap_or(1_000);
+        candidates.push(Candidate {
+            saved: word.len() - prefix.len(),
+            word: word.clone(),
+            weight: f64::from(crate::personal::personal_boost(word))
+                * ranking.context.map_or(1.0, |context| context.boost(word))
+                / (f64::from(rank) + 1.0),
+            rank,
+        });
+    }
+    ranked_completions(candidates, ranking.offset)
+}
+
+fn ranked_completions(mut candidates: Vec<Candidate>, offset: usize) -> Vec<String> {
     let mut out = Vec::with_capacity(MAX_CANDIDATES);
     for slot in 0..MAX_CANDIDATES {
-        let taps = ranking.offset + slot + 1;
+        let taps = offset + slot + 1;
         let Some((index, _)) = candidates.iter().enumerate().max_by(|(_, a), (_, b)| {
             a.value(taps)
                 .total_cmp(&b.value(taps))
@@ -1082,6 +1166,107 @@ mod tests {
         let f = freq(&[("hello", 500), ("help", 140), ("helmet", 9_000)]);
         assert_eq!(finish("hel", d, f).as_deref(), Some("help"));
         assert_eq!(offers("hel", d, f), ["help", "hello", "helmet"]);
+    }
+
+    #[test]
+    fn apostrophe_completion_uses_canonical_forms_and_frequency_evidence() {
+        let d = dict(&["do", "dont", "you", "youre", "keyboard", "i", "im", "ill"]);
+        let f = freq(&[
+            ("dont", 10),
+            ("youre", 20),
+            ("keyboard", 30),
+            ("im", 40),
+            ("ill", 50),
+        ]);
+        for (prefix, expected) in [
+            ("don'", "don't"),
+            ("you'r", "you're"),
+            ("keyboard'", "keyboard's"),
+        ] {
+            assert_eq!(finish(prefix, d, f).as_deref(), Some(expected), "{prefix}");
+        }
+        assert_eq!(completions_with("i'", d, f, 2, 30_000), ["i'm", "i'll"]);
+        for prefix in [
+            "don't",
+            "don''",
+            "don'zz",
+            "don_1'",
+            "http://don'",
+            "keyb'oard",
+            "שלום'",
+        ] {
+            assert!(offers(prefix, d, f).is_empty(), "{prefix}");
+        }
+        assert!(offers("don'", d, Freq::EMPTY).is_empty());
+        assert!(offers("unknown'", d, f).is_empty());
+        assert!(completions_with("don'", d, f, 3, 5).is_empty());
+    }
+
+    #[test]
+    fn apostrophe_completion_preserves_saved_names_and_deduplicates_forms() {
+        let saved = [
+            "o'connor",
+            "o'connor",
+            "o'conel",
+            "o'cooper",
+            "o'corin",
+            "o'cove",
+            "o''connor",
+            "o'con_nor",
+            "o'co1",
+            "o'co/nor",
+            "o'coשלום",
+        ]
+        .map(str::to_owned);
+        let names = completions_from(
+            "o'co",
+            Dict::of(&[]),
+            Freq::EMPTY,
+            3,
+            30_000,
+            &saved,
+            Ranking::default(),
+        );
+        assert_eq!(names.first().map(String::as_str), Some("o'connor"));
+        assert_eq!(names.len(), MAX_CANDIDATES);
+        assert!(names.iter().all(|word| !word.contains("''")
+            && word.bytes().all(|c| c.is_ascii_lowercase() || c == b'\'')));
+        assert_eq!(names.iter().filter(|word| *word == "o'connor").count(), 1);
+        let d = dict(&["dont"]);
+        let f = freq(&[("dont", 10)]);
+        assert_eq!(
+            completions_from(
+                "don'",
+                d,
+                f,
+                3,
+                30_000,
+                &["don't".into()],
+                Ranking::default()
+            ),
+            ["don't"]
+        );
+    }
+
+    #[test]
+    fn saved_apostrophe_name_completion_preserves_typed_capitalization() {
+        let inserted = ignore_list().lock().unwrap().insert("o'connor".into());
+        let keys: Vec<_> = "O'co"
+            .chars()
+            .map(|c| (c.to_ascii_lowercase(), c.is_ascii_uppercase()))
+            .collect();
+        let offers = crate::dictionary::complete_candidates(
+            &keys,
+            |key| Some(key.0),
+            |key| key.1,
+            crate::dictionary::en_dict(),
+            Some(crate::types::Language::English),
+            None,
+        );
+        if inserted {
+            ignore_list().lock().unwrap().remove("o'connor");
+        }
+        assert!(offers.iter().any(|word| word == "O'connor"), "{offers:?}");
     }
 
     #[test]

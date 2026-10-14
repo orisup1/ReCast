@@ -12,8 +12,8 @@ clipboard is never touched.
 
 ## How it works
 
-ReCast checks words when you finish them with Space, preserving trailing punctuation. It
-uses the current keyboard layout, dictionary matches, and word frequency to decide
+ReCast checks words when you finish them with Space, preserving trailing punctuation.
+It uses the current keyboard layout, dictionary matches, and word frequency to decide
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
 the terminator are preserved. Same-layout corrections keep an unchanged prefix
 on screen and rewrite only the remaining suffix, reducing visible deletion.
@@ -37,6 +37,10 @@ Layout correction recognizes unlisted Hebrew words with supported
 one- through four-letter prefixes, such as `במקלדת`, `ושלמקלדת`, and `וכשהמקלדת`,
 when the stem is a ranked dictionary word and the English reading is not a known word or common name.
 Conservative spelling keeps its existing single-edit limit.
+
+Spelling corrects recognized apostrophe forms by checking their stem and preserving
+the suffix (`recieve's` → `receive's`). Valid forms and saved word exceptions remain
+protected; arbitrary internal punctuation and digits are not spelling inputs.
 
 Spelling correction protects frequency-attested dictionary words, curated
 technical terms, ALL CAPS, and tokens containing
@@ -143,16 +147,19 @@ Use `-Target service-uninstall` to remove the task, or `-Target help` for all ta
 ## Controls
 
 The gestures below are defaults. In **Settings**, choose **Double-tap action
-(undo / convert)** and **Completion (single tap)** to use Left/Right Ctrl or
-Left/Right Shift, or disable either gesture. Double-tap actions also offer
+(undo / convert)**, **Completion (single tap)**, and **Spelling suggestions (single
+tap)** to use Left/Right Ctrl or Left/Right Shift, or disable any gesture.
+Double-tap actions also offer
 **Either Ctrl**. Changes save and apply immediately; help, status, and practice
-show your current bindings. Completion cannot share a key with the double-tap
-action or extra single-tap undo. Disable or move the conflicting binding first.
+show your current bindings. Completion and spelling suggestions need separate keys
+from each other, the double-tap action, and extra single-tap undo. Disable or move
+the conflicting binding first.
 Only bare taps shorter than 300 ms count; double taps must finish within 500 ms
 of each other. Holding a modifier or using it in a chord keeps its normal behavior.
 
 | Action | Gesture or control |
 | --- | --- |
+| Request spelling alternatives | Tap **Left Shift** mid-word; repeat to cycle choices and back to your original text |
 | Complete an English or Hebrew word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
 | Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space |
 | Rescue selected text (macOS) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
@@ -194,12 +201,17 @@ Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures
 Left Ctrl or Right Ctrl. The configured double-tap action remains available unless disabled. Holding Ctrl or using
 it in a chord never triggers the extra shortcut; the same cursor/focus safeguards
 apply to both gestures.
-Extra spaces preserve undo. Other typing, Enter, or cursor movement ends the undo opportunity. Undo restores the
-original text and, when changed, the previous layout. One undo suppresses that word
+Extra spaces preserve undo. Other typing, Enter, or cursor movement ends the undo
+opportunity. Undo restores the original text and, when changed, the previous layout.
+One undo suppresses that word
 for the session; undo counts are saved in `learned.txt`, and two occasions make the
 exception survive restarts. Allowing the word again clears its saved exception.
 On macOS, an undo gesture completed while a correction is landing waits for that
 correction to finish; later typing or cursor movement still cancels the queued undo.
+During the destructive part of a macOS rewrite, keyboard events and mouse button
+events wait briefly until the replacement is complete, then replay in their original
+order. This keeps continued typing from canceling a partly erased word. Unsafe queued
+input clears correction and undo context; bare modifier taps and spaces retain it.
 
 The macOS/Windows tray and Linux control window offer live **Settings** for spelling,
 completion/abbreviations, and **Conservative spelling**. Conservative spelling caps
@@ -319,11 +331,20 @@ Right Shift also offers an expansion. Capitalization follows your input:
 `Btw` becomes `By the way`. No abbreviations ship enabled; `complete = false`
 disables both abbreviations and word completion.
 
+The separate spelling-suggestion gesture (Left Shift by default) requests
+alternatives in the current language, including short misspellings (`hte` → `the`)
+and valid English words (`form` / `from`). It works with automatic spelling and
+completion disabled, never switches layout, and uses the same cycling and undo.
+Requests stay bounded to four choices and preserve capitalization and trailing
+punctuation. Choosing an alternative to a valid dictionary word does not train
+an automatic replacement for that word.
+
 Word completion uses the active English or Hebrew layout. It first offers exact
 prefix matches; if there are none, it tries one missing, extra, wrong, or swapped
 prefix letter. Cycling and undo always restore your original prefix. Prefix
-length limits count characters in either language. Saved words in `ignore.txt`
-and persistent undo exceptions are also completion candidates, including names
+length limits count characters in either language. English apostrophe prefixes
+such as `don'` can complete to `don't`; saved apostrophe words are also candidates.
+Saved words in `ignore.txt` and persistent undo exceptions are also completion candidates, including names
 and technical terms absent from the bundled dictionary.
 
 ### Application exclusions
@@ -347,11 +368,13 @@ undo_shortcut = "right_ctrl" # optional single-tap undo; none (default), left_ct
 # Shortcut defaults; these settings are global, not per-application.
 action_shortcut = "ctrl" # ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
 completion_shortcut = "right_shift" # left_ctrl, right_ctrl, left_shift, right_shift, none
+correction_shortcut = "left_shift" # explicit spelling alternatives; same choices, separate key
 # macOS uses bundle IDs; Windows uses executable filenames including .exe.
 ```
 
-A conflicting shortcut configuration disables the completion gesture at startup
-and reports the conflict in diagnostics. Abbreviation expansion is unaffected.
+A conflicting shortcut configuration keeps action/undo bindings first, then completion,
+and disables conflicting completion or spelling-suggestion gestures at startup.
+Diagnostics report the disabled gesture. Abbreviation expansion is unaffected.
 
 Excluded apps receive no corrections, expansions, completion, undo rewrites,
 word logging, or learning. Global events still track key releases. Off takes

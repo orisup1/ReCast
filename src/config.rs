@@ -7,6 +7,7 @@ pub struct Config {
     pub undo_shortcut: String,
     pub action_shortcut: String,
     pub completion_shortcut: String,
+    pub correction_shortcut: String,
     /// Persist local word-frequency, correction-pair, and typing-timing data.
     /// Off by default because the word files may contain sensitive text.
     pub personal_enabled: bool,
@@ -96,6 +97,9 @@ impl Config {
             completion_shortcut: crate::settings::get("RECAST_COMPLETION_SHORTCUT")
                 .filter(|value| valid_completion_shortcut(value))
                 .unwrap_or_else(|| "right_shift".into()),
+            correction_shortcut: crate::settings::get("RECAST_CORRECTION_SHORTCUT")
+                .filter(|value| valid_completion_shortcut(value))
+                .unwrap_or_else(|| "left_shift".into()),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
             rule_stats_enabled: crate::settings::flag("RECAST_RULE_STATS", false),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
@@ -110,8 +114,11 @@ impl Config {
             complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
         };
         // Keep the explicit action/undo bindings; disable ambiguous completion.
-        if config.shortcut_conflict() {
+        if config.completion_conflict() {
             config.completion_shortcut = "none".into();
+        }
+        if config.correction_conflict() {
+            config.correction_shortcut = "none".into();
         }
         config
     }
@@ -171,12 +178,21 @@ pub fn modifier_label(value: &str) -> &'static str {
 
 impl Config {
     pub fn shortcut_conflict(&self) -> bool {
-        let completion = self.completion_shortcut.as_str();
-        completion != "none"
-            && (completion == self.action_shortcut
-                || completion == self.undo_shortcut
-                || (self.action_shortcut == "ctrl"
-                    && matches!(completion, "left_ctrl" | "right_ctrl")))
+        self.completion_conflict() || self.correction_conflict()
+    }
+    fn tap_conflicts_action(&self, tap: &str) -> bool {
+        tap != "none"
+            && (tap == self.action_shortcut
+                || tap == self.undo_shortcut
+                || (self.action_shortcut == "ctrl" && matches!(tap, "left_ctrl" | "right_ctrl")))
+    }
+    pub fn completion_conflict(&self) -> bool {
+        self.tap_conflicts_action(&self.completion_shortcut)
+    }
+    pub fn correction_conflict(&self) -> bool {
+        self.tap_conflicts_action(&self.correction_shortcut)
+            || (self.correction_shortcut != "none"
+                && self.correction_shortcut == self.completion_shortcut)
     }
     pub fn action_gesture(&self) -> String {
         if self.action_shortcut == "none" {
@@ -190,6 +206,13 @@ impl Config {
             "completion shortcut disabled".into()
         } else {
             format!("tap {}", modifier_label(&self.completion_shortcut))
+        }
+    }
+    pub fn correction_gesture(&self) -> String {
+        if self.correction_shortcut == "none" {
+            "correction shortcut disabled".into()
+        } else {
+            format!("tap {}", modifier_label(&self.correction_shortcut))
         }
     }
 }
@@ -261,6 +284,7 @@ pub const ALL_KEYS: &[&str] = &[
     "RECAST_UNDO_SHORTCUT",
     "RECAST_ACTION_SHORTCUT",
     "RECAST_COMPLETION_SHORTCUT",
+    "RECAST_CORRECTION_SHORTCUT",
     "RECAST_PERSONAL",
     "RECAST_RULE_STATS",
     "RECAST_SHORT",
@@ -292,6 +316,26 @@ pub const ALL_KEYS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_correction_requires_its_own_tap_key() {
+        let mut config = Config::global();
+        config.action_shortcut = "ctrl".into();
+        config.undo_shortcut = "none".into();
+        config.completion_shortcut = "right_shift".into();
+        config.correction_shortcut = "left_shift".into();
+        assert!(!config.shortcut_conflict());
+        for key in ["right_shift", "left_ctrl", "right_ctrl"] {
+            config.correction_shortcut = key.into();
+            assert!(config.correction_conflict(), "{key}");
+            assert!(!config.completion_conflict());
+        }
+        config.correction_shortcut = "none".into();
+        assert!(!config.shortcut_conflict());
+        config.action_shortcut = "left_shift".into();
+        config.correction_shortcut = "left_shift".into();
+        assert!(config.correction_conflict());
+    }
 
     #[test]
     fn exclusions_match_whole_app_ids_and_decline_unknown_apps() {

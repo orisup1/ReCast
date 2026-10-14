@@ -53,6 +53,7 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "undo_shortcut" if crate::config::valid_undo_shortcut(value) => (),
         "action_shortcut" if crate::config::valid_action_shortcut(value) => (),
         "completion_shortcut" if crate::config::valid_completion_shortcut(value) => (),
+        "correction_shortcut" if crate::config::valid_completion_shortcut(value) => (),
         _ => return Err("Invalid setting value".into()),
     }
     let mut candidate = crate::config::Config::global();
@@ -60,10 +61,11 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "undo_shortcut" => candidate.undo_shortcut = value.into(),
         "action_shortcut" => candidate.action_shortcut = value.into(),
         "completion_shortcut" => candidate.completion_shortcut = value.into(),
+        "correction_shortcut" => candidate.correction_shortcut = value.into(),
         _ => (),
     }
     if candidate.shortcut_conflict() {
-        return Err("Completion must use a different key from double-tap actions and extra undo. Disable or move the conflicting shortcut first.".into());
+        return Err("Completion and correction must use different keys from each other, double-tap actions, and extra undo. Disable or move the conflicting shortcut first.".into());
     }
     let path = file_path().ok_or("No config directory available")?;
     save_value(&path, key, value).map_err(|e| format!("Could not save settings: {e}"))?;
@@ -76,6 +78,7 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "undo_shortcut" => cfg.undo_shortcut = value.into(),
         "action_shortcut" => cfg.action_shortcut = value.into(),
         "completion_shortcut" => cfg.completion_shortcut = value.into(),
+        "correction_shortcut" => cfg.correction_shortcut = value.into(),
         _ => unreachable!(),
     });
     if key == "exclude_apps" {
@@ -382,6 +385,11 @@ pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str
             "right_shift",
             crate::config::valid_completion_shortcut,
         ),
+        (
+            "RECAST_CORRECTION_SHORTCUT",
+            "left_shift",
+            crate::config::valid_completion_shortcut,
+        ),
     ] {
         if get(key).is_some_and(|value| !valid(&value)) {
             out.push(format!("{} is invalid — using {default}.", file_key(key)));
@@ -391,11 +399,18 @@ pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str
     shortcuts.completion_shortcut = get("RECAST_COMPLETION_SHORTCUT")
         .filter(|value| crate::config::valid_completion_shortcut(value))
         .unwrap_or_else(|| "right_shift".into());
-    if shortcuts.shortcut_conflict() {
+    shortcuts.correction_shortcut = get("RECAST_CORRECTION_SHORTCUT")
+        .filter(|value| crate::config::valid_completion_shortcut(value))
+        .unwrap_or_else(|| "left_shift".into());
+    if shortcuts.completion_conflict() {
         out.push(
             "Completion shortcut conflicts with an action/undo key — completion shortcut disabled."
                 .into(),
         );
+        shortcuts.completion_shortcut = "none".into();
+    }
+    if shortcuts.correction_conflict() {
+        out.push("Correction shortcut conflicts with completion or an action/undo key — correction shortcut disabled.".into());
     }
 
     for key in numeric_keys {
@@ -460,6 +475,7 @@ pub fn sample() -> String {
 #undo_shortcut = \"none\" # optional single-tap undo: none, left_ctrl, right_ctrl
 #action_shortcut = \"ctrl\" # double-tap: ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
 #completion_shortcut = \"right_shift\" # single-tap: left_ctrl, right_ctrl, left_shift, right_shift, none
+#correction_shortcut = \"left_shift\" # explicit spelling offers; separate from completion/action/undo
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
 #rule_stats = false    # persist aggregate correction, undo, and completion-use counts
 #short = true          # short switches: rank <= 30000; false restricts to <= 500
@@ -633,6 +649,10 @@ mod tests {
             "right_shift"
         );
         assert!(set_live(&control, "action_shortcut", "right_shift").is_err());
+        assert!(set_live(&control, "correction_shortcut", "right_shift").is_err());
+        assert!(set_live(&control, "correction_shortcut", "left_ctrl").is_err());
+        assert!(set_live(&control, "correction_shortcut", "tab").is_err());
+        set_live(&control, "correction_shortcut", "none").unwrap();
         set_live(&control, "action_shortcut", "left_shift").unwrap();
         assert!(set_live(&control, "completion_shortcut", "right_ctrl").is_err());
         set_live(&control, "completion_shortcut", "left_ctrl").unwrap();
@@ -652,6 +672,14 @@ mod tests {
         std::env::remove_var("RECAST_ACTION_SHORTCUT");
         set_live(&control, "action_shortcut", "none").unwrap();
         set_live(&control, "completion_shortcut", "none").unwrap();
+        set_live(&control, "correction_shortcut", "right_shift").unwrap();
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["correction_shortcut"],
+            "right_shift"
+        );
+        std::env::set_var("RECAST_CORRECTION_SHORTCUT", "left_shift");
+        assert!(set_live(&control, "correction_shortcut", "none").is_err());
+        std::env::remove_var("RECAST_CORRECTION_SHORTCUT");
         std::fs::write(file_path().unwrap(), [0xff]).unwrap();
         assert!(set_app_mode(&control, "Editor", AppMode::Full).is_err());
         assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));

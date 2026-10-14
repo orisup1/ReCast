@@ -228,9 +228,9 @@ fn typo_discount(typed: &str, corrected: &str, counts: [u64; 3]) -> f32 {
     })
 }
 
-/// Explicit spelling offers share automatic edit/rank gates, but expose close
-/// alternatives instead of silently deciding an ambiguous case. Phrase evidence
-/// orders this manually requested list without the automatic near-tie restriction.
+/// Conservative spelling fallbacks for completion share automatic edit/rank
+/// gates, but expose close alternatives without deciding an ambiguous case.
+/// Phrase evidence orders the list without the automatic near-tie restriction.
 pub(crate) fn suggestions(
     word: &str,
     dict: Dict,
@@ -238,8 +238,15 @@ pub(crate) fn suggestions(
     context: Option<&crate::complete::PhraseContext>,
 ) -> Vec<String> {
     let cfg = Config::global();
-    if !cfg.spell_enabled || dict.contains(word) {
+    if !cfg.spell_enabled || word.len() > MAX_LEN || dict.contains(word) {
         return Vec::new();
+    }
+    if let Some((stem, suffix)) = crate::dictionary::english_form(word) {
+        return suggestions(stem, dict, freq, context)
+            .into_iter()
+            .map(|stem| format!("{stem}{suffix}"))
+            .filter(|form| crate::dictionary::english_form_rank(form, dict, freq).is_some())
+            .collect();
     }
     let Some(budget) = budget_for(word, cfg.spell_min_len, cfg.spell_max_dist) else {
         return Vec::new();
@@ -248,6 +255,42 @@ pub(crate) fn suggestions(
     search.offers = Some(Vec::new());
     search.context = context;
     search.run(word, dict, freq);
+    search
+        .offers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, _, word)| word)
+        .collect()
+}
+
+/// An explicit correction request may reconsider dictionary words and short
+/// inputs. Keep malformed tokens protected and bound the search independently
+/// of the settings that govern unsolicited spelling changes.
+pub(crate) fn correction_suggestions(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Vec<String> {
+    if word.len() > MAX_LEN {
+        return Vec::new();
+    }
+    if let Some((stem, suffix)) = crate::dictionary::english_form(word) {
+        return correction_suggestions(stem, dict, freq, context)
+            .into_iter()
+            .map(|stem| format!("{stem}{suffix}"))
+            .filter(|form| crate::dictionary::english_form_rank(form, dict, freq).is_some())
+            .collect();
+    }
+    if !eligible(word, 2) {
+        return Vec::new();
+    }
+    let budget = if word.len() < DIST2_MIN_LEN { 2 } else { 3 } * COST_EDIT;
+    let mut search = Search::new(word, budget, 50_000);
+    search.offers = Some(Vec::new());
+    search.manual = true;
+    search.context = context;
+    freq.for_each_with_prefix("", |candidate, rank| search.consider(candidate, rank, dict));
     search
         .offers
         .unwrap_or_default()
@@ -335,6 +378,34 @@ fn assess_with_context(
     max_dist: u8,
     context: Option<&crate::complete::PhraseContext>,
 ) -> Assessment {
+    if let Some((stem, suffix)) =
+        crate::dictionary::english_form(word).filter(|_| word.len() <= MAX_LEN)
+    {
+        let folded = word.replace('\'', "");
+        if en_dict.contains(stem)
+            || en_dict.contains(&folded)
+            || en_freq
+                .rank(&folded)
+                .is_some_and(|rank| rank <= max_rank.min(20_000))
+            || crate::complete::ignored(stem)
+            || crate::complete::learned(stem)
+            || crate::complete::suppressed(stem)
+        {
+            return Assessment::unchanged(
+                "Protected apostrophe form: recognized stem, folded word, or saved word rule.",
+            );
+        }
+        let mut assessment =
+            assess_with_context(stem, en_dict, en_freq, min_len, max_rank, max_dist, context);
+        assessment.correction = assessment.correction.and_then(|corrected| {
+            let form = format!("{corrected}{suffix}");
+            crate::dictionary::english_form_rank(&form, en_dict, en_freq)
+                .filter(|rank| *rank <= max_rank)
+                .map(|_| form)
+        });
+        assessment.details.push_str("\nPreserved the apostrophe suffix and required dictionary and frequency evidence for the resulting form.");
+        return assessment;
+    }
     // A curated transposition, not permission to guess at other three-letter tokens.
     if word == "teh"
         && !en_dict.contains(word)
@@ -474,6 +545,8 @@ struct Search<'a> {
     best: Option<(f32, u32, u32, String)>,
     runner_up: Option<(f32, u32, u32, String)>,
     offers: Option<Vec<(f32, u32, String)>>,
+    /// Only the dedicated correction gesture bypasses automatic rank gates.
+    manual: bool,
     context: Option<&'a crate::complete::PhraseContext>,
     /// Only automatic contextual retries restrict the pre-context score.
     base_ceiling: Option<f32>,
@@ -491,6 +564,7 @@ impl<'a> Search<'a> {
             best: None,
             runner_up: None,
             offers: None,
+            manual: false,
             context: None,
             base_ceiling: None,
             typo_counts: crate::personal::typo_counts(),
@@ -554,6 +628,9 @@ impl<'a> Search<'a> {
         if rank > self.max_rank {
             return;
         }
+        if self.manual && (!eligible(cand, 1) || !en_dict.contains(cand)) {
+            return;
+        }
         // Keep candidates close enough to the winner to establish ambiguity,
         // even when they cannot win themselves.
         let budget = if self.offers.is_some() {
@@ -573,7 +650,8 @@ impl<'a> Search<'a> {
         let Some(cost) = self.dp.distance(self.typed, cb, budget) else {
             return;
         };
-        if cost == 0 || rank > rank_budget(cost, self.max_rank, self.typed.len()) {
+        if cost == 0 || (!self.manual && rank > rank_budget(cost, self.max_rank, self.typed.len()))
+        {
             return;
         }
         let candidate = score(cost, rank, cand) - self.discount(cand);
@@ -1346,6 +1424,92 @@ mod tests {
         assert!(suggestions("cake", d, f, Some(&context)).is_empty());
         assert!(suggestions("c4xe", d, f, Some(&context)).is_empty());
         assert_eq!(correct_with("caxe", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn explicit_correction_reconsiders_valid_short_and_less_common_words() {
+        let d = dict(&["form", "from", "the", "work", "hello"]);
+        let f = freq(&[
+            ("form", 900),
+            ("from", 10),
+            ("the", 0),
+            ("work", 100),
+            ("hello", 30_000),
+        ]);
+        for (typed, expected) in [
+            ("form", "from"),
+            ("hte", "the"),
+            ("wrk", "work"),
+            ("hellx", "hello"),
+        ] {
+            let offers = correction_suggestions(typed, d, f, None);
+            assert!(
+                offers.iter().any(|word| word == expected),
+                "{typed}: {offers:?}"
+            );
+            assert!(!offers.iter().any(|word| word == typed));
+            assert!(offers.len() <= crate::complete::MAX_CANDIDATES);
+            assert_eq!(offers, correction_suggestions(typed, d, f, None));
+            assert_eq!(fix(typed, d, f), None, "automatic protections for {typed}");
+        }
+        assert!(suggestions("form", d, f, None).is_empty());
+        assert!(suggestions("hte", d, f, None).is_empty());
+    }
+
+    #[test]
+    fn explicit_correction_keeps_phrase_ranking_and_rejects_malformed_tokens() {
+        let d = dict(&["cafe", "cake"]);
+        let f = freq(&[("cafe", 100), ("cake", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        assert_eq!(correction_suggestions("caxe", d, f, None)[0], "cafe");
+        assert_eq!(
+            correction_suggestions("caxe", d, f, Some(&context))[0],
+            "cake"
+        );
+        for word in [
+            "c4xe",
+            "cax_e",
+            "https://cake",
+            "ca'xe",
+            "cake''s",
+            "שלום",
+            "c",
+        ] {
+            assert!(
+                correction_suggestions(word, d, f, None).is_empty(),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn spelling_preserves_supported_apostrophe_suffixes_and_protected_stems() {
+        let d = dict(&["receive", "class", "the", "do", "does", "doesnt"]);
+        let f = freq(&[
+            ("receive", 100),
+            ("class", 100),
+            ("the", 0),
+            ("doesnt", 100),
+        ]);
+        assert_eq!(fix("recieve's", d, f).as_deref(), Some("receive's"));
+        assert_eq!(
+            correction_suggestions("recieve's", d, f, None),
+            ["receive's"]
+        );
+        for word in [
+            "receive's",
+            "clas's",
+            "hte's",
+            "recieve'll",
+            "recieve''s",
+            "recieve_1's",
+            "https://recieve's",
+            "rec'ieve",
+            "recieve'ss",
+        ] {
+            assert_eq!(fix(word, d, f), None, "{word}");
+        }
     }
 
     #[test]

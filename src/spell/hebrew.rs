@@ -5,6 +5,12 @@ use crate::config::Config;
 use crate::dictionary::{hebrew_stem, Dict, Freq};
 use std::collections::HashMap;
 
+enum Request {
+    Automatic,
+    Completion,
+    Correction,
+}
+
 /// Search one Unicode-letter edit, including transpositions. Prefix forms reuse
 /// the planner's supported prefix stacks and require a ranked dictionary stem.
 pub(crate) fn suggestions(
@@ -13,11 +19,40 @@ pub(crate) fn suggestions(
     freq: Freq,
     context: Option<&PhraseContext>,
 ) -> Vec<String> {
-    ranked_candidates(word, dict, freq, context, false)
-        .into_iter()
-        .take(MAX_CANDIDATES)
-        .map(|(word, _)| word)
-        .collect()
+    ranked_candidates(
+        word,
+        dict,
+        freq,
+        context,
+        Request::Completion,
+        &Config::global(),
+    )
+    .into_iter()
+    .take(MAX_CANDIDATES)
+    .map(|(word, _)| word)
+    .collect()
+}
+
+/// Explicit correction reconsiders real and short words independently of
+/// automatic spelling settings, while keeping the existing one-edit search.
+pub(crate) fn correction_suggestions(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+) -> Vec<String> {
+    ranked_candidates(
+        word,
+        dict,
+        freq,
+        context,
+        Request::Correction,
+        &Config::global(),
+    )
+    .into_iter()
+    .take(MAX_CANDIDATES)
+    .map(|(word, _)| word)
+    .collect()
 }
 
 /// Automatic repairs require a clear score lead; ambiguous offers remain manual.
@@ -28,7 +63,15 @@ pub(crate) fn correct(
     freq: Freq,
     context: Option<&PhraseContext>,
 ) -> Option<String> {
-    let mut candidates = ranked_candidates(word, dict, freq, context, true).into_iter();
+    let mut candidates = ranked_candidates(
+        word,
+        dict,
+        freq,
+        context,
+        Request::Automatic,
+        &Config::global(),
+    )
+    .into_iter();
     let (best, score) = candidates.next()?;
     if candidates
         .next()
@@ -44,19 +87,31 @@ fn ranked_candidates(
     dict: Dict,
     freq: Freq,
     context: Option<&PhraseContext>,
-    automatic: bool,
+    request: Request,
+    config: &Config,
 ) -> Vec<(String, f32)> {
-    let config = Config::global();
+    let automatic = matches!(request, Request::Automatic);
+    let explicit = matches!(request, Request::Correction);
     let letters: Vec<char> = word.chars().collect();
-    if !config.spell_enabled
-        || config.spell_max_dist == 0
-        || !(config.spell_min_len.max(if automatic { 4 } else { 3 })..=24).contains(&letters.len())
+    let min_len = if explicit {
+        2
+    } else {
+        config.spell_min_len.max(if automatic { 4 } else { 3 })
+    };
+    let max_rank = if explicit {
+        50_000
+    } else {
+        config.spell_max_rank.min(20_000)
+    };
+    if (!explicit && (!config.spell_enabled || config.spell_max_dist == 0))
+        || !(min_len..=24).contains(&letters.len())
         || !letters.iter().all(|c| ('א'..='ת').contains(c))
-        || dict.contains(word)
-        || hebrew_stem(word, dict).is_some()
-        || crate::complete::ignored(word)
-        || crate::complete::learned(word)
-        || crate::complete::suppressed(word)
+        || (!explicit
+            && (dict.contains(word)
+                || hebrew_stem(word, dict).is_some()
+                || crate::complete::ignored(word)
+                || crate::complete::learned(word)
+                || crate::complete::suppressed(word)))
     {
         return Vec::new();
     }
@@ -71,7 +126,7 @@ fn ranked_candidates(
         } else {
             hebrew_stem(&text, dict).and_then(|stem| freq.rank(stem))
         };
-        let Some(rank) = rank.filter(|rank| *rank <= config.spell_max_rank.min(20_000)) else {
+        let Some(rank) = rank.filter(|rank| *rank <= max_rank) else {
             return;
         };
         let discount = context.map_or(0.0, |context| 20.0 * context.boost(&text).ln() as f32);
@@ -150,6 +205,39 @@ fn valid_finals(word: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_correction_ignores_automatic_spelling_settings() {
+        let dict = Dict::of(&["שלום", "שלוש", "שלם"]);
+        let freq = Freq::of(&[("שלום", 100), ("שלוש", 100), ("שלם", 30_000)]);
+        let mut config = Config::global();
+        config.spell_enabled = false;
+        config.spell_min_len = 10;
+        config.spell_max_dist = 0;
+        config.spell_max_rank = 0;
+        for (typed, expected) in [("שלומ", "שלום"), ("שלום", "שלוש"), ("של", "שלם")]
+        {
+            let offers = ranked_candidates(typed, dict, freq, None, Request::Correction, &config);
+            assert!(
+                offers.iter().any(|(word, _)| word == expected),
+                "{typed}: {offers:?}"
+            );
+            assert!(!offers.iter().any(|(word, _)| word == typed));
+            for request in [Request::Automatic, Request::Completion] {
+                assert!(ranked_candidates(typed, dict, freq, None, request, &config).is_empty());
+            }
+        }
+        for typed in ["ש", "שלומ!", "של1מ", "http://שלומ", "שלוםx"] {
+            assert!(
+                ranked_candidates(typed, dict, freq, None, Request::Correction, &config).is_empty()
+            );
+        }
+        let offers = correction_suggestions("שלום", dict, freq, None);
+        assert!(!offers.is_empty());
+        assert!(!offers.iter().any(|word| word == "שלום"));
+        assert!(offers.len() <= MAX_CANDIDATES);
+        assert_eq!(offers, correction_suggestions("שלום", dict, freq, None));
+    }
 
     #[test]
     fn automatic_repairs_require_a_clear_winner() {

@@ -161,6 +161,12 @@ pub fn run(control: Arc<AppControl>) {
             config.completion_shortcut.as_str(),
             crate::config::MODIFIER_SHORTCUTS,
         ),
+        (
+            "Spelling suggestions (single tap)",
+            "correction_shortcut",
+            config.correction_shortcut.as_str(),
+            crate::config::MODIFIER_SHORTCUTS,
+        ),
     ] {
         let submenu = Submenu::new(title, true);
         for &(value, label) in choices {
@@ -510,7 +516,11 @@ pub fn run(control: Arc<AppControl>) {
                 }
                 let config = crate::config::Config::global();
                 for (item, setting, value) in &shortcut_items {
-                    let current = if *setting == "action_shortcut" { &config.action_shortcut } else { &config.completion_shortcut };
+                    let current = match *setting {
+                        "action_shortcut" => &config.action_shortcut,
+                        "correction_shortcut" => &config.correction_shortcut,
+                        _ => &config.completion_shortcut,
+                    };
                     item.set_checked(current == value);
                 }
             } else if undo_items.iter().any(|(item, _)| *item.id() == event.id) {

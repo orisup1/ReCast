@@ -883,3 +883,18 @@ he	gcussv	עבודדה	עבודה
 he	tbaaho	אנששים	אנשים
 he	njacho	מחשבים	מחשבים
 he	xpur	ספור	ספור
+
+# Apostrophe-aware spelling preserves suffixes, case, punctuation, and protections.
+en	recieve's	רקבןקהק,ד	receive's
+he	recieve's	רקבןקהק,ד	receive's
+en	Recieve's!	רקבןקהק,ד!	Receive's!
+he	Recieve's!	רקבןקהק,ד!	Receive's!
+en	adress's,	שגרקדד,דת	address's,
+he	adress's,	שגרקדד,דת	address's,
+en	RECIEVE'S	רקבןקהק,ד	RECIEVE'S
+en	recieve've	רקבןקהק,הק	recieve've
+en	recieve''s	רקבןקהק,,ד	recieve''s
+en	recieve_1's	רקבןקהק_1,ד	recieve_1's
+en	https://recieve's	יאאפד:..רקבןקהק,ד	https://recieve's
+en	recieve's	רקבןקהק,ד	recieve's			layout-only
+he	recieve's	רקבןקהק,ד	רקבןקהק,ד			layout-only
