@@ -1,5 +1,81 @@
 use std::process::Command;
 
+#[cfg(unix)]
+#[test]
+fn language_preference_supports_file_environment_status_and_preview() {
+    let binary = isolated_binary("prefer");
+    let dir = std::env::temp_dir().join(format!("recast-prefer-{}", std::process::id()));
+    let config = if cfg!(target_os = "macos") {
+        dir.join("Library/Application Support/recast")
+    } else {
+        dir.join("recast")
+    };
+    std::fs::create_dir_all(&config).unwrap();
+    let invoke = |args: &[&str], preference: Option<&str>| {
+        let mut command = Command::new(&binary);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RECAST_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .args(args)
+            .env("HOME", &dir)
+            .env("XDG_CONFIG_HOME", &dir)
+            .env("RECAST_LAYOUT_BACKEND", "none");
+        if let Some(preference) = preference {
+            command.env("RECAST_PREFER", preference);
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result
+    };
+    for (mode, label, english_after, hebrew_after) in [
+        ("balanced", "Balanced", "מגירה", "flute"),
+        ("english", "Prefer English", "ndhrv", "flute"),
+        ("hebrew", "Prefer Hebrew", "מגירה", "כךואק"),
+    ] {
+        std::fs::write(config.join("config.toml"), format!("prefer = \"{mode}\"\n")).unwrap();
+        let status = invoke(&["--status"], None);
+        assert!(String::from_utf8_lossy(&status.stdout)
+            .contains(&format!("language preference  {label}")));
+        for (word, layout, after) in [
+            ("ndhrv", "en", english_after),
+            ("כךואק", "he", hebrew_after),
+            ("akuo", "en", "שלום"),
+        ] {
+            let preview = invoke(&["--explain", word, "--layout", layout], None);
+            let stdout = String::from_utf8_lossy(&preview.stdout);
+            assert!(
+                stdout.contains(&format!("Replacement: {after:?}")),
+                "{mode}: {stdout}"
+            );
+            assert!(
+                stdout.contains(&format!("Language preference: {label}")),
+                "{stdout}"
+            );
+        }
+    }
+    std::fs::write(config.join("config.toml"), "prefer = \"english\"\n").unwrap();
+    let status = invoke(&["--status"], Some("hebrew"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("language preference  Prefer Hebrew"));
+    for invalid in ["engish", "", "balanced\nprefer=hebrew"] {
+        let status = invoke(&["--status"], Some(invalid));
+        assert!(String::from_utf8_lossy(&status.stdout).contains("language preference  Balanced"));
+        assert!(String::from_utf8_lossy(&status.stderr)
+            .contains("must be balanced, english, or hebrew"));
+    }
+    std::fs::remove_file(config.join("config.toml")).unwrap();
+    let status = invoke(&["--status"], None);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("language preference  Balanced"));
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+}
+
 // A unique executable name keeps status tests from discovering a developer's
 // actual ReCast instance or another CLI test running in parallel.
 fn isolated_binary(name: &str) -> std::path::PathBuf {

@@ -65,6 +65,7 @@ pub fn run_tui(control: Arc<AppControl>) -> std::io::Result<()> {
         control,
         start: Instant::now(),
         tab: 0,
+        settings_error: None,
     };
     let res = run_app(&mut terminal, app);
 
@@ -113,6 +114,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Res
                     // Re-read abbrev.txt / ignore.txt now rather than waiting
                     // for the watcher's next pass.
                     KeyCode::Char('r') => crate::complete::reload_user_files(),
+                    KeyCode::Char('b') => {
+                        use crate::config::{Config, LanguagePreference};
+                        let current = Config::global().language_preference;
+                        let next = match current {
+                            LanguagePreference::Balanced => LanguagePreference::English,
+                            LanguagePreference::English => LanguagePreference::Hebrew,
+                            LanguagePreference::Hebrew => LanguagePreference::Balanced,
+                        };
+                        app.settings_error =
+                            crate::settings::set_live(&app.control, "prefer", next.value()).err();
+                    }
                     KeyCode::F(1) | KeyCode::Char('?') => app.tab = 2,
                     _ => {}
                 }
@@ -253,7 +265,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Footer
     let footer = Paragraph::new(Span::styled(
-        " ← → : tab   e/Space : toggle   p : pause 30m   r : reload lists   q : quit   F1 : help ",
+        " ← → : tab   e/Space : toggle   p : pause   b : language   r : reload   q : quit   F1 : help ",
         Style::default().fg(Color::Gray),
     ))
     .block(
@@ -313,7 +325,17 @@ fn render_info(
             Span::from("Uptime: "),
             Span::styled(uptime_human(uptime), *normal),
         ]),
+        Line::from(format!(
+            "Language: {} (b to change)",
+            crate::config::Config::global().language_preference.label()
+        )),
     ];
+    if let Some(error) = &app.settings_error {
+        text.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
     if let Some(hint) = app.control.tighten_hint() {
         text.push(Line::from(""));
         text.push(Line::from(Span::styled(
@@ -380,6 +402,7 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         Line::from("  e / Space : turn correction on/off (remembered across restarts)"),
         Line::from("  p         : pause for 30 minutes, or resume"),
         Line::from("  r         : re-read abbrev.txt and ignore.txt now"),
+        Line::from("  b         : cycle Balanced / Prefer English / Prefer Hebrew (saved)"),
         Line::from("  q / Esc   : quit"),
         Line::from("  F1 / ?    : show this help"),
         Line::from(""),
@@ -418,6 +441,7 @@ struct App {
     control: Arc<AppControl>,
     start: Instant,
     tab: usize,
+    settings_error: Option<String>,
 }
 
 #[cfg(test)]

@@ -269,6 +269,12 @@ fn diagnostics(control: Option<&AppControl>) -> String {
     writeln!(out, "\n  settings:").unwrap();
     writeln!(
         out,
+        "    language preference  {}",
+        cfg.language_preference.label()
+    )
+    .unwrap();
+    writeln!(
+        out,
         "    excluded apps        {}",
         if cfg.excluded_apps.is_empty() {
             "none".to_string()

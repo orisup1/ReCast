@@ -49,6 +49,7 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
     match key {
         "spell" | "complete" if parse_flag(value).is_some() => (),
         "spell_dist" if parse_number("RECAST_SPELL_DIST", value).is_ok() => (),
+        "prefer" if crate::config::LanguagePreference::parse(value).is_some() => (),
         "exclude_apps" | "layout_only_apps" if !value.contains(['\n', '\r', '"', '#', '\\']) => (),
         "undo_shortcut" if crate::config::valid_undo_shortcut(value) => (),
         "action_shortcut" if crate::config::valid_action_shortcut(value) => (),
@@ -73,6 +74,9 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "spell" => cfg.spell_enabled = parse_flag(value).unwrap(),
         "complete" => cfg.complete_enabled = parse_flag(value).unwrap(),
         "spell_dist" => cfg.spell_max_dist = value.trim().parse().unwrap(),
+        "prefer" => {
+            cfg.language_preference = crate::config::LanguagePreference::parse(value).unwrap()
+        }
         "exclude_apps" => cfg.excluded_apps = crate::config::parse_excluded_apps(value),
         "layout_only_apps" => cfg.layout_only_apps = crate::config::parse_excluded_apps(value),
         "undo_shortcut" => cfg.undo_shortcut = value.into(),
@@ -368,6 +372,14 @@ pub fn parse_number(key: &str, raw: &str) -> Result<u64, String> {
 /// these out.
 pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
+    if let Some((raw, source)) = lookup("RECAST_PREFER") {
+        if crate::config::LanguagePreference::parse(&raw).is_none() {
+            out.push(format!(
+                "{}={raw:?} must be balanced, english, or hebrew — using balanced.",
+                source.describe("RECAST_PREFER")
+            ));
+        }
+    }
     if let Some(value) = get("RECAST_UNDO_SHORTCUT") {
         if !crate::config::valid_undo_shortcut(&value) {
             out.push("undo_shortcut must be none, left_ctrl, or right_ctrl — using none.".into());
@@ -470,6 +482,7 @@ pub fn sample() -> String {
 # Read once at startup, so changes take effect on the next launch.
 
 # Correction pipelines
+#prefer = \"balanced\"  # balanced, english, hebrew; stricter switches away from your preference
 #exclude_apps = \"\"    # exact app IDs where correction is Off
 #layout_only_apps = \"\" # exact app IDs where only layout correction is allowed
 #undo_shortcut = \"none\" # optional single-tap undo: none, left_ctrl, right_ctrl
@@ -583,6 +596,7 @@ mod tests {
                 .env_remove("RECAST_COMPLETE")
                 .env_remove("RECAST_SPELL_DIST")
                 .env_remove("RECAST_EXCLUDE_APPS")
+                .env_remove("RECAST_PREFER")
                 .output()
                 .unwrap();
             assert!(
@@ -594,6 +608,67 @@ mod tests {
             return;
         }
         let control = crate::types::AppControl::new_for_test();
+        use crate::config::LanguagePreference;
+        assert_eq!(
+            crate::config::Config::global().language_preference,
+            LanguagePreference::Balanced
+        );
+        for preference in LanguagePreference::ALL {
+            set_live(&control, "prefer", preference.value()).unwrap();
+            assert_eq!(
+                crate::config::Config::global().language_preference,
+                preference
+            );
+            assert_eq!(
+                load_file(&file_path().unwrap()).settings["prefer"],
+                preference.value()
+            );
+        }
+        assert!(set_live(&control, "prefer", "engish").is_err());
+        std::env::set_var("RECAST_PREFER", "english");
+        assert!(set_live(&control, "prefer", "balanced").is_err());
+        assert_eq!(
+            crate::config::Config::from_env().language_preference,
+            LanguagePreference::English
+        );
+        std::env::remove_var("RECAST_PREFER");
+        set_live(&control, "prefer", "english").unwrap();
+        let keys: Vec<_> = "thbyrby".chars().zip("אינטרנט".chars()).collect();
+        let mut history = crate::dictionary::History::default();
+        let check = |current, run| {
+            crate::dictionary::check_and_correct(
+                &keys,
+                |k| Some(k.0),
+                |k| Some(k.1),
+                |_| false,
+                run,
+                crate::dictionary::en_dict(),
+                crate::dictionary::he_dict(),
+                Some(current),
+                false,
+                |_| crate::layout::LayoutSwitch::Switched,
+            )
+        };
+        for _ in 0..3 {
+            let outcome = check(crate::types::Language::English, history.run());
+            assert!(outcome.fix.is_none());
+            assert!(
+                outcome.lang.is_none(),
+                "a rejected switch must not seed language history"
+            );
+            assert!(outcome
+                .details
+                .contains("Layout preserved by language preference"));
+        }
+        for _ in 0..2 {
+            let outcome = check(crate::types::Language::Hebrew, history.run());
+            assert!(outcome.fix.is_none());
+            history.push(outcome.lang.unwrap());
+        }
+        assert!(check(crate::types::Language::English, history.run())
+            .fix
+            .is_some());
+        set_live(&control, "prefer", "balanced").unwrap();
         let dict = crate::dictionary::Dict::of(&["hello"]);
         let freq = crate::dictionary::Freq::of(&[("hello", 1)]);
         assert_eq!(

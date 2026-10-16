@@ -254,6 +254,17 @@ impl eframe::App for App {
                     }
                 });
                 let cfg = crate::config::Config::global();
+                ui.label("Language preference");
+                let mut preference = cfg.language_preference;
+                egui::ComboBox::from_id_source("prefer").selected_text(preference.label()).show_ui(ui, |ui| {
+                    for value in crate::config::LanguagePreference::ALL {
+                        ui.selectable_value(&mut preference, value, value.label());
+                    }
+                });
+                ui.small("Switching away from your preferred language requires stronger evidence.");
+                if preference != cfg.language_preference {
+                    self.error = crate::settings::set_live(&self.control, "prefer", preference.value()).err();
+                }
                 for (label, key, mut checked) in [
                     ("Correct English/Hebrew spelling", "spell", cfg.spell_enabled),
                     ("Word completion and abbreviations", "complete", cfg.complete_enabled),

@@ -4,13 +4,15 @@ Run these checks on macOS and Windows. Cross-target Clippy verifies compilation;
 it does not verify native drawing, privacy grants, focus, or display scaling.
 
 1. Launch from Finder/Explorer and a terminal. Confirm the menu has Status, Pause,
-   Recent corrections, Settings, Help, and Quit. On macOS, the icon should remain
+   Recent corrections, Language preference, Settings, Help, and Quit. On macOS, the icon should remain
    compact in light and dark appearances, with no terminal banner in its title.
 2. Pause, resume, and disable correction. Check distinct icon shapes, matching
    status text, and the pause countdown. Re-enable correction after this check.
 3. Open each Settings section. Change spelling, sensitivity, and shortcuts; verify
    immediate behavior and persistence after restarting. A conflicting shortcut or
    environment override should show an explanation and restore the previous value.
+   Select Balanced, Prefer English, and Prefer Hebrew in both the menu and General;
+   check matching selection, persistence, and rollback when RECAST_PREFER is set.
 4. Choose an application and change its mode. Switch applications, choose Use last
    application, and confirm the identifier before changing its mode. Restore the
    original mode afterward. Open and cancel each existing word-rule editor.

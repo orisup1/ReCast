@@ -3,7 +3,7 @@
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
 
 use super::desktop::{Element as E, Kind as K, Window as Form};
-use crate::config::{AppMode, Config};
+use crate::config::{AppMode, Config, LanguagePreference};
 use crate::types::AppControl;
 
 pub enum Action {
@@ -141,6 +141,12 @@ impl Window {
                     commands.push(Action::OpenConfig);
                     Ok(())
                 }
+                106 => LanguagePreference::ALL
+                    .get(self.form.selection(106))
+                    .ok_or_else(|| "Choose a language preference.".to_string())
+                    .and_then(|preference| {
+                        crate::settings::set_live(control, "prefer", preference.value())
+                    }),
                 201..=204 => {
                     let (key, values) = match action {
                         201 => ("action_shortcut", crate::config::ACTION_SHORTCUTS),
@@ -238,8 +244,29 @@ impl Window {
                     E::new(
                         3,
                         K::Label,
+                        "Language preference",
+                        [24.0, 264.0, content, 24.0],
+                    ),
+                    E::new(
+                        106,
+                        K::Choice(
+                            LanguagePreference::ALL
+                                .iter()
+                                .map(|preference| preference.label().into())
+                                .collect(),
+                            LanguagePreference::ALL
+                                .iter()
+                                .position(|preference| *preference == config.language_preference)
+                                .unwrap_or(0),
+                        ),
+                        "Language preference",
+                        [24.0, 292.0, content, 32.0],
+                    ),
+                    E::new(
+                        5,
+                        K::Label,
                         "Spelling sensitivity",
-                        [24.0, 274.0, content, 24.0],
+                        [24.0, 338.0, content, 24.0],
                     ),
                     E::new(
                         103,
@@ -253,19 +280,19 @@ impl Window {
                             config.spell_max_dist.min(3) as usize,
                         ),
                         "Spelling sensitivity",
-                        [24.0, 302.0, content, 32.0],
+                        [24.0, 366.0, content, 32.0],
                     ),
                     E::new(
                         105,
                         K::Button,
                         "Advanced settings…",
-                        [24.0, 412.0, 190.0, 32.0],
+                        [24.0, 454.0, 190.0, 32.0],
                     ),
                     E::new(
                         4,
                         K::Label,
-                        "Manual config file edits require restarting ReCast.",
-                        [24.0, 452.0, content, 34.0],
+                        "Config file edits require restarting ReCast.",
+                        [236.0, 454.0, content - 212.0, 32.0],
                     ),
                 ]);
                 if let Some(enabled) = crate::prefs::autostart_enabled() {
@@ -273,7 +300,7 @@ impl Window {
                         104,
                         K::Check(enabled),
                         "Start at login",
-                        [24.0, 358.0, content, 30.0],
+                        [24.0, 410.0, content, 30.0],
                     ));
                 }
             }

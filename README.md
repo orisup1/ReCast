@@ -224,12 +224,12 @@ order. This keeps continued typing from canceling a partly erased word. Unsafe q
 input clears correction and undo context; bare modifier taps and spaces retain it.
 
 The macOS/Windows tray opens a native **Settings** window with General, Shortcuts,
-Applications, and Word rules sections. General offers spelling, completion,
-spelling sensitivity, and Start at login. Sensitivity ranges from no automatic
+Applications, and Word rules sections. General offers language preference,
+spelling, completion, spelling sensitivity, and Start at login. Sensitivity ranges from no automatic
 spelling edits to Conservative (one edit), Balanced (two), and Flexible (three);
 shorter words still have stricter limits. The status submenu suggests Conservative
 spelling when many corrections have been undone. The Linux control window offers
-live toggles for spelling, completion, and Conservative spelling. The
+language preference and live toggles for spelling, completion, and Conservative spelling. The
 enabled/disabled switch survives restarts.
 
 ### Command line
@@ -304,6 +304,7 @@ Keys are environment names lowercased without `RECAST_`; for example,
 
 ```toml
 # Example overrides; everything else uses its default.
+prefer = "balanced" # balanced (default), english, or hebrew
 spell_dist = 1      # Single-edit spelling fixes (default ceiling: 3)
 complete = true    # Completion and abbreviations (default: true)
 split = false      # Missing-space splitting (default: false)
@@ -317,6 +318,29 @@ Short layout switches accept ranks up to 30,000; `short = false` restricts them
 to ranks up to 500. Homograph overrides accept alternate readings ranked up to
 5,000, requiring a tenfold frequency advantage without language history;
 `freq = false` disables the frequency tie-break between valid readings in both layouts.
+
+Choose **Balanced**, **Prefer English**, or **Prefer Hebrew** from **Language
+preference** in the tray/menubar, **Settings > General**, or the Linux window.
+In the terminal dashboard (`recast -g`), press **b** to cycle through these modes.
+Changes save and apply immediately. For a command-line launch, use
+`RECAST_PREFER=english recast` (or `hebrew` / `balanced`); services use
+`prefer = "english"` in `config.toml` after a restart. `recast --status` shows
+the active preference; `--explain` includes its decision checks.
+
+**Balanced** retains the existing symmetric rules. A preference adds checks only
+to automatic switches into the other language: exact targets of 2–3 letters must
+rank within 500, longer targets within 5,000. A recognized preferred-language
+word stays unchanged without an established run in the other language. After two
+confirmed words in that language, the limits relax to 5,000 and 20,000 respectively.
+Combined layout and spelling repairs require at least five target letters and
+rank within 5,000 (20,000 with an established run). Supported Hebrew prefixes can
+use their ranked dictionary stem. Unranked targets are left unchanged.
+These conservative heuristics trade some automatic corrections for fewer unwanted
+switches; they are not measured confidence probabilities. Switching toward the
+preferred language retains all Balanced protections. Explicit conversion,
+completion, abbreviations, and spelling within the current language work as usual.
+Automatic learned layout replacements also pass the preference checks.
+
 An absent config uses defaults. Invalid values produce diagnostics and fall back;
 an unreadable config stops startup so exclusions are not silently discarded.
 
@@ -405,8 +429,8 @@ On **native GNOME/KDE Wayland**, this means correction pauses throughout the ses
 the Linux window disables adding restrictions when detection is unavailable.
 After returning to an allowed app, finish the current word with Space/Enter to resume.
 
-The compact tray menu contains Status, Pause, Recent corrections, Settings, Help,
-and Quit. Status includes the current application mode, recovery details, and
+The compact tray menu contains Status, Pause, Recent corrections, Language preference,
+Settings, Help, and Quit. Status includes the current application mode, recovery details, and
 correction counts. **Pause correction** groups temporary pauses and **Disable until
 I enable it again**, which persists across restarts. The icon distinguishes active,
 paused, disabled, and attention states by shape. macOS uses a monochrome template

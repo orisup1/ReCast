@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::types::AppControl;
@@ -59,6 +59,19 @@ pub fn run(control: Arc<AppControl>) {
 
     let recent_item = MenuItem::new("Recent corrections…", true, None);
     let settings_item = MenuItem::new("Settings…", true, None);
+    let preference_menu = Submenu::new("Language preference", true);
+    let preference_items = crate::config::LanguagePreference::ALL.map(|preference| {
+        let item = CheckMenuItem::new(
+            preference.label(),
+            true,
+            crate::config::Config::global().language_preference == preference,
+            None,
+        );
+        preference_menu
+            .append(&item)
+            .expect("append language preference");
+        (preference, item)
+    });
     let help_menu = Submenu::new("Help", true);
     let shortcuts_item = MenuItem::new("Typing shortcuts…", true, None);
     let practice_item = MenuItem::new("Practice correction and undo…", true, None);
@@ -80,6 +93,8 @@ pub fn run(control: Arc<AppControl>) {
     menu.append(&PredefinedMenuItem::separator())
         .expect("append separator");
     menu.append(&recent_item).expect("append history");
+    menu.append(&preference_menu)
+        .expect("append language preference");
     menu.append(&settings_item).expect("append settings");
     menu.append(&help_menu).expect("append help");
     menu.append(&PredefinedMenuItem::separator())
@@ -154,6 +169,10 @@ pub fn run(control: Arc<AppControl>) {
                 detail
             });
             status_item.set_text(status_label(&control));
+            let preference = crate::config::Config::global().language_preference;
+            for (value, item) in &preference_items {
+                item.set_checked(*value == preference);
+            }
             conservative_item.set_enabled(
                 control.tighten_hint().is_some()
                     && crate::config::Config::global().spell_max_dist > 1,
@@ -291,7 +310,20 @@ pub fn run(control: Arc<AppControl>) {
         }
 
         while let Ok(event) = menu_channel.try_recv() {
-            if event.id == *conservative_item.id() {
+            if let Some((preference, _)) = preference_items
+                .iter()
+                .find(|(_, item)| event.id == *item.id())
+            {
+                if let Err(error) =
+                    crate::settings::set_live(&control, "prefer", preference.value())
+                {
+                    crate::notify::notify("Settings unchanged", &error);
+                }
+                let selected = crate::config::Config::global().language_preference;
+                for (value, item) in &preference_items {
+                    item.set_checked(*value == selected);
+                }
+            } else if event.id == *conservative_item.id() {
                 if let Err(error) = crate::settings::set_live(&control, "spell_dist", "1") {
                     crate::notify::notify("Settings unchanged", &error);
                 }

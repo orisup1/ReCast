@@ -13,6 +13,8 @@ pub struct Config {
     pub personal_enabled: bool,
     /// Persist only aggregate counts of automatic corrections and undos by rule.
     pub rule_stats_enabled: bool,
+    /// Require stronger evidence before switching away from the preferred language.
+    pub language_preference: LanguagePreference,
     /// Allow short (≤3 char) switches up to frequency rank 30,000.
     /// Turning this off restricts them to very common words (rank ≤500).
     pub short_enabled: bool,
@@ -59,6 +61,51 @@ pub const DEFAULT_SPELL_MAX_DIST: u8 = 3;
 pub const DEFAULT_COMPLETE_MIN_LEN: usize = 3;
 pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LanguagePreference {
+    #[default]
+    Balanced,
+    English,
+    Hebrew,
+}
+
+impl LanguagePreference {
+    pub const ALL: [Self; 3] = [Self::Balanced, Self::English, Self::Hebrew];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "balanced" => Some(Self::Balanced),
+            "english" => Some(Self::English),
+            "hebrew" => Some(Self::Hebrew),
+            _ => None,
+        }
+    }
+
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::English => "english",
+            Self::Hebrew => "hebrew",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Balanced => "Balanced",
+            Self::English => "Prefer English",
+            Self::Hebrew => "Prefer Hebrew",
+        }
+    }
+
+    pub fn disfavours(self, target: crate::types::Language) -> bool {
+        matches!(
+            (self, target),
+            (Self::English, crate::types::Language::Hebrew)
+                | (Self::Hebrew, crate::types::Language::English)
+        )
+    }
+}
+
 impl Config {
     /// Load configuration from environment variables.
     /// RECAST_SHORT – set to `0` to restrict short (≤3 char) switches to very
@@ -80,6 +127,7 @@ impl Config {
     ///                        (default: 30000).
     /// RECAST_PERSONAL – set to `1` to persist local personalization data
     ///                   (default: disabled).
+    /// RECAST_PREFER – balanced (default), english, or hebrew.
     pub fn from_env() -> Self {
         let mut config = Self {
             excluded_apps: parse_excluded_apps(
@@ -102,6 +150,9 @@ impl Config {
                 .unwrap_or_else(|| "left_shift".into()),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
             rule_stats_enabled: crate::settings::flag("RECAST_RULE_STATS", false),
+            language_preference: crate::settings::get("RECAST_PREFER")
+                .and_then(|value| LanguagePreference::parse(&value))
+                .unwrap_or_default(),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
             split_enabled: crate::settings::flag("RECAST_SPLIT", false),
             freq_enabled: crate::settings::flag("RECAST_FREQ", true),
@@ -279,6 +330,7 @@ pub const BOOLEAN_KEYS: &[&str] = &[
 
 /// All known settings, for validating the config file.
 pub const ALL_KEYS: &[&str] = &[
+    "RECAST_PREFER",
     "RECAST_EXCLUDE_APPS",
     "RECAST_LAYOUT_ONLY_APPS",
     "RECAST_UNDO_SHORTCUT",

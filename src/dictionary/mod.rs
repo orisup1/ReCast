@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 mod blob;
 pub use blob::{en_dict, en_freq, he_dict, he_freq, Dict, Freq};
 
-use crate::config::Config;
+use crate::config::{Config, LanguagePreference};
 use crate::types::Language;
 
 /// Whether to log every word check and switch decision.
@@ -951,6 +951,139 @@ fn plan(
     context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
 ) -> Option<Plan> {
+    let preference = Config::global().language_preference;
+    details.push_str(&format!("\nLanguage preference: {}.", preference.label()));
+    let candidate = plan_candidate(
+        en,
+        he,
+        offsets_en,
+        offsets_he,
+        keys_len,
+        current,
+        run,
+        case,
+        en_dict,
+        he_dict,
+        en_freq,
+        he_freq,
+        layout_only,
+        context,
+        details,
+    )?;
+    // One final gate covers exact, split, learned, and combined spelling switches.
+    // Explicit expansions and spelling within the current layout pass unchanged.
+    preference_allows_plan(
+        &candidate, preference, en, he, offsets_en, offsets_he, current, run, en_dict, he_dict,
+        en_freq, he_freq, details,
+    )
+    .then_some(candidate)
+}
+
+/// A preference is an additional precision gate, never permission to bypass the
+/// balanced planner's protections. Existing thresholds supply the stricter bars:
+/// top-500 short words, top-5,000 longer words, and top-20,000 with a confirmed run.
+#[allow(clippy::too_many_arguments)]
+fn preference_allows_plan(
+    candidate: &Plan,
+    preference: LanguagePreference,
+    en: Reading,
+    he: Reading,
+    offsets_en: &[usize],
+    offsets_he: &[usize],
+    current: Option<Language>,
+    run: Run,
+    en_dict: Dict,
+    he_dict: Dict,
+    en_freq: Freq,
+    he_freq: Freq,
+    details: &mut String,
+) -> bool {
+    let (lang, start, repaired) = match candidate {
+        Plan::Switch { lang, start } => (*lang, *start, None),
+        Plan::SwitchAndSpell { lang, text } => (*lang, 0, Some(text.as_str())),
+        _ => return true,
+    };
+    if !preference.disfavours(lang) || current == Some(lang) {
+        return true;
+    }
+    let (source, target, offsets_source, offsets_target) = match lang {
+        Language::English => (he.word, en.word, offsets_he, offsets_en),
+        Language::Hebrew => (en.word, he.word, offsets_en, offsets_he),
+    };
+    let (source, target) = if start == 0 {
+        (source, target)
+    } else {
+        (
+            &source[offsets_source[start]..],
+            &target[offsets_target[start]..],
+        )
+    };
+    let target = repaired.unwrap_or(target);
+    let rank = freq_rank(target, lang, en_freq, he_freq).or_else(|| {
+        (lang == Language::Hebrew)
+            .then(|| hebrew_stem(target, he_dict))
+            .flatten()
+            .filter(|stem| stem.chars().count() >= 3)
+            .and_then(|stem| he_freq.rank(stem))
+    });
+    let established = run.favours(lang);
+    let len = target.chars().count();
+    // A recent run relaxes, but never removes, the frequency gate. Combined
+    // spelling repairs also need at least five letters, checked below.
+    let max_rank = if len <= SHORT_MAX {
+        if established {
+            FREQ_COMMON_MAX
+        } else {
+            SHORT_COMMON_MAX
+        }
+    } else if established {
+        FREQ_COMMON_MAX_RUN
+    } else {
+        FREQ_COMMON_MAX
+    };
+    let rejection = if valid_loose(source, lang.other(), en_dict, he_dict) && !established {
+        Some("the preferred-language reading is already a recognized word or form")
+    } else if repaired.is_some() && len < 5 {
+        Some("a combined layout and spelling change needs at least five target letters")
+    } else if rank.is_none_or(|rank| rank > max_rank) {
+        Some("the alternate reading lacks sufficiently strong frequency evidence")
+    } else {
+        None
+    };
+    details.push_str(&format!(
+        "\n{}: switching to {lang:?} requires frequency rank <= {max_rank}; target {target:?} rank {}; confirmed target-language run: {established}.",
+        preference.label(),
+        rank.map_or_else(|| "unranked".into(), |rank| rank.to_string()),
+    ));
+    if let Some(reason) = rejection {
+        details.push_str(&format!(
+            "\nLayout preserved by language preference: {reason}."
+        ));
+        false
+    } else {
+        details.push_str("\nThe switch also passed the language preference checks.");
+        true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_candidate(
+    en: Reading,
+    he: Reading,
+    offsets_en: &[usize],
+    offsets_he: &[usize],
+    keys_len: usize,
+    current: Option<Language>,
+    run: Run,
+    case: Case,
+    en_dict: Dict,
+    he_dict: Dict,
+    en_freq: Freq,
+    he_freq: Freq,
+    layout_only: bool,
+    context: Option<&crate::complete::PhraseContext>,
+    details: &mut String,
+) -> Option<Plan> {
     // Every pipeline below asks about the *word* — the punctuation the user
     // finished it with is set aside by `Reading` and put back by the caller.
     // The split scan is the one exception: its offsets index the full readings.
@@ -1583,7 +1716,11 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
             details,
             rule: None,
             fix: None,
-            lang: seen,
+            // An alternate word that was not inserted must not establish its
+            // own language run and eventually justify the rejected switch.
+            lang: seen.filter(|&lang| {
+                current == Some(lang) || !Config::global().language_preference.disfavours(lang)
+            }),
         };
     };
 
@@ -1909,6 +2046,292 @@ mod tests {
     /// Frequency list from `(word, rank)` pairs (rank 0 = most common).
     fn freq(entries: &[(&str, u32)]) -> Freq {
         Freq::of(entries)
+    }
+
+    #[test]
+    fn language_preference_requires_common_targets_in_both_directions() {
+        for (preference, target_lang, en_text, he_text) in [
+            (
+                LanguagePreference::English,
+                Language::Hebrew,
+                "akuo",
+                "שלום",
+            ),
+            (
+                LanguagePreference::Hebrew,
+                Language::English,
+                "hello",
+                "יקךךם",
+            ),
+            (LanguagePreference::English, Language::Hebrew, "zv", "זה"),
+            (LanguagePreference::Hebrew, Language::English, "the", "איק"),
+        ] {
+            let short = en_text.chars().count() <= 3;
+            let target = if target_lang == Language::English {
+                en_text
+            } else {
+                he_text
+            };
+            let candidate = Plan::Switch {
+                lang: target_lang,
+                start: 0,
+            };
+            let allows = |preference, current, run, rank: Option<u32>| {
+                let ranks = rank.map_or(nofreq(), |rank| freq(&[(target, rank)]));
+                preference_allows_plan(
+                    &candidate,
+                    preference,
+                    Reading::of(en_text),
+                    Reading::of(he_text),
+                    &[],
+                    &[],
+                    current,
+                    run,
+                    dict(&[]),
+                    dict(&[]),
+                    if target_lang == Language::English {
+                        ranks
+                    } else {
+                        nofreq()
+                    },
+                    if target_lang == Language::Hebrew {
+                        ranks
+                    } else {
+                        nofreq()
+                    },
+                    &mut String::new(),
+                )
+            };
+            let current = Some(target_lang.other());
+            assert!(allows(
+                LanguagePreference::Balanced,
+                current,
+                Run::default(),
+                None
+            ));
+            let toward_preference = if target_lang == Language::English {
+                LanguagePreference::English
+            } else {
+                LanguagePreference::Hebrew
+            };
+            assert!(allows(toward_preference, current, Run::default(), None));
+            assert!(allows(preference, Some(target_lang), Run::default(), None));
+            assert!(!allows(preference, current, Run::default(), None));
+            let limit = if short { 500 } else { 5_000 };
+            assert!(allows(preference, current, Run::default(), Some(limit)));
+            assert!(!allows(
+                preference,
+                current,
+                Run::default(),
+                Some(limit + 1)
+            ));
+            assert!(!allows(preference, None, Run::default(), Some(limit + 1)));
+            assert!(!allows(
+                preference,
+                current,
+                Run {
+                    lang: Some(target_lang),
+                    len: 1
+                },
+                Some(limit + 1)
+            ));
+            assert!(!allows(
+                preference,
+                current,
+                Run {
+                    lang: current,
+                    len: 8
+                },
+                Some(limit + 1)
+            ));
+            let run = Run {
+                lang: Some(target_lang),
+                len: 2,
+            };
+            let relaxed_limit = if short { 5_000 } else { 20_000 };
+            assert!(allows(preference, current, run, Some(relaxed_limit)));
+            assert!(!allows(preference, current, run, Some(relaxed_limit + 1)));
+            assert!(!allows(preference, current, run, None));
+        }
+    }
+
+    #[test]
+    fn language_preference_protects_words_and_checks_combined_and_split_targets() {
+        let check = |candidate: &Plan, en_text: &str, he_text: &str, run, en, he, en_f, he_f| {
+            let offsets_en: Vec<_> = en_text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([en_text.len()])
+                .collect();
+            let offsets_he: Vec<_> = he_text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([he_text.len()])
+                .collect();
+            preference_allows_plan(
+                candidate,
+                LanguagePreference::English,
+                Reading::of(en_text),
+                Reading::of(he_text),
+                &offsets_en,
+                &offsets_he,
+                Some(Language::English),
+                run,
+                en,
+                he,
+                en_f,
+                he_f,
+                &mut String::new(),
+            )
+        };
+        let empty = dict(&[]);
+        let exact = Plan::Switch {
+            lang: Language::Hebrew,
+            start: 0,
+        };
+        let known_source = dict(&["form"]);
+        assert!(!check(
+            &exact,
+            "form",
+            "שלום",
+            Run::default(),
+            known_source,
+            empty,
+            nofreq(),
+            freq(&[("שלום", 1)])
+        ));
+        assert!(check(
+            &exact,
+            "form",
+            "שלום",
+            Run {
+                lang: Some(Language::Hebrew),
+                len: 2
+            },
+            known_source,
+            empty,
+            nofreq(),
+            freq(&[("שלום", 1)])
+        ));
+        // A supported prefix may use a common stem without inventing a rank
+        // for an unranked word that has no dictionary stem.
+        assert!(check(
+            &exact,
+            "kakuo",
+            "לשלום",
+            Run::default(),
+            empty,
+            dict(&["שלום"]),
+            nofreq(),
+            freq(&[("שלום", 200)])
+        ));
+        assert!(!check(
+            &exact,
+            "kakuo",
+            "לשלום",
+            Run::default(),
+            empty,
+            empty,
+            nofreq(),
+            freq(&[("שלום", 200)])
+        ));
+        let repair = Plan::SwitchAndSpell {
+            lang: Language::Hebrew,
+            text: "אינטרנט".into(),
+        };
+        assert!(check(
+            &repair,
+            "thbyrbhy",
+            "אינטרניט",
+            Run::default(),
+            empty,
+            empty,
+            nofreq(),
+            freq(&[("אינטרנט", 5_000)])
+        ));
+        assert!(!check(
+            &repair,
+            "thbyrbhy",
+            "אינטרניט",
+            Run::default(),
+            empty,
+            empty,
+            nofreq(),
+            freq(&[("אינטרנט", 5_001)])
+        ));
+        assert!(check(
+            &repair,
+            "thbyrbhy",
+            "אינטרניט",
+            Run {
+                lang: Some(Language::Hebrew),
+                len: 2
+            },
+            empty,
+            empty,
+            nofreq(),
+            freq(&[("אינטרנט", 20_000)])
+        ));
+        let short_repair = Plan::SwitchAndSpell {
+            lang: Language::Hebrew,
+            text: "שלום".into(),
+        };
+        assert!(!check(
+            &short_repair,
+            "akuoo",
+            "שלוםם",
+            Run::default(),
+            empty,
+            empty,
+            nofreq(),
+            freq(&[("שלום", 1)])
+        ));
+        let split = Plan::Switch {
+            lang: Language::Hebrew,
+            start: 3,
+        };
+        assert!(check(
+            &split,
+            "fooakuo",
+            "כםםשלום",
+            Run::default(),
+            empty,
+            empty,
+            nofreq(),
+            freq(&[("שלום", 5_000)])
+        ));
+        assert!(!check(
+            &split,
+            "fooakuo",
+            "כםםשלום",
+            Run::default(),
+            empty,
+            empty,
+            nofreq(),
+            freq(&[("שלום", 5_001)])
+        ));
+        for candidate in [
+            Plan::Expand {
+                text: "שלום".into(),
+            },
+            Plan::Spell {
+                text: "hello".into(),
+            },
+            Plan::HebrewSpell {
+                text: "שלום".into(),
+            },
+        ] {
+            assert!(check(
+                &candidate,
+                "unknown",
+                "לאידוע",
+                Run::default(),
+                empty,
+                empty,
+                nofreq(),
+                nofreq()
+            ));
+        }
     }
 
     #[test]
@@ -2274,7 +2697,48 @@ mod tests {
             "regression",
             include_str!("../../tests/data/corrections.tsv"),
             "",
+            false,
         );
+    }
+
+    #[test]
+    fn preferred_modes_preserve_precision_on_regression_corpus() {
+        const CHILD: &str = "RECAST_PREFERENCE_CORPUS_CHILD";
+        if let Ok(value) = std::env::var(CHILD) {
+            let preference = LanguagePreference::parse(&value).unwrap();
+            Config::update_live(|config| config.language_preference = preference);
+            accuracy_corpus(
+                preference.label(),
+                include_str!("../../tests/data/corrections.tsv"),
+                "",
+                true,
+            );
+            return;
+        }
+        // Each mode needs its own process: runtime settings are shared by tests.
+        for preference in [LanguagePreference::English, LanguagePreference::Hebrew] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dictionary::tests::preferred_modes_preserve_precision_on_regression_corpus",
+                    "--nocapture",
+                ])
+                .env(CHILD, preference.value())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                result.status.success(),
+                "{stderr}\n{}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            for line in stderr
+                .lines()
+                .filter(|line| line.starts_with("Accuracy (") || line.starts_with("Precision:"))
+            {
+                eprintln!("{line}");
+            }
+        }
     }
 
     #[test]
@@ -2411,10 +2875,11 @@ mod tests {
             "independent",
             include_str!("../../tests/data/evaluation.tsv"),
             include_str!("../../tests/data/evaluation_updates.tsv"),
+            false,
         );
     }
 
-    fn accuracy_corpus(name: &str, corpus: &str, baseline_updates: &str) {
+    fn accuracy_corpus(name: &str, corpus: &str, baseline_updates: &str, allow_abstentions: bool) {
         // Frozen inputs and desired outputs never change when a fix lands.
         // Reviewed baseline changes are explicit, exact, and fail if stale.
         let mut updates = std::collections::BTreeMap::new();
@@ -2601,10 +3066,17 @@ mod tests {
             100.0 * correct as f64 / wanted as f64,
             100.0 * unwanted.len() as f64 / unchanged as f64
         );
-        assert!(
-            regressions.is_empty(),
-            "accuracy regressions or resolved baselines: {regressions:#?}"
-        );
+        if allow_abstentions {
+            assert!(
+                unwanted.is_empty() && wrong.is_empty(),
+                "a language preference must preserve precision: {regressions:#?}"
+            );
+        } else {
+            assert!(
+                regressions.is_empty(),
+                "accuracy regressions or resolved baselines: {regressions:#?}"
+            );
+        }
     }
 
     #[test]
