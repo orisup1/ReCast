@@ -228,55 +228,6 @@ fn plain_banner() -> String {
     )
 }
 
-/// Same half-block renderer but downsamples the 32×32 source to 16 rows so
-/// the output is a single compact line (good for a menubar/tray title).
-///
-/// Only the macOS menubar shows an inline text title, so this is macOS-only;
-/// gating it keeps other targets from flagging it as unused.
-#[cfg(target_os = "macos")]
-pub fn logo_rows_compact(depth: ColorDepth) -> String {
-    let px = |x: usize, y: usize| -> (u8, u8, u8, u8) {
-        let i = (y * LOGO_W + x) * 4;
-        (
-            LOGO_RGBA[i],
-            LOGO_RGBA[i + 1],
-            LOGO_RGBA[i + 2],
-            LOGO_RGBA[i + 3],
-        )
-    };
-    let mut s = String::new();
-    let step = LOGO_H / 8;
-    for row in 0..8 {
-        let y0 = row * step;
-        for x in 0..LOGO_W {
-            let (tr, tg, tb, ta) = px(x, y0);
-            let (br, bgc, bb, ba) = px(x, y0 + 1);
-            let top = ta >= ALPHA_CUTOFF;
-            let bot = ba >= ALPHA_CUTOFF;
-            match (top, bot) {
-                (true, true) => {
-                    s.push_str(&fg(depth, tr, tg, tb));
-                    s.push_str(&bg(depth, br, bgc, bb));
-                    s.push('▀');
-                }
-                (true, false) => {
-                    s.push_str("\x1b[0m");
-                    s.push_str(&fg(depth, tr, tg, tb));
-                    s.push('▀');
-                }
-                (false, true) => {
-                    s.push_str("\x1b[0m");
-                    s.push_str(&fg(depth, br, bgc, bb));
-                    s.push('▄');
-                }
-                (false, false) => s.push_str("\x1b[0m "),
-            }
-        }
-    }
-    s.push_str("\x1b[0m");
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

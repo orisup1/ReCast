@@ -1,174 +1,168 @@
-//! Native edit controls hosted by the existing tray event loop.
+//! A single guided step at a time, using the real keyboard engine.
 
+use std::sync::atomic::Ordering;
+use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
+
+use crate::platform::desktop::{Element as E, Kind as K, Window as Form};
 use crate::types::AppControl;
-use tao::event_loop::EventLoopWindowTarget;
 
 pub struct Window {
-    pub window: tao::window::Window,
-    #[cfg(target_os = "macos")]
-    feedback: cocoa::base::id,
-    #[cfg(target_os = "macos")]
-    field: cocoa::base::id,
-    #[cfg(target_os = "windows")]
-    feedback: winapi::shared::windef::HWND,
-    #[cfg(target_os = "windows")]
-    field: winapi::shared::windef::HWND,
-    last_feedback: String,
+    pub form: Form,
 }
 
 impl Window {
-    pub fn new(target: &EventLoopWindowTarget<()>, control: &AppControl) -> Result<Self, String> {
-        let window = tao::window::WindowBuilder::new()
-            .with_title("Practice ReCast — close to skip")
-            .with_inner_size(tao::dpi::LogicalSize::new(680.0, 440.0))
-            .with_resizable(false)
-            .with_visible(false)
-            .build(target)
-            .map_err(|e| e.to_string())?;
-        #[cfg(target_os = "macos")]
-        let (field, feedback) = unsafe { mac_controls(&window) };
-        #[cfg(target_os = "windows")]
-        let (field, feedback) = unsafe { windows_controls(&window)? };
+    pub fn new(
+        target: &EventLoopWindowTarget<()>,
+        proxy: EventLoopProxy<()>,
+        control: &AppControl,
+    ) -> Result<Self, String> {
+        let form = Form::new(
+            target,
+            proxy,
+            "Practice ReCast",
+            [720.0, 570.0],
+            [660.0, 460.0],
+        )?;
+        let mut practice = Self { form };
         super::opened(control);
-        window.set_visible(true);
-        let practice = Self {
-            window,
-            feedback,
-            field,
-            last_feedback: String::new(),
-        };
+        practice.update(control, &crate::platform::status(control))?;
+        practice.form.show();
         practice.focus();
         Ok(practice)
     }
 
     pub fn focus(&self) {
-        self.window.set_focus();
-        #[cfg(target_os = "macos")]
-        unsafe {
-            use objc::{msg_send, sel, sel_impl};
-            use tao::platform::macos::WindowExtMacOS;
-            let window = self.window.ns_window() as cocoa::base::id;
-            let _: bool = msg_send![window, makeFirstResponder: self.field];
+        self.form.focus(20);
+    }
+
+    /// Return true when the explicit Skip/Done button closes practice.
+    pub fn update(&mut self, control: &AppControl, health: &str) -> Result<bool, String> {
+        let mut refocus = false;
+        for action in self.form.actions() {
+            match action {
+                10 => {
+                    control.practice_stage.store(0, Ordering::Relaxed);
+                    self.form.clear_input(20);
+                    refocus = true;
+                }
+                11 => return Ok(true),
+                #[cfg(target_os = "windows")]
+                22 => unsafe {
+                    use winapi::um::{shellapi::ShellExecuteW, winuser::SW_SHOWNORMAL};
+                    let url: Vec<u16> = "ms-settings:regionlanguage"
+                        .encode_utf16()
+                        .chain(Some(0))
+                        .collect();
+                    let result = ShellExecuteW(
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        url.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        SW_SHOWNORMAL,
+                    ) as isize;
+                    if result <= 32 {
+                        return Err("Could not open Windows Language settings. Open Settings > Time & language > Language manually.".into());
+                    }
+                },
+                _ => (),
+            }
         }
+        let [width, height] = self.form.size();
+        let stage = control.practice_stage.load(Ordering::Relaxed);
+        let (english, hebrew) = crate::layout::enabled_languages();
+        let ready = english && hebrew;
+        let state = |ready| if ready { "Ready" } else { "Needs setup" };
+        let progress = if stage >= 3 {
+            "Practice complete".into()
+        } else {
+            format!(
+                "Step {} of 3 — {}",
+                stage + 1,
+                ["Correction", "Undo", "Completion"][stage as usize]
+            )
+        };
+        #[allow(unused_mut)]
+        let mut scene = vec![
+            E::new(
+                1,
+                K::Heading,
+                "Practice ReCast",
+                [24.0, 20.0, width - 48.0, 30.0],
+            ),
+            E::new(
+                2,
+                K::Label,
+                format!(
+                    "English keyboard: {}   ·   Hebrew keyboard: {}",
+                    state(english),
+                    state(hebrew)
+                ),
+                [24.0, 62.0, width - 48.0, 36.0],
+            ),
+            E::new(3, K::Heading, progress, [24.0, 112.0, width - 48.0, 30.0]),
+            E::new(
+                4,
+                K::Label,
+                if ready {
+                    super::step_instruction(stage)
+                } else {
+                    "Add the missing keyboards in your system's keyboard settings. Return here to continue; this checklist updates automatically.".into()
+                },
+                [24.0, 156.0, width - 48.0, 64.0],
+            ),
+            E::new(
+                5,
+                K::Label,
+                "Practice typing field",
+                [24.0, 226.0, width - 48.0, 24.0],
+            ),
+            E::new(
+                20,
+                K::Input,
+                "Practice typing field",
+                [24.0, 254.0, width - 48.0, 34.0],
+            )
+            .enabled(ready && stage < 3),
+            E::new(
+                6,
+                K::Label,
+                super::feedback(control).lines().next().unwrap_or_default(),
+                [24.0, 306.0, width - 48.0, (height - 426.0).max(34.0)],
+            ),
+            E::new(
+                7,
+                K::Label,
+                health,
+                [24.0, height - 112.0, width - 48.0, 54.0],
+            ),
+            E::new(
+                10,
+                K::Button,
+                "Start over",
+                [24.0, height - 46.0, 116.0, 32.0],
+            ),
+            E::new(
+                11,
+                K::Button,
+                if stage >= 3 { "Done" } else { "Skip practice" },
+                [width - 154.0, height - 46.0, 130.0, 32.0],
+            ),
+        ];
         #[cfg(target_os = "windows")]
-        unsafe {
-            winapi::um::winuser::SetFocus(self.field);
-        }
-    }
-
-    pub fn update(&mut self, control: &AppControl, health: &str) {
-        let text = format!("{}\n{health}", super::feedback(control));
-        if self.last_feedback == text {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        unsafe {
-            mac_text(self.feedback, &text);
-        }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            winapi::um::winuser::SetWindowTextW(self.feedback, wide(&text).as_ptr());
-        }
-        self.last_feedback = text;
-    }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn mac_text(field: cocoa::base::id, value: &str) {
-    use cocoa::base::nil;
-    use cocoa::foundation::NSString;
-    use objc::{msg_send, sel, sel_impl};
-    let text = NSString::alloc(nil).init_str(value);
-    let _: () = msg_send![field, setStringValue: text];
-    let _: () = msg_send![text, release];
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn mac_controls(window: &tao::window::Window) -> (cocoa::base::id, cocoa::base::id) {
-    use cocoa::base::{id, NO, YES};
-    use cocoa::foundation::{NSPoint, NSRect, NSSize};
-    use objc::{class, msg_send, sel, sel_impl};
-    use tao::platform::macos::WindowExtMacOS;
-    let ns_window = window.ns_window() as id;
-    let view: id = msg_send![ns_window, contentView];
-    let font: id = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
-    let make = |y: f64, height: f64, editable: bool, text: &str| -> id {
-        let field: id = msg_send![class!(NSTextField), alloc];
-        let field: id = msg_send![field, initWithFrame: NSRect::new(NSPoint::new(20.0, y), NSSize::new(640.0, height))];
-        let _: () = msg_send![field, setFont: font];
-        let _: () = msg_send![field, setEditable: if editable { YES } else { NO }];
-        let _: () = msg_send![field, setSelectable: if editable { YES } else { NO }];
-        let _: () = msg_send![field, setBezeled: if editable { YES } else { NO }];
-        let _: () = msg_send![field, setDrawsBackground: if editable { YES } else { NO }];
-        let cell: id = msg_send![field, cell];
-        let _: () = msg_send![cell, setWraps: if editable { NO } else { YES }];
-        mac_text(field, text);
-        let _: () = msg_send![view, addSubview: field];
-        let _: () = msg_send![field, release];
-        field
-    };
-    make(240.0, 180.0, false, &super::instructions());
-    let field = make(192.0, 32.0, true, "");
-    {
-        use cocoa::foundation::NSString;
-        let label = NSString::alloc(cocoa::base::nil).init_str("Practice typing field");
-        let _: () = msg_send![field, setAccessibilityLabel: label];
-        let _: () = msg_send![label, release];
-    }
-    let feedback = make(16.0, 160.0, false, "");
-    let _: () = msg_send![ns_window, setInitialFirstResponder: field];
-    let _: bool = msg_send![ns_window, makeFirstResponder: field];
-    let editor: id = msg_send![ns_window, fieldEditor: YES forObject: field];
-    let _: () = msg_send![editor, setAutomaticSpellingCorrectionEnabled: NO];
-    let _: () = msg_send![editor, setAutomaticTextReplacementEnabled: NO];
-    (field, feedback)
-}
-
-#[cfg(target_os = "windows")]
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(Some(0)).collect()
-}
-
-#[cfg(target_os = "windows")]
-unsafe fn windows_controls(
-    window: &tao::window::Window,
-) -> Result<(winapi::shared::windef::HWND, winapi::shared::windef::HWND), String> {
-    use tao::platform::windows::WindowExtWindows;
-    use winapi::um::winuser::*;
-    let scale = window.scale_factor();
-    let make = |class: &str, text: &str, y: f64, height: f64, style: u32| {
-        let child = CreateWindowExW(
-            0,
-            wide(class).as_ptr(),
-            wide(text).as_ptr(),
-            WS_CHILD | WS_VISIBLE | style,
-            (20.0 * scale) as i32,
-            (y * scale) as i32,
-            (640.0 * scale) as i32,
-            (height * scale) as i32,
-            window.hwnd() as _,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+        scene.push(
+            E::new(
+                22,
+                K::Button,
+                "Keyboard settings…",
+                [156.0, height - 46.0, 190.0, 32.0],
+            )
+            .enabled(!ready),
         );
-        if child.is_null() {
-            return Err(std::io::Error::last_os_error().to_string());
+        self.form.render(scene)?;
+        if refocus {
+            self.focus();
         }
-        let font = winapi::um::wingdi::GetStockObject(winapi::um::wingdi::DEFAULT_GUI_FONT as i32);
-        SendMessageW(child, WM_SETFONT, font as usize, 1);
-        Ok(child)
-    };
-    make("STATIC", &super::instructions(), 20.0, 180.0, 0)?;
-    make("STATIC", "Practice typing field", 198.0, 18.0, 0)?;
-    let field = make(
-        "EDIT",
-        "",
-        216.0,
-        34.0,
-        WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-    )?;
-    SendMessageW(field, EM_SETLIMITTEXT.into(), 128, 0);
-    let feedback = make("STATIC", "", 272.0, 160.0, 0)?;
-    SetFocus(field);
-    Ok((field, feedback))
+        Ok(false)
+    }
 }

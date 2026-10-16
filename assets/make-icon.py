@@ -16,3 +16,7 @@ i=Image.open("tray-icon.png")
 rgba=i.tobytes()
 open("tray-icon.rgba","wb").write(rgba)
 print(f"Created {len(rgba)} bytes")
+
+# Embed the existing macOS template in the same raw RGBA format as the tray icon.
+with open("tray-template.rgba", "wb") as output:
+    output.write(Image.open("icons/template-32.png").convert("RGBA").tobytes())

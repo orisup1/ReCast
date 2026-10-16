@@ -94,14 +94,17 @@ Enable English and Hebrew keyboards, reopen ReCast, and verify correction, undo,
 and completion in TextEdit. Quit and reopen once more to check that access persists.
 Automated tests cannot verify macOS privacy grants for a downloaded app.
 
-Use **Start at login** in the menubar menu for autostart. Alternatively,
+Use **Settings > General > Start at login** in the menubar app for autostart. Alternatively,
 `make service` installs a bare binary with a launchd LaunchAgent;
 `make service-uninstall` removes that service. Terminal-launched binaries may have
 permissions attributed to the terminal rather than ReCast.
 
 After the keyboard listener is ready, **Practice correction and undo** opens once
-in the tray app or Linux control window. Close it to skip, or reopen it from the
-menu/controls. The exercise uses a real local text field: try layout correction,
+in the tray app or Linux control window. Close it to skip, or reopen it from
+**Help > Practice correction and undo** in the tray or the Linux controls.
+On macOS and Windows, practice shows one step at a time and checks both installed
+keyboards. Windows offers a link to Language settings; the checklist updates when
+you return. The exercise uses a real local text field: try layout correction,
 undo it, then complete `keyb` with Right Shift. Successful steps are confirmed by
 the keyboard engine. Practice does not train word exceptions or personalization,
 consume the first-correction hint, or change correction counts. Saved word rules
@@ -136,7 +139,7 @@ Disconnected keyboards are detected automatically; ReCast waits for reconnection
 
 ### Windows
 
-Run `ReCast.exe` for the tray app. **Start at login** registers it in the per-user
+Run `ReCast.exe` for the tray app. **Settings > General > Start at login** registers it in the per-user
 Run key. To build, install, and register a logon Scheduled Task from source:
 
 ```powershell
@@ -169,9 +172,9 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 | Undo the latest correction or completion | Tap **Ctrl twice** immediately, or use the optional single-Ctrl undo shortcut |
 | Allow an ignored word again | Use the configured single-Ctrl undo shortcut after the word, or edit your word lists |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
-| Inspect or ignore a correction | Open **Recent corrections → Why this correction…** in the tray, or expand it in the Linux window; choose **Ignore this word** to save an exception |
-| Inspect live activity | **Start live log…** in the tray/menubar, or **Live log…** in the Linux control window |
-| Review gestures | **Typing shortcuts** in the tray or Linux control window |
+| Inspect or ignore a correction | Open **Recent corrections…** in the tray, then choose **Details** or **Ignore**; in the Linux window, expand a correction and choose **Ignore this word** |
+| Inspect live activity | **Help > Start live log…** in the tray/menubar, or **Live log…** in the Linux control window |
+| Review gestures | **Help > Typing shortcuts** in the tray, or **Typing shortcuts** in the Linux control window |
 
 Double-Ctrl undoes the latest automatic correction, abbreviation expansion, or
 completion, restoring the original text or prefix. If the last word was unchanged,
@@ -215,11 +218,14 @@ events wait briefly until the replacement is complete, then replay in their orig
 order. This keeps continued typing from canceling a partly erased word. Unsafe queued
 input clears correction and undo context; bare modifier taps and spaces retain it.
 
-The macOS/Windows tray and Linux control window offer live **Settings** for spelling,
-completion/abbreviations, and **Conservative spelling**. Conservative spelling caps
-fixes at one edit; turning it off restores the default ceiling of three, with
-stricter limits for shorter words. The tray counter offers this setting when many
-corrections have been undone. The enabled/disabled switch survives restarts.
+The macOS/Windows tray opens a native **Settings** window with General, Shortcuts,
+Applications, and Word rules sections. General offers spelling, completion,
+spelling sensitivity, and Start at login. Sensitivity ranges from no automatic
+spelling edits to Conservative (one edit), Balanced (two), and Flexible (three);
+shorter words still have stricter limits. The status submenu suggests Conservative
+spelling when many corrections have been undone. The Linux control window offers
+live toggles for spelling, completion, and Conservative spelling. The
+enabled/disabled switch survives restarts.
 
 ### Command line
 
@@ -244,8 +250,12 @@ remain unchanged and apply when correction resumes.
 
 The Linux control window offers **Pause for 30 minutes** / **Resume** and
 **Recent corrections**. Expand a correction to see its captured decision evidence,
-then choose **Ignore this word** to save an exception. The tray offers the same
-details and ignore action. Undone corrections remain visible and marked. Details
+then choose **Ignore this word** to save an exception. On macOS and Windows,
+**Recent corrections…** opens a window with separate Original and Replacement
+columns, timestamps, **Details**, and **Ignore**. It shows a snapshot of up to 20
+corrections, up to five per page depending on window height. Choose **Refresh** to include newer corrections; rows
+stay stable while you inspect or ignore a word. Closing Settings, history, or
+practice leaves ReCast running in the tray. Undone corrections remain visible and marked. Details
 include both layout readings, dictionary/form matches, frequency ranks, and spelling
 scores and competing candidates when spelling was evaluated. Evidence is captured
 when the decision is made, stays in the bounded in-memory history, and is not
@@ -317,9 +327,11 @@ an unreadable config stops startup so exclusions are not silently discarded.
 | `practice-offered` | Marker for the optional first-run practice window |
 | `personal/` | Opt-in personalization files, `rules.txt` rule counts, and `usefulness.txt` usage counts |
 
-`abbrev.txt` and `ignore.txt` reload within about two seconds of edits. The tray's
-**Advanced settings** and **Open ignored words** open files in your editor, creating
-missing files without overwriting existing content.
+`abbrev.txt` and `ignore.txt` reload within about two seconds of edits.
+**Settings > General > Advanced settings** opens the config file in your editor,
+creating it if needed without overwriting existing content. **Settings > Word
+rules** opens the native editors for ignored words, learned exceptions, and
+abbreviations. **Reload lists** is available in that section.
 
 For abbreviations, add rules to `abbrev.txt`:
 
@@ -351,14 +363,16 @@ and technical terms absent from the bundled dictionary.
 
 ### Application exclusions
 
-Use **Application modes** in the tray or Linux window for the last detected app:
+On macOS and Windows, open **Settings > Applications** and choose the last detected
+app or a saved app. **Use last application** refreshes that list after switching
+apps. On Linux, use **Application modes** in the control window:
 
 - **Full correction** follows the global spelling/completion settings.
 - **Layout only** keeps layout correction and undo, with spelling, abbreviations,
   completion, and personalization disabled in that app.
 - **Off** excludes the app from processing.
 
-Choose a saved entry to restore Full correction. Changes save together and apply
+Choose a saved application and set its mode to **Full correction** to restore it. Changes save together and apply
 immediately; an in-flight replacement is canceled if its app mode changes.
 You can also edit these values and restart:
 
@@ -386,10 +400,13 @@ On **native GNOME/KDE Wayland**, this means correction pauses throughout the ses
 the Linux window disables adding restrictions when detection is unavailable.
 After returning to an allowed app, finish the current word with Space/Enter to resume.
 
-The tray leads with the current status and application mode, with recovery details
-in its submenu. **Pause correction** groups temporary pauses; **Disable until I
-enable it again** persists across restarts. Correction counts appear below these
-controls. The Linux window uses the same status wording and groups pause controls.
+The compact tray menu contains Status, Pause, Recent corrections, Settings, Help,
+and Quit. Status includes the current application mode, recovery details, and
+correction counts. **Pause correction** groups temporary pauses and **Disable until
+I enable it again**, which persists across restarts. The icon distinguishes active,
+paused, disabled, and attention states by shape. macOS uses a monochrome template
+icon that adapts to the menubar appearance. The Linux window uses the same status
+wording and groups pause controls.
 
 The status submenu and Linux window explain Active, Disabled, Paused,
 Excluded application, Secure Input, unavailable keyboard capture, and unknown
@@ -398,7 +415,8 @@ silent. `--status` exposes the same status from the running process.
 
 ### Word-rule editor
 
-Open **Settings → Word rules** in the tray/menubar or Linux control window.
+Open **Settings** in the tray/menubar and select the **Word rules** section, or
+expand **Settings > Word rules** in the Linux control window.
 Choose **Ignored words**, **Learned exceptions**, or **Abbreviations**. Add or
 remove words one per line; write abbreviations as `shortcut = expansion`.
 Learned exceptions shows saved exceptions from repeated undos; single-undo
@@ -417,7 +435,7 @@ or update checks. Recent corrections stay in memory. Undo counts and explicitly
 ignored words are saved locally; debug logging and personalization are off by default.
 Synthetic input replaces text without using the clipboard.
 
-The live log starts only when you choose **Start live log…** in the tray/menubar
+The live log starts only when you choose **Help > Start live log…** in the tray/menubar
 or press **Start logging** in the Linux control window. It shows timestamps,
 correction and undo text, and Accessibility, listener, or keyboard setup issues
 as they appear.

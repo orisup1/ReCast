@@ -33,6 +33,8 @@ pub use macos::enabled_languages;
 #[cfg(target_os = "macos")]
 pub use macos::switch_layout_to;
 #[cfg(target_os = "windows")]
+pub use windows::enabled_languages;
+#[cfg(target_os = "windows")]
 pub use windows::switch_layout_to;
 
 /// What ReCast can do about the layout on this system, for `--status`.

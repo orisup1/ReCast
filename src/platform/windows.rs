@@ -316,10 +316,9 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
         press(VK_BACK as u16, &mut inputs);
     }
     type_text(&text, &mut inputs);
-    match terminator {
-        Some(_) => type_text(" ", &mut inputs),
-        // A completion ends mid-word: no terminator, no trailing space.
-        None => {}
+    // A completion ends mid-word: no terminator, no trailing space.
+    if terminator.is_some() {
+        type_text(" ", &mut inputs);
     }
     if !engine.replacement_valid(generation) {
         return None;

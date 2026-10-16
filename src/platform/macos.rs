@@ -807,6 +807,7 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SetupAction {
+    Start,
     Check,
     Accessibility,
     Keyboards,
@@ -814,15 +815,18 @@ enum SetupAction {
     Quit,
 }
 
-const SETUP_ACTIONS: &[(SetupAction, &str)] = &[
-    (SetupAction::Check, "Check again"),
-    (SetupAction::Accessibility, "Open Accessibility"),
-    (SetupAction::Keyboards, "Keyboard Settings"),
-    (SetupAction::Reveal, "Show ReCast in Finder"),
-    (SetupAction::Quit, "Quit"),
-];
-
 impl SetupAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start ReCast",
+            Self::Check => "Check again",
+            Self::Accessibility => "Open Accessibility",
+            Self::Keyboards => "Open Keyboard Settings",
+            Self::Reveal => "Show ReCast in Finder",
+            Self::Quit => "Quit",
+        }
+    }
+
     fn settings_url(self, modern: bool) -> Option<&'static str> {
         match (self, modern) {
             (Self::Accessibility, true) => Some("x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"),
@@ -830,6 +834,52 @@ impl SetupAction {
             (Self::Keyboards, true) => Some("x-apple.systempreferences:com.apple.Keyboard-Settings.extension?inputSources"),
             (Self::Keyboards, false) => Some("x-apple.systempreferences:com.apple.preference.keyboard?InputSources"),
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SetupStep {
+    Accessibility,
+    Keyboards,
+    Ready,
+}
+
+impl SetupStep {
+    fn current(accessibility: bool, english: bool, hebrew: bool) -> Self {
+        if !accessibility {
+            Self::Accessibility
+        } else if !english || !hebrew {
+            Self::Keyboards
+        } else {
+            Self::Ready
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Accessibility => "Set up ReCast: Accessibility",
+            Self::Keyboards => "Set up ReCast: Keyboards",
+            Self::Ready => "ReCast is ready",
+        }
+    }
+
+    fn actions(self, can_reveal: bool) -> Vec<SetupAction> {
+        match self {
+            Self::Accessibility => {
+                let mut actions = vec![SetupAction::Accessibility, SetupAction::Check];
+                if can_reveal {
+                    actions.push(SetupAction::Reveal);
+                }
+                actions.push(SetupAction::Quit);
+                actions
+            }
+            Self::Keyboards => vec![
+                SetupAction::Keyboards,
+                SetupAction::Check,
+                SetupAction::Quit,
+            ],
+            Self::Ready => vec![SetupAction::Start, SetupAction::Quit],
         }
     }
 }
@@ -869,48 +919,54 @@ pub fn setup_guidance() -> bool {
         let accessibility = unsafe { AXIsProcessTrusted() != 0 };
         let (english, hebrew) = crate::layout::enabled_languages();
         // The active session tap and event posting both use Accessibility.
-        let ready = accessibility && english && hebrew;
-        if ready && !first {
+        let step = SetupStep::current(accessibility, english, hebrew);
+        if step == SetupStep::Ready && !first {
             return true;
         }
-        let state = |ok| if ok { "Ready" } else { "Needs setup" };
-        let mut body = format!("ReCast fixes English/Hebrew layout mistakes and English/Hebrew spelling as you type. Processing stays on this Mac.\n\nAccessibility: {}\nEnglish keyboard: {}\nHebrew keyboard: {}\n\n{}", state(accessibility), state(english), state(hebrew), if ready { "You're ready. Optional practice opens after setup so you can try correction, undo, and completion in a local field. Close it to skip; reopen Practice from the menu anytime." } else { "In System Settings → Privacy & Security → Accessibility, enable ReCast. Accessibility covers both reading keys and typing corrections; a separate Input Monitoring entry is not required.\n\nFor keyboards, open Keyboard → Text Input → Edit and add English and Hebrew. Return here and choose Check again. After granting permission, macOS may require you to quit and reopen ReCast." });
-        if !accessibility {
+        let instruction = match step {
+            SetupStep::Accessibility => "Step 1 of 2: Enable ReCast in Privacy & Security → Accessibility. Return here and choose Check again. If macOS asks, quit and reopen ReCast.",
+            SetupStep::Keyboards => match (english, hebrew) {
+                (false, false) => "Step 2 of 2: Open Keyboard → Text Input → Edit and add English and Hebrew. Return here and choose Check again.",
+                (false, true) => "Step 2 of 2: Open Keyboard → Text Input → Edit and add English. Return here and choose Check again.",
+                _ => "Step 2 of 2: Open Keyboard → Text Input → Edit and add Hebrew. Return here and choose Check again.",
+            },
+            SetupStep::Ready => "Start ReCast to try correction, undo, and completion in a local practice field. Close practice to skip; reopen it from Help anytime.",
+        };
+        let state = |ok| if ok { "Ready" } else { "Needed" };
+        let mut body = format!(
+            "ReCast corrects typing locally on this Mac.\n\nAccessibility: {}\nEnglish keyboard: {}\nHebrew keyboard: {}\n\n{}",
+            state(accessibility), state(english), state(hebrew), instruction
+        );
+        if step == SetupStep::Accessibility {
             if let Some(path) = permission_target {
-                body.push_str(&format!("\n\nIf ReCast is missing, click + in Accessibility, press Cmd+Shift+G, and enter:\n{}\n\nShow ReCast in Finder reveals this exact copy.", path.display()));
+                body.push_str(&format!(
+                    "\n\nIf it is missing, click +, press Cmd+Shift+G, and add this copy:\n{}",
+                    path.display()
+                ));
             }
             if bundle.is_none() {
-                body.push_str("\n\nThis is a standalone executable. A terminal launch may appear under the terminal's name. For permissions attached to ReCast.app, install the app bundle and open it from Finder.");
+                body.push_str("\n\nA terminal launch may appear under the terminal's name. To grant access to ReCast.app, install the app bundle and open it from Finder.");
             }
         }
-        let buttons: Vec<&str> = if ready {
-            vec!["Start ReCast", "Quit"]
-        } else {
-            SETUP_ACTIONS.iter().map(|(_, label)| *label).collect()
-        };
+        let actions = step.actions(permission_target.is_some());
+        let buttons: Vec<&str> = actions.iter().map(|action| action.label()).collect();
         let choice = crate::notify::dialog_with_destination(
-            "Set up ReCast",
+            step.title(),
             &body,
             &buttons,
             destination.take(),
         );
-        if ready {
-            if choice != 0 {
-                return false;
-            }
-            if let Some(path) = &marker {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                    let _ = std::fs::write(path, "Setup completed\n");
-                }
-            }
-            return true;
-        }
-        let action = SETUP_ACTIONS
-            .get(choice)
-            .map(|(action, _)| *action)
-            .unwrap_or(SetupAction::Quit);
+        let action = actions.get(choice).copied().unwrap_or(SetupAction::Quit);
         match action {
+            SetupAction::Start => {
+                if let Some(path) = &marker {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        let _ = std::fs::write(path, "Setup completed\n");
+                    }
+                }
+                return true;
+            }
             SetupAction::Check => {
                 first = true;
             }
@@ -1454,6 +1510,40 @@ mod setup_tests {
     }
 
     #[test]
+    fn setup_guides_the_next_requirement_only() {
+        for accessibility in [false, true] {
+            for english in [false, true] {
+                for hebrew in [false, true] {
+                    let step = SetupStep::current(accessibility, english, hebrew);
+                    let actions = step.actions(true);
+                    if !accessibility {
+                        assert_eq!(step, SetupStep::Accessibility);
+                        assert_eq!(actions[0], SetupAction::Accessibility);
+                        assert!(actions.contains(&SetupAction::Reveal));
+                        assert!(!actions.contains(&SetupAction::Keyboards));
+                    } else if !english || !hebrew {
+                        assert_eq!(step, SetupStep::Keyboards);
+                        assert_eq!(actions[0], SetupAction::Keyboards);
+                        assert!(!actions.contains(&SetupAction::Accessibility));
+                        assert!(!actions.contains(&SetupAction::Reveal));
+                    } else {
+                        assert_eq!(step, SetupStep::Ready);
+                        assert_eq!(actions, [SetupAction::Start, SetupAction::Quit]);
+                    }
+                    assert_eq!(actions.last(), Some(&SetupAction::Quit));
+                    assert_eq!(
+                        actions.contains(&SetupAction::Start),
+                        accessibility && english && hebrew
+                    );
+                }
+            }
+        }
+        assert!(!SetupStep::Accessibility
+            .actions(false)
+            .contains(&SetupAction::Reveal));
+    }
+
+    #[test]
     fn permission_target_is_the_running_copy_not_another_installed_bundle() {
         for path in ["/Applications/ReCast.app", "/tmp/local build/ReCast.app"] {
             let executable = Path::new(path).join("Contents/MacOS/recast");
@@ -1470,6 +1560,15 @@ mod setup_tests {
         let keyboards = SetupAction::Keyboards.settings_url(true).unwrap();
         assert!(accessibility.ends_with("PrivacySecurity.extension?Privacy_Accessibility"));
         assert!(keyboards.ends_with("Keyboard-Settings.extension?inputSources"));
+        assert!(SetupAction::Accessibility
+            .settings_url(false)
+            .unwrap()
+            .ends_with("security?Privacy_Accessibility"));
+        assert!(SetupAction::Keyboards
+            .settings_url(false)
+            .unwrap()
+            .ends_with("keyboard?InputSources"));
+        assert!(SetupAction::Start.settings_url(true).is_none());
         assert!(SetupAction::Reveal.settings_url(true).is_none());
         assert!(SetupAction::Quit.settings_url(true).is_none());
     }

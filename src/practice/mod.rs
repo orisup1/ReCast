@@ -31,6 +31,7 @@ fn restore_instruction(config: &crate::config::Config) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn instructions() -> String {
     let config = crate::config::Config::global();
     format!(
@@ -42,6 +43,17 @@ pub fn shortcut_label(value: &str) -> &'static str {
         "left_ctrl" => "Also single-tap Left Ctrl",
         "right_ctrl" => "Also single-tap Right Ctrl",
         _ => "No extra single-tap undo",
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub fn step_instruction(stage: u8) -> String {
+    let config = crate::config::Config::global();
+    match stage {
+        0 => "Select your English keyboard. Click the field below, press Space, type akuo, then Space. Watch it become שלום.\nPractice is local; no learning or correction counts.".into(),
+        1 => format!("Immediately {} to restore akuo. Keep the cursor in the field; do not click or type first.", restore_instruction(&config)),
+        2 => format!("Select all and delete in the field. Press Space, type keyb, then {} to complete keyboard.", config.completion_gesture()),
+        _ => "You tried correction, undo, and completion. Choose Done and keep typing anywhere. Practice does not save learned words or change your correction counts.".into(),
     }
 }
 
@@ -92,14 +104,20 @@ mod tests {
     #[test]
     fn practice_progress_requires_the_actual_operations_in_order() {
         let control = AppControl::new_for_test();
+        let instruction = || step_instruction(control.practice_stage.load(Ordering::Relaxed));
+        assert!(instruction().contains("type akuo"));
+        assert!(!instruction().contains("type keyb"));
         fixed(&control, "keyb", "keyboard", FixKind::Complete);
         assert_eq!(control.practice_stage.load(Ordering::Relaxed), 0);
         fixed(&control, "akuo", "שלום", FixKind::Layout);
         assert_eq!(control.practice_stage.load(Ordering::Relaxed), 1);
+        assert!(instruction().contains("restore akuo"));
         fixed(&control, "שלום", "akuo", FixKind::Layout);
         assert_eq!(control.practice_stage.load(Ordering::Relaxed), 2);
+        assert!(instruction().contains("type keyb"));
         fixed(&control, "keyb", "keyboard", FixKind::Complete);
         assert_eq!(control.practice_stage.load(Ordering::Relaxed), 3);
+        assert!(instruction().contains("Done"));
         assert_eq!(control.fixed_count(), 0);
     }
 }

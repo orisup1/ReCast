@@ -6,6 +6,7 @@
 # faithfully than ImageMagick's built-in SVG rasterizer, so go via a PNG.
 rsvg-convert -w 32 -h 32 banner-logo.svg -o tray-icon.png
 convert tray-icon.png RGBA:tray-icon.rgba
+convert icons/template-32.png -depth 8 RGBA:tray-template.rgba
 # Verify byte count
 if [ -f tray-icon.rgba ]; then
   size=$(wc -c < tray-icon.rgba | tr -d ' ')

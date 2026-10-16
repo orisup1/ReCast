@@ -67,7 +67,7 @@ winapi = { version = "0.3", features = [
     # though release builds run under `windows_subsystem = "windows"` (see
     # platform::windows::attach_parent_console).
     "wincon", "consoleapi", "processenv", "winbase",
-    "fileapi", "handleapi", "winnt",
+    "fileapi", "handleapi", "winnt", "commctrl", "libloaderapi",
     # "Start at login": the per-user Run key (see prefs::windows_autostart).
     # Listed explicitly rather than relied on through tao/tray-icon's own
     # feature set, which cargo happens to unify with ours today.

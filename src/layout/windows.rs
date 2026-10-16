@@ -9,6 +9,25 @@
 use super::{set_layout_cache, LayoutSwitch};
 use crate::types::Language;
 
+/// Inspect installed layouts without loading a keyboard or changing the active layout.
+pub fn enabled_languages() -> (bool, bool) {
+    use winapi::um::winuser::GetKeyboardLayoutList;
+    unsafe {
+        let count = GetKeyboardLayoutList(0, std::ptr::null_mut());
+        if count <= 0 {
+            return (false, false);
+        }
+        let mut layouts = vec![std::ptr::null_mut(); count as usize];
+        let count = GetKeyboardLayoutList(count, layouts.as_mut_ptr()).max(0) as usize;
+        let primary = |id| {
+            layouts[..count.min(layouts.len())]
+                .iter()
+                .any(|layout| *layout as usize & 0x03ff == id)
+        };
+        (primary(0x09), primary(0x0d))
+    }
+}
+
 pub fn query_layout() -> Option<Language> {
     use std::ffi::c_void;
     type DWORD = u32;

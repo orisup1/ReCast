@@ -42,7 +42,16 @@ mod log_viewer;
 mod word_rules;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-mod inspection;
+pub(crate) mod desktop;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod preferences;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod history;
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+mod tray_icon;
 
 /// Friendly label plus the exact identifier used by the exclusion engine.
 pub fn active_application() -> Option<(String, String)> {

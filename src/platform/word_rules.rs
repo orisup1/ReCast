@@ -172,6 +172,36 @@ fn show(mut editor: RuleEditor) -> Result<(), String> {
                     IDCANCEL,
                 );
                 SetFocus(text);
+                super::desktop::windows::layout_rules(hwnd);
+                0
+            }
+            WM_SIZE => {
+                super::desktop::windows::layout_rules(hwnd);
+                1
+            }
+            WM_DPICHANGED => {
+                let rect = &*(l as *const winapi::shared::windef::RECT);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                super::desktop::windows::layout_rules(hwnd);
+                1
+            }
+            WM_GETMINMAXINFO => {
+                let scale = super::desktop::windows::window_dpi(hwnd) as f64 / 96.0;
+                let limits = &mut *(l as *mut MINMAXINFO);
+                limits.ptMinTrackSize.x = (560.0 * scale) as i32;
+                limits.ptMinTrackSize.y = (400.0 * scale) as i32;
+                1
+            }
+            WM_DESTROY => {
+                super::desktop::windows::clear_dialog_font(hwnd);
                 0
             }
             WM_COMMAND if (w & 0xffff) as i32 == IDOK => {
@@ -210,7 +240,7 @@ fn show(mut editor: RuleEditor) -> Result<(), String> {
     }
     // Empty native dialog template. Controls are created in WM_INITDIALOG;
     // u32 storage provides the DWORD alignment required by Win32.
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | DS_MODALFRAME;
     let words: [u16; 12] = [
         style as u16,
         (style >> 16) as u16,
