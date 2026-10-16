@@ -146,9 +146,9 @@ impl<S: Replaceable> Drop for ReplaceGuard<'_, S> {
 
 /// Longest run of keys that can still be treated as one word.
 ///
-/// Both pipelines already refuse anything much shorter than this — the speller
-/// stops at 20 characters (`spell::MAX_LEN`) and the completer at 20
-/// (`complete::MAX_PREFIX_LEN`) — so past this point the buffer is being filled
+/// Most speculative searches stop much earlier — spelling and edited-prefix
+/// completion stop at 20 characters, while exact completion can use this full
+/// tracked range. Past this point the buffer is being filled
 /// with something that is provably never going to be corrected: a base64 blob,
 /// a URL, a path, a key held down. Held at 64 rather than 20 because the buffer
 /// also has to hold the punctuation a word ends with and, once the split

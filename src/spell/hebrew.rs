@@ -2,7 +2,7 @@
 
 use crate::complete::{PhraseContext, MAX_CANDIDATES};
 use crate::config::Config;
-use crate::dictionary::{hebrew_stem, Dict, Freq};
+use crate::dictionary::{hebrew_stem, ranked_hebrew_stem, Dict, Freq};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -179,12 +179,9 @@ fn unranked_repeat_base(word: &str, dict: Dict, freq: Freq) -> bool {
             .iter()
             .chain(&letters[index + 1..])
             .collect();
-        let stem = if dict.contains(&base) {
-            Some(base.as_str())
-        } else {
-            hebrew_stem(&base, dict)
-        };
-        stem.is_some_and(|stem| freq.rank(stem).is_none())
+        (dict.contains(&base) || hebrew_stem(&base, dict).is_some())
+            && freq.rank(&base).is_none()
+            && ranked_hebrew_stem(&base, dict, freq, 1).is_none()
     })
 }
 
@@ -255,15 +252,13 @@ fn search(
         if text == plain || !valid_finals(&chars) {
             return;
         }
-        let stem = if dict.contains(&text) {
+        let direct_rank = dict.contains(&text).then(|| freq.rank(&text)).flatten();
+        let stem = if direct_rank.is_some() {
             None
         } else {
-            hebrew_stem(&text, dict)
+            ranked_hebrew_stem(&text, dict, freq, 1)
         };
-        let Some(rank) = freq
-            .rank(stem.unwrap_or(&text))
-            .filter(|_| dict.contains(&text) || stem.is_some())
-        else {
+        let Some(rank) = direct_rank.or_else(|| stem.map(|(_, rank)| rank)) else {
             return;
         };
         let max_rank = if explicit {
@@ -308,7 +303,7 @@ fn search(
                 cost,
                 rank,
             },
-            stem: stem.map(str::to_owned),
+            stem: stem.map(|(stem, _)| stem.to_owned()),
             context_discount: discount,
             learned_discount,
         };
@@ -538,6 +533,42 @@ mod tests {
         assert!(assess_with("מסמךך", d, f, None, &config)
             .details
             .contains("disabled"));
+    }
+
+    #[test]
+    fn a_ranked_deeper_stem_survives_a_shallow_dictionary_collision() {
+        for d in [
+            Dict::of(&["מקלדת", "כשמקלדת", "שמקלדת"]),
+            Dict::of(&["מקלדת", "כשמקלדת", "שמקלדת", "וכשמקלדת"]),
+        ] {
+            for f in [
+                Freq::of(&[("מקלדת", 500)]),
+                Freq::of(&[("מקלדת", 500), ("כשמקלדת", 70_000), ("שמקלדת", 60_000)]),
+            ] {
+                let suggestions = correction_suggestions("וכשמקלדתת", d, f, None);
+                assert!(
+                    suggestions.iter().any(|word| word == "וכשמקלדת"),
+                    "{suggestions:?}"
+                );
+                assert!(!unranked_repeat_base("וכשמקלדתת", d, f));
+                let mut config = Config::global();
+                config.spell_enabled = true;
+                config.spell_max_dist = 1;
+                config.spell_max_rank = 30_000;
+                assert_eq!(
+                    assess_with("וכשמקלדתת", d, f, None, &config)
+                        .correction
+                        .as_deref(),
+                    Some("וכשמקלדת")
+                );
+            }
+        }
+        let d = Dict::of(&["מקלדת", "וכשמקלדת"]);
+        let f = Freq::of(&[("מקלדת", 500), ("וכשמקלדת", 70_000)]);
+        assert!(
+            !correction_suggestions("וכשמקלדתת", d, f, None).contains(&"וכשמקלדת".to_owned()),
+            "a directly attested rare rank must retain its frequency gate"
+        );
     }
 
     #[test]

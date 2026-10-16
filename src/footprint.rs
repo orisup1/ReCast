@@ -120,6 +120,12 @@ mod tests {
             let _ = he.contains(&word);
             let _ = freq.rank(&word);
             let _ = crate::complete::completions_with(&word, en, freq, 3, 30_000);
+            if i % 100 == 0 {
+                // Exercise the full, transient completion pool as well as
+                // rejection paths. Every pool is dropped before the next request.
+                let prefix = ["com", "trans", "proc", "under", "inter", "pre"][(i / 100) % 6];
+                let _ = crate::complete::all_completions_in_context(prefix, en, freq, None);
+            }
             let _ = crate::spell::correct(&word, en, freq);
             // Per-correction state.
             control.record_fix(&word, "fixed", FixKind::Spelling);
@@ -129,6 +135,28 @@ mod tests {
 
     #[test]
     fn a_long_session_does_not_grow_without_limit() {
+        const CHILD: &str = "RECAST_MEMORY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Other parallel tests fault dictionary pages and allocate their own
+            // candidate pools. Measure one daemon workload in its own process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "footprint::tests::a_long_session_does_not_grow_without_limit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         let control = AppControl::new_for_test();
 
         // Warm up: fault in the dictionary pages and every allocator arena

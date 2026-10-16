@@ -4,9 +4,9 @@
 //! There is no such thing as "the Linux way" to do this. X11 has one (the XKB
 //! group, settable by anyone who can open the display) and Wayland deliberately
 //! has none — the compositor owns the keymap, and each one exposes its own
-//! private way to ask. So this module holds five [`Backend`]s, probed once at
-//! startup in order of specificity, and every one of them answers the same
-//! three questions:
+//! private way to ask. So this module holds five [`Backend`]s, probed in order
+//! of specificity, with unavailable sessions retried after startup. Every one
+//! of them answers the same three questions:
 //!
 //! * [`Backend::names`] — the layouts configured, in order
 //! * [`Backend::current`] — which of them is live
@@ -31,14 +31,14 @@
 //! and a D-Bus client is a great deal more code than these two calls are worth;
 //! the cache is what makes that survivable.
 
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::{language_of_keymap, set_layout_cache, LayoutSwitch};
 use crate::types::Language;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The backend, chosen once
+// The backend, retained once its session is available
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,7 +59,61 @@ enum Backend {
     None,
 }
 
-/// Which backend this session gets, decided once.
+const BACKEND_RETRY: Duration = Duration::from_secs(1);
+
+struct BackendProbe {
+    chosen: Option<Backend>,
+    attempted: Option<Instant>,
+}
+
+impl BackendProbe {
+    fn resolve(&mut self, now: Instant, probe: impl FnOnce() -> Option<Backend>) -> Backend {
+        if let Some(chosen) = self.chosen {
+            return chosen;
+        }
+        if self
+            .attempted
+            .is_some_and(|attempted| now.duration_since(attempted) < BACKEND_RETRY)
+        {
+            return Backend::None;
+        }
+        self.attempted = Some(now);
+        self.chosen = probe();
+        self.chosen.unwrap_or(Backend::None)
+    }
+
+    fn explicitly_disabled(&self) -> bool {
+        self.chosen == Some(Backend::None)
+    }
+}
+
+/// Session hints remain authoritative while the compositor creates its socket;
+/// an already-running XWayland server cannot manage its Wayland layout state.
+fn auto_backend(
+    desktop: &str,
+    hyprland: bool,
+    sway: bool,
+    kde: bool,
+    x11: impl FnOnce() -> bool,
+) -> Option<Backend> {
+    let desktop = desktop.to_uppercase();
+    if hyprland || desktop.contains("HYPRLAND") {
+        Some(Backend::Hyprland)
+    } else if sway || desktop.contains("SWAY") {
+        Some(Backend::Sway)
+    } else if kde || desktop.contains("KDE") {
+        Some(Backend::Kde)
+    } else if desktop.contains("GNOME") || desktop.contains("UNITY") {
+        Some(Backend::Gnome)
+    } else if x11() {
+        Some(Backend::X11)
+    } else {
+        None
+    }
+}
+
+/// Which backend this session gets. Retry an unavailable session rather than
+/// making a compositor startup race disable layout correction until restart.
 ///
 /// Order is specificity, not preference: a compositor that owns the keymap has
 /// to be asked in its own language, and X11 is the catch-all underneath because
@@ -68,8 +122,20 @@ enum Backend {
 /// setting the group under GNOME works for exactly as long as it takes
 /// gnome-shell to set it back.
 fn backend() -> Backend {
-    static BACKEND: OnceLock<Backend> = OnceLock::new();
-    *BACKEND.get_or_init(|| {
+    backend_state().0
+}
+
+/// The second value distinguishes an explicit off setting from an unavailable
+/// session, whose watcher and discovery must remain eligible to recover.
+fn backend_state() -> (Backend, bool) {
+    static BACKEND: Mutex<BackendProbe> = Mutex::new(BackendProbe {
+        chosen: None,
+        attempted: None,
+    });
+    let Ok(mut state) = BACKEND.lock() else {
+        return (Backend::None, false);
+    };
+    let chosen = state.resolve(Instant::now(), || {
         // An escape hatch for a session the probe reads wrongly — a compositor
         // that sets XDG_CURRENT_DESKTOP to something unexpected, or an X11
         // session under a desktop that also answers on D-Bus. Named rather than
@@ -85,7 +151,7 @@ fn backend() -> Backend {
                 _ => None,
             };
             match chosen {
-                Some(b) => return b,
+                Some(b) => return Some(b),
                 None => eprintln!(
                     "Unknown layout backend {forced:?} — expected one of \
                      hyprland, sway, kde, gnome, x11, none. Detecting instead."
@@ -93,23 +159,22 @@ fn backend() -> Backend {
             }
         }
 
-        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
-            .unwrap_or_default()
-            .to_uppercase();
-        if hypr::available() {
-            Backend::Hyprland
-        } else if sway::available() {
-            Backend::Sway
-        } else if desktop.contains("KDE") || std::env::var_os("KDE_FULL_SESSION").is_some() {
-            Backend::Kde
-        } else if desktop.contains("GNOME") || desktop.contains("UNITY") {
-            Backend::Gnome
-        } else if x11::available() {
-            Backend::X11
-        } else {
-            Backend::None
-        }
-    })
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let configured = |key| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+        let hyprland = hypr::available() || configured("HYPRLAND_INSTANCE_SIGNATURE");
+        let sway = sway::available()
+            || configured("SWAYSOCK")
+            || (configured("I3SOCK")
+                && std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland"));
+        auto_backend(
+            &desktop,
+            hyprland,
+            sway,
+            std::env::var_os("KDE_FULL_SESSION").is_some(),
+            x11::available,
+        )
+    });
+    (chosen, state.explicitly_disabled())
 }
 
 impl Backend {
@@ -281,7 +346,7 @@ pub fn query_layout() -> Option<Language> {
 pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     // Already on the requested layout. Nothing to send — and, unlike before,
     // this is reported as the success it is.
-    if super::current_layout() == Some(lang) {
+    if super::fresh_layout() == Some(lang) {
         return LayoutSwitch::AlreadyThere;
     }
 
@@ -348,10 +413,9 @@ type Signals = Box<dyn Iterator<Item = ()> + Send>;
 /// here, on a thread nobody is waiting on, and only when something has actually
 /// changed.
 ///
-/// Failure is quiet and safe by construction. A backend with no subscription, a
-/// compositor that restarts and closes the socket, a `gsettings` that is not
-/// there — all of them end this thread, and what is left is the 300 ms cache
-/// that was the whole story before. Nothing here is load-bearing.
+/// Disconnected notification sources are reopened with a capped backoff. A
+/// failed refresh also clears the old answer, including when the user selects
+/// a third language. The ordinary cache remains the fallback between retries.
 pub fn spawn_watcher() {
     let spawned = std::thread::Builder::new()
         .name("recast-layout".into())
@@ -362,16 +426,23 @@ pub fn spawn_watcher() {
 }
 
 fn watch_forever() {
-    let Some(signals) = backend().subscribe() else {
-        return;
-    };
-    for () in signals {
-        // Ask in the ordinary way. The cache is not consulted on this path —
-        // `query_layout` goes straight to the backend — so this is the fresh
-        // answer, taken at the one moment it is known to have changed.
-        if let Some(lang) = query_layout() {
-            set_layout_cache(lang);
+    let mut retry = Duration::from_secs(1);
+    loop {
+        let (backend, disabled) = backend_state();
+        if backend == Backend::X11 || disabled {
+            return;
         }
+        if let Some(signals) = backend.subscribe() {
+            // Reconnecting can miss the change that closed the old stream.
+            let _ = super::fresh_layout();
+            for () in signals {
+                retry = Duration::from_secs(1);
+                let _ = super::fresh_layout();
+            }
+        }
+        super::invalidate();
+        std::thread::sleep(retry);
+        retry = (retry * 2).min(Duration::from_secs(5));
     }
 }
 
@@ -401,6 +472,15 @@ impl<R: std::io::BufRead> Iterator for Lines<R> {
             if (self.interesting)(&line) {
                 return Some(());
             }
+        }
+    }
+}
+
+impl<R> Drop for Lines<R> {
+    fn drop(&mut self) {
+        if let Some(child) = self._child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -585,7 +665,6 @@ mod hypr {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
     use super::{json_str, language_of_keymap, Language, INJECTOR};
@@ -594,22 +673,18 @@ mod hypr {
     /// runs on the thread a correction is waiting on.
     const IO_TIMEOUT: Duration = Duration::from_millis(250);
 
-    fn socket_path() -> Option<&'static PathBuf> {
-        static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-        PATH.get_or_init(|| {
-            let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-            // Hyprland moved this under XDG_RUNTIME_DIR in 0.40; older builds
-            // kept it in /tmp. Both are checked so the daemon works either way.
-            let runtime = std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from);
-            [
-                runtime.map(|r| r.join("hypr").join(&sig).join(".socket.sock")),
-                Some(PathBuf::from("/tmp/hypr").join(&sig).join(".socket.sock")),
-            ]
-            .into_iter()
-            .flatten()
-            .find(|p| p.exists())
-        })
-        .as_ref()
+    fn socket_path() -> Option<PathBuf> {
+        let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+        // Do not cache a missing socket: the daemon can start before Hyprland
+        // creates it. Recheck both supported locations on each connection.
+        let runtime = std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from);
+        [
+            runtime.map(|r| r.join("hypr").join(&sig).join(".socket.sock")),
+            Some(PathBuf::from("/tmp/hypr").join(&sig).join(".socket.sock")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| p.exists())
     }
 
     /// Send one command and return the reply, or `None` if this is not a
@@ -682,48 +757,56 @@ mod hypr {
             .filter(|block| json_str(block, "name") != Some(INJECTOR))
     }
 
-    /// The active layout, read out of a `j/devices` reply.
-    ///
-    /// Deliberately not "whatever keyboard is flagged `main`". On a session with
-    /// an input method running, `main` is the *input method's own virtual
-    /// keyboard* — on the machine this was written on,
-    /// `hl-virtual-keyboard-fcitx5`. Reading it means reporting the layout of a
-    /// device nobody types on.
-    ///
-    /// So: our injector never counts, `main` is preferred among the rest, and
-    /// anything else recognizable is the fallback.
+    /// Choose one keyboard for both the live layout and its configured list.
+    /// Input methods can mark their virtual keyboard as `main` while retaining
+    /// a different layout. Prefer physical keyboards, then those configured for
+    /// both supported languages; keep virtual-only sessions usable as a fallback.
+    fn preferred_keyboard(devices_json: &str) -> Option<&str> {
+        keyboards(devices_json)
+            .filter(|block| {
+                ["layout", "active_keymap"].iter().any(|field| {
+                    json_str(block, field).is_some_and(|value| !value.trim().is_empty())
+                })
+            })
+            .max_by_key(|block| {
+                let name = json_str(block, "name").unwrap_or("").to_lowercase();
+                let virtual_keyboard =
+                    name.contains("virtual") || name.contains("fcitx") || name.contains("ibus");
+                let layout = json_str(block, "layout").unwrap_or("");
+                let english = layout
+                    .split(',')
+                    .any(|name| language_of_keymap(name) == Some(Language::English));
+                let hebrew = layout
+                    .split(',')
+                    .any(|name| language_of_keymap(name) == Some(Language::Hebrew));
+                let main = block.contains("\"main\": true") || block.contains("\"main\":true");
+                (
+                    !virtual_keyboard,
+                    english && hebrew,
+                    main,
+                    layout.split(',').count(),
+                )
+            })
+    }
+
+    /// The selected keyboard's actual layout, including `None` for a third
+    /// language rather than another device's unrelated supported layout.
     pub fn parse_layout(devices_json: &str) -> Option<Language> {
-        let mut fallback = None;
-        for block in keyboards(devices_json) {
-            let Some(lang) = json_str(block, "active_keymap").and_then(language_of_keymap) else {
-                continue;
-            };
-            let is_main = block.contains("\"main\": true") || block.contains("\"main\":true");
-            if is_main {
-                return Some(lang);
-            }
-            fallback.get_or_insert(lang);
-        }
-        fallback
+        json_str(preferred_keyboard(devices_json)?, "active_keymap").and_then(language_of_keymap)
     }
 
     /// The configured layout list, as the comma-separated xkb codes Hyprland
     /// reports per device (`"layout": "us,il"`).
     ///
-    /// Taken from the device with the *longest* list rather than from `main`,
-    /// for the same reason `parse_layout` distrusts `main`: a virtual keyboard
-    /// often carries a single-layout list of its own, and reading `us` off it
-    /// would make Hebrew unreachable.
+    /// Taken from the same device as `parse_layout`, keeping the reported
+    /// current layout and language-index lookup anchored to one keyboard.
     pub fn parse_names(devices_json: &str) -> Option<Vec<String>> {
-        keyboards(devices_json)
-            .filter_map(|block| json_str(block, "layout"))
-            .map(|layout| {
-                layout
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .max_by_key(Vec::len)
+        Some(
+            json_str(preferred_keyboard(devices_json)?, "layout")?
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect(),
+        )
     }
 
     pub fn current() -> Option<Language> {
@@ -789,7 +872,6 @@ mod sway {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
     use super::{json_num, json_str, json_str_array, INJECTOR};
@@ -800,19 +882,13 @@ mod sway {
     const GET_INPUTS: u32 = 100;
     const IO_TIMEOUT: Duration = Duration::from_millis(250);
 
-    fn socket_path() -> Option<&'static PathBuf> {
-        static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-        PATH.get_or_init(|| {
-            // SWAYSOCK is what sway exports; I3SOCK is the same protocol under
-            // i3, which has no xkb layout switching of its own but does answer
-            // the input query.
-            let sock = std::env::var("SWAYSOCK")
-                .or_else(|_| std::env::var("I3SOCK"))
-                .ok()?;
-            let path = PathBuf::from(sock);
-            path.exists().then_some(path)
-        })
-        .as_ref()
+    fn socket_path() -> Option<PathBuf> {
+        // Recheck availability so an initial startup race is recoverable.
+        let sock = std::env::var("SWAYSOCK")
+            .or_else(|_| std::env::var("I3SOCK"))
+            .ok()?;
+        let path = PathBuf::from(sock);
+        path.exists().then_some(path)
     }
 
     pub fn available() -> bool {
@@ -1257,7 +1333,7 @@ mod x11 {
     use std::ffi::{c_char, c_int, c_long, c_ulong, c_void, CString};
     use std::sync::{Mutex, OnceLock};
 
-    use nix::libc::{dlopen, dlsym, RTLD_LAZY};
+    use nix::libc::{dlclose, dlopen, dlsym, RTLD_LAZY};
 
     /// `XkbUseCoreKbd` — the keyboard the group applies to.
     const XKB_USE_CORE_KBD: u32 = 0x0100;
@@ -1352,8 +1428,23 @@ mod x11 {
     unsafe impl Send for Conn {}
 
     fn conn() -> Option<&'static Mutex<Conn>> {
-        static CONN: OnceLock<Option<Mutex<Conn>>> = OnceLock::new();
-        CONN.get_or_init(|| unsafe {
+        static CONN: OnceLock<Mutex<Conn>> = OnceLock::new();
+        static ATTEMPTED: Mutex<Option<super::Instant>> = Mutex::new(None);
+        if let Some(connection) = CONN.get() {
+            return Some(connection);
+        }
+        // The X server may not accept connections yet during session startup.
+        // Serialize and throttle retries without retaining a failed connection.
+        let mut attempted = ATTEMPTED.lock().ok()?;
+        if let Some(connection) = CONN.get() {
+            return Some(connection);
+        }
+        let now = super::Instant::now();
+        if attempted.is_some_and(|last| now.duration_since(last) < super::BACKEND_RETRY) {
+            return None;
+        }
+        *attempted = Some(now);
+        let connection = (|| unsafe {
             // No DISPLAY means no X server to talk to, and dlopen'ing the
             // library to find that out would be work for nothing.
             std::env::var("DISPLAY").ok()?;
@@ -1373,6 +1464,7 @@ mod x11 {
                     let s = CString::new($name).ok()?;
                     let p = dlsym(handle, s.as_ptr());
                     if p.is_null() {
+                        dlclose(handle);
                         return None;
                     }
                     std::mem::transmute::<*mut c_void, $ty>(p)
@@ -1392,11 +1484,13 @@ mod x11 {
             };
             let display = (lib.open_display)(std::ptr::null());
             if display.is_null() {
+                dlclose(handle);
                 return None;
             }
             Some(Mutex::new(Conn { lib, display }))
-        })
-        .as_ref()
+        })()?;
+        let _ = CONN.set(connection);
+        CONN.get()
     }
 
     pub fn available() -> bool {
@@ -1570,6 +1664,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compositor_startup_hints_take_precedence_over_xwayland() {
+        for (desktop, hyprland, sway, expected) in [
+            ("Hyprland", false, false, Backend::Hyprland),
+            ("sway", false, false, Backend::Sway),
+            ("", true, false, Backend::Hyprland),
+            ("", false, true, Backend::Sway),
+        ] {
+            assert_eq!(
+                auto_backend(desktop, hyprland, sway, false, || {
+                    panic!("XWayland must not override a known Wayland session")
+                }),
+                Some(expected)
+            );
+        }
+        // An ordinary X11/i3 session retains the existing XKB fallback.
+        for desktop in ["", "i3"] {
+            assert_eq!(
+                auto_backend(desktop, false, false, false, || true),
+                Some(Backend::X11)
+            );
+        }
+        assert_eq!(auto_backend("", false, false, false, || false), None);
+    }
+
+    #[test]
+    fn backend_discovery_retries_a_missing_session_then_retains_success() {
+        let mut probe = BackendProbe {
+            chosen: None,
+            attempted: None,
+        };
+        let now = Instant::now();
+        assert_eq!(probe.resolve(now, || None), Backend::None);
+        assert!(
+            !probe.explicitly_disabled(),
+            "a watcher must keep retrying when automatic discovery has no session yet"
+        );
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY / 2, || panic!("probe retried too soon")),
+            Backend::None
+        );
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY, || Some(Backend::Hyprland)),
+            Backend::Hyprland
+        );
+        assert!(!probe.explicitly_disabled());
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY * 10, || panic!("lost chosen backend")),
+            Backend::Hyprland
+        );
+    }
+
+    #[test]
+    fn explicitly_disabled_backend_is_not_rediscovered() {
+        let mut probe = BackendProbe {
+            chosen: None,
+            attempted: None,
+        };
+        let now = Instant::now();
+        assert_eq!(probe.resolve(now, || Some(Backend::None)), Backend::None);
+        assert!(
+            probe.explicitly_disabled(),
+            "an explicitly disabled backend must stop its watcher"
+        );
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY * 10, || panic!(
+                "explicit off was ignored"
+            )),
+            Backend::None
+        );
+    }
+
+    #[test]
+    fn disconnected_notification_commands_are_stopped_and_reaped() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec 1>&-; exec sleep 10"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        let reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut signals = Lines::stream(reader, |_| true, Some(child));
+        assert_eq!(signals.next(), None);
+        drop(signals);
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD),
+            "a disconnected watcher must not leave a child behind when reconnecting"
+        );
+    }
+
+    #[test]
     fn layout_commands_capture_output_and_reap_timeouts() {
         use std::process::Command;
         assert_eq!(
@@ -1626,6 +1811,60 @@ mod tests {
     #[test]
     fn the_layout_comes_from_a_keyboard_someone_types_on() {
         assert_eq!(hypr::parse_layout(DEVICES), Some(Language::Hebrew));
+    }
+
+    #[test]
+    fn hyprland_physical_keyboard_outranks_a_disagreeing_main_input_method() {
+        let devices = r#"{"keyboards": [
+            {"name": "at-keyboard", "layout": "il,us", "active_keymap": "Hebrew", "main": false},
+            {"name": "hl-virtual-keyboard-fcitx5", "layout": "us,il,ru", "active_keymap": "English (US)", "main": true},
+            {"name": "recast-injector", "layout": "us,il,ru,de", "active_keymap": "English (US)", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(devices), Some(Language::Hebrew));
+        assert_eq!(
+            hypr::parse_names(devices),
+            Some(vec!["il".to_string(), "us".to_string()])
+        );
+        // The same selected physical device must remain authoritative when
+        // its live language is unsupported instead of borrowing virtual English.
+        assert_eq!(
+            hypr::parse_layout(&devices.replace(
+                "\"active_keymap\": \"Hebrew\"",
+                "\"active_keymap\": \"Russian\""
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn hyprland_prefers_a_bilingual_physical_keyboard_and_keeps_virtual_fallback() {
+        let devices = r#"{"keyboards": [
+            {"name": "at-keyboard", "layout": "il,us", "active_keymap": "Hebrew", "main": false},
+            {"name": "media-keyboard", "layout": "us", "active_keymap": "English (US)", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(devices), Some(Language::Hebrew));
+        assert_eq!(
+            hypr::parse_names(devices),
+            Some(vec!["il".to_string(), "us".to_string()])
+        );
+        let virtual_only = r#"{"keyboards": [
+            {"name": "recast-injector", "layout": "us,il,ru", "active_keymap": "English (US)", "main": true},
+            {"name": "hl-virtual-keyboard-fcitx5", "layout": "us,il", "active_keymap": "Hebrew", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(virtual_only), Some(Language::Hebrew));
+        assert_eq!(
+            hypr::parse_names(virtual_only),
+            Some(vec!["us".to_string(), "il".to_string()])
+        );
+    }
+
+    #[test]
+    fn hyprland_can_read_an_active_keymap_without_a_configured_layout_list() {
+        let devices = r#"{"keyboards": [
+            {"name": "at-keyboard", "active_keymap": "Hebrew", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(devices), Some(Language::Hebrew));
+        assert_eq!(hypr::parse_names(devices), None);
     }
 
     #[test]

@@ -60,6 +60,19 @@ impl Dict {
         let range = self.index.range(word, self.blob.len());
         lookup(&self.blob.as_bytes()[range], word.as_bytes()).is_some()
     }
+
+    /// Visit the contiguous sorted run without allocating or scanning unrelated words.
+    pub fn for_each_with_prefix(self, prefix: &str, mut visit: impl FnMut(&str)) {
+        let range = self.index.range(prefix, self.blob.len());
+        let blob = &self.blob[range];
+        let start = lower_bound(blob.as_bytes(), prefix.as_bytes());
+        for word in blob[start..].lines() {
+            if !word.starts_with(prefix) {
+                break;
+            }
+            visit(word);
+        }
+    }
 }
 
 impl Freq {
@@ -242,6 +255,28 @@ mod tests {
 
     #[test]
     fn indexed_prefix_scans_match_full_blob_searches() {
+        for dict in [en_dict(), he_dict()] {
+            let plain = Dict::new(dict.blob);
+            let collect = |dict: Dict, prefix: &str| {
+                let mut found = Vec::new();
+                dict.for_each_with_prefix(prefix, |word| found.push(word.to_owned()));
+                found
+            };
+            for prefix in ["", "a", "z", "א", "ת", "don't", "שלו", "~", "🙂"] {
+                assert_eq!(collect(dict, prefix), collect(plain, prefix), "{prefix}");
+            }
+            let start = dict.index.first as u32;
+            for first in start..start + dict.index.letters as u32 {
+                let first = char::from_u32(first).unwrap();
+                let prefix = first.to_string();
+                assert_eq!(collect(dict, &prefix), collect(plain, &prefix), "{prefix}");
+                for second in start..start + dict.index.letters as u32 {
+                    let second = char::from_u32(second).unwrap();
+                    let prefix = format!("{first}{second}");
+                    assert_eq!(collect(dict, &prefix), collect(plain, &prefix), "{prefix}");
+                }
+            }
+        }
         for freq in [en_freq(), he_freq()] {
             let plain = Freq::new(freq.blob);
             let collect = |freq: Freq, prefix: &str| {

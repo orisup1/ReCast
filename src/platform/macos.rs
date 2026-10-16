@@ -56,6 +56,9 @@ impl Platform for Mac {
     fn retype_len(text: &String) -> usize {
         textkeys::retype_len(text)
     }
+    fn append_retype(text: &mut String, tail: String) {
+        text.push_str(&tail);
+    }
     fn buffer_after(text: &String) -> Vec<Typed> {
         textkeys::buffer_after(text)
     }
@@ -696,6 +699,7 @@ unsafe extern "C" fn tap_callback(
 unsafe fn capture_event(ctx: &Arc<Engine<Mac>>, event_type: u32, cg_event: CGEventRef) {
     match event_type {
         KCG_EVENT_KEY_DOWN => {
+            ctx.caps_lock_changed(CGEventGetFlags(cg_event) & FLAG_ALPHA_SHIFT != 0);
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
             ctx.key_press(key_from_code(code));
         }
@@ -731,6 +735,7 @@ fn handle_flags_changed(ctx: &Arc<Engine<Mac>>, key: Key, flags: u64) {
     if key == Key::CapsLock {
         // A latch rather than a held key: the flag is the state itself.
         ctx.caps_lock_changed(flags & FLAG_ALPHA_SHIFT != 0);
+        crate::layout::invalidate();
         return;
     }
     let Some(bit) = device_flag(key) else {
@@ -1150,7 +1155,7 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         Some(_) => {
             paste_text(&format!("{text} "))?;
         }
-        // A completion ends mid-word: no terminator, no trailing space.
+        // Explicit offers already include any tracked trailing spaces.
         None => {
             paste_text(&text)?;
         }

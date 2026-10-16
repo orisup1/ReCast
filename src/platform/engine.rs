@@ -37,8 +37,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::dictionary::{
-    check_and_correct_in_context, complete_candidates, correction_candidates, declined_by_list,
-    Dict, Fix, History, Outcome, Run,
+    all_completion_candidates, check_and_correct_in_context, correction_candidates,
+    declined_by_list, Dict, Fix, History, Outcome, Run,
 };
 use crate::types::{
     lock_forgiving, AppControl, FixKind, Language, ReplaceGuard, Replaceable, WordBuffer,
@@ -206,6 +206,9 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// one character, which is what lets an erase count be a key count.
     fn retype_len(retype: &Self::Retype) -> usize;
 
+    /// Join injectable payloads without losing the original separator keys.
+    fn append_retype(retype: &mut Self::Retype, tail: Self::Retype);
+
     /// The word buffer to leave behind once this is on screen: the last word of
     /// it, since an abbreviation expansion may carry spaces and only the tail
     /// is still in progress.
@@ -227,9 +230,9 @@ pub trait Platform: Sized + Send + Sync + 'static {
         generation: u64,
     ) -> Option<Vec<Typed<Self::Key>>>;
 
-    /// The re-entry gate, when this platform has one. macOS and Windows filter
-    /// their own injected events with an atomic flag; Linux filters by device
-    /// name instead and has nothing here.
+    /// The injection lifecycle flag, when this platform has one. Native capture
+    /// backends distinguish our injected events from physical input themselves;
+    /// Linux filters by device name and has no flag here.
     fn injecting_flag(injector: &Self::Injector) -> Option<&std::sync::atomic::AtomicBool>;
 
     /// Release deferred native input. True means later input made text context stale.
@@ -298,8 +301,22 @@ pub enum LastAction<P: Platform> {
     Unchanged {
         keys: Vec<Typed<P::Key>>,
         terminator: Option<P::Key>,
-        layout: Language,
+        trailing_spaces: Vec<Typed<P::Key>>,
+        layout: Option<Language>,
     },
+}
+
+impl<P: Platform> LastAction<P> {
+    fn trailing_spaces_mut(&mut self) -> Option<&mut Vec<Typed<P::Key>>> {
+        match self {
+            Self::Fixed(fix) => Some(&mut fix.trailing_spaces),
+            Self::Skipped(skip) => Some(&mut skip.trailing_spaces),
+            Self::Unchanged {
+                trailing_spaces, ..
+            } => Some(trailing_spaces),
+            Self::Selection { .. } => None,
+        }
+    }
 }
 
 /// A correction that is on screen right now, with the cursor still sitting
@@ -352,6 +369,8 @@ pub struct LastSkip<P: Platform> {
     /// The terminator already on screen after it, erased with the word and
     /// pressed again afterwards exactly as on the normal path.
     terminator: Option<P::Key>,
+    trailing_spaces: Vec<Typed<P::Key>>,
+    layout: Option<Language>,
     /// The reading that is on the list.
     word: String,
 }
@@ -367,18 +386,112 @@ pub struct LastSkip<P: Platform> {
 pub struct Cycle<P: Platform> {
     /// The word buffer as the user typed it, before any completion.
     typed: Vec<Typed<P::Key>>,
+    /// Separators already following a finished word, preserved on every offer.
+    trailing_spaces: Vec<Typed<P::Key>>,
     candidates: Vec<String>,
+    candidate_langs: Vec<Language>,
     index: usize,
+    /// The next page starts here after the original-text checkpoint.
+    resume_index: usize,
     /// Characters the current offer put on screen, to erase for the next one.
     on_screen: usize,
     /// Layout currently displayed, checked before every injection.
     lang: Language,
     original_lang: Language,
-    candidate_lang: Language,
     correction: bool,
 }
 
+impl<P: Platform> Clone for Cycle<P> {
+    fn clone(&self) -> Self {
+        Self {
+            typed: self.typed.clone(),
+            trailing_spaces: self.trailing_spaces.clone(),
+            candidates: self.candidates.clone(),
+            candidate_langs: self.candidate_langs.clone(),
+            index: self.index,
+            resume_index: self.resume_index,
+            on_screen: self.on_screen,
+            lang: self.lang,
+            original_lang: self.original_lang,
+            correction: self.correction,
+        }
+    }
+}
+
+impl<P: Platform> Clone for LastFix<P> {
+    fn clone(&self) -> Self {
+        Self {
+            visible: self.visible.clone(),
+            visible_layout: self.visible_layout,
+            manual_conversion: self.manual_conversion,
+            on_screen: self.on_screen,
+            restore: self.restore.clone(),
+            restore_layout: self.restore_layout,
+            trailing_spaces: self.trailing_spaces.clone(),
+            terminator: self.terminator,
+            layout: self.layout,
+            keep: self.keep.clone(),
+            suppress: self.suppress.clone(),
+            rule: self.rule,
+            learning_pair: self.learning_pair.clone(),
+        }
+    }
+}
+
+/// Restore tracked text only when a rewrite failed before injection started.
+struct RetryContext<P: Platform> {
+    layout: Option<Language>,
+    finish_completion_on_commit: bool,
+    clear_phrase_on_commit: bool,
+    keys: Vec<Typed<P::Key>>,
+    no_fix: bool,
+    last_action: Option<LastAction<P>>,
+    cycle: Option<Cycle<P>>,
+    pending_learning: Option<PendingLearning>,
+}
+
+impl<P: Platform> RetryContext<P> {
+    fn capture(st: &AppState<P>, layout: Option<Language>) -> Self {
+        let last_action = st.last_action.as_ref().map(|action| match action {
+            LastAction::Fixed(fix) => LastAction::Fixed(fix.clone()),
+            LastAction::Selection { before, after } => LastAction::Selection {
+                before: before.clone(),
+                after: after.clone(),
+            },
+            LastAction::Skipped(skip) => LastAction::Skipped(LastSkip {
+                keys: skip.keys.clone(),
+                terminator: skip.terminator,
+                trailing_spaces: skip.trailing_spaces.clone(),
+                layout: skip.layout,
+                word: skip.word.clone(),
+            }),
+            LastAction::Unchanged {
+                keys,
+                terminator,
+                trailing_spaces,
+                layout,
+            } => LastAction::Unchanged {
+                keys: keys.clone(),
+                terminator: *terminator,
+                trailing_spaces: trailing_spaces.clone(),
+                layout: *layout,
+            },
+        });
+        Self {
+            layout,
+            finish_completion_on_commit: false,
+            clear_phrase_on_commit: false,
+            keys: st.keys.to_vec(),
+            no_fix: st.no_fix,
+            last_action,
+            cycle: st.cycle.clone(),
+            pending_learning: st.pending_learning.clone(),
+        }
+    }
+}
+
 /// A rewrite is not a retained choice until subsequent trusted typing.
+#[derive(Clone)]
 struct PendingLearning {
     /// A correction's original text; None for an unaccepted completion offer.
     from: Option<String>,
@@ -442,6 +555,8 @@ pub struct AppState<P: Platform> {
     pending_undo: bool,
     /// Whether the queued action uses double-tap undo/conversion semantics.
     pending_conversion: bool,
+    /// Coalesce rapid suggestion taps while the previous offer is landing.
+    pending_suggestion: Option<bool>,
     shortcut_bindings: Option<(String, String, String, String)>,
     /// A key combination shaped like a layout-switch hotkey has been pressed and
     /// the modifiers holding it have not all come back up yet. When they do, the
@@ -490,6 +605,7 @@ impl<P: Platform> AppState<P> {
             last_action_tap: None,
             pending_undo: false,
             pending_conversion: false,
+            pending_suggestion: None,
             shortcut_bindings: None,
             layout_hotkey: false,
             last_action: None,
@@ -523,6 +639,7 @@ impl<P: Platform> AppState<P> {
             self.last_action_tap = None;
             self.pending_undo = false;
             self.pending_conversion = false;
+            self.pending_suggestion = None;
             self.shortcut_bindings = Some((
                 config.action_shortcut.clone(),
                 config.completion_shortcut.clone(),
@@ -607,6 +724,7 @@ impl<P: Platform> AppState<P> {
         self.last_action_tap = None;
         self.pending_undo = false;
         self.pending_conversion = false;
+        self.pending_suggestion = None;
     }
     fn invalidate_text(&mut self) {
         self.finish_completion_use(false);
@@ -790,10 +908,14 @@ impl<P: Platform> Engine<P> {
         self.forget_everything();
     }
 
-    #[cfg(target_os = "macos")]
+    /// Synchronize a native lock-state snapshot, including startup and reconnect.
     pub fn caps_lock_changed(&self, on: bool) {
         let mut st = self.lock();
+        if st.caps_lock == on {
+            return;
+        }
         st.caps_lock = on;
+        st.revision = st.revision.wrapping_add(1);
         if st.is_replacing {
             st.invalidate_text();
         }
@@ -821,6 +943,17 @@ impl<P: Platform> Engine<P> {
 
     /// A key went down.
     pub fn key_press(self: &Arc<Self>, key: P::Key) {
+        self.press(key, false);
+    }
+
+    /// Kernel repeats can be delivered together after a slow desktop reply.
+    /// Their delivery spacing must not be mistaken for duplicate device reports.
+    #[cfg(target_os = "linux")]
+    pub fn key_repeat(self: &Arc<Self>, key: P::Key) {
+        self.press(key, true);
+    }
+
+    fn press(self: &Arc<Self>, key: P::Key, repeat: bool) {
         let config = crate::config::Config::global();
         let mut st = self.lock();
         st.sync_shortcuts(&config);
@@ -830,7 +963,7 @@ impl<P: Platform> Engine<P> {
 
         // One physical press arrives on several evdev nodes; the same key again
         // inside the window is that, not a second press.
-        if let Some(window) = P::DEDUP_WINDOW {
+        if let Some(window) = P::DEDUP_WINDOW.filter(|_| !repeat) {
             if st.last_key == Some(key) && st.last_key_at.elapsed() < window {
                 return;
             }
@@ -864,15 +997,28 @@ impl<P: Platform> Engine<P> {
         // is when the compositor has had the whole combination and the layout it
         // was asking for is live.
         st.layout_hotkey |= st.is_layout_hotkey(key);
-        if key == P::CAPS_LOCK {
+        if key == P::CAPS_LOCK && fresh_press {
             st.caps_lock = !st.caps_lock;
+            if st.is_replacing {
+                st.invalidate_text();
+                return;
+            }
         }
         let is_action = shortcut_matches::<P>(&config.action_shortcut, key)
             || shortcut_matches::<P>(&config.undo_shortcut, key);
         let is_completion = shortcut_matches::<P>(&config.completion_shortcut, key);
         let is_correction = shortcut_matches::<P>(&config.correction_shortcut, key);
         let bare = fresh_press && st.held_keys.len() == 1;
-        st.completion_down = ((is_completion || is_correction) && bare).then(Instant::now);
+        // A Shift tap may overlap the release of the prefix's final letter.
+        // A new key pressed after Shift still cancels the gesture below.
+        let suggestion_bare = bare
+            || (fresh_press
+                && is_shift
+                && st.held_keys.iter().all(|&held| {
+                    held == key || (!P::is_modifier(held) && P::english_char_plain(held).is_some())
+                }));
+        st.completion_down =
+            ((is_completion || is_correction) && suggestion_bare).then(Instant::now);
         st.action_down = (is_action && bare).then(Instant::now);
         if !is_action {
             st.last_action_tap = None;
@@ -880,21 +1026,27 @@ impl<P: Platform> Engine<P> {
         let preserve_spaces = P::is_terminator(key)
             && !P::is_line_break(key)
             && !chorded_shortcut
-            && (matches!(
-                &st.last_action,
-                Some(LastAction::Fixed(fix)) if fix.trailing_spaces.len() < MAX_UNDO_SPACES
-            ) || (st.is_replacing
-                && st.buffered_keys.len() < MAX_UNDO_SPACES
-                && st
-                    .buffered_keys
-                    .iter()
-                    .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))));
+            && (st
+                .last_action
+                .as_mut()
+                .and_then(LastAction::trailing_spaces_mut)
+                .is_some_and(|spaces| spaces.len() < MAX_UNDO_SPACES)
+                || (st.is_replacing
+                    && st.buffered_keys.len() < MAX_UNDO_SPACES
+                    && st
+                        .buffered_keys
+                        .iter()
+                        .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))));
         if !is_action && !is_completion && !is_correction && !preserve_spaces {
             st.forget_gestures();
         } else if preserve_spaces {
             st.cycle = None;
         }
-        let shift = st.shift_active();
+        let shift = if P::english_char_plain(key).is_some_and(|c| c.is_ascii_alphabetic()) {
+            st.shift_active()
+        } else {
+            st.held_keys.contains(&P::SHIFT_LEFT) || st.held_keys.contains(&P::SHIFT_RIGHT)
+        };
         if st.selection_replacing && !is_action {
             st.invalidate_text();
             return;
@@ -904,6 +1056,13 @@ impl<P: Platform> Engine<P> {
         // eager undo does not cancel a half-written correction. Chords still
         // cancel below, and any later text clears the queued undo.
         if P::QUEUE_UNDO_DURING_REPLACEMENT && st.is_replacing && is_action && bare {
+            return;
+        }
+        if st.is_replacing
+            && (is_completion || is_correction)
+            && suggestion_bare
+            && (is_shift || P::QUEUE_UNDO_DURING_REPLACEMENT)
+        {
             return;
         }
 
@@ -973,6 +1132,22 @@ impl<P: Platform> Engine<P> {
                             st.retain_phrase_word(&pending.to);
                         }
                     }
+                } else if st.keys.is_empty() {
+                    // A suggestion made after Space was already a finished word.
+                    // Advancing to the next word accepts it without another Space.
+                    if !st.practice
+                        && st.mode == crate::config::AppMode::Full
+                        && self.control.is_enabled()
+                        && P::input_allowed()
+                        && st.focus == focus
+                    {
+                        crate::personal::record_word(&pending.to);
+                        if let Some((from, to)) = &pending.manual_pair {
+                            crate::personal::record_confusion(from, to);
+                        }
+                        st.finish_completion_use(true);
+                        st.retain_phrase_word(&pending.to);
+                    }
                 } else if P::is_terminator(key) {
                     st.pending_learning = Some(pending);
                 } else {
@@ -1022,6 +1197,11 @@ impl<P: Platform> Engine<P> {
                 }
             }
             st.push_key(Typed { key, shift });
+            if st.is_replacing && st.buffered_keys.is_empty() {
+                // An overflowing replay buffer cannot describe the visible suffix.
+                st.invalidate_text();
+                return;
+            }
             if !st.is_replacing && st.keys.is_empty() {
                 // The word buffer gave up on an overlong token.
                 st.no_fix = true;
@@ -1041,26 +1221,48 @@ impl<P: Platform> Engine<P> {
             st.buffered_keys.push(Typed { key, shift });
             return;
         }
+        if st.keys.is_empty() {
+            // A manual mid-word conversion leaves no word to recheck, but
+            // spaces still belong to its undo payload.
+            st.no_fix = false;
+            if P::is_line_break(key) {
+                st.invalidate_text();
+                st.no_fix = false;
+            } else if st.last_action.is_some() {
+                if st.focus != focus || !P::input_allowed() {
+                    st.invalidate_text();
+                    st.no_fix = false;
+                } else if let Some(spaces) = st
+                    .last_action
+                    .as_mut()
+                    .and_then(LastAction::trailing_spaces_mut)
+                {
+                    spaces.push(Typed { key, shift });
+                }
+            }
+            return;
+        }
         if std::mem::take(&mut st.no_fix) || !self.control.is_enabled() {
+            // Suppressing an automatic edit must not discard the user's next
+            // explicit opportunity to convert the freshly tracked word.
+            if !P::is_line_break(key)
+                && self.control.is_enabled()
+                && P::input_allowed()
+                && st.focus == focus
+                && (!P::requires_focus() || focus.is_some())
+            {
+                st.last_action = Some(LastAction::Unchanged {
+                    keys: st.keys.to_vec(),
+                    terminator: Some(key),
+                    trailing_spaces: Vec::new(),
+                    layout: P::current_layout(),
+                });
+            }
             st.keys.clear();
             st.phrase.clear();
             if P::is_line_break(key) {
                 st.invalidate_text();
                 st.no_fix = false;
-            }
-            return;
-        }
-        if st.keys.is_empty() {
-            if P::is_line_break(key) {
-                st.invalidate_text();
-                st.no_fix = false;
-            } else if matches!(st.last_action, Some(LastAction::Fixed(_))) {
-                if st.focus != focus || !P::input_allowed() {
-                    st.invalidate_text();
-                    st.no_fix = false;
-                } else if let Some(LastAction::Fixed(fix)) = &mut st.last_action {
-                    fix.trailing_spaces.push(Typed { key, shift });
-                }
             }
             return;
         }
@@ -1134,6 +1336,16 @@ impl<P: Platform> Engine<P> {
             // +1 for the terminator the user physically typed, which is erased
             // along with the word and pressed again afterwards.
             let erase = rep.erase + 1;
+            let deferred_layout = rep.previous_layout.map(|_| rep.target_layout);
+            let mut retry =
+                RetryContext::capture(&st, Some(rep.previous_layout.unwrap_or(rep.target_layout)));
+            retry.keys.clear();
+            retry.last_action = Some(LastAction::Unchanged {
+                keys: st.keys.to_vec(),
+                terminator: Some(key),
+                trailing_spaces: Vec::new(),
+                layout: Some(rep.previous_layout.unwrap_or(rep.target_layout)),
+            });
             st.keys.clear();
             self.start_replacement(
                 st,
@@ -1150,8 +1362,9 @@ impl<P: Platform> Engine<P> {
                     kind,
                     rule,
                     details,
-                    deferred_layout: None,
+                    deferred_layout,
                 }),
+                Some(retry),
             );
             return;
         }
@@ -1178,7 +1391,7 @@ impl<P: Platform> Engine<P> {
                 declined_by_list(
                     &st.keys,
                     |t: Typed<P::Key>| P::english_char(t.key, t.shift),
-                    |t: Typed<P::Key>| P::hebrew_char(t.key),
+                    hebrew_char::<P>,
                     |t: Typed<P::Key>| t.shift,
                     P::current_layout(),
                 )
@@ -1190,17 +1403,18 @@ impl<P: Platform> Engine<P> {
             st.last_action = Some(LastAction::Skipped(LastSkip {
                 keys: st.keys.to_vec(),
                 terminator: Some(key),
+                trailing_spaces: Vec::new(),
+                layout: P::current_layout(),
                 word,
             }));
         }
         if st.last_action.is_none() {
-            if let Some(layout) = P::current_layout() {
-                st.last_action = Some(LastAction::Unchanged {
-                    keys: st.keys.to_vec(),
-                    terminator: Some(key),
-                    layout,
-                });
-            }
+            st.last_action = Some(LastAction::Unchanged {
+                keys: st.keys.to_vec(),
+                terminator: Some(key),
+                trailing_spaces: Vec::new(),
+                layout: P::current_layout(),
+            });
         }
         st.keys.clear();
     }
@@ -1274,7 +1488,25 @@ impl<P: Platform> Engine<P> {
         {
             return;
         }
-        if st.is_replacing || st.no_fix || !self.control.is_enabled() {
+        if !self.control.is_enabled() {
+            return;
+        }
+        if st.is_replacing {
+            if !st.selection_replacing
+                && st.cycle.is_some()
+                && (key == P::SHIFT_LEFT
+                    || key == P::SHIFT_RIGHT
+                    || P::QUEUE_UNDO_DURING_REPLACEMENT)
+            {
+                st.pending_suggestion = Some(is_correction);
+            }
+            return;
+        }
+        self.request_suggestion(st, is_correction);
+    }
+
+    fn request_suggestion(self: &Arc<Self>, st: MutexGuard<'_, AppState<P>>, correction: bool) {
+        if !self.control.is_enabled() {
             return;
         }
         let Some((mut st, focus)) = self.refresh_focus(st) else {
@@ -1284,7 +1516,7 @@ impl<P: Platform> Engine<P> {
             st.invalidate_text();
             return;
         }
-        self.suggestion_tap(st, is_correction);
+        self.suggestion_tap(st, correction);
     }
 
     /// Completion and explicit correction share cycling and undo, but search
@@ -1300,14 +1532,52 @@ impl<P: Platform> Engine<P> {
             }
             return;
         }
-        let Some(lang) = P::current_layout() else {
-            st.invalidate_text();
+        let Some(active_lang) = P::current_layout() else {
+            // No text changed. Keep the prefix and cycle so another tap can retry.
             return;
         };
-        if st.cycle.as_ref().is_some_and(|cycle| cycle.lang != lang) {
+        if st
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.lang != active_lang)
+        {
             st.invalidate_text();
             return;
         }
+        // A word boundary clears the typing buffer, not the tracked word at
+        // the cursor. Explicit requests may reconsider that word and its layout.
+        let (source_keys, separators, lang) = if !st.keys.is_empty() {
+            (st.keys.to_vec(), Vec::new(), active_lang)
+        } else {
+            let (keys, terminator, spaces, layout) = match &st.last_action {
+                Some(LastAction::Fixed(fix)) => (
+                    &fix.visible,
+                    fix.terminator,
+                    &fix.trailing_spaces,
+                    Some(fix.visible_layout),
+                ),
+                Some(LastAction::Skipped(skip)) => (
+                    &skip.keys,
+                    skip.terminator,
+                    &skip.trailing_spaces,
+                    skip.layout,
+                ),
+                Some(LastAction::Unchanged {
+                    keys,
+                    terminator,
+                    trailing_spaces,
+                    layout,
+                }) => (keys, *terminator, trailing_spaces, *layout),
+                _ => return,
+            };
+            let mut separators = Vec::with_capacity(spaces.len() + 1);
+            if let Some(key) = terminator {
+                separators.push(Typed { key, shift: false });
+            }
+            separators.extend_from_slice(spaces);
+            (keys.clone(), separators, layout.unwrap_or(active_lang))
+        };
+        let mut retry = RetryContext::capture(&st, Some(active_lang));
         let switched = if st
             .cycle
             .as_ref()
@@ -1323,43 +1593,76 @@ impl<P: Platform> Engine<P> {
                 .get(cycle.index)
                 .cloned()
                 .unwrap_or_else(|| reading::<P>(&cycle.typed, cycle.original_lang)),
-            None => reading::<P>(&st.keys, lang),
+            None => reading::<P>(&source_keys, lang),
         };
-        let (typed, candidates, index, erase, original_lang, candidate_lang) = match st.cycle.take()
-        {
+        let (
+            typed,
+            candidates,
+            candidate_langs,
+            index,
+            resume_index,
+            erase,
+            original_lang,
+            trailing_spaces,
+        ) = match st.cycle.take() {
             Some(cycle) => {
-                let next = if cycle.index >= cycle.candidates.len() {
-                    0
+                let (next, resume) = if cycle.index >= cycle.candidates.len() {
+                    (cycle.resume_index, cycle.resume_index)
+                } else if cycle.index + 1 == cycle.candidates.len()
+                    || (cycle.index + 1) % crate::complete::MAX_CANDIDATES == 0
+                {
+                    (
+                        cycle.candidates.len(),
+                        (cycle.index + 1) % cycle.candidates.len(),
+                    )
                 } else {
-                    cycle.index + 1
+                    (cycle.index + 1, cycle.resume_index)
                 };
                 (
                     cycle.typed,
                     cycle.candidates,
+                    cycle.candidate_langs,
                     next,
+                    resume,
                     cycle.on_screen,
                     cycle.original_lang,
-                    cycle.candidate_lang,
+                    cycle.trailing_spaces,
                 )
             }
             None => {
-                if st.keys.is_empty() {
+                if source_keys.is_empty() {
                     st.cycle = switched;
                     return;
                 }
+                let visible = reading::<P>(&source_keys, lang);
+                let (frame_start, frame_end) =
+                    crate::dictionary::frame_bounds_for_layout(&visible, lang);
+                let framed_keys: Vec<_> = source_keys
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, typed)| (typed, index < frame_start || index >= frame_end))
+                    .collect();
+                let candidate_char = |(typed, wrapper): (Typed<P::Key>, bool), candidate_lang| {
+                    match if wrapper { lang } else { candidate_lang } {
+                        Language::English => P::english_char(typed.key, typed.shift),
+                        Language::Hebrew => (!typed.shift
+                            || P::english_char_plain(typed.key)
+                                .is_some_and(|c| !c.is_ascii_alphabetic()))
+                        .then(|| hebrew_char::<P>(typed))
+                        .flatten(),
+                    }
+                };
                 let offers = |candidate_lang| {
                     let candidates = if correction {
                         correction_candidates
                     } else {
-                        complete_candidates
+                        all_completion_candidates
                     };
                     candidates(
-                        &st.keys,
-                        |t: Typed<P::Key>| match candidate_lang {
-                            Language::English => P::english_char(t.key, t.shift),
-                            Language::Hebrew => (!t.shift).then(|| P::hebrew_char(t.key)).flatten(),
-                        },
-                        |t: Typed<P::Key>| t.shift,
+                        &framed_keys,
+                        |typed| candidate_char(typed, candidate_lang),
+                        |(typed, _): (Typed<P::Key>, bool)| typed.shift,
                         if candidate_lang == Language::English {
                             self.en_dict
                         } else {
@@ -1369,28 +1672,55 @@ impl<P: Platform> Engine<P> {
                         (!st.practice).then_some(&st.phrase),
                     )
                 };
-                let mut candidates = offers(lang);
-                let prefix = reading::<P>(&st.keys, lang).to_lowercase();
+                let typeable_offers = |lang| {
+                    offers(lang)
+                        .into_iter()
+                        .filter(|word| P::retype_completion(word, lang).is_some())
+                        .collect::<Vec<_>>()
+                };
+                let mut candidates = typeable_offers(lang);
+                let prefix = visible.to_lowercase();
                 let dict = if lang == Language::English {
                     self.en_dict
                 } else {
                     self.he_dict
                 };
                 let strong = dict.contains(&prefix)
-                    || crate::complete::expand(&prefix).is_some()
-                    || candidates
+                    || crate::complete::expand(&prefix)
+                        .is_some_and(|word| P::retype_completion(&word, lang).is_some())
+                    || candidates.iter().any(|word| {
+                        crate::dictionary::completion_matches_prefix(&prefix, &word.to_lowercase())
+                    });
+                let mut candidate_langs = vec![lang; candidates.len()];
+                if !correction {
+                    let alternate_prefix: String = framed_keys
                         .iter()
-                        .any(|word| word.to_lowercase().starts_with(&prefix));
-                let mut candidate_lang = lang;
-                if !correction && !strong {
-                    let alternate_prefix = reading::<P>(&st.keys, lang.other()).to_lowercase();
-                    let alternate: Vec<_> = offers(lang.other())
+                        .copied()
+                        .filter_map(|typed| candidate_char(typed, lang.other()))
+                        .collect();
+                    let alternate_prefix = alternate_prefix.to_lowercase();
+                    let alternate: Vec<_> = typeable_offers(lang.other())
                         .into_iter()
-                        .filter(|word| word.to_lowercase().starts_with(&alternate_prefix))
+                        .filter(|word| {
+                            crate::dictionary::completion_matches_prefix(
+                                &alternate_prefix,
+                                &word.to_lowercase(),
+                            )
+                        })
                         .collect();
                     if !alternate_prefix.is_empty() && !alternate.is_empty() {
-                        candidates = alternate;
-                        candidate_lang = lang.other();
+                        let alternate_langs = vec![lang.other(); alternate.len()];
+                        if strong {
+                            candidates.extend(alternate);
+                            candidate_langs.extend(alternate_langs);
+                        } else {
+                            let mut combined = alternate;
+                            combined.extend(candidates);
+                            candidates = combined;
+                            let mut combined_langs = alternate_langs;
+                            combined_langs.extend(candidate_langs);
+                            candidate_langs = combined_langs;
+                        }
                     }
                 }
                 if candidates.is_empty() {
@@ -1398,22 +1728,33 @@ impl<P: Platform> Engine<P> {
                     return;
                 }
                 // Switching gestures keeps the first typed text as the cycle's undo target.
-                let (typed, erase, original_lang) = if let Some(previous) = &switched {
-                    let tail = reading::<P>(&st.keys, lang);
-                    let head = current.strip_suffix(&tail).unwrap_or_default();
-                    candidates = candidates
-                        .into_iter()
-                        .map(|word| format!("{head}{word}"))
-                        .collect();
-                    (
-                        previous.typed.clone(),
-                        previous.on_screen,
-                        previous.original_lang,
-                    )
-                } else {
-                    (st.keys.to_vec(), st.keys.len(), lang)
-                };
-                (typed, candidates, 0, erase, original_lang, candidate_lang)
+                let (typed, erase, original_lang, trailing_spaces) =
+                    if let Some(previous) = &switched {
+                        let tail = visible;
+                        let head = current.strip_suffix(&tail).unwrap_or_default();
+                        candidates = candidates
+                            .into_iter()
+                            .map(|word| format!("{head}{word}"))
+                            .collect();
+                        (
+                            previous.typed.clone(),
+                            previous.on_screen,
+                            previous.original_lang,
+                            previous.trailing_spaces.clone(),
+                        )
+                    } else {
+                        (source_keys.clone(), source_keys.len(), lang, separators)
+                    };
+                (
+                    typed,
+                    candidates,
+                    candidate_langs,
+                    0,
+                    0,
+                    erase,
+                    original_lang,
+                    trailing_spaces,
+                )
             }
         };
 
@@ -1424,7 +1765,7 @@ impl<P: Platform> Engine<P> {
         let target_lang = if back_to_typed {
             original_lang
         } else {
-            candidate_lang
+            candidate_langs[index]
         };
         let retype = if back_to_typed {
             P::retype_original(&typed, original_lang)
@@ -1447,22 +1788,32 @@ impl<P: Platform> Engine<P> {
         let commit = if back_to_typed {
             Some(Commit::Undo {
                 suppress: None,
-                layout: (lang != target_lang).then_some(target_lang),
+                layout: (active_lang != target_lang).then_some(target_lang),
                 rule: None,
                 learning_pair: None,
             })
         } else if index == 0 {
+            let first_page = candidates
+                .iter()
+                .take(crate::complete::MAX_CANDIDATES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
             Some(Commit::Fix {
                 from: was.clone(),
                 to: candidates[index].clone(),
                 kind: FixKind::Complete,
                 rule: None,
                 details: if correction {
-                    format!("Requested spelling alternatives. Choices in order: {}. Automatic spelling protections remain unchanged.", candidates.join(", "))
+                    format!("Requested spelling alternatives. Choices in order: {first_page}. Automatic spelling protections remain unchanged.")
                 } else {
-                    format!("Requested completion. Choices in order: {}.\nRanking balances frequency, a bounded letters-saved benefit, context, and prefix-edit penalties. Configured abbreviations take priority.", candidates.join(", "))
+                    format!("Requested completion. First page: {first_page}. {} choices remain reachable across pages.\nRanking balances frequency, a bounded letters-saved benefit, context, and prefix-edit penalties. Configured abbreviations take priority.", candidates.len())
                 },
-                deferred_layout: (lang != target_lang).then_some(target_lang),
+                deferred_layout: (active_lang != target_lang).then_some(target_lang),
+            })
+        } else if active_lang != target_lang {
+            Some(Commit::Suggestion {
+                layout: target_lang,
             })
         } else {
             None
@@ -1470,10 +1821,15 @@ impl<P: Platform> Engine<P> {
 
         // The buffer has to end up holding what is on screen, or the next Space
         // would check a word the user is no longer looking at.
-        let keep = if back_to_typed {
+        let visible = if back_to_typed {
             typed.clone()
         } else {
             P::buffer_after(&retype)
+        };
+        let keep = if trailing_spaces.is_empty() {
+            visible.clone()
+        } else {
+            Vec::new()
         };
         // Keep the prefix shared by the original, current offer, and next offer.
         // First completion usually appends only; cycling and undo touch suffixes.
@@ -1488,62 +1844,74 @@ impl<P: Platform> Engine<P> {
             .zip(target.chars())
             .take_while(|((original, current), target)| original == current && current == target)
             .count();
-        let Some(suffix) = P::retype_completion(
+        let Some(mut suffix) = P::retype_completion(
             &target.chars().skip(prefix).collect::<String>(),
             target_lang,
         ) else {
             st.cycle = switched;
             return;
         };
+        P::append_retype(
+            &mut suffix,
+            P::retype_original(&trailing_spaces, target_lang),
+        );
         // A completion can be taken back with the undo gesture too — except
         // when it has just handed back the user's own text, which is nothing to
         // undo.
         let undo = (!back_to_typed).then(|| LastFix {
-            visible: keep.clone(),
+            visible,
             visible_layout: target_lang,
             manual_conversion: false,
-            on_screen: P::retype_len(&retype) - prefix,
+            on_screen: P::retype_len(&retype) - prefix + usize::from(!trailing_spaces.is_empty()),
             restore: typed[prefix..].to_vec(),
             restore_layout: original_lang,
-            trailing_spaces: Vec::new(),
-            terminator: None,
-            layout: (candidate_lang != original_lang).then_some(original_lang),
-            keep: typed.clone(),
+            trailing_spaces: trailing_spaces.iter().skip(1).copied().collect(),
+            terminator: trailing_spaces.first().map(|typed| typed.key),
+            layout: (target_lang != original_lang).then_some(original_lang),
+            keep: if trailing_spaces.is_empty() {
+                typed.clone()
+            } else {
+                Vec::new()
+            },
             learning_pair: if correction && self.en_dict.contains(&was.to_lowercase()) {
                 None
             } else {
-                completion_correction(&was, target, original_lang, candidate_lang)
+                completion_correction(&was, target, original_lang, target_lang)
             },
             suppress: non_empty(was.clone()),
             rule: None,
         });
 
         if switched.is_some() {
-            st.finish_completion_use(false);
+            retry.finish_completion_on_commit = true;
             st.pending_learning = None;
         }
+        retry.clear_phrase_on_commit |= !trailing_spaces.is_empty();
         st.cycle = Some(Cycle {
             typed,
+            trailing_spaces: trailing_spaces.clone(),
             candidates,
+            candidate_langs,
             index,
+            resume_index,
             on_screen: P::retype_len(&retype),
-            lang,
+            lang: active_lang,
             original_lang,
-            candidate_lang,
             correction,
         });
-        // The completion key types nothing, so only what is on screen for the
-        // partial word is erased and there is no terminator to press again.
+        // The gesture types nothing. Replace the word suffix and replay only
+        // the separators we already tracked at this cursor.
         self.start_replacement(
             st,
             Plan {
-                erase: erase - prefix,
+                erase: erase - prefix + trailing_spaces.len(),
                 retype: suffix,
                 terminator: None,
             },
             keep,
             undo,
             commit,
+            Some(retry),
         );
     }
 
@@ -1637,28 +2005,41 @@ impl<P: Platform> Engine<P> {
             st.invalidate_text();
             return;
         }
+        let retry = RetryContext::capture(&st, None);
         match st.last_action.take() {
-            Some(LastAction::Fixed(fix)) if !single => self.double_tap_fixed(st, fix),
-            Some(LastAction::Fixed(fix)) => self.undo_fix(st, fix),
+            Some(LastAction::Fixed(fix)) if !single => self.double_tap_fixed(st, fix, retry),
+            Some(LastAction::Fixed(fix)) => self.undo_fix(st, fix, retry),
             Some(LastAction::Skipped(skip)) if !single => {
-                if let Some(layout) = P::current_layout() {
-                    self.manual_correct(st, skip.keys, skip.terminator, layout);
+                if let Some(layout) = skip.layout.or_else(P::current_layout) {
+                    self.manual_correct(
+                        st,
+                        skip.keys,
+                        skip.terminator,
+                        skip.trailing_spaces,
+                        layout,
+                        retry,
+                    );
+                } else {
+                    st.last_action = retry.last_action;
                 }
             }
             Some(LastAction::Skipped(skip)) => self.unlist_and_correct(st, skip),
             Some(LastAction::Unchanged {
                 keys,
                 terminator,
+                trailing_spaces,
                 layout,
             }) if !single => {
-                if P::current_layout() == Some(layout) {
-                    self.manual_correct(st, keys, terminator, layout);
+                if let Some(layout) = layout.or_else(P::current_layout) {
+                    self.manual_correct(st, keys, terminator, trailing_spaces, layout, retry);
+                } else {
+                    st.last_action = retry.last_action;
                 }
             }
-            None if !single && !st.no_fix && !st.keys.is_empty() => {
+            None if !single && !st.keys.is_empty() => {
                 if let Some(layout) = P::current_layout() {
                     let keys = st.keys.to_vec();
-                    self.manual_correct(st, keys, None, layout);
+                    self.manual_correct(st, keys, None, Vec::new(), layout, retry);
                 }
             }
             _ => {}
@@ -1710,11 +2091,23 @@ impl<P: Platform> Engine<P> {
     }
 
     /// Undo normal corrections; only repeat conversions explicitly requested by the user.
-    fn double_tap_fixed(self: &Arc<Self>, st: MutexGuard<'_, AppState<P>>, fix: LastFix<P>) {
+    fn double_tap_fixed(
+        self: &Arc<Self>,
+        st: MutexGuard<'_, AppState<P>>,
+        fix: LastFix<P>,
+        retry: RetryContext<P>,
+    ) {
         if !fix.manual_conversion || !fix.trailing_spaces.is_empty() {
-            self.undo_fix(st, fix);
-        } else if P::current_layout() == Some(fix.visible_layout) {
-            self.manual_correct(st, fix.visible, fix.terminator, fix.visible_layout);
+            self.undo_fix(st, fix, retry);
+        } else {
+            self.manual_correct(
+                st,
+                fix.visible,
+                fix.terminator,
+                fix.trailing_spaces,
+                fix.visible_layout,
+                retry,
+            );
         }
     }
 
@@ -1724,11 +2117,14 @@ impl<P: Platform> Engine<P> {
         mut st: MutexGuard<'_, AppState<P>>,
         keys: Vec<Typed<P::Key>>,
         terminator: Option<P::Key>,
+        trailing_spaces: Vec<Typed<P::Key>>,
         layout: Language,
+        mut retry: RetryContext<P>,
     ) {
-        st.phrase.clear();
+        retry.layout = Some(layout);
+        retry.clear_phrase_on_commit = true;
+        retry.finish_completion_on_commit = true;
         st.cycle = None;
-        st.finish_completion_use(false);
         st.pending_learning = None;
         let text = reading::<P>(&keys, layout.other());
         if keys.is_empty() || text.chars().count() != keys.len() {
@@ -1741,24 +2137,34 @@ impl<P: Platform> Engine<P> {
             lang: layout.other(),
         });
         let note = fix.as_ref().map(|fix| note_of::<P>(&keys, fix));
-        let Some(rep) = replacement::<P>(&keys, fix) else {
+        let Some(mut rep) = replacement::<P>(&keys, fix) else {
             return;
         };
         let mut undo = undo_of::<P>(&keys, &rep, terminator);
         // Asking for a conversion is not training a word exception.
         undo.suppress = None;
         undo.manual_conversion = true;
-        if terminator.is_none() {
+        if terminator.is_none() && trailing_spaces.is_empty() {
             undo.keep = keys;
         }
+        undo.trailing_spaces = trailing_spaces;
+        let mut separators = Vec::with_capacity(undo.trailing_spaces.len() + 1);
+        if let Some(key) = terminator {
+            separators.push(Typed { key, shift: false });
+        }
+        separators.extend_from_slice(&undo.trailing_spaces);
+        P::append_retype(
+            &mut rep.retype,
+            P::retype_original(&separators, rep.target_layout),
+        );
         st.keys.clear();
-        st.no_fix = terminator.is_none();
+        st.no_fix = separators.is_empty();
         self.start_replacement(
             st,
             Plan {
-                erase: rep.erase + usize::from(terminator.is_some()),
+                erase: rep.erase + separators.len(),
                 retype: rep.retype,
-                terminator,
+                terminator: None,
             },
             Vec::new(),
             Some(undo),
@@ -1770,14 +2176,21 @@ impl<P: Platform> Engine<P> {
                 details: "Manual layout conversion requested by the shortcut. Dictionary and spelling confidence checks do not apply.".into(),
                 deferred_layout,
             }),
+            Some(retry),
         );
     }
 
     /// Put back what the user typed before the correction on screen replaced it.
-    fn undo_fix(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, fix: LastFix<P>) {
+    fn undo_fix(
+        self: &Arc<Self>,
+        mut st: MutexGuard<'_, AppState<P>>,
+        fix: LastFix<P>,
+        mut retry: RetryContext<P>,
+    ) {
+        retry.layout = Some(fix.visible_layout);
+        retry.clear_phrase_on_commit = true;
+        retry.finish_completion_on_commit = true;
         st.cycle = None;
-        st.finish_completion_use(false);
-        st.phrase.clear();
         let mut restore = fix.restore;
         if let Some(key) = fix.terminator {
             restore.push(Typed { key, shift: false });
@@ -1799,6 +2212,7 @@ impl<P: Platform> Engine<P> {
                 rule: fix.rule,
                 learning_pair: fix.learning_pair,
             }),
+            Some(retry),
         );
     }
 
@@ -1824,17 +2238,27 @@ impl<P: Platform> Engine<P> {
         let details = format!("Reason: {}\n{}", outcome.reason, outcome.details);
         let result = outcome.fix;
         let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
-        let Some(rep) = replacement::<P>(&skip.keys, result) else {
+        let Some(mut rep) = replacement::<P>(&skip.keys, result) else {
             return;
         };
         st.cycle = None;
-        let erase = rep.erase + usize::from(skip.terminator.is_some());
+        let mut separators = Vec::with_capacity(skip.trailing_spaces.len() + 1);
+        if let Some(key) = skip.terminator {
+            separators.push(Typed { key, shift: false });
+        }
+        separators.extend_from_slice(&skip.trailing_spaces);
+        let erase = rep.erase + separators.len();
+        P::append_retype(
+            &mut rep.retype,
+            P::retype_original(&separators, rep.target_layout),
+        );
+        let deferred_layout = rep.previous_layout.map(|_| rep.target_layout);
         self.start_replacement(
             st,
             Plan {
                 erase,
                 retype: rep.retype,
-                terminator: skip.terminator,
+                terminator: None,
             },
             Vec::new(),
             None,
@@ -1844,8 +2268,9 @@ impl<P: Platform> Engine<P> {
                 kind,
                 rule: None,
                 details,
-                deferred_layout: None,
+                deferred_layout,
             }),
+            None,
         );
     }
 
@@ -1862,7 +2287,7 @@ impl<P: Platform> Engine<P> {
         check_and_correct_in_context(
             keys,
             |t: Typed<P::Key>| P::english_char(t.key, t.shift),
-            |t: Typed<P::Key>| P::hebrew_char(t.key),
+            hebrew_char::<P>,
             |t: Typed<P::Key>| t.shift,
             run,
             self.en_dict,
@@ -1870,7 +2295,9 @@ impl<P: Platform> Engine<P> {
             P::current_layout(),
             mode == crate::config::AppMode::LayoutOnly,
             Some(context),
-            P::switch_layout_to,
+            // Planning never waits for the compositor while holding typing state.
+            // The replacement worker performs and confirms the requested switch.
+            |_| crate::layout::LayoutSwitch::Switched,
         )
     }
 
@@ -1887,12 +2314,13 @@ impl<P: Platform> Engine<P> {
         keep: Vec<Typed<P::Key>>,
         undo: Option<LastFix<P>>,
         commit: Option<Commit>,
+        retry: Option<RetryContext<P>>,
     ) {
         let generation = st.generation;
         st.is_replacing = true;
         drop(st);
         let engine = Arc::clone(self);
-        thread::spawn(move || engine.replace_word(plan, keep, undo, generation, commit));
+        thread::spawn(move || engine.replace_word(plan, keep, undo, generation, commit, retry));
     }
 
     /// Erase what the user typed and put the replacement in its place.
@@ -1908,6 +2336,7 @@ impl<P: Platform> Engine<P> {
         mut undo: Option<LastFix<P>>,
         generation: u64,
         commit: Option<Commit>,
+        retry: Option<RetryContext<P>>,
     ) {
         // Armed for the whole replacement: whatever happens below — including a
         // panic — `is_replacing` and the injecting gate are cleared, rather than
@@ -1915,10 +2344,7 @@ impl<P: Platform> Engine<P> {
         let gate = ReplaceGuard::new(&self.state, P::injecting_flag(&self.injector));
 
         if !self.replacement_valid(generation) {
-            let mut st = self.lock();
-            if st.generation == generation {
-                st.invalidate_text();
-            }
+            self.abort_before_injection(generation, retry);
             return;
         }
         // Layout confirmation can block. Keep it off the capture callback and
@@ -1931,6 +2357,7 @@ impl<P: Platform> Engine<P> {
                 deferred_layout: Some(lang),
                 ..
             }) => Some((*lang, true)),
+            Some(Commit::Suggestion { layout }) => Some((*layout, true)),
             _ => None,
         };
         if let Some((lang, required)) = switch {
@@ -1944,10 +2371,7 @@ impl<P: Platform> Engine<P> {
                 }
             }
             if (required && !outcome.ready()) || !self.replacement_valid(generation) {
-                let mut st = self.lock();
-                if st.generation == generation {
-                    st.invalidate_text();
-                }
+                self.abort_before_injection(generation, retry);
                 return;
             }
         }
@@ -1960,7 +2384,26 @@ impl<P: Platform> Engine<P> {
             return;
         };
         let (practice, mode) = {
-            let st = self.lock();
+            let mut st = self.lock();
+            if st.generation != generation {
+                return;
+            }
+            if st.buffered_keys.len() != buffered.len() {
+                // Input arriving after the native replay snapshot moves the
+                // cursor beyond our undo payload. Never restore stale text state.
+                st.invalidate_text();
+                return;
+            }
+            if st.generation == generation {
+                if let Some(retry) = &retry {
+                    if retry.finish_completion_on_commit {
+                        st.finish_completion_use(false);
+                    }
+                    if retry.clear_phrase_on_commit {
+                        st.phrase.clear();
+                    }
+                }
+            }
             (st.practice, st.mode)
         };
         let mut learn = None;
@@ -2026,11 +2469,24 @@ impl<P: Platform> Engine<P> {
                     }
                 }
             }
-            None => {}
+            Some(Commit::Suggestion { .. }) | None => {}
         }
 
         let mut st = self.lock();
         if st.generation == generation {
+            if st.cycle.is_some() {
+                // An explicit successful edit establishes trusted text at the
+                // cursor, even if capture began after a click into an unknown field.
+                st.no_fix = false;
+            }
+            if st
+                .cycle
+                .as_ref()
+                .is_some_and(|cycle| !cycle.trailing_spaces.is_empty())
+            {
+                // The last recorded language described the word we just replaced.
+                st.history.clear();
+            }
             if !practice && crate::config::Config::global().rule_stats_enabled {
                 if let Some(cycle) = &st.cycle {
                     let back = cycle.index >= cycle.candidates.len();
@@ -2061,7 +2517,7 @@ impl<P: Platform> Engine<P> {
                                 &from,
                                 to,
                                 cycle.original_lang,
-                                cycle.candidate_lang,
+                                cycle.candidate_langs[cycle.index],
                             )
                         }
                     },
@@ -2069,7 +2525,8 @@ impl<P: Platform> Engine<P> {
             } else {
                 pending_learning
             };
-            let only_spaces = buffered.len() <= MAX_UNDO_SPACES
+            let tracked_spaces = undo.as_ref().map_or(0, |fix| fix.trailing_spaces.len());
+            let only_spaces = tracked_spaces + buffered.len() <= MAX_UNDO_SPACES
                 && buffered
                     .iter()
                     .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key));
@@ -2080,12 +2537,39 @@ impl<P: Platform> Engine<P> {
                     fix.keep.clear();
                 }
             } else {
-                st.keys.replace_with(keep);
-                st.keys.extend(buffered.iter().copied());
+                if let Some(boundary) = buffered
+                    .iter()
+                    .rposition(|typed| P::is_terminator(typed.key))
+                {
+                    st.keys
+                        .replace_with(buffered[boundary + 1..].iter().copied());
+                    st.no_fix = false;
+                    st.cycle = None;
+                    st.pending_learning = None;
+                    st.phrase.clear();
+                    st.history.clear();
+                } else {
+                    st.keys.replace_with(keep);
+                    st.keys.extend(buffered.iter().copied());
+                }
             }
             // Only tracked spaces may follow a correction that can still be undone.
             st.last_action = if only_spaces {
-                undo.map(LastAction::Fixed)
+                undo.map(LastAction::Fixed).or_else(|| {
+                    let cycle = st.cycle.as_ref()?;
+                    if cycle.index < cycle.candidates.len() || cycle.trailing_spaces.is_empty() {
+                        return None;
+                    }
+                    let mut trailing_spaces: Vec<_> =
+                        cycle.trailing_spaces.iter().skip(1).copied().collect();
+                    trailing_spaces.extend_from_slice(&buffered);
+                    Some(LastAction::Unchanged {
+                        keys: cycle.typed.clone(),
+                        terminator: cycle.trailing_spaces.first().map(|typed| typed.key),
+                        trailing_spaces,
+                        layout: Some(cycle.original_lang),
+                    })
+                })
             } else {
                 None
             };
@@ -2095,15 +2579,23 @@ impl<P: Platform> Engine<P> {
         drop(gate);
 
         let mut st = self.lock();
+        let retry = RetryContext::capture(&st, None);
         let pending = (!st.is_replacing && std::mem::take(&mut st.pending_undo))
             .then(|| st.last_action.take())
             .flatten();
+        let suggestion = if st.generation == generation && !st.is_replacing && st.cycle.is_some() {
+            st.pending_suggestion.take()
+        } else {
+            None
+        };
         if let Some(LastAction::Fixed(fix)) = pending {
             if std::mem::take(&mut st.pending_conversion) {
-                self.double_tap_fixed(st, fix);
+                self.double_tap_fixed(st, fix, retry);
             } else {
-                self.undo_fix(st, fix);
+                self.undo_fix(st, fix, retry);
             }
+        } else if let Some(correction) = suggestion {
+            self.request_suggestion(st, correction);
         } else {
             drop(st);
         }
@@ -2113,9 +2605,42 @@ impl<P: Platform> Engine<P> {
             crate::complete::learn(&word);
         }
     }
+
+    /// A refused switch did not edit text. Preserve retry context only while
+    /// focus and tracked input still match; never use this after injection.
+    fn abort_before_injection(&self, generation: u64, retry: Option<RetryContext<P>>) {
+        let (focus, mode) = self.read_focus();
+        let layout = P::current_layout();
+        let mut st = self.lock();
+        if st.generation != generation {
+            return;
+        }
+        if let Some(retry) = retry.filter(|retry| {
+            st.buffered_keys.is_empty()
+                && (layout.is_none() || retry.clear_phrase_on_commit || retry.layout == layout)
+                && st.focus == focus
+                && (!P::requires_focus() || focus.is_some())
+                && mode == Some(st.mode)
+                && mode != Some(crate::config::AppMode::Off)
+                && self.control.is_enabled()
+        }) {
+            st.keys.replace_with(retry.keys);
+            st.no_fix = retry.no_fix;
+            st.last_action = retry.last_action;
+            st.cycle = retry.cycle;
+            st.pending_learning = retry.pending_learning;
+            st.pending_undo = false;
+            st.pending_conversion = false;
+            st.pending_suggestion = None;
+        } else {
+            st.invalidate_text();
+        }
+    }
 }
 
 enum Commit {
+    /// Cycling may change language without counting another corrected word.
+    Suggestion { layout: Language },
     Fix {
         from: String,
         to: String,
@@ -2249,6 +2774,14 @@ fn undo_of<P: Platform>(
 /// only read for the history and the suppression list. Shared anyway, because a
 /// history that shows `Shalom` on two platforms and `shalom` on the third is a
 /// difference nobody chose.
+fn hebrew_char<P: Platform>(typed: Typed<P::Key>) -> Option<char> {
+    crate::keymap::hebrew_char_shifted(
+        P::english_char(typed.key, typed.shift),
+        P::hebrew_char(typed.key),
+        typed.shift,
+    )
+}
+
 pub fn reading<P: Platform>(keys: &[Typed<P::Key>], lang: Language) -> String {
     keys.iter()
         .filter_map(|t| match lang {
@@ -2261,7 +2794,7 @@ pub fn reading<P: Platform>(keys: &[Typed<P::Key>], lang: Language) -> String {
                 }
             }),
             // Hebrew has no case, so the shift the user held says nothing.
-            Language::Hebrew => P::hebrew_char(t.key),
+            Language::Hebrew => hebrew_char::<P>(*t),
         })
         .collect()
 }
@@ -2311,12 +2844,17 @@ mod tests {
         std::sync::atomic::AtomicBool::new(false);
     static REFUSE_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static REJECT_UNICODE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static EMPTY_INPUT_SUPPORTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
     struct FocusGate {
         ready: mpsc::SyncSender<()>,
         proceed: mpsc::Receiver<()>,
     }
     static FOCUS_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
     static LAYOUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
+    static INJECT_RETURN_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
     struct Simulated;
     struct Screen {
         text: Mutex<String>,
@@ -2332,6 +2870,8 @@ mod tests {
         type Focus = usize;
         const REQUIRES_FOCUS: bool = true;
         const QUEUE_UNDO_DURING_REPLACEMENT: bool = true;
+        // Exercise the stricter keycode-injection refusal policy as well.
+        const ABORT_UNDO_IF_LAYOUT_REFUSED: bool = true;
         const SHIFT_LEFT: char = '\x01';
         const SHIFT_RIGHT: char = '\x02';
         const CTRL_LEFT: char = '\x03';
@@ -2373,8 +2913,14 @@ mod tests {
         fn retype_text(text: &str) -> Option<String> {
             Some(text.to_string())
         }
+        fn retype_completion(text: &str, _: Language) -> Option<String> {
+            (!REJECT_UNICODE.load(Ordering::SeqCst) || text.is_ascii()).then(|| text.to_owned())
+        }
         fn retype_len(text: &String) -> usize {
             text.chars().count()
+        }
+        fn append_retype(text: &mut String, tail: String) {
+            text.push_str(&tail);
         }
         fn buffer_after(text: &String) -> Vec<Typed<char>> {
             let text = text.rsplit(char::is_whitespace).next().unwrap_or_default();
@@ -2450,7 +2996,7 @@ mod tests {
             Some(after)
         }
         fn input_empty(screen: &Screen) -> bool {
-            screen.text.lock().unwrap().is_empty()
+            EMPTY_INPUT_SUPPORTED.load(Ordering::SeqCst) && screen.text.lock().unwrap().is_empty()
         }
         fn current_layout() -> Option<Language> {
             match SIMULATED_LAYOUT.load(Ordering::SeqCst) {
@@ -2504,6 +3050,12 @@ mod tests {
                 screen.push(key);
             }
             screen.extend(buffered.iter().map(|t| t.key));
+            drop(screen);
+            let gate = INJECT_RETURN_GATE.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.ready.send(()).unwrap();
+                gate.proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
             Some(buffered)
         }
     }
@@ -2541,6 +3093,8 @@ mod tests {
                 self.engine.key_press(key);
                 let visible = if Simulated::current_layout() == Some(Language::Hebrew) {
                     Simulated::hebrew_char(key).unwrap_or(key)
+                } else if self.engine.lock().shift_active() {
+                    key.to_ascii_uppercase()
                 } else {
                     key
                 };
@@ -2577,6 +3131,9 @@ mod tests {
         }
         fn finish(&self) {
             self.proceed.send(()).unwrap();
+            self.idle();
+        }
+        fn idle(&self) {
             let deadline = Instant::now() + Duration::from_secs(3);
             while self.engine.lock().is_replacing {
                 assert!(Instant::now() < deadline, "replacement did not finish");
@@ -2586,6 +3143,806 @@ mod tests {
         fn text(&self) -> String {
             self.engine.injector.text.lock().unwrap().clone()
         }
+    }
+
+    #[test]
+    fn explicit_requests_and_continued_typing_work_across_native_boundaries() {
+        const CHILD: &str = "RECAST_BOUNDARY_COVERAGE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::engine::tests::explicit_requests_and_continued_typing_work_across_native_boundaries", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+        for previous in ["", "existing"] {
+            for (prefix, key) in [
+                ("keyb", Simulated::SHIFT_RIGHT),
+                ("hte", Simulated::SHIFT_LEFT),
+            ] {
+                let s = Session::new();
+                s.engine.injector.text.lock().unwrap().push_str(previous);
+                s.engine.mouse_click();
+                s.type_text(prefix);
+                assert!(s.engine.lock().no_fix);
+                s.tap(key);
+                s.pending();
+                s.finish();
+                assert!(s.text().starts_with(previous));
+                assert_ne!(s.text(), format!("{previous}{prefix}"));
+                s.type_text(" ");
+                s.undo();
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), format!("{previous}{prefix} "));
+                crate::complete::unlist(prefix);
+            }
+        }
+        // Automatic correction still waits for a known boundary after navigation.
+        let s = Session::new();
+        s.engine.mouse_click();
+        s.type_text("recieve ");
+        assert!(!s.engine.lock().is_replacing);
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve receive ");
+
+        for buffered in ["next ", "one two ", "next par"] {
+            let s = Session::new();
+            s.type_text("recieve ");
+            s.pending();
+            s.type_text(buffered);
+            s.finish();
+            let expected = buffered.rsplit(' ').next().unwrap();
+            assert_eq!(
+                reading::<Simulated>(&s.engine.lock().keys, Language::English),
+                expected
+            );
+            if expected.is_empty() {
+                s.type_text("recieve ");
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), format!("receive {buffered}receive "));
+            } else {
+                s.tap(Simulated::SHIFT_RIGHT);
+                s.pending();
+                s.finish();
+                assert!(s.text().starts_with("receive next "));
+            }
+        }
+        // Native writes can finish while new physical input is already arriving.
+        // That late input must cancel stale undo, not erase a subsequent word.
+        let s = Session::new();
+        let (ready, waiting) = mpsc::sync_channel(1);
+        let (proceed, reply) = mpsc::sync_channel(1);
+        *INJECT_RETURN_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: reply,
+        });
+        s.type_text("recieve ");
+        s.pending();
+        s.proceed.send(()).unwrap();
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.type_text("next ");
+        proceed.send(()).unwrap();
+        s.idle();
+        assert_eq!(s.text(), "receive next ");
+        assert!(s.engine.lock().last_action.is_none());
+        s.undo();
+        assert!(s.ready.try_recv().is_err());
+        assert_eq!(s.text(), "receive next ");
+        s.type_text(" keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive next  keyboard");
+
+        // Caps Lock affects letter case, never unshifted punctuation or digits.
+        let s = Session::new();
+        s.tap(Simulated::CAPS_LOCK);
+        s.type_text("1[");
+        assert!(s.engine.lock().keys.iter().all(|typed| !typed.shift));
+
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for source in [0, 1] {
+            for spaces in ["", " ", "  "] {
+                SIMULATED_LAYOUT.store(source, Ordering::SeqCst);
+                let s = Session::new();
+                s.engine.injector.text.lock().unwrap().push_str("older ");
+                s.engine.mouse_click();
+                s.type_text("akuo");
+                let original = s.text();
+                for _ in 0..2 {
+                    s.tap(Simulated::CTRL_LEFT);
+                }
+                s.pending();
+                s.finish();
+                assert_ne!(s.text(), original);
+                s.type_text(spaces);
+                for _ in 0..2 {
+                    s.tap(Simulated::CTRL_LEFT);
+                }
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), format!("{original}{spaces}"));
+                assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), source);
+            }
+        }
+        for source in [0, 1] {
+            SIMULATED_LAYOUT.store(source, Ordering::SeqCst);
+            let s = Session::new();
+            s.engine.mouse_click();
+            s.type_text("akuo ");
+            let original = s.text();
+            assert!(!s.engine.lock().is_replacing);
+            assert!(matches!(
+                s.engine.lock().last_action,
+                Some(LastAction::Unchanged { .. })
+            ));
+            for _ in 0..2 {
+                s.tap(Simulated::CTRL_LEFT);
+            }
+            s.pending();
+            s.finish();
+            assert_ne!(s.text(), original);
+            for _ in 0..2 {
+                s.tap(Simulated::CTRL_LEFT);
+            }
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), original);
+        }
+        for unknown_at_boundary in [false, true] {
+            SIMULATED_LAYOUT.store(if unknown_at_boundary { 2 } else { 0 }, Ordering::SeqCst);
+            let s = Session::new();
+            s.engine.mouse_click();
+            s.type_text("qzxx ");
+            // A recovered backend or an external switch must not consume the
+            // stored word before the explicit conversion can retry it.
+            SIMULATED_LAYOUT.store(usize::from(!unknown_at_boundary), Ordering::SeqCst);
+            for _ in 0..2 {
+                s.tap(Simulated::CTRL_LEFT);
+            }
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "/זסס ");
+            for _ in 0..2 {
+                s.tap(Simulated::CTRL_LEFT);
+            }
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "qzxx ");
+        }
+        // Real prefixes that are dictionary words in the wrong layout still
+        // expose the intended language in the full explicit suggestion pool.
+        for (target, freq, dict, other) in [
+            (
+                Language::English,
+                crate::dictionary::en_freq(),
+                crate::dictionary::en_dict(),
+                crate::dictionary::he_dict(),
+            ),
+            (
+                Language::Hebrew,
+                crate::dictionary::he_freq(),
+                crate::dictionary::he_dict(),
+                crate::dictionary::en_dict(),
+            ),
+        ] {
+            let mut cases = Vec::new();
+            let mut prefixes = HashSet::new();
+            freq.for_each_with_prefix("", |word, rank| {
+                if cases.len() >= 5
+                    || rank > 30_000
+                    || !dict.contains(word)
+                    || !word.chars().all(|c| {
+                        if target == Language::English {
+                            c.is_ascii_lowercase()
+                        } else {
+                            ('א'..='ת').contains(&c)
+                        }
+                    })
+                {
+                    return;
+                }
+                let len = word.chars().count();
+                if len < 4 {
+                    return;
+                }
+                let prefix: String = word.chars().take((len - 1).min(6)).collect();
+                let alternate = crate::keymap::convert_selection(&prefix);
+                if other.contains(&alternate) && prefixes.insert(prefix.clone()) {
+                    cases.push((
+                        word.to_owned(),
+                        if target == Language::English {
+                            prefix
+                        } else {
+                            alternate
+                        },
+                    ));
+                }
+            });
+            assert_eq!(cases.len(), 5);
+            for (word, physical) in cases {
+                SIMULATED_LAYOUT.store(
+                    usize::from(target.other() == Language::Hebrew),
+                    Ordering::SeqCst,
+                );
+                let s = Session::new();
+                s.type_text(&physical);
+                s.tap(Simulated::SHIFT_RIGHT);
+                s.pending();
+                s.finish();
+                let st = s.engine.lock();
+                let cycle = st.cycle.as_ref().unwrap();
+                assert!(
+                    cycle
+                        .candidates
+                        .iter()
+                        .zip(&cycle.candidate_langs)
+                        .any(|(offer, lang)| offer == &word && *lang == target),
+                    "lost alternate {word}: {:?}",
+                    cycle.candidates
+                );
+            }
+        }
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("abc");
+        let candidates: Vec<String> = [
+            "first",
+            "second",
+            "third",
+            "fourth",
+            "שלום",
+            "מחשב",
+            "חלון",
+            "בדיקה",
+            "fifth",
+            "sixth",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let langs: Vec<_> = candidates
+            .iter()
+            .map(|word| {
+                if word.is_ascii() {
+                    Language::English
+                } else {
+                    Language::Hebrew
+                }
+            })
+            .collect();
+        {
+            let mut st = s.engine.lock();
+            st.cycle = Some(Cycle {
+                typed: st.keys.to_vec(),
+                trailing_spaces: Vec::new(),
+                candidates: candidates.clone(),
+                candidate_langs: langs.clone(),
+                index: candidates.len(),
+                resume_index: 0,
+                on_screen: 3,
+                lang: Language::English,
+                original_lang: Language::English,
+                correction: false,
+            });
+        }
+        for (index, expected) in candidates.iter().enumerate() {
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), *expected);
+            assert_eq!(Simulated::current_layout(), Some(langs[index]));
+            if (index + 1) % crate::complete::MAX_CANDIDATES == 0 || index + 1 == candidates.len() {
+                s.tap(Simulated::SHIFT_RIGHT);
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), "abc");
+                assert_eq!(Simulated::current_layout(), Some(Language::English));
+            }
+        }
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), candidates[0]);
+
+        let s = Session::new();
+        let (ready, waiting) = mpsc::sync_channel(1);
+        let (proceed, reply) = mpsc::sync_channel(1);
+        *LAYOUT_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: reply,
+        });
+        s.type_text("akuo ");
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            s.engine.state.try_lock().is_ok(),
+            "automatic layout switch holds typing state"
+        );
+        s.engine.mouse_click();
+        proceed.send(()).unwrap();
+        s.idle();
+        assert_eq!(s.text(), "akuo ");
+        assert!(s.ready.try_recv().is_err());
+    }
+
+    #[test]
+    fn finished_words_remain_available_to_explicit_suggestions() {
+        const CHILD: &str = "RECAST_FINISHED_SUGGESTIONS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::finished_words_remain_available_to_explicit_suggestions",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        crate::config::Config::update_live(|config| {
+            config.spell_enabled = false;
+            config.rule_stats_enabled = true;
+        });
+        for (lang, physical, gesture) in [
+            (Language::English, "keyb", Simulated::SHIFT_RIGHT),
+            (Language::English, "[keyb]", Simulated::SHIFT_RIGHT),
+            (Language::English, "hte", Simulated::SHIFT_LEFT),
+            (Language::Hebrew, "njac", Simulated::SHIFT_RIGHT),
+        ] {
+            for spaces in [1, 2, MAX_UNDO_SPACES + 1] {
+                SIMULATED_LAYOUT.store(usize::from(lang == Language::Hebrew), Ordering::SeqCst);
+                let s = Session::new();
+                let tail = " ".repeat(spaces);
+                s.type_text(&format!("{physical}{tail}"));
+                let original = s.text();
+                assert!(s.engine.lock().keys.is_empty());
+                s.tap(gesture);
+                s.pending();
+                s.finish();
+                let choices = s.engine.lock().cycle.as_ref().unwrap().candidates.clone();
+                assert!(!choices.is_empty());
+                assert_eq!(s.text(), format!("{}{tail}", choices[0]));
+                assert!(s.engine.lock().keys.is_empty());
+                for choice in choices.iter().take(crate::complete::MAX_CANDIDATES).skip(1) {
+                    s.tap(gesture);
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{choice}{tail}"));
+                    assert!(s.engine.lock().keys.is_empty());
+                }
+                s.tap(gesture);
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), original);
+                assert!(s.engine.lock().keys.is_empty());
+                s.tap(gesture);
+                s.pending();
+                s.finish();
+                s.undo();
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), original);
+                assert!(s.engine.lock().keys.is_empty());
+            }
+        }
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("keyb   ");
+        SIMULATED_LAYOUT.store(2, Ordering::SeqCst);
+        for _ in 0..3 {
+            s.tap(Simulated::SHIFT_RIGHT);
+        }
+        assert_eq!(s.text(), "keyb   ");
+        // An external layout change does not reinterpret the finished word.
+        SIMULATED_LAYOUT.store(1, Ordering::SeqCst);
+        REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.idle();
+        assert_eq!(s.text(), "keyb   ");
+        assert!(s.ready.try_recv().is_err());
+        REFUSE_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyboard   ");
+        assert_eq!(Simulated::current_layout(), Some(Language::English));
+        s.type_text("next");
+        assert_eq!(s.text(), "keyboard   next");
+        assert_eq!(
+            reading::<Simulated>(&s.engine.lock().keys, Language::English),
+            "next"
+        );
+        assert!(s.engine.lock().completion_use.is_none());
+        assert!(s.engine.lock().last_action.is_none());
+
+        // A rapid second request also works with no in-progress word buffer.
+        let s = Session::new();
+        s.type_text("keyb  ");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        let second = s.engine.lock().cycle.as_ref().unwrap().candidates[1].clone();
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.proceed.send(()).unwrap();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("{second}  "));
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyb  ");
+
+        // Once a correction was accepted, a fresh request starts from that
+        // visible word rather than resurrecting its original misspelling.
+        crate::config::Config::update_live(|config| config.spell_enabled = true);
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive ");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(
+            reading::<Simulated>(
+                &s.engine.lock().cycle.as_ref().unwrap().typed,
+                Language::English
+            ),
+            "receive"
+        );
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive ");
+        crate::config::Config::update_live(|config| config.spell_enabled = false);
+
+        crate::complete::suppress("keyb");
+        let s = Session::new();
+        s.type_text("keyb  ");
+        assert!(matches!(
+            s.engine.lock().last_action,
+            Some(LastAction::Skipped(_))
+        ));
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyboard  ");
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyb  ");
+
+        let s = Session::new();
+        s.type_text("keyb ");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.type_text("next");
+        s.finish();
+        assert_eq!(s.text(), "keyboard next");
+        assert_eq!(
+            reading::<Simulated>(&s.engine.lock().keys, Language::English),
+            "next"
+        );
+        assert!(s.engine.lock().last_action.is_none());
+
+        let s = Session::new();
+        s.type_text("keyb  ");
+        s.engine.mouse_click();
+        s.tap(Simulated::SHIFT_RIGHT);
+        assert!(s.ready.try_recv().is_err());
+        assert_eq!(s.text(), "keyb  ");
+
+        let s = Session::new();
+        s.type_text(&format!("keyb{}", " ".repeat(MAX_UNDO_SPACES + 2)));
+        s.tap(Simulated::SHIFT_RIGHT);
+        assert!(s.ready.try_recv().is_err());
+
+        let s = Session::new();
+        s.type_text("hello   ");
+        for _ in 0..2 {
+            s.tap(Simulated::CTRL_LEFT);
+        }
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "יקךךם   ");
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "hello   ");
+
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.engine.caps_lock_changed(true);
+        s.type_text("keyb");
+        assert_eq!(s.text(), "KEYB");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        // An identical native snapshot must not cancel a pending edit.
+        s.engine.caps_lock_changed(true);
+        s.finish();
+        assert_eq!(s.text(), "KEYBOARD");
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "KEYB");
+        let s = Session::new();
+        s.engine.caps_lock_changed(true);
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        // A changed latch during injection invalidates the original replay plan.
+        s.engine.caps_lock_changed(false);
+        s.finish();
+        assert_eq!(s.text(), "KEYB");
+        assert!(!s.engine.lock().caps_lock);
+    }
+
+    #[test]
+    fn suggestions_and_conversion_recover_without_retyping() {
+        const CHILD: &str = "RECAST_RETRY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::suggestions_and_conversion_recover_without_retyping",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|config| config.rule_stats_enabled = true);
+        for (text, key) in [
+            ("keyb", Simulated::SHIFT_RIGHT),
+            ("hte", Simulated::SHIFT_LEFT),
+        ] {
+            let s = Session::new();
+            s.type_text(text);
+            SIMULATED_LAYOUT.store(2, Ordering::SeqCst);
+            for _ in 0..3 {
+                s.tap(key);
+            }
+            assert_eq!(s.text(), text);
+            assert_eq!(s.engine.lock().keys.len(), text.len());
+            assert!(!s.engine.lock().no_fix);
+            SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+            s.tap(key);
+            s.pending();
+            s.finish();
+            assert_ne!(s.text(), text);
+        }
+
+        // A release overlapping a Shift tap is ordinary typing rollover.
+        for key in [Simulated::SHIFT_RIGHT, Simulated::SHIFT_LEFT] {
+            let s = Session::new();
+            let (prefix, tail) = if key == Simulated::SHIFT_RIGHT {
+                ("key", 'b')
+            } else {
+                ("ht", 'e')
+            };
+            s.type_text(prefix);
+            s.engine.key_press(tail);
+            s.engine.injector.text.lock().unwrap().push(tail);
+            s.engine.key_press(key);
+            s.engine.key_release(tail);
+            s.engine.key_release(key);
+            s.pending();
+            s.finish();
+            assert_ne!(s.text(), format!("{prefix}{tail}"));
+
+            // A letter pressed after Shift is still a chord, never a request.
+            let s = Session::new();
+            s.type_text(prefix);
+            s.engine.key_press(key);
+            s.engine.key_press(tail);
+            s.engine.key_release(tail);
+            s.engine.key_release(key);
+            assert!(!s.engine.lock().is_replacing);
+        }
+
+        // An unsupported abbreviation must not starve usable dictionary offers.
+        let path = crate::complete::user_path("abbrev.txt").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "keyb = 🙂\n").unwrap();
+        crate::complete::reload_user_files();
+        REJECT_UNICODE.store(true, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "keyboard");
+        assert!(s
+            .engine
+            .lock()
+            .cycle
+            .as_ref()
+            .unwrap()
+            .candidates
+            .iter()
+            .all(|word| word.is_ascii()));
+        REJECT_UNICODE.store(false, Ordering::SeqCst);
+        std::fs::write(&path, "").unwrap();
+        crate::complete::reload_user_files();
+
+        // Rapid taps coalesce to one queued step instead of disappearing.
+        let reference = Session::new();
+        reference.type_text("keyb");
+        for _ in 0..2 {
+            reference.tap(Simulated::SHIFT_RIGHT);
+            reference.pending();
+            reference.finish();
+        }
+        let s = Session::new();
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        for _ in 0..3 {
+            s.tap(Simulated::SHIFT_RIGHT);
+        }
+        s.proceed.send(()).unwrap();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), reference.text());
+        assert!(s.engine.lock().pending_suggestion.is_none());
+        for cancel in ["typing", "click", "focus", "overflow"] {
+            let s = Session::new();
+            s.type_text("keyb");
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.tap(Simulated::SHIFT_RIGHT);
+            match cancel {
+                "typing" => s.type_text("x"),
+                "click" => s.engine.mouse_click(),
+                "focus" => FOCUS.store(2, Ordering::SeqCst),
+                _ => s.type_text(&"x".repeat(crate::types::MAX_WORD_KEYS + 1)),
+            }
+            s.finish();
+            assert!(s.ready.try_recv().is_err(), "queued tap survived {cancel}");
+            assert!(s.engine.lock().pending_suggestion.is_none());
+            FOCUS.store(1, Ordering::SeqCst);
+        }
+
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(1, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("compu");
+        let original = s.text();
+        REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.idle();
+        assert_eq!(s.text(), original);
+        assert!(s.ready.try_recv().is_err());
+        assert!(!s.engine.lock().no_fix);
+        assert!(s.engine.lock().cycle.is_none());
+        REFUSE_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert!(s.text().starts_with("compu"));
+        assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), 0);
+
+        // A failed switch back must retain the displayed offer and cycle index.
+        let count = s
+            .engine
+            .lock()
+            .cycle
+            .as_ref()
+            .unwrap()
+            .candidates
+            .len()
+            .min(crate::complete::MAX_CANDIDATES);
+        for _ in 1..count {
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+        }
+        let offered = s.text();
+        REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.idle();
+        assert_eq!(s.text(), offered);
+        assert_eq!(s.engine.lock().cycle.as_ref().unwrap().index, count - 1);
+        REFUSE_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), original);
+        assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), 1);
+
+        // A refused undo leaves the offered word available for acceptance,
+        // without recording abandonment or discarding the preceding phrase.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("good ");
+        SIMULATED_LAYOUT.store(1, Ordering::SeqCst);
+        s.type_text("compu");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        let offered = s.text();
+        let counts = crate::personal::usefulness_counts();
+        REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        s.undo();
+        s.idle();
+        assert_eq!(s.text(), offered);
+        assert_eq!(crate::personal::usefulness_counts(), counts);
+        assert_eq!(s.engine.lock().phrase.previous_word(), Some("good"));
+        REFUSE_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        s.type_text(" ");
+        assert_eq!(crate::personal::usefulness_counts()[2], counts[2] + 1);
+
+        for source in [0, 1] {
+            for separator in ["", " "] {
+                SIMULATED_LAYOUT.store(source, Ordering::SeqCst);
+                let s = Session::new();
+                s.type_text(&format!("do{separator}"));
+                let original = s.text();
+                REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+                for _ in 0..2 {
+                    s.tap(Simulated::CTRL_LEFT);
+                }
+                s.idle();
+                assert_eq!(s.text(), original);
+                assert!(s.ready.try_recv().is_err());
+                REFUSE_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+                for _ in 0..2 {
+                    s.tap(Simulated::CTRL_LEFT);
+                }
+                s.pending();
+                s.finish();
+                let expected = if source == 0 { "גם" } else { "do" };
+                assert_eq!(s.text(), format!("{expected}{separator}"));
+            }
+        }
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        crate::complete::suppress("qzxx");
+        let s = Session::new();
+        s.type_text("qzxx ");
+        SIMULATED_LAYOUT.store(2, Ordering::SeqCst);
+        REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            s.tap(Simulated::CTRL_LEFT);
+        }
+        s.idle();
+        assert!(matches!(
+            s.engine.lock().last_action,
+            Some(LastAction::Skipped(_))
+        ));
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        REFUSE_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
+        for _ in 0..2 {
+            s.tap(Simulated::CTRL_LEFT);
+        }
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "/זסס ");
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
     }
 
     #[cfg(target_os = "linux")]
@@ -2934,7 +4291,15 @@ mod tests {
             s.finish();
             assert!(s.text().starts_with(expected_prefix), "{}", s.text());
             assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), 1 - source);
-            let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
+            let count = s
+                .engine
+                .lock()
+                .cycle
+                .as_ref()
+                .unwrap()
+                .candidates
+                .len()
+                .min(crate::complete::MAX_CANDIDATES);
             for _ in 0..count {
                 s.tap(Simulated::SHIFT_RIGHT);
                 s.pending();
@@ -3137,7 +4502,15 @@ mod tests {
         s.finish();
         let first = s.text();
         assert_eq!(crate::personal::personal_count(&first), None);
-        let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
+        let count = s
+            .engine
+            .lock()
+            .cycle
+            .as_ref()
+            .unwrap()
+            .candidates
+            .len()
+            .min(crate::complete::MAX_CANDIDATES);
         for _ in 0..count {
             s.tap(Simulated::SHIFT_RIGHT);
             s.pending();
@@ -3150,7 +4523,10 @@ mod tests {
         s.pending();
         s.finish();
         s.type_text(" ");
-        assert_eq!(crate::personal::personal_count(&first), Some(1));
+        assert_eq!(
+            crate::personal::personal_count(s.text().trim_end()),
+            Some(1)
+        );
         assert_eq!(crate::personal::personal_correction("keyb"), None);
         assert!(!s.engine.lock().is_replacing);
 
@@ -3216,7 +4592,15 @@ mod tests {
             reading::<Simulated>(&s.engine.lock().keys, Language::Hebrew),
             s.text()
         );
-        let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
+        let count = s
+            .engine
+            .lock()
+            .cycle
+            .as_ref()
+            .unwrap()
+            .candidates
+            .len()
+            .min(crate::complete::MAX_CANDIDATES);
         for _ in 0..count {
             s.tap(Simulated::SHIFT_RIGHT);
             s.pending();
@@ -3752,8 +5136,8 @@ mod tests {
         s.finish();
         assert_eq!(s.text(), "receive ");
 
-        // Arrows and forward delete lose the cursor context. Deleting the
-        // tracked suffix must not make an unknown word safe to rewrite.
+        // Arrows and forward delete suppress automatic rewriting. An explicit
+        // request may still replace the freshly tracked suffix, preserving older text.
         for reset in '\x10'..='\x14' {
             let s = Session::new();
             s.type_text("old ");
@@ -3762,13 +5146,14 @@ mod tests {
             s.backspace();
             s.type_text("recieve");
             s.tap(Simulated::SHIFT_RIGHT);
-            assert!(!s.engine.lock().is_replacing);
+            s.pending();
+            s.finish();
             s.type_text(" ");
             assert!(!s.engine.lock().is_replacing);
             s.type_text("recieve ");
             s.pending();
             s.finish();
-            assert_eq!(s.text(), "old recieve receive ");
+            assert_eq!(s.text(), "old receive receive ");
         }
 
         // Backspacing into an unknown prefix suspends correction until a boundary.
@@ -3797,7 +5182,15 @@ mod tests {
             [0],
             "first completion must append without deleting the prefix"
         );
-        let count = s.engine.lock().cycle.as_ref().unwrap().candidates.len();
+        let count = s
+            .engine
+            .lock()
+            .cycle
+            .as_ref()
+            .unwrap()
+            .candidates
+            .len()
+            .min(crate::complete::MAX_CANDIDATES);
         for _ in 0..count {
             s.tap(Simulated::SHIFT_RIGHT);
             s.pending();
@@ -3834,13 +5227,15 @@ mod tests {
             let mut st = s.engine.lock();
             st.cycle = Some(Cycle {
                 typed: st.keys.to_vec(),
+                trailing_spaces: Vec::new(),
                 candidates: vec!["by the way".into(), "between".into()],
+                candidate_langs: vec![Language::English; 2],
                 correction: false,
                 index: 2,
+                resume_index: 0,
                 on_screen: 3,
                 lang: Language::English,
                 original_lang: Language::English,
-                candidate_lang: Language::English,
             });
         }
         for expected in ["by the way", "between", "btw", "by the way"] {
@@ -4810,12 +6205,14 @@ mod tests {
             let mut state = session.engine.lock();
             state.cycle = Some(Cycle {
                 typed: state.keys.to_vec(),
+                trailing_spaces: Vec::new(),
                 candidates: vec!["by the waay".into()],
+                candidate_langs: vec![Language::English],
                 index: 1,
+                resume_index: 0,
                 on_screen: 3,
                 lang: Language::English,
                 original_lang: Language::English,
-                candidate_lang: Language::English,
                 correction: false,
             });
         }

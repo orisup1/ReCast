@@ -491,6 +491,123 @@ mod tests {
     }
 }
 
+/// Read Hebrew symbol keys with their actual Shift state. The standard Hebrew
+/// layout mirrors brackets, parentheses, and angle brackets relative to US.
+/// Shifted letters retain the existing conservative Hebrew reading: handling
+/// alternate alphabet levels requires knowing the installed keymap variant.
+pub fn hebrew_char_shifted(
+    english: Option<char>,
+    hebrew: Option<char>,
+    shift: bool,
+) -> Option<char> {
+    let hebrew = hebrew?;
+    if !shift {
+        return Some(hebrew);
+    }
+    Some(match english {
+        Some('(') => ')',
+        Some(')') => '(',
+        Some('{') => '}',
+        Some('}') => '{',
+        Some('<') => '>',
+        Some('>') => '<',
+        Some(
+            c @ ('!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '_' | '+' | '|' | ':' | '"' | '~'
+            | '?'),
+        ) => c,
+        _ => hebrew,
+    })
+}
+
+fn physical_english_to_hebrew(c: char) -> Option<char> {
+    #[cfg(target_os = "linux")]
+    {
+        english_char_to_evkey_shifted(c).and_then(|(key, _)| evkey_to_hebrew_char(key))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        english_char_to_key(c).and_then(|(key, _)| key_to_hebrew_char(key))
+    }
+}
+
+/// Express supported Hebrew text as US characters on the same physical keys.
+/// Linux uses this before injecting under the Hebrew layout. Unsupported
+/// characters fail the whole replacement instead of producing partial text.
+#[cfg(any(target_os = "linux", test))]
+pub fn hebrew_text_to_physical_english(text: &str) -> Option<String> {
+    text.chars()
+        .map(|c| {
+            if ('א'..='ת').contains(&c) {
+                return (' '..='~')
+                    .filter(|key| {
+                        !key.is_ascii_uppercase() && !"~!@#$%^&*()_+{}|:\"<>?".contains(*key)
+                    })
+                    .find(|&key| physical_english_to_hebrew(key) == Some(c));
+            }
+            Some(match c {
+                '(' => ')',
+                ')' => '(',
+                '[' => ']',
+                ']' => '[',
+                '{' => '}',
+                '}' => '{',
+                '<' => '>',
+                '>' => '<',
+                ',' => '\'',
+                '.' => '/',
+                '\'' => 'w',
+                '/' => 'q',
+                ';' => '`',
+                c if c.is_ascii_digit() || " !@#$%^&*_+=\\|:\"~?-".contains(c) => c,
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod hebrew_symbol_tests {
+    use super::*;
+
+    #[test]
+    fn hebrew_text_inverse_round_trips_every_supported_letter_and_symbol() {
+        for expected in
+            "אבגדהוזחטיךכלםמןנסעףפץצקרשת0123456789 ()[]{}<>,.';/\\|!@#$%^&*_-+=:\"~?".chars()
+        {
+            let physical = hebrew_text_to_physical_english(&expected.to_string()).unwrap();
+            assert_eq!(physical.chars().count(), 1);
+            let physical = physical.chars().next().unwrap();
+            #[cfg(target_os = "linux")]
+            let (english, hebrew, shift) = {
+                let (key, shift) = english_char_to_evkey_shifted(physical).unwrap();
+                (
+                    evkey_to_english_char_shifted(key, shift),
+                    evkey_to_hebrew_char(key),
+                    shift,
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let (english, hebrew, shift) = {
+                let (key, shift) = english_char_to_key(physical).unwrap();
+                (
+                    key_to_english_char_shifted(key, shift),
+                    key_to_hebrew_char(key),
+                    shift,
+                )
+            };
+            let actual = if expected == ' ' {
+                Some(' ')
+            } else {
+                hebrew_char_shifted(english, hebrew, shift)
+            };
+            assert_eq!(actual, Some(expected), "physical {physical:?}");
+        }
+        for unsupported in ["🙂", "english", "א🙂"] {
+            assert!(hebrew_text_to_physical_english(unsupported).is_none());
+        }
+    }
+}
+
 /// Convert a selection by physical key positions, using the first English or
 /// Hebrew letter as its source layout. Unmapped characters remain unchanged.
 pub fn convert_selection(text: &str) -> String {
@@ -506,25 +623,15 @@ pub fn convert_selection(text: &str) -> String {
     let Some(hebrew) = hebrew else {
         return text.to_owned();
     };
-    let mapping = |c: char| {
-        #[cfg(target_os = "linux")]
-        {
-            english_char_to_evkey_shifted(c).and_then(|(key, _)| evkey_to_hebrew_char(key))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            english_char_to_key(c).and_then(|(key, _)| key_to_hebrew_char(key))
-        }
-    };
     text.chars()
         .map(|c| {
             if hebrew {
                 (' '..='~')
                     .filter(|c| !c.is_ascii_uppercase() && !"~!@#$%^&*()_+{}|:\"<>?".contains(*c))
-                    .find(|&key| mapping(key) == Some(c))
+                    .find(|&key| physical_english_to_hebrew(key) == Some(c))
                     .unwrap_or(c)
             } else if c.is_ascii_alphabetic() || "`[];',./".contains(c) {
-                mapping(c).unwrap_or(c)
+                physical_english_to_hebrew(c).unwrap_or(c)
             } else {
                 c
             }

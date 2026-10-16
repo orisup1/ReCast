@@ -500,7 +500,7 @@ pub fn sample() -> String {
 #spell_dist = {spell_dist}          # maximum edit distance, 0 to 3 (0 disables)
 #complete = true       # word completion + abbreviation expansion
 #complete_min = {complete_min}        # shortest prefix that will be completed
-#complete_rank = {complete_rank}   # worst frequency rank a completion may have
+#complete_rank = {complete_rank}   # ordinary completion cutoff; long exact dictionary matches may exceed it
 #debug = false         # log every word check and switch decision
 
 # Linux only: what drives the keyboard layout. Detected from the session when

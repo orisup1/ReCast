@@ -5,7 +5,7 @@ use crate::keymap::{
     evkey_to_hebrew_char,
 };
 use crate::types::{AppControl, Language};
-use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode};
+use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode, LedCode};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,44 @@ fn completion_keys_match_the_active_language() {
         .collect();
     assert_eq!(text, "Keyboard");
     assert!(Linux::retype_completion("🙂", Language::Hebrew).is_none());
+}
+
+fn injection_shift(key: KeyCode, shift: bool, caps_lock: bool, lang: Option<Language>) -> bool {
+    if lang == Some(Language::English)
+        && Linux::english_char_plain(key).is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        shift != caps_lock
+    } else {
+        shift
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn english_replay_preserves_requested_case_with_caps_lock_on_or_off() {
+    for text in [
+        "abcdefghijklmnopqrstuvwxyz",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "Mixed(cAsE)12![];",
+    ] {
+        for caps_lock in [false, true] {
+            let keys = Linux::retype_completion(text, Language::English).unwrap();
+            let visible: String = keys
+                .into_iter()
+                .map(|(key, shift)| {
+                    let physical_shift =
+                        injection_shift(key, shift, caps_lock, Some(Language::English));
+                    let c = Linux::english_char(key, physical_shift).unwrap();
+                    if c.is_ascii_alphabetic() && (physical_shift != caps_lock) {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            assert_eq!(visible, text);
+        }
+    }
 }
 
 impl Platform for Linux {
@@ -109,26 +147,38 @@ impl Platform for Linux {
     fn hebrew_char(key: KeyCode) -> Option<char> {
         evkey_to_hebrew_char(key)
     }
-    fn retype_original(keys: &[Typed], lang: Language) -> Self::Retype {
-        keys.iter()
-            .map(|t| (t.key, t.shift && lang == Language::English))
-            .collect()
+    fn retype_original(keys: &[Typed], _: Language) -> Self::Retype {
+        keys.iter().map(|t| (t.key, t.shift)).collect()
     }
-    fn retype_layout(keys: &[Typed], _: &str, lang: Language) -> Option<Self::Retype> {
-        Some(Self::retype_original(keys, lang))
+    fn retype_layout(keys: &[Typed], text: &str, lang: Language) -> Option<Self::Retype> {
+        if engine::reading::<Self>(keys, lang).to_lowercase() != text.to_lowercase() {
+            return Self::retype_completion(text, lang);
+        }
+        Some(
+            keys.iter()
+                .map(|t| {
+                    let symbol =
+                        Self::english_char_plain(t.key).is_some_and(|c| !c.is_ascii_alphabetic());
+                    (t.key, t.shift && (lang == Language::English || symbol))
+                })
+                .collect(),
+        )
     }
     fn retype_text(text: &str) -> Option<Self::Retype> {
         text.chars().map(english_char_to_evkey_shifted).collect()
     }
     fn retype_completion(text: &str, lang: Language) -> Option<Self::Retype> {
         if lang == Language::Hebrew {
-            Self::retype_text(&crate::keymap::convert_selection(text))
+            Self::retype_text(&crate::keymap::hebrew_text_to_physical_english(text)?)
         } else {
             Self::retype_text(text)
         }
     }
     fn retype_len(retype: &Self::Retype) -> usize {
         retype.len()
+    }
+    fn append_retype(retype: &mut Self::Retype, tail: Self::Retype) {
+        retype.extend(tail);
     }
     fn buffer_after(retype: &Self::Retype) -> Vec<Typed> {
         retype
@@ -340,6 +390,14 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                     }
                 };
                 engine.forget_everything();
+                if dev
+                    .supported_leds()
+                    .is_some_and(|leds| leds.contains(LedCode::LED_CAPSL))
+                {
+                    if let Ok(leds) = dev.get_led_state() {
+                        engine.caps_lock_changed(leds.contains(LedCode::LED_CAPSL));
+                    }
+                }
                 let mut held = HashSet::new();
                 // Retry transient failures, but retire disconnected readers at once.
                 const GIVE_UP_AFTER: u32 = 10;
@@ -368,18 +426,22 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                     };
 
                     for event in events {
-                        if let EventSummary::Key(_, keycode, value) = event.destructure() {
-                            match value {
-                                1 => {
-                                    held.insert(keycode);
-                                    engine.key_press(keycode);
-                                }
-                                0 => {
-                                    held.remove(&keycode);
-                                    engine.key_release(keycode);
-                                }
-                                _ => {}
+                        match event.destructure() {
+                            EventSummary::Key(_, keycode, value) => {
+                                capture_key_event(&mut held, keycode, value, |key, pressed| {
+                                    if pressed && value == 2 {
+                                        engine.key_repeat(key);
+                                    } else if pressed {
+                                        engine.key_press(key);
+                                    } else {
+                                        engine.key_release(key);
+                                    }
+                                });
                             }
+                            EventSummary::Led(_, LedCode::LED_CAPSL, value) => {
+                                engine.caps_lock_changed(value != 0);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -394,6 +456,68 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
         // use a udev monitor if idle wakeups or reconnect latency matter.
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn capture_key_event(
+    held: &mut HashSet<KeyCode>,
+    key: KeyCode,
+    value: i32,
+    dispatch: impl FnOnce(KeyCode, bool),
+) {
+    match value {
+        // A repeat changes the application's text just like another press.
+        // The reader distinguishes repeats from duplicate device reports;
+        // modifier-gesture guards still observe the repeated press.
+        1 | 2 => {
+            held.insert(key);
+            dispatch(key, true);
+        }
+        0 => {
+            held.remove(&key);
+            dispatch(key, false);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn native_repeats_preserve_text_and_physical_key_state() {
+    let mut held = HashSet::new();
+    let mut events = Vec::new();
+    let mut text = String::new();
+    for key in [
+        KeyCode::KEY_A,
+        KeyCode::KEY_BACKSPACE,
+        KeyCode::KEY_RIGHTSHIFT,
+    ] {
+        for value in [1, 2, 2, 0, -1, 3] {
+            capture_key_event(&mut held, key, value, |key, pressed| {
+                events.push((key, pressed));
+                if pressed {
+                    if key == KeyCode::KEY_BACKSPACE {
+                        text.pop();
+                    } else if let Some(c) = Linux::english_char_plain(key) {
+                        text.push(c);
+                    }
+                }
+            });
+            assert_eq!(held.contains(&key), matches!(value, 1 | 2));
+        }
+        if key == KeyCode::KEY_A {
+            assert_eq!(text, "aaa");
+        } else {
+            assert!(text.is_empty());
+        }
+    }
+    assert_eq!(events.len(), 12);
+    for group in events.chunks_exact(4) {
+        assert_eq!(
+            group.iter().map(|(_, down)| *down).collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+    }
+    assert!(held.is_empty());
 }
 
 fn refresh_readers(
@@ -527,6 +651,8 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
         return None;
     }
     let buffered = engine.buffered();
+    let caps_lock = crate::types::lock_forgiving(&engine.state).caps_lock;
+    let active_layout = crate::layout::current_layout();
 
     // Build the whole erase+retype sequence as one event batch and emit it in
     // a single locked write. Each key is press / SYN / release / SYN so the
@@ -540,6 +666,7 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     // A capital is Left Shift held around the letter — the only way to type one
     // through a device that speaks key positions.
     let mut push_char = |kc: KC, shift: bool| {
+        let shift = injection_shift(kc, shift, caps_lock, active_layout);
         if shift {
             evs.push(InputEvent::new(EventType::KEY.0, KC::KEY_LEFTSHIFT.0, 1));
             evs.push(syn());

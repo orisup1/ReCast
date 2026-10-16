@@ -166,11 +166,19 @@ from each other, the double-tap action, and extra single-tap undo. Disable or mo
 the conflicting binding first.
 Only bare taps shorter than 300 ms count; double taps must finish within 500 ms
 of each other. Holding a modifier or using it in a chord keeps its normal behavior.
+Completion and spelling-suggestion Shift taps may overlap the release of the
+last typed letter. Rapid suggestion taps while an offer is landing queue one
+additional step; typing, cursor movement, or a focus change cancels that step.
+If a layout query or requested switch temporarily fails before editing starts,
+the same gesture can retry the tracked word without retyping it.
+After cursor movement, an explicit request can complete, correct, or convert the
+keys typed since that movement. Previously existing text stays untouched;
+automatic correction still waits for a trusted word boundary.
 
 | Action | Gesture or control |
 | --- | --- |
-| Request spelling alternatives | Tap **Left Shift** mid-word; repeat to cycle choices and back to your original text |
-| Complete an English or Hebrew word | Tap **Right Shift** mid-word; tap again to cycle through suggestions and back to your prefix |
+| Request spelling alternatives | Tap **Left Shift** before or after Space; repeat to cycle choices and back to your original text |
+| Complete an English or Hebrew word | Tap **Right Shift** before or after Space; tap again to cycle through suggestions and back to your prefix |
 | Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space |
 | Rescue selected text (macOS) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Convert an unchanged last word to the other layout | Tap **Ctrl twice within half a second**, even for unknown words |
@@ -187,7 +195,7 @@ it converts the word to the other keyboard layout, even if neither reading is a
 dictionary word. Conversion works before or after Space and preserves the
 separator. Repeating a manual conversion converts the word back without changing
 saved exceptions or training spelling replacements. Up to 32 extra spaces preserve
-correction undo and are restored with the original word. Other typing, Enter, or
+correction undo and explicit suggestions, and are restored with the original word. Other typing, Enter, or
 moving the cursor ends the opportunity to act on a finished word.
 
 The optional single-Ctrl shortcut handles undo/unlisting. If it shares the action
@@ -377,7 +385,7 @@ disables both abbreviations and word completion.
 The separate spelling-suggestion gesture (Left Shift by default) requests
 alternatives in the current language, including short misspellings (`hte` → `the`)
 and valid English words (`form` / `from`). It works with automatic spelling and
-completion disabled, never switches layout, and uses the same cycling and undo.
+completion disabled, stays in the word's language, and uses the same cycling and undo.
 Requests stay bounded to four choices and preserve capitalization and trailing
 punctuation. Choosing an alternative to a valid dictionary word does not train
 an automatic replacement for that word.
@@ -389,6 +397,18 @@ length limits count characters in either language. English apostrophe prefixes
 such as `don'` can complete to `don't`; saved apostrophe words are also candidates.
 Saved words in `ignore.txt` and persistent undo exceptions are also completion candidates, including names
 and technical terms absent from the bundled dictionary.
+Completion presents four choices, then restores the original prefix. Keep tapping
+to reach the next page instead of repeating the same four choices forever. After
+the final page, the sequence starts again. Undo always restores the original prefix.
+Bundled technical vocabulary is available even without a general-language frequency
+rank. Long, exact prefixes can also complete specific dictionary words beyond the
+ordinary rank cutoff; short and edited prefixes retain their confidence limits.
+Opening quotes and brackets are preserved around corrections and completions.
+Completion and spelling suggestions also work on the last finished word while
+the cursor remains after its tracked spaces. Every choice and undo preserves
+those spaces; typing the next word accepts the choice without requiring another
+Space. Hebrew completion can attach supported prefixes to ranked dictionary
+stems or saved words even when the combined form has no separate dictionary entry.
 
 ### Application exclusions
 
@@ -580,9 +600,10 @@ phrase in the preceding word's language can resolve the language choice, without
 bypassing either speller's acceptance gates. Scores are heuristics, not confidence
 percentages.
 
-When the current layout has no exact completion, known word, or explicit
-abbreviation, the completion gesture also checks the other layout. An exact
-alternate-layout prefix match can replace weak current-layout offers. Acceptance
+The completion gesture checks both layouts. Current-language exact matches,
+known words, and explicit abbreviations retain priority; exact alternate-layout
+matches remain reachable on later pages. An exact alternate-layout prefix match
+can precede weak current-layout offers. Acceptance
 by the completion tap switches layout and inserts the completion together. Cycling
 back or undo restores the original text and requests the original layout. A refused
 initial layout switch cancels insertion. No automatic layout change happens from

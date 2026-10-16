@@ -34,15 +34,20 @@ use std::sync::{Mutex, OnceLock};
 use crate::config::Config;
 use crate::dictionary::{Dict, Freq};
 
-/// Longest partial word we will try to complete. Past this the user is typing
-/// an identifier or a URL, not reaching for a word.
-const MAX_PREFIX_LEN: usize = 20;
+/// Exact completion can use any tracked prefix. Expensive prefix-edit search
+/// stays shorter; dictionary membership still protects long identifiers/URLs.
+const MAX_PREFIX_LEN: usize = crate::types::MAX_WORD_KEYS - 1;
+const MAX_EDITED_PREFIX_LEN: usize = 20;
 
-/// How many guesses a cycle offers before coming back round to what the user
-/// typed. Small on purpose: past three or four taps, deleting the word and
-/// typing it out is faster than hunting, and every extra candidate is a rarer
-/// word than the one before it.
+/// Guesses per completion page before the caller can restore the typed prefix.
+/// The bounded API returns one page; repeated explicit requests can use the full
+/// pool without making undo require a long walk through every possible word.
 pub const MAX_CANDIDATES: usize = 4;
+
+/// Unranked dictionary words require a substantial, exact part of the word.
+/// Short prefixes still rely on corpus evidence or explicitly curated vocabulary.
+const RARE_PREFIX_MIN: usize = 5;
+const RARE_SUFFIX_MAX: usize = 8;
 
 /// Phrase evidence is local to one uninterrupted typing context, never persisted.
 /// Two observations are required before a learned pair influences ranking.
@@ -147,6 +152,7 @@ struct Ranking<'a> {
     context: Option<&'a PhraseContext>,
     offset: usize,
     exclude: Option<&'a str>,
+    all: bool,
 }
 
 /// Frequency and retained personal evidence estimate likelihood. Prefix edits
@@ -158,6 +164,7 @@ struct Candidate {
     saved: usize,
     weight: f64,
     rank: u32,
+    fallback: bool,
 }
 
 impl Candidate {
@@ -182,6 +189,27 @@ pub(crate) fn completions_in_context(
     freq: Freq,
     context: Option<&PhraseContext>,
 ) -> Vec<String> {
+    completions_for_request(prefix, dict, freq, context, false)
+}
+
+/// Every eligible offer, for a caller that pages through choices on repeated requests.
+/// The first page uses exactly the same ranking as the bounded completion API.
+pub(crate) fn all_completions_in_context(
+    prefix: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+) -> Vec<String> {
+    completions_for_request(prefix, dict, freq, context, true)
+}
+
+fn completions_for_request(
+    prefix: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+    all: bool,
+) -> Vec<String> {
     let cfg = Config::global();
     if !cfg.complete_enabled {
         return Vec::new();
@@ -203,11 +231,10 @@ pub(crate) fn completions_in_context(
             context,
             offset: out.len(),
             exclude: out.first().map(String::as_str),
+            all,
         },
     ) {
-        if !out.contains(&word) {
-            out.push(word);
-        }
+        out.push(word);
     }
     out
 }
@@ -217,8 +244,9 @@ pub(crate) fn completions_in_context(
 ///
 /// A candidate must be a *longer* word than what was typed (completing a word
 /// to itself is a no-op the caller shouldn't have to unwind), a dictionary word
-/// — the frequency list is corpus-derived and full of junk tokens — and common
-/// enough to be a word someone reaching for that prefix might mean.
+/// — the frequency list is corpus-derived and full of junk tokens. Short prefixes
+/// require frequency evidence or curated vocabulary; a long exact prefix can also
+/// recover specific dictionary words outside the general frequency cutoff.
 #[cfg(test)]
 pub fn completions_with(
     prefix: &str,
@@ -289,23 +317,28 @@ fn completions_from(
         exact |= saved
             .iter()
             .any(|word| word.starts_with(prefix) && word.chars().count() > len);
+        if english {
+            technical_words().for_each_with_prefix(prefix, |word| {
+                exact |= word.len() > len && dict.contains(word);
+            });
+        }
         exact
     } else {
         false
     };
-    let mut prefixes = if exact {
+    let mut prefixes = if exact || len > MAX_EDITED_PREFIX_LEN {
         HashSet::new()
     } else {
         edited_prefixes(prefix, english)
     };
     prefixes.insert(prefix.to_owned());
-    let mut consider = |word: &str, rank: u32, explicit: bool| {
+    let mut consider = |word: &str, rank: u32, explicit: bool, fallback: bool| {
         let word_len = word.chars().count();
         if word_len <= len
             || word_len > crate::types::MAX_WORD_KEYS
             || ranking.exclude == Some(word)
             || candidates.contains_key(word)
-            || (!explicit && (rank > max_rank || !dict.contains(word)))
+            || (!explicit && !fallback && (rank > max_rank || !dict.contains(word)))
         {
             return;
         }
@@ -321,11 +354,12 @@ fn completions_from(
                 saved: word_len - len,
                 weight,
                 rank,
+                fallback,
             },
         );
     };
     for matching in &prefixes {
-        freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false));
+        freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false, false));
     }
     for word in saved {
         let valid = word.chars().all(|c| {
@@ -336,10 +370,85 @@ fn completions_from(
             }
         });
         if valid && prefixes.iter().any(|p| word.starts_with(p)) {
-            consider(word, freq.rank(word).unwrap_or(1_000), true);
+            consider(word, freq.rank(word).unwrap_or(1_000), true, false);
         }
     }
-    ranked_completions(candidates.into_values().collect(), ranking.offset)
+    if english {
+        // This reviewed list is already merged into the dictionary at build time.
+        // Its terms need not appear in a general-language frequency corpus.
+        for matching in &prefixes {
+            technical_words().for_each_with_prefix(matching, |word| {
+                if dict.contains(word) {
+                    consider(word, freq.rank(word).unwrap_or(20_000), false, true);
+                }
+            });
+        }
+    }
+    if len >= RARE_PREFIX_MIN {
+        // Dictionary-only fallback never edits the prefix or infers a new form.
+        // Requiring at least half the word and a bounded suffix keeps this useful
+        // for specific requests without flooding short-prefix completion.
+        dict.for_each_with_prefix(prefix, |word| {
+            let word_len = word.chars().count();
+            if word_len <= len * 2
+                && word_len.saturating_sub(len) <= RARE_SUFFIX_MAX
+                && word.chars().all(|c| {
+                    if english {
+                        c.is_ascii_lowercase()
+                    } else {
+                        ('א'..='ת').contains(&c)
+                    }
+                })
+            {
+                consider(word, freq.rank(word).unwrap_or(50_000), false, true);
+            }
+        });
+    }
+    if !english {
+        // Productive Hebrew prefixes need not have a separately listed full
+        // form. Infer only exact matches from the supported prefix grammar and
+        // a dictionary stem, after directly attested candidates.
+        for (attached, stem_prefix) in crate::dictionary::hebrew_prefix_splits(prefix) {
+            let stem_len = stem_prefix.chars().count();
+            if stem_len < 2 {
+                continue;
+            }
+            let mut inferred = |stem: &str, rank: u32| {
+                if stem.chars().count() >= 3 && stem.chars().all(|c| ('א'..='ת').contains(&c)) {
+                    consider(&format!("{attached}{stem}"), rank, false, true);
+                }
+            };
+            freq.for_each_with_prefix(stem_prefix, |stem, rank| {
+                if rank <= max_rank && dict.contains(stem) {
+                    inferred(stem, rank);
+                }
+            });
+            for stem in saved {
+                if stem.starts_with(stem_prefix) {
+                    inferred(stem, freq.rank(stem).unwrap_or(1_000));
+                }
+            }
+            if stem_len >= RARE_PREFIX_MIN {
+                dict.for_each_with_prefix(stem_prefix, |stem| {
+                    let word_len = stem.chars().count();
+                    if word_len <= stem_len * 2
+                        && word_len.saturating_sub(stem_len) <= RARE_SUFFIX_MAX
+                    {
+                        inferred(stem, freq.rank(stem).unwrap_or(50_000));
+                    }
+                });
+            }
+        }
+    }
+    ranked_completions(
+        candidates.into_values().collect(),
+        ranking.offset,
+        ranking.all,
+    )
+}
+
+fn technical_words() -> Dict {
+    Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_tech.blob")))
 }
 
 /// Complete supported English suffixes and explicitly saved apostrophe names.
@@ -385,6 +494,7 @@ fn apostrophe_completions(
             word,
             weight,
             rank,
+            fallback: false,
         });
     }
     for word in saved {
@@ -415,26 +525,53 @@ fn apostrophe_completions(
                 * ranking.context.map_or(1.0, |context| context.boost(word))
                 / (f64::from(rank) + 1.0),
             rank,
+            fallback: false,
         });
     }
-    ranked_completions(candidates, ranking.offset)
+    ranked_completions(candidates, ranking.offset, ranking.all)
 }
 
-fn ranked_completions(mut candidates: Vec<Candidate>, offset: usize) -> Vec<String> {
-    let mut out = Vec::with_capacity(MAX_CANDIDATES);
-    for slot in 0..MAX_CANDIDATES {
+fn candidate_order(a: &Candidate, b: &Candidate, taps: usize) -> std::cmp::Ordering {
+    b.fallback
+        .cmp(&a.fallback)
+        .then_with(|| a.value(taps).total_cmp(&b.value(taps)))
+        .then_with(|| a.weight.total_cmp(&b.weight))
+        .then_with(|| b.rank.cmp(&a.rank))
+        .then_with(|| b.saved.cmp(&a.saved))
+        .then_with(|| b.word.cmp(&a.word))
+}
+
+fn ranked_completions(mut candidates: Vec<Candidate>, offset: usize, all: bool) -> Vec<String> {
+    let limit = if all {
+        candidates.len()
+    } else {
+        MAX_CANDIDATES
+    };
+    let mut out = Vec::with_capacity(limit.min(candidates.len()));
+    // Scores stop changing once taps exceed every saved suffix. At most
+    // MAX_WORD_KEYS linear selections are needed; the remainder sorts once.
+    let changing_slots = candidates
+        .iter()
+        .map(|candidate| candidate.saved)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(offset)
+        .max(MAX_CANDIDATES)
+        .min(limit);
+    for slot in 0..changing_slots {
         let taps = offset + slot + 1;
-        let Some((index, _)) = candidates.iter().enumerate().max_by(|(_, a), (_, b)| {
-            a.value(taps)
-                .total_cmp(&b.value(taps))
-                .then_with(|| a.weight.total_cmp(&b.weight))
-                .then_with(|| b.rank.cmp(&a.rank))
-                .then_with(|| b.saved.cmp(&a.saved))
-                .then_with(|| b.word.cmp(&a.word))
-        }) else {
+        let Some((index, _)) = candidates
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| candidate_order(a, b, taps))
+        else {
             break;
         };
         out.push(candidates.swap_remove(index).word);
+    }
+    if all {
+        candidates.sort_unstable_by(|a, b| candidate_order(b, a, usize::MAX));
+        out.extend(candidates.into_iter().map(|candidate| candidate.word));
     }
     out
 }
@@ -1580,6 +1717,321 @@ mod tests {
     }
 
     #[test]
+    fn productive_hebrew_completions_use_supported_exact_prefixes() {
+        let d = dict(&["מקלדת", "מחשבים", "תוכנה", "מערכות", "וכשמקלחת"]);
+        let f = freq(&[
+            ("מקלדת", 500),
+            ("מחשבים", 1_000),
+            ("תוכנה", 2_000),
+            ("מערכות", 3_000),
+            ("וכשמקלחת", 20_000),
+            ("מתיכוון", 50),
+        ]);
+        for (prefix, expected) in [
+            ("וכשמקל", "וכשמקלדת"),
+            ("במחש", "במחשבים"),
+            ("מהתוכ", "מהתוכנה"),
+            ("כשמער", "כשמערכות"),
+            ("ולמקל", "ולמקלדת"),
+            ("לכשהמקל", "לכשהמקלדת"),
+        ] {
+            let all = completions_from(
+                prefix,
+                d,
+                f,
+                3,
+                30_000,
+                &[],
+                Ranking {
+                    all: true,
+                    ..Ranking::default()
+                },
+            );
+            assert!(
+                all.iter().any(|word| word == expected),
+                "missing {expected}: {all:?}"
+            );
+            assert_eq!(all.iter().filter(|word| *word == expected).count(), 1);
+        }
+        let all = completions_from(
+            "וכשמקל",
+            d,
+            f,
+            3,
+            30_000,
+            &[],
+            Ranking {
+                all: true,
+                ..Ranking::default()
+            },
+        );
+        assert_eq!(
+            all[0], "וכשמקלחת",
+            "direct evidence precedes inferred forms"
+        );
+        for prefix in ["הבמקל", "ווומקל", "במתי"] {
+            assert!(
+                completions_from(prefix, d, f, 3, 30_000, &[], Ranking::default()).is_empty(),
+                "inferred an unsupported form for {prefix}"
+            );
+        }
+        let saved = vec!["מקלדית".to_owned()];
+        assert!(completions_from(
+            "ובמקל",
+            d,
+            f,
+            3,
+            30_000,
+            &saved,
+            Ranking {
+                all: true,
+                ..Ranking::default()
+            }
+        )
+        .contains(&"ובמקלדית".to_owned()));
+    }
+
+    #[test]
+    fn productive_hebrew_forms_are_reachable_across_ranked_vocabulary() {
+        let d = crate::dictionary::he_dict();
+        let f = crate::dictionary::he_freq();
+        let mut stems = Vec::new();
+        f.for_each_with_prefix("", |word, rank| {
+            if rank <= 30_000
+                && (4..=14).contains(&word.chars().count())
+                && word.chars().all(|c| ('א'..='ת').contains(&c))
+                && d.contains(word)
+            {
+                stems.push(word.to_owned());
+            }
+        });
+        let mut checked = 0;
+        for stem in stems.iter().step_by(211) {
+            for attached in ["ב", "ל", "ש", "וב", "מה", "כשה", "ושל", "וכשמ", "לכשה"]
+            {
+                let expected = format!("{attached}{stem}");
+                if d.contains(&expected) {
+                    continue;
+                }
+                let prefix = format!(
+                    "{attached}{}",
+                    stem.chars()
+                        .take(stem.chars().count() - 1)
+                        .collect::<String>()
+                );
+                let all = completions_from(
+                    &prefix,
+                    d,
+                    f,
+                    3,
+                    30_000,
+                    &[],
+                    Ranking {
+                        all: true,
+                        ..Ranking::default()
+                    },
+                );
+                assert!(
+                    all.iter().any(|word| word == &expected),
+                    "missing {expected} for {prefix}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 200, "only {checked} unlisted forms checked");
+        eprintln!(
+            "Hebrew completion coverage: {checked} sampled unlisted productive forms reachable."
+        );
+    }
+
+    #[test]
+    fn full_completion_pool_keeps_every_ranked_choice_and_first_page_order() {
+        let words = [
+            "prefixa",
+            "prefixab",
+            "prefixabc",
+            "prefixabcd",
+            "prefixabcde",
+            "prefixabcdef",
+            "prefixabcdefg",
+            "prefixabcdefgh",
+            "prefixabcdefghi",
+        ];
+        let d = dict(&words);
+        let entries: Vec<_> = words
+            .iter()
+            .enumerate()
+            .map(|(rank, &word)| (word, rank as u32 * 100))
+            .collect();
+        let f = freq(&entries);
+        let first = offers("pref", d, f);
+        let all = completions_from(
+            "pref",
+            d,
+            f,
+            3,
+            30_000,
+            &[],
+            Ranking {
+                all: true,
+                ..Ranking::default()
+            },
+        );
+        assert_eq!(&all[..MAX_CANDIDATES], first);
+        assert_eq!(all.len(), words.len());
+        for word in words {
+            assert_eq!(all.iter().filter(|offer| *offer == word).count(), 1);
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                all,
+                completions_from(
+                    "pref",
+                    d,
+                    f,
+                    3,
+                    30_000,
+                    &[],
+                    Ranking {
+                        all: true,
+                        ..Ranking::default()
+                    },
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn ranked_vocabulary_is_reachable_across_sampled_prefix_families() {
+        let mut checked = 0;
+        let mut recovered = 0;
+        for (dict, freq, english) in [
+            (
+                crate::dictionary::en_dict(),
+                crate::dictionary::en_freq(),
+                true,
+            ),
+            (
+                crate::dictionary::he_dict(),
+                crate::dictionary::he_freq(),
+                false,
+            ),
+        ] {
+            let mut words = Vec::new();
+            freq.for_each_with_prefix("", |word, rank| {
+                let len = word.chars().count();
+                if rank <= 30_000
+                    && (4..=20).contains(&len)
+                    && dict.contains(word)
+                    && word.chars().all(|c| {
+                        if english {
+                            c.is_ascii_lowercase()
+                        } else {
+                            ('א'..='ת').contains(&c)
+                        }
+                    })
+                {
+                    words.push(word.to_owned());
+                }
+            });
+            for word in words.iter().step_by(97) {
+                let len = word.chars().count();
+                for prefix_len in [3, (len / 2).max(3), len - 1] {
+                    let prefix: String = word.chars().take(prefix_len).collect();
+                    let all = completions_from(
+                        &prefix,
+                        dict,
+                        freq,
+                        3,
+                        30_000,
+                        &[],
+                        Ranking {
+                            all: true,
+                            ..Ranking::default()
+                        },
+                    );
+                    assert!(all.contains(word), "unreachable {word:?} from {prefix:?}");
+                    recovered +=
+                        usize::from(!all.iter().take(MAX_CANDIDATES).any(|offer| offer == word));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1_000, "coverage unexpectedly small: {checked}");
+        assert!(
+            recovered > 100,
+            "later pages must recover broad vocabulary: {recovered}"
+        );
+        eprintln!("Completion coverage: {checked} prefix/word pairs reachable; {recovered} require later pages.");
+        let d = dict(&["electroencephalographically"]);
+        assert_eq!(
+            offers("electroencephalographical", d, Freq::EMPTY),
+            ["electroencephalographically"]
+        );
+    }
+
+    #[test]
+    fn rare_dictionary_fallback_requires_a_long_exact_specific_prefix() {
+        for (prefix, words, near, typo, too_short) in [
+            (
+                "specific",
+                ["specificity", "specifically", "specifics"],
+                "specif",
+                "specifx",
+                "spe",
+            ),
+            (
+                "משמעות",
+                ["משמעותיות", "משמעותיים", "משמעותית"],
+                "משמעו",
+                "משמוע",
+                "משמ",
+            ),
+        ] {
+            let d = dict(&words);
+            let f = freq(&[(words[2], 45_000)]);
+            let all = |typed: &str| {
+                completions_from(
+                    typed,
+                    d,
+                    f,
+                    3,
+                    30_000,
+                    &[],
+                    Ranking {
+                        all: true,
+                        ..Ranking::default()
+                    },
+                )
+            };
+            let actual = all(prefix);
+            for word in words {
+                assert!(
+                    actual.iter().any(|offer| offer == word),
+                    "{prefix}: {actual:?}"
+                );
+            }
+            assert!(!all(near).is_empty(), "{near}");
+            assert!(all(typo).is_empty(), "rare fallback edited {typo}");
+            assert!(
+                all(too_short).is_empty(),
+                "rare fallback accepted {too_short}"
+            );
+            for noisy in [
+                format!("{prefix}1"),
+                format!("{prefix}_"),
+                format!("{prefix}/"),
+            ] {
+                assert!(all(&noisy).is_empty(), "{noisy}");
+            }
+        }
+        let d = dict(&["abcdeabcdefghijklmn", "abcdef", "abcdegh"]);
+        let f = freq(&[("abcdef", 29_999), ("abcdegh", 45_000)]);
+        assert_eq!(offers("abcde", d, f), ["abcdef", "abcdegh"]);
+        assert!(offers("abcd", d, Freq::EMPTY).is_empty());
+    }
+
+    #[test]
     fn a_longer_completion_beats_an_equally_common_short_one() {
         // Equal frequency still gives a bounded advantage to useful savings;
         // this does not remove the short candidate's frequency weight.
@@ -1729,6 +2181,79 @@ mod real_data {
                 offers.iter().any(|w| w == word),
                 "{word} missing: {offers:?}"
             );
+        }
+    }
+
+    #[test]
+    fn curated_technical_vocabulary_is_reachable_without_frequency_entries() {
+        let mut checked = 0;
+        technical_words().for_each_with_prefix("", |word| {
+            if word.len() <= 3 || !word.bytes().all(|c| c.is_ascii_lowercase()) {
+                return;
+            }
+            let prefix = &word[..3];
+            let all = completions_from(
+                prefix,
+                en_dict(),
+                en_freq(),
+                3,
+                30_000,
+                &[],
+                Ranking {
+                    all: true,
+                    ..Ranking::default()
+                },
+            );
+            assert!(all.iter().any(|offer| offer == word), "{prefix}: {word}");
+            checked += 1;
+        });
+        assert!(checked > 150, "curated coverage shrank: {checked}");
+    }
+
+    #[test]
+    fn full_pool_keeps_bounded_ranking_in_both_languages_and_recovers_hidden_choices() {
+        for (d, f, prefixes) in [
+            (
+                en_dict(),
+                en_freq(),
+                ["hel", "com", "unde", "differ", "devel"],
+            ),
+            (
+                crate::dictionary::he_dict(),
+                crate::dictionary::he_freq(),
+                ["שלו", "אמר", "מאחו", "משמעות", "פוליטי"],
+            ),
+        ] {
+            let mut recovered = 0;
+            for prefix in prefixes {
+                let bounded = completions_with(prefix, d, f, 3, 30_000);
+                let all = completions_from(
+                    prefix,
+                    d,
+                    f,
+                    3,
+                    30_000,
+                    &[],
+                    Ranking {
+                        all: true,
+                        ..Ranking::default()
+                    },
+                );
+                assert!(all.starts_with(&bounded), "{prefix}: {all:?}");
+                assert!(all.len() > bounded.len(), "{prefix}");
+                let unique: HashSet<_> = all.iter().collect();
+                assert_eq!(unique.len(), all.len(), "{prefix}");
+                f.for_each_with_prefix(prefix, |word, rank| {
+                    if rank <= 30_000
+                        && word.chars().count() > prefix.chars().count()
+                        && d.contains(word)
+                    {
+                        assert!(all.iter().any(|offer| offer == word), "{prefix}: {word}");
+                    }
+                });
+                recovered += all.len() - bounded.len();
+            }
+            assert!(recovered > 10);
         }
     }
 

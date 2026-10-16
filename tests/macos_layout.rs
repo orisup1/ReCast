@@ -21,7 +21,7 @@ enum LayoutSwitch {
 fn set_layout_cache(_: types::Language) {}
 
 #[cfg(target_os = "macos")]
-fn current_layout() -> Option<types::Language> {
+fn fresh_layout() -> Option<types::Language> {
     macos::query_layout()
 }
 

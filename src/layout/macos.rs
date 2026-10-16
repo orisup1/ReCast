@@ -73,7 +73,7 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
 
     // Already on the target layout. Uses the language-based detection so any
     // English/Hebrew *variant* counts.
-    if super::current_layout() == Some(lang) {
+    if super::fresh_layout() == Some(lang) {
         return LayoutSwitch::AlreadyThere;
     }
 

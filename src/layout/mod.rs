@@ -80,7 +80,16 @@ pub fn describe_backend() -> String {
 // enough that a manual layout change is picked up almost immediately, long
 // enough to absorb a burst of words. Our own `switch_layout_to` updates the
 // cache directly, so self-initiated switches are reflected with no staleness.
-static LAYOUT_CACHE: Mutex<Option<(Instant, Language)>> = Mutex::new(None);
+#[derive(Default)]
+struct LayoutCache {
+    value: Option<(Instant, Language)>,
+    revision: u64,
+}
+
+static LAYOUT_CACHE: Mutex<LayoutCache> = Mutex::new(LayoutCache {
+    value: None,
+    revision: 0,
+});
 const LAYOUT_TTL: Duration = Duration::from_millis(300);
 
 /// What happened when a correction asked for a layout.
@@ -129,24 +138,49 @@ impl LayoutSwitch {
 /// Best-effort current keyboard layout. `None` when it can't be determined;
 /// callers then fall back to a layout-agnostic decision.
 pub fn current_layout() -> Option<Language> {
-    if let Ok(guard) = LAYOUT_CACHE.lock() {
-        if let Some((t, l)) = *guard {
-            if t.elapsed() < LAYOUT_TTL {
-                return Some(l);
+    read_layout(&LAYOUT_CACHE, false, query_layout)
+}
+
+/// Confirm the live layout before reporting that a requested switch succeeded.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn fresh_layout() -> Option<Language> {
+    read_layout(&LAYOUT_CACHE, true, query_layout)
+}
+
+fn read_layout(
+    cache: &Mutex<LayoutCache>,
+    fresh: bool,
+    query: impl FnOnce() -> Option<Language>,
+) -> Option<Language> {
+    let revision = {
+        let mut guard = crate::types::lock_forgiving(cache);
+        if !fresh {
+            if let Some((time, lang)) = guard.value {
+                if time.elapsed() < LAYOUT_TTL {
+                    return Some(lang);
+                }
             }
         }
+        // Allocate before querying: a later confirmation must not be overtaken
+        // by an older query that happens to finish first.
+        guard.revision = guard.revision.wrapping_add(1);
+        guard.value = None;
+        guard.revision
+    };
+    let answer = query();
+    let mut guard = crate::types::lock_forgiving(cache);
+    if guard.revision != revision {
+        // A hotkey, watcher, or confirmed switch overtook this OS query.
+        return guard.value.map(|(_, lang)| lang);
     }
-    let fresh = query_layout();
-    if let Some(l) = fresh {
-        set_layout_cache(l);
-    }
-    fresh
+    guard.value = answer.map(|lang| (Instant::now(), lang));
+    answer
 }
 
 fn set_layout_cache(lang: Language) {
-    if let Ok(mut guard) = LAYOUT_CACHE.lock() {
-        *guard = Some((Instant::now(), lang));
-    }
+    let mut guard = crate::types::lock_forgiving(&LAYOUT_CACHE);
+    guard.revision = guard.revision.wrapping_add(1);
+    guard.value = Some((Instant::now(), lang));
 }
 
 /// Forget the cached layout, so the next question goes to the OS.
@@ -165,9 +199,9 @@ fn set_layout_cache(lang: Language) {
 /// does not need to: the cost of being wrong is one extra query.
 #[allow(dead_code)]
 pub fn invalidate() {
-    if let Ok(mut guard) = LAYOUT_CACHE.lock() {
-        *guard = None;
-    }
+    let mut guard = crate::types::lock_forgiving(&LAYOUT_CACHE);
+    guard.revision = guard.revision.wrapping_add(1);
+    guard.value = None;
 }
 
 #[cfg(target_os = "linux")]
@@ -263,15 +297,75 @@ mod tests {
     fn invalidating_sends_the_next_question_back_to_the_os() {
         set_layout_cache(Language::Hebrew);
         assert_eq!(
-            LAYOUT_CACHE.lock().unwrap().map(|(_, lang)| lang),
+            LAYOUT_CACHE.lock().unwrap().value.map(|(_, lang)| lang),
             Some(Language::Hebrew),
             "the cache holds what it was told"
         );
         invalidate();
         assert!(
-            LAYOUT_CACHE.lock().unwrap().is_none(),
+            LAYOUT_CACHE.lock().unwrap().value.is_none(),
             "a hand-switched layout must not be answered from the old cache"
         );
+    }
+
+    #[test]
+    fn fresh_queries_bypass_cached_answers_and_clear_unknown_layouts() {
+        let cache = Mutex::new(LayoutCache {
+            value: Some((Instant::now(), Language::English)),
+            revision: 0,
+        });
+        assert_eq!(
+            read_layout(&cache, false, || panic!("cached")),
+            Some(Language::English)
+        );
+        assert_eq!(
+            read_layout(&cache, true, || Some(Language::Hebrew)),
+            Some(Language::Hebrew)
+        );
+        assert_eq!(read_layout(&cache, true, || None), None);
+        assert!(cache.lock().unwrap().value.is_none());
+        assert_eq!(
+            read_layout(&cache, false, || Some(Language::English)),
+            Some(Language::English)
+        );
+    }
+
+    #[test]
+    fn an_overtaken_query_cannot_restore_an_obsolete_layout() {
+        for newer in [None, Some(Language::Hebrew)] {
+            let cache = Mutex::new(LayoutCache::default());
+            let answer = read_layout(&cache, false, || {
+                let mut guard = cache.lock().unwrap();
+                guard.revision += 1;
+                guard.value = newer.map(|lang| (Instant::now(), lang));
+                Some(Language::English)
+            });
+            assert_eq!(answer, newer);
+            assert_eq!(cache.lock().unwrap().value.map(|(_, lang)| lang), newer);
+        }
+    }
+
+    #[test]
+    fn a_fresh_query_cannot_be_satisfied_by_an_older_in_flight_answer() {
+        let cache = std::sync::Arc::new(Mutex::new(LayoutCache::default()));
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let older_cache = std::sync::Arc::clone(&cache);
+        let older = std::thread::spawn(move || {
+            read_layout(&older_cache, false, || {
+                started.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(3)).unwrap();
+                Some(Language::English)
+            })
+        });
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        let answer = read_layout(&cache, true, || {
+            release.send(()).unwrap();
+            assert_eq!(older.join().unwrap(), None);
+            Some(Language::Hebrew)
+        });
+        assert_eq!(answer, Some(Language::Hebrew));
+        assert_eq!(read_layout(&cache, false, || panic!("cache lost")), answer);
     }
 
     #[test]

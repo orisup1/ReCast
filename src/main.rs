@@ -134,14 +134,15 @@ scrambled, or if you want them faster and are willing to measure):
 
 Auto-complete:
   Default shortcuts (change in Settings or config.toml):
-  Tap Right Shift mid-word to finish it; tap again to cycle through the
-  next guesses, and once more to get back exactly what you typed.
+  Tap Right Shift before or after Space to complete the tracked word.
+  Four choices, then your original text; keep tapping for the next page.
+  Tracked trailing spaces survive every choice and undo.
   Abbreviations expand when a word is finished, and are offered by the
   first tap too; define them one per line as `abbr = expansion` in
   <config dir>/recast/abbrev.txt.
 
 Spelling suggestions:
-  Tap Left Shift mid-word to request alternatives; tap again to cycle and
+  Tap Left Shift before or after Space; tap again to cycle alternatives and
   return to your original text. Includes short and already valid words.
   This explicit gesture works when automatic spelling or completion is off.
 
