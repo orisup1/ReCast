@@ -1,0 +1,17 @@
+# Reviewed baseline changes; evaluation.tsv inputs and desired outputs stay frozen.
+# line<TAB>old baseline<TAB>new baseline<TAB>review reason
+12	inez	ines	Frequency evidence for the original competes with a replacement.
+16	nor	nour	A short unknown token is no longer changed merely because one candidate wins.
+18	sore	soren	Frequency evidence for the original competes with a replacement.
+23	wasting	wasmtime	Trusted compound components protect an intentional unknown tool name.
+50	enviroment	environment	Reviewed nonword spelling does not acquire trust from dictionary membership.
+51	enviroment	environment	Reviewed spelling repair composes with layout correction.
+66	priviledge	privilege	Reviewed nonword spelling does not acquire trust from dictionary membership.
+67	priviledge	privilege	Reviewed spelling repair composes with layout correction.
+70	resistence	resistance	Reviewed nonword spelling does not acquire trust from dictionary membership.
+71	resistence	resistance	Reviewed spelling repair composes with layout correction.
+72	succesful	successful	Reviewed nonword spelling does not acquire trust from dictionary membership.
+73	succesful	successful	Reviewed spelling repair composes with layout correction.
+98	necks,,	מקלדת	A duplicated Hebrew letter has a cheap repair inside the configured rank limit.
+99	necks,,	neks,,	Preserve ambiguous English punctuation instead of rewriting it from a truncated reading.
+110	וכשמקלדתת	וכשמקלדת	The duplicated-letter repair also supports ranked Hebrew prefix stems.

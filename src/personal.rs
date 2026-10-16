@@ -481,6 +481,16 @@ pub fn record_confusion(typed: &str, corrected: &str) {
 /// A snapshot keeps locks and file reads out of the spelling candidate loop.
 /// Only repeatedly retained pairs contribute; a single observation is not evidence.
 pub(crate) fn typo_counts() -> [u64; 3] {
+    typo_counts_with(crate::spell::typo_class)
+}
+
+/// Keep Hebrew and English channel evidence separate; their letter and
+/// repetition patterns are not interchangeable despite shared key geometry.
+pub(crate) fn hebrew_typo_counts() -> [u64; 3] {
+    typo_counts_with(crate::spell::hebrew::typo_class)
+}
+
+fn typo_counts_with(classify: fn(&str, &str) -> Option<usize>) -> [u64; 3] {
     let mut counts = [0u64; 3];
     if !enabled() {
         return counts;
@@ -491,7 +501,7 @@ pub(crate) fn typo_counts() -> [u64; 3] {
             for (corrected, evidence) in corrections {
                 let count = evidence.count_at(now);
                 if count >= 2 {
-                    if let Some(class) = crate::spell::typo_class(typed, corrected) {
+                    if let Some(class) = classify(typed, corrected) {
                         counts[class] = counts[class].saturating_add(count);
                     }
                 }

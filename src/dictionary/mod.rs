@@ -1062,7 +1062,17 @@ fn plan(
         // Compose both changes before injection, preserving one-step undo.
         if lang == Language::English && !layout_only {
             if let Some(spelling) = plan_spelling(
-                word_en, word_he, current, case, en_dict, he_dict, en_freq, context, details,
+                en,
+                he,
+                current,
+                Some(lang),
+                case,
+                en_dict,
+                he_dict,
+                en_freq,
+                he_freq,
+                context,
+                details,
             ) {
                 return Some(spelling);
             }
@@ -1083,40 +1093,9 @@ fn plan(
         None
     } else {
         details.push_str("\nNo layout change passed its confidence checks (word protection, short-word frequency, and language history).");
-        if current == Some(Language::Hebrew) {
-            if let Some(text) = crate::spell::hebrew::correct(word_he, he_dict, he_freq, context) {
-                details.push_str("\nHebrew spelling passed the candidate confidence margin.");
-                return Some(Plan::HebrewSpell { text });
-            }
-        }
-        let english = plan_spelling(
-            word_en, word_he, current, case, en_dict, he_dict, en_freq, context, details,
-        );
-        if english.is_some() {
-            return english;
-        }
-        if current == Some(Language::English)
-            && case != Case::Upper
-            && !valid_loose(word_en, Language::English, en_dict, he_dict)
-            && en_freq.rank(word_en).is_none_or(|rank| rank > 20_000)
-            && !crate::complete::ignored(word_en)
-            && !crate::complete::learned(word_en)
-            && en.full.chars().count() == he.full.chars().count()
-        {
-            // Source punctuation may occupy a Hebrew letter key (period = ץ).
-            let end = he
-                .full
-                .char_indices()
-                .nth(en.word.chars().count())
-                .map_or(he.full.len(), |(index, _)| index);
-            if let Some(text) =
-                crate::spell::hebrew::correct(&he.full[..end], he_dict, he_freq, context)
-            {
-                details.push_str("\nThe English reading is unprotected and no confident English repair won; Hebrew spelling passed its existing confidence gates.");
-                return Some(compose_spelling(Language::English, Language::Hebrew, text));
-            }
-        }
-        None
+        plan_spelling(
+            en, he, current, None, case, en_dict, he_dict, en_freq, he_freq, context, details,
+        )
     }
 }
 
@@ -1161,31 +1140,20 @@ fn learned_plan(
     None
 }
 
-/// Second pipeline: neither exact layout reading matched, but the English
-/// reading may be a misspelling.
-///
-/// With a known English layout this is an ordinary spelling rewrite. With a
-/// known Hebrew layout, a confident English correction composes with a switch
-/// to English. An unknown live layout remains hands-off because we cannot know
-/// whether a switch is required.
-///
-/// The Hebrew reading is also required to be nothing at all, loose match
-/// included. A key sequence that reads as a prefixed Hebrew word is the layout
-/// pipeline's business (it just wasn't confident enough to switch); rewriting it
-/// as an English word would be the two pipelines fighting over one word.
-/// An all-caps token is an acronym (`NASA`, `HTTP`, a ticker, an env var), not
-/// a misspelling — the dictionary has no opinion on it and the speller would
-/// happily turn it into the nearest common word. Case tracking is what makes
-/// this distinction visible at all.
+/// Evaluate both spelling hypotheses before choosing a layout. A rejected
+/// candidate remains evidence of ambiguity; failure to accept a Hebrew repair
+/// is not evidence that an English repair is correct (or vice versa).
 #[allow(clippy::too_many_arguments)]
 fn plan_spelling(
-    full_en: &str,
-    full_he: &str,
+    en: Reading,
+    he: Reading,
     current: Option<Language>,
+    confirmed_layout: Option<Language>,
     case: Case,
     en_dict: Dict,
     he_dict: Dict,
     en_freq: Freq,
+    he_freq: Freq,
     context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
 ) -> Option<Plan> {
@@ -1193,27 +1161,145 @@ fn plan_spelling(
         details.push_str("\nSpelling skipped: the current keyboard layout is unknown.");
         return None;
     };
-    if case == Case::Upper {
-        details.push_str("\nALL CAPS tokens are protected from spelling changes.");
+    let english = if case == Case::Upper {
+        crate::spell::Assessment::unchanged(
+            "ALL CAPS tokens are protected from English spelling changes.",
+        )
+    } else if crate::complete::ignored(en.word) || crate::complete::learned(en.word) {
+        crate::spell::Assessment::unchanged(
+            "Spelling skipped: the English reading is an ignored word or a learned undo exception.",
+        )
+    } else if valid_loose(he.word, Language::Hebrew, en_dict, he_dict) {
+        crate::spell::Assessment::unchanged(
+            "Spelling skipped: the Hebrew reading is a recognized word or prefixed form.",
+        )
+    } else {
+        crate::spell::assess(en.word, en_dict, en_freq, context)
+    };
+
+    let hebrew_allowed = current == Language::Hebrew
+        || (case != Case::Upper
+            && !valid_loose(en.word, Language::English, en_dict, he_dict)
+            && en_freq.rank(en.word).is_none_or(|rank| rank > 20_000)
+            && !crate::complete::ignored(en.word)
+            && !crate::complete::learned(en.word)
+            && en.full.chars().count() == he.full.chars().count());
+    // Preserve punctuation that was actually typed in English. A period key can
+    // represent the Hebrew letter ץ; it must not silently become part of a repair.
+    let hebrew_word = if current == Language::English {
+        let end = he
+            .full
+            .char_indices()
+            .nth(en.word.chars().count())
+            .map_or(he.full.len(), |(index, _)| index);
+        &he.full[..end]
+    } else {
+        he.word
+    };
+    let hebrew = if hebrew_allowed {
+        crate::spell::hebrew::assess(hebrew_word, he_dict, he_freq, context)
+    } else {
+        crate::spell::Assessment::unchanged("Hebrew spelling skipped: the English source is protected or the layout readings do not cover the same keys.")
+    };
+    details.push_str(&format!("\n{}\n{}", english.details, hebrew.details));
+    let omitted_letters = if current == Language::Hebrew {
+        he.word
+            .chars()
+            .count()
+            .saturating_sub(en.word.chars().count())
+    } else {
+        0
+    };
+    // An exact layout decision has already passed its word, frequency, and
+    // history guards. Its target supplies the prior for a composed spelling fix.
+    let scoring_layout = confirmed_layout.unwrap_or(current);
+    let omitted_letters = if scoring_layout == current {
+        omitted_letters
+    } else {
+        0
+    };
+    let phrase_layout = context.and_then(|context| {
+        let previous = context.previous_word()?;
+        let supported = |assessment: &crate::spell::Assessment| {
+            assessment
+                .best
+                .as_ref()
+                .is_some_and(|best| context.boost(&best.text) >= 2.0)
+        };
+        if previous.chars().all(|c| c.is_ascii_lowercase())
+            && supported(&english)
+            && !supported(&hebrew)
+        {
+            Some(Language::English)
+        } else if previous.chars().all(|c| ('א'..='ת').contains(&c))
+            && supported(&hebrew)
+            && !supported(&english)
+        {
+            Some(Language::Hebrew)
+        } else {
+            None
+        }
+    });
+    let lang = spelling_language(
+        scoring_layout,
+        &english,
+        &hebrew,
+        omitted_letters,
+        phrase_layout,
+        details,
+    )?;
+    let text = if lang == Language::English {
+        english.correction?
+    } else {
+        hebrew.correction?
+    };
+    Some(compose_spelling(current, lang, text))
+}
+
+fn spelling_language(
+    current: Language,
+    english: &crate::spell::Assessment,
+    hebrew: &crate::spell::Assessment,
+    omitted_letters: usize,
+    phrase_layout: Option<Language>,
+    details: &mut String,
+) -> Option<Language> {
+    const LAYOUT_COST: f32 = 90.0;
+    const REQUIRED_LEAD: f32 = 20.0;
+    let (native, alternate) = if current == Language::English {
+        (english, hebrew)
+    } else {
+        (hebrew, english)
+    };
+    let layout_cost = if phrase_layout == Some(current.other()) {
+        -LAYOUT_COST
+    } else {
+        LAYOUT_COST
+    };
+    let alternate_cost = layout_cost + omitted_letters as f32 * 100.0;
+    if let (Some(native_best), Some(alternate_best)) = (&native.best, &alternate.best) {
+        let alternate_score = alternate_best.score + alternate_cost;
+        details.push_str(&format!(
+            "\nBilingual spelling: current-layout candidate {:?}: score {:.2}; alternate {:?}: score {:.2} plus layout/word-boundary cost {alternate_cost:.2} ({omitted_letters} source letter keys read as punctuation). Phrase language prior: {phrase_layout:?}. Required lead: {REQUIRED_LEAD:.2}.", native_best.text, native_best.score, alternate_best.text, alternate_best.score
+        ));
+        if native_best.score + REQUIRED_LEAD <= alternate_score {
+            if native.correction.is_some() {
+                return Some(current);
+            }
+            details.push_str("\nLeft unchanged: the current-language candidate vetoed a layout switch but did not pass its own confidence gates.");
+            return None;
+        }
+        if alternate_score + REQUIRED_LEAD <= native_best.score && alternate.correction.is_some() {
+            return Some(current.other());
+        }
+        details.push_str("\nLeft unchanged: competing language repairs remain ambiguous, including candidates rejected by their individual confidence gates.");
         return None;
     }
-    // A word the user has declared theirs is never second-guessed — whether
-    // they declared it by writing it in `ignore.txt` or by taking the same
-    // correction back twice.
-    if crate::complete::ignored(full_en) || crate::complete::learned(full_en) {
-        details.push_str("\nSpelling skipped: the English reading is an ignored word or a learned undo exception.");
-        return None;
+    if native.correction.is_some() {
+        Some(current)
+    } else {
+        alternate.correction.as_ref().map(|_| current.other())
     }
-    if valid_loose(full_he, Language::Hebrew, en_dict, he_dict) {
-        details.push_str(
-            "\nSpelling skipped: the Hebrew reading is a recognized word or prefixed form.",
-        );
-        return None;
-    }
-    let assessment = crate::spell::assess(full_en, en_dict, en_freq, context);
-    details.push_str(&format!("\n{}", assessment.details));
-    let text = assessment.correction?;
-    Some(compose_spelling(current, Language::English, text))
 }
 
 /// Turn any accepted spelling result into the action required by the
@@ -2187,6 +2273,135 @@ mod tests {
         accuracy_corpus(
             "regression",
             include_str!("../../tests/data/corrections.tsv"),
+            "",
+        );
+    }
+
+    #[test]
+    fn bilingual_spelling_keeps_rejected_candidates_and_word_boundaries() {
+        let assessment = |score: f32, accepted: bool| crate::spell::Assessment {
+            correction: accepted.then(|| "candidate".into()),
+            details: String::new(),
+            best: Some(crate::spell::Candidate {
+                text: "candidate".into(),
+                score,
+                cost: 100,
+                rank: 100,
+            }),
+        };
+        let english = assessment(120.0, true);
+        let mut details = String::new();
+        assert_eq!(
+            spelling_language(
+                Language::Hebrew,
+                &english,
+                &assessment(140.0, false),
+                0,
+                None,
+                &mut details
+            ),
+            None
+        );
+        assert!(details.contains("vetoed a layout switch"));
+        assert_eq!(
+            spelling_language(
+                Language::Hebrew,
+                &english,
+                &assessment(350.0, false),
+                0,
+                None,
+                &mut details
+            ),
+            Some(Language::English)
+        );
+        assert_eq!(
+            spelling_language(
+                Language::Hebrew,
+                &english,
+                &assessment(350.0, false),
+                2,
+                None,
+                &mut details
+            ),
+            None,
+            "punctuation in the alternate reading must not hide source letter keys"
+        );
+        assert_eq!(
+            spelling_language(
+                Language::Hebrew,
+                &english,
+                &assessment(140.0, false),
+                0,
+                Some(Language::English),
+                &mut details
+            ),
+            Some(Language::English)
+        );
+        assert_eq!(
+            spelling_language(
+                Language::Hebrew,
+                &assessment(60.0, true),
+                &assessment(150.0, true),
+                0,
+                None,
+                &mut details
+            ),
+            None,
+            "a tie between languages is not an accepted repair"
+        );
+        assert_eq!(
+            spelling_language(
+                Language::English,
+                &assessment(140.0, false),
+                &assessment(120.0, true),
+                0,
+                None,
+                &mut details
+            ),
+            None,
+            "the ambiguity rule is symmetric"
+        );
+    }
+
+    #[test]
+    fn spelling_trust_preserves_permissive_layout_dictionary_membership() {
+        let en = dict(&["enviroment", "environment", "calender"]);
+        assert!(valid_strict("enviroment", Language::English, en, dict(&[])));
+        for word in ["environment", "calender"] {
+            assert!(valid_strict(word, Language::English, en, dict(&[])));
+        }
+        let check = |layout_only| {
+            plan(
+                Reading::of("enviroment"),
+                Reading::of("קמהןרםצקמא"),
+                &[],
+                &[],
+                10,
+                Some(Language::Hebrew),
+                Run::default(),
+                Case::Lower,
+                en,
+                dict(&[]),
+                freq(&[("environment", 3_000)]),
+                nofreq(),
+                layout_only,
+                None,
+                &mut String::new(),
+            )
+        };
+        assert_eq!(
+            check(true),
+            Some(Plan::Switch {
+                lang: Language::English,
+                start: 0
+            })
+        );
+        assert_eq!(
+            check(false),
+            Some(Plan::SwitchAndSpell {
+                lang: Language::English,
+                text: "environment".into()
+            })
         );
     }
 
@@ -2195,10 +2410,34 @@ mod tests {
         accuracy_corpus(
             "independent",
             include_str!("../../tests/data/evaluation.tsv"),
+            include_str!("../../tests/data/evaluation_updates.tsv"),
         );
     }
 
-    fn accuracy_corpus(name: &str, corpus: &str) {
+    fn accuracy_corpus(name: &str, corpus: &str, baseline_updates: &str) {
+        // Frozen inputs and desired outputs never change when a fix lands.
+        // Reviewed baseline changes are explicit, exact, and fail if stale.
+        let mut updates = std::collections::BTreeMap::new();
+        for row in baseline_updates
+            .lines()
+            .filter(|row| !row.is_empty() && !row.starts_with('#'))
+        {
+            let fields: Vec<_> = row.splitn(4, '\t').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "baseline updates need line, old, new, reason"
+            );
+            assert!(
+                !fields[3].is_empty(),
+                "a baseline update needs a review reason"
+            );
+            let line: usize = fields[0].parse().expect("baseline update line number");
+            assert!(
+                updates.insert(line, (fields[1], fields[2])).is_none(),
+                "duplicate update for line {line}"
+            );
+        }
         // Exercise the planner with explicit layouts: this check never switches
         // the OS keyboard or depends on whichever layout the developer uses.
         let mut unchanged = 0;
@@ -2308,14 +2547,21 @@ mod tests {
             );
             // Desired results still count toward accuracy. A documented existing
             // failure gets an exact baseline so new damage cannot hide in a budget.
-            let baseline = fields
+            let mut baseline = fields
                 .get(4)
                 .copied()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(expected);
+            if let Some((old, new)) = updates.remove(&(line + 1)) {
+                assert_eq!(old, baseline, "stale baseline update for line {}", line + 1);
+                assert_ne!(old, new, "a baseline update must change behavior");
+                assert!(new == expected || (old != before && new == before), "baseline updates may only resolve errors or replace a wrong correction with abstention");
+                baseline = new;
+            }
             if after != baseline {
                 regressions.push(format!(
-                    "{detail}; baseline {baseline:?} (remove baseline if fixed)"
+                    "{detail}; baseline {baseline:?} (review baseline if fixed)\n{}",
+                    result.details
                 ));
             }
             if expected == before {
@@ -2332,6 +2578,10 @@ mod tests {
                 }
             }
         }
+        assert!(
+            updates.is_empty(),
+            "baseline updates referenced missing corpus rows: {updates:?}"
+        );
         assert!(
             unchanged > 0 && wanted > 0,
             "the corpus must test both protection and correction"

@@ -6,10 +6,28 @@ use crate::dictionary::{hebrew_stem, Dict, Freq};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+#[derive(Clone, Copy)]
 enum Request {
     Automatic,
     Completion,
     Correction,
+}
+
+const MIN_SCORE_GAP: f32 = 20.0;
+const PREFIX_INFERENCE_COST: u32 = 12;
+
+struct RankedCandidate {
+    evidence: super::Candidate,
+    stem: Option<String>,
+    context_discount: f32,
+    learned_discount: f32,
+}
+
+#[derive(Default)]
+struct SearchResult {
+    candidates: Vec<RankedCandidate>,
+    rejected_rank: Vec<(String, u32, u32)>,
+    protection: Option<&'static str>,
 }
 
 /// Search one Unicode-letter edit, including transpositions. Prefix forms reuse
@@ -58,29 +76,116 @@ pub(crate) fn correction_suggestions(
 
 /// Automatic repairs require a clear score lead; ambiguous offers remain manual.
 /// Bound phrase influence so context cannot manufacture a confident correction.
+#[cfg(test)]
 pub(crate) fn correct(
     word: &str,
     dict: Dict,
     freq: Freq,
     context: Option<&PhraseContext>,
 ) -> Option<String> {
-    let mut candidates = ranked_candidates(
-        word,
-        dict,
-        freq,
-        context,
-        Request::Automatic,
-        &Config::global(),
-    )
-    .into_iter();
-    let (best, score) = candidates.next()?;
-    if candidates
-        .next()
-        .is_some_and(|(_, runner_up)| runner_up - score < 20.0)
-    {
-        return None;
+    assess(word, dict, freq, context).correction
+}
+
+pub(crate) fn assess(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+) -> super::Assessment {
+    assess_with(word, dict, freq, context, &Config::global())
+}
+
+fn assess_with(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+    config: &Config,
+) -> super::Assessment {
+    let result = search(word, dict, freq, context, Request::Automatic, config);
+    if let Some(reason) = result.protection {
+        return super::Assessment::unchanged(reason);
     }
-    Some(best)
+    let mut details = format!(
+        "Hebrew spelling candidates (lower score is better; scores are not confidence percentages):\nLimits: one letter edit, configured maximum frequency rank {}; edits without a keyboard or repetition explanation are limited to rank 20000.", config.spell_max_rank
+    );
+    for (text, rank, cost) in &result.rejected_rank {
+        details.push_str(&format!(
+            "\nRejected by frequency-rank gate: {text}: frequency rank {rank}, edit cost {cost}."
+        ));
+    }
+    let Some(best) = result.candidates.first() else {
+        details.push_str(
+            "\nNo Hebrew candidate passed the dictionary, final-letter, and frequency-rank gates.",
+        );
+        return super::Assessment::unchanged(&details);
+    };
+    for candidate in result.candidates.iter().take(2) {
+        let evidence = &candidate.evidence;
+        details.push_str(&format!(
+            "\n  {}: score {:.2}, edit cost {}, frequency rank {}; context discount {:.2}; learned edit discount {:.2}.",
+            evidence.text, evidence.score, evidence.cost, evidence.rank, candidate.context_discount, candidate.learned_discount
+        ));
+        if let Some(stem) = &candidate.stem {
+            details.push_str(&format!(
+                "\n  Prefix inference reused ranked dictionary stem {stem:?}; cost surcharge {PREFIX_INFERENCE_COST}."
+            ));
+        }
+    }
+    let clear_gap = result
+        .candidates
+        .get(1)
+        .is_none_or(|second| second.evidence.score - best.evidence.score >= MIN_SCORE_GAP);
+    if let Some(second) = result.candidates.get(1) {
+        details.push_str(&format!(
+            "\nScore gap: {:.2}; required minimum: {MIN_SCORE_GAP:.2}.",
+            second.evidence.score - best.evidence.score
+        ));
+    }
+    // An unranked but valid word beneath a repeated key is another plausible
+    // original. Do not let a frequent neighbor substitute for that uncertainty.
+    let keep_cost = if unranked_repeat_base(word, dict, freq) {
+        super::COST_DOUBLE
+    } else {
+        super::COST_EDIT
+    };
+    let keep_score = super::score(keep_cost, config.spell_max_rank, word);
+    let beats_original = keep_score - best.evidence.score >= MIN_SCORE_GAP;
+    details.push_str(&format!(
+        "\nKeep original: score {keep_score:.2}; replacement lead {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", keep_score - best.evidence.score
+    ));
+    let accepted = clear_gap && beats_original;
+    details.push_str(if accepted {
+        "\nAccepted the best Hebrew spelling candidate."
+    } else if !clear_gap {
+        "\nLeft unchanged: the leading Hebrew candidates are too close in score."
+    } else {
+        "\nLeft unchanged: the Hebrew candidate did not overcome keeping the original token."
+    });
+    super::Assessment {
+        correction: accepted.then(|| best.evidence.text.clone()),
+        details,
+        best: Some(best.evidence.clone()),
+    }
+}
+
+fn unranked_repeat_base(word: &str, dict: Dict, freq: Freq) -> bool {
+    let letters: Vec<_> = word.chars().collect();
+    letters.windows(2).enumerate().any(|(index, pair)| {
+        if pair[0] != pair[1] {
+            return false;
+        }
+        let base: String = letters[..index]
+            .iter()
+            .chain(&letters[index + 1..])
+            .collect();
+        let stem = if dict.contains(&base) {
+            Some(base.as_str())
+        } else {
+            hebrew_stem(&base, dict)
+        };
+        stem.is_some_and(|stem| freq.rank(stem).is_none())
+    })
 }
 
 fn ranked_candidates(
@@ -91,10 +196,27 @@ fn ranked_candidates(
     request: Request,
     config: &Config,
 ) -> Vec<(String, f32)> {
+    search(word, dict, freq, context, request, config)
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.evidence.text, candidate.evidence.score))
+        .collect()
+}
+
+fn search(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+    request: Request,
+    config: &Config,
+) -> SearchResult {
+    let mut result = SearchResult::default();
     let automatic = matches!(request, Request::Automatic);
     let explicit = matches!(request, Request::Correction);
     let Some(letters) = spelling_letters(word, !automatic) else {
-        return Vec::new();
+        result.protection = Some("Hebrew spelling requires Hebrew letters; automatic repairs protect attached marks, quotes, and internal punctuation.");
+        return result;
     };
     let plain: String = letters.iter().map(|(letter, _)| letter).collect();
     let min_len = if explicit {
@@ -102,71 +224,112 @@ fn ranked_candidates(
     } else {
         config.spell_min_len.max(if automatic { 4 } else { 3 })
     };
-    let max_rank = if explicit {
-        50_000
-    } else {
-        config.spell_max_rank.min(20_000)
-    };
-    if (!explicit && (!config.spell_enabled || config.spell_max_dist == 0))
-        || !(min_len..=24).contains(&letters.len())
-        || (!explicit
-            && (dict.contains(word)
-                || dict.contains(&plain)
-                || hebrew_stem(&plain, dict).is_some()
-                || crate::complete::ignored(word)
-                || crate::complete::learned(word)
-                || crate::complete::suppressed(word)))
-    {
-        return Vec::new();
+    if !explicit && (!config.spell_enabled || config.spell_max_dist == 0) {
+        result.protection =
+            Some("Hebrew spelling is disabled by the spelling setting or edit-distance limit.");
+        return result;
     }
-    let mut candidates = HashMap::<String, f32>::new();
+    if !(min_len..=24).contains(&letters.len()) {
+        result.protection = Some("The word is outside the configured Hebrew spelling length limits (at least four letters for automatic repairs, at most 24).");
+        return result;
+    }
+    if !explicit
+        && (dict.contains(word) || dict.contains(&plain) || hebrew_stem(&plain, dict).is_some())
+    {
+        result.protection = Some("Protected Hebrew dictionary word or recognized prefix form.");
+        return result;
+    }
+    if !explicit
+        && (crate::complete::ignored(word)
+            || crate::complete::learned(word)
+            || crate::complete::suppressed(word))
+    {
+        result.protection = Some("Protected Hebrew word: saved word rule or undo exception.");
+        return result;
+    }
+    let mut candidates = HashMap::<String, RankedCandidate>::new();
+    let typo_counts = crate::personal::hebrew_typo_counts();
     let mut consider = |candidate: Vec<(char, String)>, cost: u32| {
         let chars: Vec<char> = candidate.iter().map(|(letter, _)| *letter).collect();
         let text: String = chars.iter().collect();
         if text == plain || !valid_finals(&chars) {
             return;
         }
-        let rank = if dict.contains(&text) {
-            freq.rank(&text)
+        let stem = if dict.contains(&text) {
+            None
         } else {
-            hebrew_stem(&text, dict).and_then(|stem| freq.rank(stem))
+            hebrew_stem(&text, dict)
         };
-        let Some(rank) = rank.filter(|rank| *rank <= max_rank) else {
+        let Some(rank) = freq
+            .rank(stem.unwrap_or(&text))
+            .filter(|_| dict.contains(&text) || stem.is_some())
+        else {
             return;
         };
+        let max_rank = if explicit {
+            50_000
+        } else if automatic && cost <= super::COST_ADJACENT_DIAG {
+            config.spell_max_rank
+        } else {
+            config.spell_max_rank.min(20_000)
+        };
+        if rank > max_rank {
+            if !result.rejected_rank.iter().any(|(word, ..)| word == &text) {
+                result.rejected_rank.push((text, rank, cost));
+                result
+                    .rejected_rank
+                    .sort_by(|a, b| (a.1, a.2, &a.0).cmp(&(b.1, b.2, &b.0)));
+                result.rejected_rank.truncate(3);
+            }
+            return;
+        }
         let discount = context.map_or(0.0, |context| 20.0 * context.boost(&text).ln() as f32);
-        let score = super::score(cost, rank, &text)
-            - if automatic {
-                discount.min(super::MAX_AUTOMATIC_CONTEXT_DISCOUNT)
+        let discount = if automatic {
+            discount.min(super::MAX_AUTOMATIC_CONTEXT_DISCOUNT)
+        } else {
+            discount
+        };
+        let cost = cost
+            + if stem.is_some() {
+                PREFIX_INFERENCE_COST
             } else {
-                discount
+                0
             };
+        let learned_discount = super::class_discount(typo_class(&plain, &text), typo_counts);
+        let score = super::score(cost, rank, &text) - discount - learned_discount;
         let visible: String = candidate
             .into_iter()
             .map(|(letter, marks)| format!("{letter}{marks}"))
             .collect();
-        candidates
-            .entry(visible)
-            .and_modify(|old| *old = old.min(score))
-            .or_insert(score);
+        let candidate = RankedCandidate {
+            evidence: super::Candidate {
+                text: visible.clone(),
+                score,
+                cost,
+                rank,
+            },
+            stem: stem.map(str::to_owned),
+            context_discount: discount,
+            learned_discount,
+        };
+        if candidates
+            .get(&visible)
+            .is_none_or(|old| score < old.evidence.score)
+        {
+            candidates.insert(visible, candidate);
+        }
     };
     for index in 0..letters.len() {
         // Never delete an attached mark or quote along with its letter.
         if letters[index].1.is_empty() {
             let mut deleted = letters.clone();
             deleted.remove(index);
-            consider(deleted, vowel_cost(letters[index].0));
+            consider(deleted, deletion_cost(&letters, index));
         }
         for letter in 'א'..='ת' {
             let mut replaced = letters.clone();
             replaced[index].0 = letter;
-            // Neighbor weighting starts in manual offers; automatic costs stay calibrated.
-            let cost = if automatic && medial(letters[index].0) != medial(letter) {
-                100
-            } else {
-                substitution_cost(letters[index].0, letter)
-            };
-            consider(replaced, cost);
+            consider(replaced, substitution_cost(letters[index].0, letter));
         }
         if index + 1 < letters.len() {
             let mut swapped = letters.clone();
@@ -178,12 +341,76 @@ fn ranked_candidates(
         for letter in 'א'..='ת' {
             let mut inserted = letters.clone();
             inserted.insert(index, (letter, String::new()));
-            consider(inserted, vowel_cost(letter));
+            let repeated = index.checked_sub(1).is_some_and(|i| letters[i].0 == letter)
+                || letters.get(index).is_some_and(|next| next.0 == letter);
+            consider(
+                inserted,
+                if repeated {
+                    super::COST_DOUBLE
+                } else {
+                    vowel_cost(letter)
+                },
+            );
         }
     }
-    let mut candidates: Vec<_> = candidates.into_iter().collect();
-    candidates.sort_by(|(a, x), (b, y)| x.total_cmp(y).then_with(|| a.cmp(b)));
-    candidates
+    result.candidates = candidates.into_values().collect();
+    result.candidates.sort_by(|a, b| {
+        a.evidence
+            .score
+            .total_cmp(&b.evidence.score)
+            .then_with(|| a.evidence.text.cmp(&b.evidence.text))
+    });
+    result
+}
+
+fn deletion_cost(letters: &[(char, String)], index: usize) -> u32 {
+    let letter = letters[index].0;
+    let neighbors = index
+        .checked_sub(1)
+        .into_iter()
+        .chain((index + 1 < letters.len()).then_some(index + 1));
+    if neighbors.clone().any(|i| letters[i].0 == letter) {
+        super::COST_DOUBLE
+    } else if neighbors
+        .into_iter()
+        .any(|i| substitution_cost(letter, letters[i].0) <= super::COST_ADJACENT_DIAG)
+    {
+        vowel_cost(letter).min(super::COST_STRAY_KEY)
+    } else {
+        vowel_cost(letter)
+    }
+}
+
+/// Only exact one-edit pairs train the channel. Marks, mixed scripts, and
+/// multi-edit corrections cannot supply reliable keyboard-class evidence.
+pub(crate) fn typo_class(typed: &str, corrected: &str) -> Option<usize> {
+    if typed.is_empty()
+        || corrected.is_empty()
+        || !typed
+            .chars()
+            .chain(corrected.chars())
+            .all(|c| ('א'..='ת').contains(&c))
+    {
+        return None;
+    }
+    let (a, b): (Vec<_>, Vec<_>) = (typed.chars().collect(), corrected.chars().collect());
+    let prefix = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
+    let (a, b) = (&a[prefix..], &b[prefix..]);
+    if a.len() == b.len() {
+        if a.len() >= 2 && a[0] == b[1] && a[1] == b[0] && a[2..] == b[2..] {
+            return Some(0);
+        }
+        if !a.is_empty()
+            && a[1..] == b[1..]
+            && medial(a[0]) != medial(b[0])
+            && substitution_cost(a[0], b[0]) <= super::COST_ADJACENT_DIAG
+        {
+            return Some(1);
+        }
+    } else if (a.len() == b.len() + 1 && a[1..] == *b) || (b.len() == a.len() + 1 && *a == b[1..]) {
+        return Some(2);
+    }
+    None
 }
 
 pub(crate) fn is_mark(letter: char) -> bool {
@@ -265,6 +492,139 @@ fn valid_finals(word: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cheap_hebrew_repairs_use_the_configured_rank_ceiling() {
+        let mut config = Config::global();
+        config.spell_enabled = true;
+        config.spell_min_len = 4;
+        config.spell_max_dist = 1;
+        config.spell_max_rank = 40_000;
+        let d = Dict::of(&["מסמך"]);
+        let f = Freq::of(&[("מסמך", 35_000)]);
+        let repaired = assess_with("מסמךך", d, f, None, &config);
+        assert_eq!(
+            repaired.correction.as_deref(),
+            Some("מסמך"),
+            "{}",
+            repaired.details
+        );
+        assert!(repaired.details.contains("edit cost 55"));
+        let rejected = assess_with("מסמז", d, f, None, &config);
+        assert_eq!(
+            rejected.correction, None,
+            "an arbitrary substitution retains the tighter gate"
+        );
+        assert!(rejected
+            .details
+            .contains("Rejected by frequency-rank gate: מסמך"));
+        assert_eq!(
+            assess_with(
+                "שלופ",
+                Dict::of(&["שלום"]),
+                Freq::of(&[("שלום", 30_000)]),
+                None,
+                &config
+            )
+            .correction
+            .as_deref(),
+            Some("שלום")
+        );
+        config.spell_max_rank = 30_000;
+        let rejected = assess_with("מסמךך", d, f, None, &config);
+        assert_eq!(rejected.correction, None);
+        assert!(rejected.details.contains("frequency rank 35000"));
+        config.spell_max_dist = 0;
+        assert!(assess_with("מסמךך", d, f, None, &config)
+            .details
+            .contains("disabled"));
+    }
+
+    #[test]
+    fn a_repeated_key_does_not_justify_an_unrelated_frequent_neighbor() {
+        let assessment = assess(
+            "מחחב",
+            Dict::of(&["מחב", "מיחב"]),
+            Freq::of(&[("מיחב", 3_000)]),
+            None,
+        );
+        assert_eq!(assessment.correction, None, "{}", assessment.details);
+        assert_eq!(assessment.best.unwrap().text, "מיחב");
+        assert!(assessment.details.contains("keeping the original token"));
+    }
+
+    #[test]
+    fn hebrew_assessments_explain_ambiguity_prefixes_and_protection() {
+        let ambiguous = assess(
+            "שלוב",
+            Dict::of(&["שלום", "שלוש"]),
+            Freq::of(&[("שלום", 100), ("שלוש", 100)]),
+            None,
+        );
+        assert_eq!(ambiguous.correction, None);
+        for evidence in [
+            "שלום: score",
+            "שלוש: score",
+            "Score gap:",
+            "required minimum: 20.00",
+            "Keep original:",
+        ] {
+            assert!(
+                ambiguous.details.contains(evidence),
+                "{}",
+                ambiguous.details
+            );
+        }
+        let prefixed = assess(
+            "במחבש",
+            Dict::of(&["מחשב"]),
+            Freq::of(&[("מחשב", 100)]),
+            None,
+        );
+        assert_eq!(prefixed.correction.as_deref(), Some("במחשב"));
+        assert!(prefixed.details.contains("ranked dictionary stem \"מחשב\""));
+        assert!(prefixed.details.contains("cost surcharge 12"));
+        assert!(assess("שלום", Dict::of(&["שלום"]), Freq::EMPTY, None)
+            .details
+            .contains("Protected Hebrew dictionary word"));
+        assert!(assess("שָלום", Dict::of(&["שלום"]), Freq::EMPTY, None)
+            .details
+            .contains("attached marks"));
+    }
+
+    #[test]
+    fn hebrew_learning_classifies_only_single_script_single_edit_pairs() {
+        for (typed, corrected, class) in [
+            ("מחבש", "מחשב", 0),
+            ("שלופ", "שלום", 1),
+            ("מסמךך", "מסמך", 2),
+            ("ספור", "סיפור", 2),
+        ] {
+            assert_eq!(typo_class(typed, corrected), Some(class), "{typed}");
+            assert_eq!(
+                super::super::class_discount(typo_class(typed, corrected), [1; 3]),
+                0.0
+            );
+            assert_eq!(
+                super::super::class_discount(typo_class(typed, corrected), [2; 3]),
+                4.0
+            );
+            assert_eq!(
+                super::super::class_discount(typo_class(typed, corrected), [u64::MAX; 3]),
+                super::super::MAX_TYPO_DISCOUNT
+            );
+        }
+        for (typed, corrected) in [
+            ("שלום", "שלום"),
+            ("שלומ", "שלום"),
+            ("מכחב", "מחשב"),
+            ("שָלום", "שלום"),
+            ("hello", "שלום"),
+            ("", "שלום"),
+        ] {
+            assert_eq!(typo_class(typed, corrected), None, "{typed}");
+        }
+    }
 
     #[test]
     fn keyboard_neighbors_rank_ahead_of_distant_substitutions() {

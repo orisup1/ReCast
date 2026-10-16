@@ -48,8 +48,13 @@ Spelling correction protects frequency-attested dictionary words, curated
 technical terms, ALL CAPS, and tokens containing
 digits or internal punctuation. It uses word frequency and weighted typo costs;
 the previous finished word can resolve close candidates using bounded phrase
-evidence. Unfamiliar names or jargon can still get unwanted fixes. When competing
-candidates remain too close, ReCast leaves the word unchanged. Undo, ignored words,
+evidence. Keeping the original token also competes with a replacement: frequency
+evidence, short unknown words, and trusted compound components can prevent an
+otherwise unique suggestion from winning. Reviewed nonword misspellings remain
+repairable even when the broad layout dictionary contains them; valid rare words
+and regional variants are not added to that reviewed list. Unfamiliar names or
+jargon can still get unwanted fixes. When competing candidates remain too close,
+ReCast leaves the word unchanged. Undo, ignored words,
 and Conservative spelling give you control.
 Navigation, mouse clicks, and focus changes cancel stale corrections where detected.
 
@@ -525,17 +530,31 @@ positions, and recognize the layout planner's supported prefix stacks. Candidate
 need a ranked dictionary word or stem. Existing words and saved exceptions are
 preserved; the spelling enable, minimum-length, and rank settings still apply.
 Automatic Hebrew corrections require at least four letters and a 20-point lead
-over the next candidate; phrase context contributes at most eight points.
-Manual Hebrew offers additionally favor neighboring physical keys, including
-letters on punctuation keys. Manual spelling search normalizes niqqud and Hebrew
+over both the next candidate and keeping the original; phrase context contributes
+at most eight points to candidate ranking. Neighboring physical keys and repeated
+letters receive lower costs. These cheap repairs use the configured spelling rank
+ceiling; speculative edits retain a ceiling of 20,000. Inferred prefixes receive
+a score surcharge rather than inheriting the stem's full confidence. Correction
+details show candidates, costs, frequency rejections, prefix evidence, learned
+discounts, and the keep-original comparison.
+Manual spelling search normalizes niqqud and Hebrew
 or ASCII quotes for lookup, preserving them attached to their original letters
 in offered repairs. A decorated letter cannot be deleted. Automatic Hebrew spelling
-keeps its original edit costs and accepts plain letters only. Live keyboard capture
+accepts plain letters only. Live keyboard capture
 still supports the existing unshifted Hebrew keymap; this does not add niqqud input
 capture or new Linux injection mappings.
 Ambiguous candidates remain available through the completion gesture. Hebrew
 repairs preserve the current layout and punctuation, replace only the changed
 suffix, and support the same undo and retained-correction learning as English.
+
+Before a combined layout and spelling repair, both language assessments compete.
+A candidate rejected by its own confidence gate can still veto an ambiguous switch.
+Reading source letter keys as alternate-language punctuation adds uncertainty;
+English punctuation is preserved when evaluating a Hebrew repair. Exact layout
+decisions retain their existing word, frequency, and history guards. A supported
+phrase in the preceding word's language can resolve the language choice, without
+bypassing either speller's acceptance gates. Scores are heuristics, not confidence
+percentages.
 
 When the current layout has no exact completion, known word, or explicit
 abbreviation, the completion gesture also checks the other layout. An exact
@@ -545,9 +564,10 @@ back or undo restores the original text and requests the original layout. A refu
 initial layout switch cancels insertion. No automatic layout change happens from
 these completion suggestions before the gesture.
 
-With personalization enabled, repeatedly retained English correction pairs also
+With personalization enabled, repeatedly retained English and Hebrew correction pairs also
 adjust the ranking cost of transpositions, neighboring-key substitutions, and
-missing letters. The discount is capped, does not widen edit-distance or frequency
+missing letters (including extra letters in Hebrew). Each language trains its own
+counts. The discount is capped at 15 score units, does not widen edit-distance or frequency
 limits, and never trains from a single observation. Undo withdraws one vote for the
 rejected correction, weakening its learned edit-class evidence.
 
@@ -599,6 +619,11 @@ the Hebrew and phrase changes, with exact baselines for existing failures. Expec
 results still count toward accuracy; a passing baseline test does not imply perfect
 correction. These synthetic cases are not a random sample of real user typing and
 must not be used to tune thresholds. The original regression corpus remains separate.
+Reviewed baseline changes are recorded separately in
+`tests/data/evaluation_updates.tsv`, leaving the frozen examples unchanged. Each
+update must name the exact old and new result and a review reason; stale updates,
+new errors, and unreviewed changes fail the test. Replacing a wrong correction
+with abstention is allowed only as an explicit update and still counts as a miss.
 
 Regenerate the measured phrase priors by downloading the two public archives named
 in `src/phrase_counts.tsv`, then running:

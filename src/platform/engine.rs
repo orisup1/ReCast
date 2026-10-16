@@ -2999,6 +2999,40 @@ mod tests {
         assert_eq!(crate::personal::typo_counts()[0], before + 2);
         crate::personal::reject_confusion("watre", "water");
         assert_eq!(crate::personal::typo_counts()[0], before);
+        let english_counts = crate::personal::typo_counts();
+        let hebrew_counts = crate::personal::hebrew_typo_counts();
+        let dict = crate::dictionary::Dict::of(&["מחשב"]);
+        let freq = crate::dictionary::Freq::of(&[("מחשב", 100)]);
+        let before_score = crate::spell::hebrew::assess("מחבש", dict, freq, None)
+            .best
+            .unwrap()
+            .score;
+        crate::personal::record_confusion("מחבש", "מחשב");
+        assert_eq!(crate::personal::hebrew_typo_counts(), hebrew_counts);
+        crate::personal::record_confusion("מחבש", "מחשב");
+        assert_eq!(
+            crate::personal::hebrew_typo_counts()[0],
+            hebrew_counts[0] + 2
+        );
+        assert_eq!(
+            crate::personal::typo_counts(),
+            english_counts,
+            "Hebrew votes must not alter the English channel"
+        );
+        let trained = crate::spell::hebrew::assess("מחבש", dict, freq, None);
+        assert!((before_score - trained.best.unwrap().score - 4.0).abs() < 0.001);
+        assert!(trained.details.contains("learned edit discount 4.00"));
+        crate::personal::reject_confusion("מחבש", "מחשב");
+        assert_eq!(crate::personal::hebrew_typo_counts(), hebrew_counts);
+        assert!(
+            (crate::spell::hebrew::assess("מחבש", dict, freq, None)
+                .best
+                .unwrap()
+                .score
+                - before_score)
+                .abs()
+                < 0.001
+        );
         for _ in 0..2 {
             crate::personal::record_confusion("recieve", "receive");
         }
@@ -3019,6 +3053,7 @@ mod tests {
             cfg.rule_stats_enabled = false;
         });
         assert_eq!(crate::personal::typo_counts(), [0; 3]);
+        assert_eq!(crate::personal::hebrew_typo_counts(), [0; 3]);
         let s = Session::new();
         s.type_text("keyb");
         s.tap(Simulated::SHIFT_RIGHT);

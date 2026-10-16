@@ -72,6 +72,7 @@
 //! never touches the OS.
 
 pub(crate) mod hebrew;
+mod lexicon;
 mod rules;
 
 use std::sync::OnceLock;
@@ -219,7 +220,11 @@ pub(crate) fn typo_class(typed: &str, corrected: &str) -> Option<usize> {
 const MAX_TYPO_DISCOUNT: f32 = 15.0;
 
 fn typo_discount(typed: &str, corrected: &str, counts: [u64; 3]) -> f32 {
-    typo_class(typed, corrected).map_or(0.0, |class| {
+    class_discount(typo_class(typed, corrected), counts)
+}
+
+fn class_discount(class: Option<usize>, counts: [u64; 3]) -> f32 {
+    class.map_or(0.0, |class| {
         if counts[class] < 2 {
             0.0
         } else {
@@ -300,17 +305,67 @@ pub(crate) fn correction_suggestions(
 }
 
 /// Result and evidence from one spelling search. No diagnostic replay is needed.
+#[derive(Clone, Debug)]
+pub(crate) struct Candidate {
+    pub text: String,
+    pub score: f32,
+    pub cost: u32,
+    pub rank: u32,
+}
+
 pub(crate) struct Assessment {
     pub correction: Option<String>,
     pub details: String,
+    /// Preserve the best rejected candidate for bilingual ambiguity checks.
+    pub best: Option<Candidate>,
 }
 
 impl Assessment {
-    fn unchanged(reason: &str) -> Self {
+    pub(crate) fn unchanged(reason: &str) -> Self {
         Self {
             correction: None,
             details: reason.into(),
+            best: None,
         }
+    }
+}
+
+/// Keeping the original is an action with its own evidence, not the absence of
+/// a second dictionary candidate. These are cost scores, not probabilities.
+fn keep_original(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    budget: u32,
+    max_rank: u32,
+    phrase_evidence: bool,
+) -> (f32, &'static str) {
+    if let Some(rank) = freq.rank(word) {
+        (
+            score(COST_DOUBLE, rank, word),
+            "the original is frequency-attested",
+        )
+    } else if let Some(rank) = lexicon::compound_rank(word, dict, freq) {
+        (
+            score(2 * COST_EDIT, rank, word),
+            "both compound components are trusted",
+        )
+    } else if word.len() <= 4
+        && word.bytes().any(is_vowel)
+        && !dict.contains(word)
+        && !phrase_evidence
+    {
+        // Short unknown words are also names and handles. A common, cheap slip
+        // can beat this score; a merely unique rare suggestion cannot.
+        (
+            score(COST_DOUBLE, 5_000, word),
+            "short unknown token protection",
+        )
+    } else {
+        (
+            score(budget, max_rank, word),
+            "the configured edit and rank budget",
+        )
     }
 }
 
@@ -382,11 +437,12 @@ fn assess_with_context(
         crate::dictionary::english_form(word).filter(|_| word.len() <= MAX_LEN)
     {
         let folded = word.replace('\'', "");
-        if en_dict.contains(stem)
-            || en_dict.contains(&folded)
-            || en_freq
-                .rank(&folded)
-                .is_some_and(|rank| rank <= max_rank.min(20_000))
+        if (lexicon::reviewed_misspelling(stem).is_none()
+            && (en_dict.contains(stem)
+                || en_dict.contains(&folded)
+                || en_freq
+                    .rank(&folded)
+                    .is_some_and(|rank| rank <= max_rank.min(20_000))))
             || crate::complete::ignored(stem)
             || crate::complete::learned(stem)
             || crate::complete::suppressed(stem)
@@ -403,6 +459,15 @@ fn assess_with_context(
                 .filter(|rank| *rank <= max_rank)
                 .map(|_| form)
         });
+        assessment.best = assessment.best.and_then(|mut best| {
+            let form = format!("{}{suffix}", best.text);
+            crate::dictionary::english_form_rank(&form, en_dict, en_freq)
+                .filter(|rank| *rank <= max_rank)
+                .map(|_| {
+                    best.text = form;
+                    best
+                })
+        });
         assessment.details.push_str("\nPreserved the apostrophe suffix and required dictionary and frequency evidence for the resulting form.");
         return assessment;
     }
@@ -417,6 +482,16 @@ fn assess_with_context(
         return Assessment {
             correction: Some("the".into()),
             details: "Recognized the curated transposition teh / the.".into(),
+            best: Some(Candidate {
+                text: "the".into(),
+                score: score(
+                    COST_TRANSPOSE,
+                    en_freq.rank("the").unwrap_or_default(),
+                    "the",
+                ),
+                cost: COST_TRANSPOSE,
+                rank: en_freq.rank("the").unwrap_or_default(),
+            }),
         };
     }
     let Some(mut budget) = budget_for(word, min_len, max_dist) else {
@@ -435,20 +510,42 @@ fn assess_with_context(
     } else {
         max_rank
     };
-    // Broad dictionaries include archaic forms and abbreviations that also
-    // look like everyday slips. Only reconsider unobserved entries, requiring
-    // a cheap edit into a very common word. Corpus-attested words and curated
-    // technical terms stay intact.
-    if en_dict.contains(word) {
-        if en_freq.rank(word).is_some()
-            || Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_tech.blob"))).contains(word)
-        {
+    // Layout dictionaries are intentionally permissive. Reviewed nonwords do
+    // not become trusted spellings merely because an imported list contains them.
+    match lexicon::trust(word, en_dict, en_freq) {
+        lexicon::Trust::Technical | lexicon::Trust::Attested => {
             return Assessment::unchanged(
                 "Protected dictionary word: attested frequency or curated technical term.",
             );
         }
-        budget = budget.min(COST_VOWEL);
-        max_rank = max_rank.min(1_000);
+        lexicon::Trust::ReviewedMisspelling(target) => {
+            let candidate = en_freq
+                .rank(target)
+                .filter(|_| en_dict.contains(target))
+                .and_then(|rank| {
+                    let cost =
+                        Dp::default().distance(word.as_bytes(), target.as_bytes(), budget)?;
+                    (rank <= rank_budget(cost, max_rank, word.len())).then(|| Candidate {
+                        text: target.into(),
+                        score: score(cost, rank, target),
+                        cost,
+                        rank,
+                    })
+                });
+            return match candidate {
+                Some(candidate) => Assessment {
+                    correction: Some(candidate.text.clone()),
+                    details: format!("Reviewed misspelling: {word} / {target}; dictionary membership does not confer spelling trust.\n  {target}: score {:.2}, edit cost {}, frequency rank {}.\nThe reviewed repair passed the configured length, edit, dictionary, and rank gates.", candidate.score, candidate.cost, candidate.rank),
+                    best: Some(candidate),
+                },
+                None => Assessment::unchanged("The reviewed spelling repair failed the configured edit, dictionary, or frequency-rank gate."),
+            };
+        }
+        lexicon::Trust::Unattested => {
+            budget = budget.min(COST_VOWEL);
+            max_rank = max_rank.min(1_000);
+        }
+        lexicon::Trust::Unknown => {}
     }
     // Not in the dictionary, but common enough in the corpus that people
     // clearly type it on purpose: names and internet spellings ("sami", "ori",
@@ -498,10 +595,17 @@ fn assess_with_context(
             "No candidate passed the spelling gates (weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits)."
         ));
     };
-    let confident = search
+    let clear_gap = search
         .runner_up
         .as_ref()
         .is_none_or(|(second, ..)| second - best_score >= MIN_SCORE_GAP);
+    let phrase_evidence = search
+        .context
+        .is_some_and(|context| context.boost(&fixed) >= 2.0);
+    let (keep_score, keep_reason) =
+        keep_original(word, en_dict, en_freq, budget, max_rank, phrase_evidence);
+    let beats_original = keep_score - best_score >= MIN_SCORE_GAP;
+    let confident = clear_gap && beats_original;
     let mut details = format!(
         "Spelling candidates (lower score is better; scores are not confidence percentages):\n  {fixed}: score {best_score:.2}, edit cost {cost}, frequency rank {rank}\nLimits: weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits."
     );
@@ -513,14 +617,25 @@ fn assess_with_context(
         details.push_str("\nNo competing candidate was found within the confidence window.");
     }
     details.push_str(&context_details);
+    details.push_str(&format!(
+        "\nKeep original: score {keep_score:.2} ({keep_reason}); replacement lead {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", keep_score - best_score
+    ));
     details.push_str(if confident {
         "\nAccepted the best spelling candidate."
-    } else {
+    } else if !clear_gap {
         "\nLeft unchanged: the leading candidates are too close in score."
+    } else {
+        "\nLeft unchanged: the spelling candidate did not overcome keeping the original token."
     });
     Assessment {
-        correction: confident.then_some(fixed),
+        correction: confident.then(|| fixed.clone()),
         details,
+        best: Some(Candidate {
+            text: fixed,
+            score: best_score,
+            cost,
+            rank,
+        }),
     }
 }
 
@@ -625,7 +740,7 @@ impl<'a> Search<'a> {
         {
             return;
         }
-        if rank > self.max_rank {
+        if rank > self.max_rank || lexicon::reviewed_misspelling(cand).is_some() {
             return;
         }
         if self.manual && (!eligible(cand, 1) || !en_dict.contains(cand)) {
@@ -1391,6 +1506,79 @@ impl Dp {
 mod tests {
     use super::*;
 
+    #[test]
+    fn keeping_an_unknown_token_competes_even_with_a_unique_candidate() {
+        let d = Dict::of(&["aunt"]);
+        let f = Freq::of(&[("aunt", 100)]);
+        let guarded = assess_with("auno", d, f, 4, 50_000, 3);
+        assert_eq!(guarded.correction, None);
+        assert_eq!(guarded.best.unwrap().text, "aunt");
+        assert!(guarded.details.contains("Keep original:"));
+        assert_eq!(correction_suggestions("auno", d, f, None), ["aunt"]);
+
+        let guarded = assess_with(
+            "selin",
+            Dict::of(&["selina"]),
+            Freq::of(&[("selin", 30_000), ("selina", 15_000)]),
+            4,
+            50_000,
+            3,
+        );
+        assert_eq!(guarded.correction, None);
+        assert_eq!(guarded.best.unwrap().text, "selina");
+        assert!(guarded.details.contains("original is frequency-attested"));
+
+        let guarded = assess_with(
+            "cloudforge",
+            Dict::of(&["cloud", "forge", "cloudfront"]),
+            Freq::of(&[("cloud", 500), ("forge", 2_000), ("cloudfront", 100)]),
+            4,
+            50_000,
+            3,
+        );
+        assert_eq!(guarded.correction, None);
+        assert_eq!(guarded.best.unwrap().text, "cloudfront");
+        assert!(guarded.details.contains("compound components are trusted"));
+    }
+
+    #[test]
+    fn reviewed_nonwords_do_not_inherit_dictionary_or_frequency_protection() {
+        for (typed, corrected) in [
+            ("enviroment", "environment"),
+            ("priviledge", "privilege"),
+            ("succesful", "successful"),
+        ] {
+            let d = Dict::of(&[typed, corrected]);
+            let f = Freq::of(&[(typed, 100), (corrected, 12_000)]);
+            let assessment = assess_with(typed, d, f, 4, 50_000, 1);
+            assert_eq!(
+                assessment.correction.as_deref(),
+                Some(corrected),
+                "{}",
+                assessment.details
+            );
+            assert!(assessment.details.contains("Reviewed misspelling"));
+            assert_eq!(correct_with(typed, d, f, typed.len() + 1, 50_000, 1), None);
+            assert_eq!(correct_with(typed, d, f, 4, 11_999, 1), None);
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 0), None);
+            assert_eq!(
+                correct_with(typed, Dict::of(&[typed]), f, 4, 50_000, 1),
+                None
+            );
+        }
+        let d = Dict::of(&["enviroment", "environment", "calender", "calendar"]);
+        let f = Freq::of(&[("environment", 3_000), ("calendar", 6_000)]);
+        assert_eq!(
+            correct_with("enviroment's", d, f, 4, 50_000, 1).as_deref(),
+            Some("environment's")
+        );
+        assert_eq!(
+            correct_with("calender", d, f, 4, 50_000, 3),
+            None,
+            "a rare valid word is not a reviewed nonword"
+        );
+    }
+
     fn dict(words: &[&str]) -> Dict {
         Dict::of(words)
     }
@@ -1546,9 +1734,15 @@ mod tests {
             Some("cake")
         );
         let f = freq(&[("cafe", 100), ("cake", 1_000)]);
+        let guarded = assess(d, f, Some(&context));
         assert_eq!(
-            assess(d, f, Some(&context)).correction.as_deref(),
-            Some("cafe")
+            guarded.correction, None,
+            "keeping the unknown token still competes"
+        );
+        assert_eq!(
+            guarded.best.unwrap().text,
+            "cafe",
+            "context cannot rescue a distant candidate"
         );
     }
 
@@ -1764,26 +1958,26 @@ mod tests {
 
     #[test]
     fn close_distinct_candidates_are_not_silently_chosen() {
-        let d = dict(&["bake", "bare"]);
+        let d = dict(&["baker", "barer"]);
         for entries in [
-            [("bake", 100), ("bare", 101)],
-            [("bake", 101), ("bare", 100)],
+            [("baker", 100), ("barer", 101)],
+            [("baker", 101), ("barer", 100)],
         ] {
-            assert_eq!(fix("baxe", d, freq(&entries)), None);
+            assert_eq!(fix("baxer", d, freq(&entries)), None);
         }
         assert_eq!(
-            fix("baxe", d, freq(&[("bake", 100), ("bare", 10_000)])).as_deref(),
-            Some("bake")
+            fix("baxer", d, freq(&[("baker", 100), ("barer", 10_000)])).as_deref(),
+            Some("baker")
         );
         // A corpus token outside the dictionary must not become a runner-up.
         assert_eq!(
             fix(
-                "baxe",
-                dict(&["bake"]),
-                freq(&[("bake", 100), ("bare", 101)])
+                "baxer",
+                dict(&["baker"]),
+                freq(&[("baker", 100), ("barer", 101)])
             )
             .as_deref(),
-            Some("bake")
+            Some("baker")
         );
     }
 
@@ -1819,9 +2013,9 @@ mod tests {
     fn a_neighbouring_key_beats_a_distant_one() {
         // "s" and "d" are neighbours; "s" and "t" are not. Both candidates are
         // one substitution away and the distant one is the more common word.
-        let d = dict(&["wand", "want"]);
-        let f = freq(&[("want", 100), ("wand", 900)]);
-        assert_eq!(fix("wans", d, f).as_deref(), Some("wand"));
+        let d = dict(&["wands", "wants"]);
+        let f = freq(&[("wants", 100), ("wands", 900)]);
+        assert_eq!(fix("wanss", d, f).as_deref(), Some("wands"));
     }
 
     #[test]
@@ -1832,9 +2026,9 @@ mod tests {
         let d = dict(&["same"]);
         let f = freq(&[("same", 240), ("sami", 18_299)]);
         assert_eq!(fix("sami", d, f), None);
-        // The same word, unseen by the corpus, is treated as a typo.
+        // An unseen short name now competes through the keep-original action.
         let f_unseen = freq(&[("same", 240)]);
-        assert_eq!(fix("sami", d, f_unseen).as_deref(), Some("same"));
+        assert_eq!(fix("sami", d, f_unseen), None);
     }
 
     #[test]
@@ -1878,7 +2072,12 @@ mod tests {
         // an unrelated word.
         let d = dict(&["work", "sort"]);
         let f = freq(&[("work", 100), ("sort", 900)]);
-        assert_eq!(fix("sork", d, f).as_deref(), Some("sort"));
+        let assessment = assess_with("sork", d, f, 4, 20_000, 3);
+        assert_eq!(assessment.best.unwrap().text, "sort");
+        assert_eq!(
+            assessment.correction, None,
+            "a sole candidate need not beat keeping a short unknown token"
+        );
     }
 
     #[test]

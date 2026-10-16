@@ -50,6 +50,40 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     };
     for (word, layout, expected, reason) in [
         ("recieve", "en", "receive", "English spelling"),
+        ("enviroment", "en", "environment", "English spelling"),
+        ("priviledge", "en", "privilege", "English spelling"),
+        (
+            "ines",
+            "en",
+            "ines",
+            "Protected word or no confident correction",
+        ),
+        (
+            "nour",
+            "en",
+            "nour",
+            "Protected word or no confident correction",
+        ),
+        (
+            "soren",
+            "en",
+            "soren",
+            "Protected word or no confident correction",
+        ),
+        (
+            "wasmtime",
+            "en",
+            "wasmtime",
+            "Protected word or no confident correction",
+        ),
+        ("מקלדתת", "he", "מקלדת", "Hebrew spelling"),
+        ("וכשמקלדתת", "he", "וכשמקלדת", "Hebrew spelling"),
+        (
+            "מחשבש",
+            "he",
+            "מחשבש",
+            "Protected word or no confident correction",
+        ),
         ("thos", "en", "this", "English spelling"),
         ("xocmputer", "en", "computer", "English spelling"),
         ("computerx", "en", "computer", "English spelling"),
@@ -147,6 +181,17 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
         }
         if word == "hello" {
             assert!(text.contains("Protected dictionary word"), "{text}");
+        }
+        if matches!(word, "מקלדתת" | "וכשמקלדתת" | "מחשבש") {
+            assert!(text.contains("Hebrew spelling candidates"), "{text}");
+            assert!(text.contains("Keep original:"), "{text}");
+        }
+        if word == "מחשבש" {
+            assert!(text.contains("Score gap:"), "{text}");
+            assert!(
+                text.contains("leading Hebrew candidates are too close"),
+                "{text}"
+            );
         }
     }
     for args in [
