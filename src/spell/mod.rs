@@ -176,7 +176,11 @@ const MAX_PERSONAL_DISCOUNT: f32 = 50.0;
 /// Abstain when two distinct words have almost the same posterior score.
 // ponytail: fixed score margin; recalibrate from ambiguity reports if recall suffers.
 const MIN_SCORE_GAP: f32 = 4.0;
-/// Automatic context can resolve a near tie, never rescue a distant candidate.
+/// Joint ranking retains margins up to four acceptance thresholds. Search
+/// runners-up throughout that range rather than treating unsearched words as
+/// evidence of strong confidence.
+const CONFIDENCE_WINDOW: f32 = 4.0 * MIN_SCORE_GAP;
+/// Bound contextual influence without widening the edit or frequency gates.
 const MAX_AUTOMATIC_CONTEXT_DISCOUNT: f32 = 8.0;
 
 /// Posterior score of a candidate: the channel cost of the slip plus the
@@ -318,6 +322,9 @@ pub(crate) struct Assessment {
     pub details: String,
     /// Preserve the best rejected candidate for bilingual ambiguity checks.
     pub best: Option<Candidate>,
+    /// Minimum lead over keeping the original and the next candidate, in
+    /// shared policy units: four means this language's acceptance threshold.
+    pub lead: f32,
 }
 
 impl Assessment {
@@ -326,6 +333,7 @@ impl Assessment {
             correction: None,
             details: reason.into(),
             best: None,
+            lead: 0.0,
         }
     }
 }
@@ -380,12 +388,25 @@ pub(crate) fn assess(
     en_freq: Freq,
     context: Option<&crate::complete::PhraseContext>,
 ) -> Assessment {
+    assess_for_visible(word, word, en_dict, en_freq, context)
+}
+
+/// The layout reading supplies edit evidence; the visible source supplies the
+/// contextual evidence for leaving the user's literal text unchanged.
+pub(crate) fn assess_for_visible(
+    word: &str,
+    visible: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Assessment {
     let cfg = Config::global();
     if !cfg.spell_enabled {
         return Assessment::unchanged("English spelling is disabled.");
     }
-    assess_with_context(
+    assess_with_visible_context(
         word,
+        visible,
         en_dict,
         en_freq,
         cfg.spell_min_len,
@@ -423,9 +444,26 @@ fn assess_with(
     assess_with_context(word, en_dict, en_freq, min_len, max_rank, max_dist, None)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn assess_with_context(
     word: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    max_dist: u8,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Assessment {
+    assess_with_visible_context(
+        word, word, en_dict, en_freq, min_len, max_rank, max_dist, context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assess_with_visible_context(
+    word: &str,
+    visible: &str,
     en_dict: Dict,
     en_freq: Freq,
     min_len: usize,
@@ -451,8 +489,9 @@ fn assess_with_context(
                 "Protected apostrophe form: recognized stem, folded word, or saved word rule.",
             );
         }
-        let mut assessment =
-            assess_with_context(stem, en_dict, en_freq, min_len, max_rank, max_dist, context);
+        let mut assessment = assess_with_visible_context(
+            stem, visible, en_dict, en_freq, min_len, max_rank, max_dist, context,
+        );
         assessment.correction = assessment.correction.and_then(|corrected| {
             let form = format!("{corrected}{suffix}");
             crate::dictionary::english_form_rank(&form, en_dict, en_freq)
@@ -492,6 +531,7 @@ fn assess_with_context(
                 cost: COST_TRANSPOSE,
                 rank: en_freq.rank("the").unwrap_or_default(),
             }),
+            lead: 16.0,
         };
     }
     let Some(mut budget) = budget_for(word, min_len, max_dist) else {
@@ -537,6 +577,7 @@ fn assess_with_context(
                     correction: Some(candidate.text.clone()),
                     details: format!("Reviewed misspelling: {word} / {target}; dictionary membership does not confer spelling trust.\n  {target}: score {:.2}, edit cost {}, frequency rank {}.\nThe reviewed repair passed the configured length, edit, dictionary, and rank gates.", candidate.score, candidate.cost, candidate.rank),
                     best: Some(candidate),
+                    lead: 16.0,
                 },
                 None => Assessment::unchanged("The reviewed spelling repair failed the configured edit, dictionary, or frequency-rank gate."),
             };
@@ -564,30 +605,20 @@ fn assess_with_context(
     }
 
     let mut search = Search::new(word, budget, max_rank);
+    search.context = context;
     search.run(word, en_dict, en_freq);
 
-    // Context only reconsiders an abstention. Restrict the second search to the
-    // original confidence window, keeping all edit/rank and protection gates.
+    // Apply the same bounded evidence before selecting any winner, including
+    // a previously confident guess. Protection and search eligibility stay hard.
     let mut context_details = String::new();
-    if let (Some(context), Some((best, ..)), Some((second, ..))) = (
+    if let (Some(context), Some((_, _, _, winner))) = (
         context.filter(|context| context.previous_word().is_some()),
         search.best.as_ref(),
-        search.runner_up.as_ref(),
     ) {
-        if second - best < MIN_SCORE_GAP {
-            let mut contextual = Search::new(word, budget, max_rank);
-            contextual.typo_counts = search.typo_counts;
-            contextual.context = Some(context);
-            contextual.base_ceiling = Some(best + MIN_SCORE_GAP);
-            contextual.run(word, en_dict, en_freq);
-            if let Some((_, _, _, winner)) = &contextual.best {
-                context_details = format!(
-                    "\nPhrase context reconsidered only candidates within {MIN_SCORE_GAP:.2} of the original best score; maximum discount {MAX_AUTOMATIC_CONTEXT_DISCOUNT:.2}.\nPrevious word: {:?}; context weight for {winner}: {:.2}; score discount: {:.2}.",
-                    context.previous_word().unwrap_or_default(), context.boost(winner), contextual.context_discount(winner)
-                );
-            }
-            search = contextual;
-        }
+        context_details = format!(
+            "\nPhrase context reconsidered all eligible candidates before deciding; maximum cost adjustment +/-{MAX_AUTOMATIC_CONTEXT_DISCOUNT:.2}.\nPrevious word: {:?}; context weight for {winner}: {:.2}; score discount: {:.2}.",
+            context.previous_word().unwrap_or_default(), context.boost(winner), search.context_discount(winner)
+        );
     }
 
     let Some((best_score, cost, rank, fixed)) = search.best else {
@@ -604,8 +635,14 @@ fn assess_with_context(
         .is_some_and(|context| context.boost(&fixed) >= 2.0);
     let (keep_score, keep_reason) =
         keep_original(word, en_dict, en_freq, budget, max_rank, phrase_evidence);
-    let beats_original = keep_score - best_score >= MIN_SCORE_GAP;
-    let confident = clear_gap && beats_original;
+    let keep_score =
+        keep_score - context.map_or(0.0, |context| context.automatic_discount(visible));
+    let mut scores = vec![keep_score, best_score];
+    if let Some((second, ..)) = &search.runner_up {
+        scores.push(*second);
+    }
+    let confident = crate::intent::select(&scores, MIN_SCORE_GAP) == Some(1);
+    let lead = crate::intent::normalized_lead(&scores, 1, MIN_SCORE_GAP);
     let mut details = format!(
         "Spelling candidates (lower score is better; scores are not confidence percentages):\n  {fixed}: score {best_score:.2}, edit cost {cost}, frequency rank {rank}\nLimits: weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits."
     );
@@ -636,6 +673,7 @@ fn assess_with_context(
             cost,
             rank,
         }),
+        lead,
     }
 }
 
@@ -663,8 +701,6 @@ struct Search<'a> {
     /// Only the dedicated correction gesture bypasses automatic rank gates.
     manual: bool,
     context: Option<&'a crate::complete::PhraseContext>,
-    /// Only automatic contextual retries restrict the pre-context score.
-    base_ceiling: Option<f32>,
     typo_counts: [u64; 3],
 }
 
@@ -681,7 +717,6 @@ impl<'a> Search<'a> {
             offers: None,
             manual: false,
             context: None,
-            base_ceiling: None,
             typo_counts: crate::personal::typo_counts(),
         }
     }
@@ -714,10 +749,9 @@ impl<'a> Search<'a> {
         let discount = 20.0 * boost.ln() as f32;
         if self.offers.is_some() {
             discount
-        } else if boost >= 2.0 {
-            discount.min(MAX_AUTOMATIC_CONTEXT_DISCOUNT)
         } else {
-            0.0
+            self.context
+                .map_or(0.0, |context| context.automatic_discount(cand))
         }
     }
 
@@ -753,7 +787,7 @@ impl<'a> Search<'a> {
         } else {
             self.best.as_ref().map_or(self.budget, |(best, ..)| {
                 self.budget.min(
-                    (best + MIN_SCORE_GAP - score(0, rank, cand) + self.discount(cand)).ceil()
+                    (best + CONFIDENCE_WINDOW - score(0, rank, cand) + self.discount(cand)).ceil()
                         as u32,
                 )
             })
@@ -770,12 +804,6 @@ impl<'a> Search<'a> {
             return;
         }
         let candidate = score(cost, rank, cand) - self.discount(cand);
-        if self
-            .base_ceiling
-            .is_some_and(|ceiling| candidate + self.context_discount(cand) > ceiling)
-        {
-            return;
-        }
         if let Some(offers) = &mut self.offers {
             if en_dict.contains(cand) {
                 offers.push((candidate, rank, cand.to_owned()));
@@ -834,7 +862,7 @@ impl<'a> Search<'a> {
         };
         let budget = self.best.as_ref().map_or(self.budget, |(best, ..)| {
             self.budget.min(
-                (best + MIN_SCORE_GAP + discount - PRIOR_WEIGHT * PRIOR_SMOOTHING.ln()).ceil()
+                (best + CONFIDENCE_WINDOW + discount - PRIOR_WEIGHT * PRIOR_SMOOTHING.ln()).ceil()
                     as u32,
             )
         });
@@ -1701,7 +1729,47 @@ mod tests {
     }
 
     #[test]
-    fn automatic_phrase_context_resolves_only_close_candidates() {
+    fn visible_source_controls_keep_context_including_apostrophe_repairs() {
+        let d = dict(&["catee"]);
+        let f = freq(&[("catee", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        for _ in 0..2 {
+            context.retain("zzsource");
+            context.retain("held");
+        }
+        context.retain("zzsource");
+        let keep_score = |assessment: &Assessment| {
+            assessment
+                .details
+                .split("Keep original: score ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<f32>()
+                .unwrap()
+        };
+        for word in ["caxee", "caxee's"] {
+            let literal =
+                assess_with_visible_context(word, "held", d, f, 4, 20_000, 1, Some(&context));
+            let unrelated =
+                assess_with_visible_context(word, "unrelated", d, f, 4, 20_000, 1, Some(&context));
+            let literal_best = literal.best.as_ref().expect("eligible spelling candidate");
+            let unrelated_best = unrelated.best.as_ref().unwrap();
+            assert_eq!(literal_best.text, unrelated_best.text);
+            assert_eq!(literal_best.score, unrelated_best.score);
+            assert!(
+                (keep_score(&unrelated) - keep_score(&literal) - 8.0).abs() < 0.01,
+                "{word}: {}\n{}",
+                literal.details,
+                unrelated.details,
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_phrase_context_respects_bounded_evidence_and_original() {
         let d = dict(&["cafe", "cake", "cane"]);
         let f = freq(&[("cafe", 100), ("cake", 100), ("cane", 100)]);
         let mut context = crate::complete::PhraseContext::default();
@@ -1717,8 +1785,8 @@ mod tests {
         context.clear();
         assert_eq!(assess(d, f, Some(&context)).correction, None);
 
-        // Even strong context cannot pull a weaker candidate into the original
-        // confidence window or change an already confident decision.
+        // Bounded context cannot overcome a large likelihood difference or
+        // remove the independent keep-original and candidate-margin checks.
         context.observe("birthday", false);
         let f = freq(&[("cafe", 100), ("cake", 200), ("cane", 100)]);
         assert_eq!(assess(d, f, Some(&context)).correction, None);
@@ -1743,6 +1811,45 @@ mod tests {
             guarded.best.unwrap().text,
             "cafe",
             "context cannot rescue a distant candidate"
+        );
+    }
+
+    #[test]
+    fn sentence_context_can_overturn_a_previously_confident_wrong_guess() {
+        let d = dict(&["canee", "catee"]);
+        let f = freq(&[("canee", 200), ("catee", 100)]);
+        let without = assess_with_context("caxee", d, f, 4, 20_000, 1, None);
+        assert_eq!(without.correction.as_deref(), Some("catee"));
+        let model = "at\t100\t10000\nat the\t100\t100\nat the canee\t12\t100\ncanee\t200\t10000\ncatee\t100\t10000\nthe\t100\t10000\nthe canee\t12\t100\nthe catee\t12\t100\n";
+        let mut context = crate::complete::PhraseContext::with_model(model);
+        context.observe("at", false);
+        context.observe("the", false);
+        let with = assess_with_context("caxee", d, f, 4, 20_000, 1, Some(&context));
+        assert_eq!(
+            with.correction.as_deref(),
+            Some("canee"),
+            "{}",
+            with.details
+        );
+        context.clear();
+        assert_eq!(
+            assess_with_context("caxee", d, f, 4, 20_000, 1, Some(&context)).correction,
+            without.correction,
+        );
+    }
+
+    #[test]
+    fn joint_confidence_keeps_runners_up_beyond_the_acceptance_margin() {
+        let d = dict(&["canee", "catee"]);
+        let f = freq(&[("canee", 100), ("catee", 300)]);
+        // The winner is visited first. A later competitor beyond the local
+        // four-point acceptance margin must still limit joint confidence.
+        let assessment = assess_with_context("caxee", d, f, 4, 20_000, 1, None);
+        assert_eq!(assessment.correction.as_deref(), Some("canee"));
+        assert!(
+            assessment.lead > 4.0 && assessment.lead < 12.0,
+            "{}",
+            assessment.details
         );
     }
 

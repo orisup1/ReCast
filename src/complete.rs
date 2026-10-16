@@ -53,17 +53,25 @@ const RARE_SUFFIX_MAX: usize = 8;
 /// Two observations are required before a learned pair influences ranking.
 #[derive(Default)]
 pub(crate) struct PhraseContext {
-    previous: Option<String>,
+    history: crate::intent::Context,
     pairs: HashMap<(String, String), u16>,
 }
 
 impl PhraseContext {
+    #[cfg(test)]
+    pub(crate) fn with_model(data: &'static str) -> Self {
+        Self {
+            history: crate::intent::Context::with_model(data),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn previous_word(&self) -> Option<&str> {
-        self.previous.as_deref()
+        self.history.previous_word()
     }
 
     pub(crate) fn clear(&mut self) {
-        self.previous = None;
+        self.history.clear();
         self.pairs.clear();
     }
 
@@ -86,36 +94,43 @@ impl PhraseContext {
             || !(word.chars().all(|c| c.is_ascii_lowercase())
                 || word.chars().all(|c| ('א'..='ת').contains(&c)))
         {
-            self.previous = None;
+            self.history.clear();
             return;
         }
-        if let Some(previous) = self.previous.take().filter(|_| learn) {
-            let pair = (previous, word.clone());
+        if let Some(previous) = self.previous_word().filter(|_| learn) {
+            let pair = (previous.to_owned(), word.clone());
             if self.pairs.len() < 256 || self.pairs.contains_key(&pair) {
                 let count = self.pairs.entry(pair).or_default();
                 *count = count.saturating_add(1);
             }
         }
-        self.previous = Some(word);
+        self.history.observe(word);
     }
 
     pub(crate) fn boost(&self, word: &str) -> f64 {
-        let count = self
-            .previous
-            .as_ref()
-            .and_then(|previous| self.pairs.get(&(previous.clone(), word.to_owned())))
-            .copied()
-            .unwrap_or(0);
+        let count = if self.pairs.is_empty() {
+            0
+        } else {
+            self.previous_word()
+                .and_then(|previous| self.pairs.get(&(previous.to_owned(), word.to_owned())))
+                .copied()
+                .unwrap_or(0)
+        };
         let personal = if count < 2 {
             1.0
         } else {
             1.0 + f64::from(count.min(4)) / 2.0
         };
         let bundled = self
-            .previous
-            .as_deref()
+            .previous_word()
             .map_or(1.0, |previous| phrase_boost(previous, word));
-        personal.max(bundled)
+        (personal.max(bundled) * self.history.factor(word)).clamp(0.25, 16.0)
+    }
+
+    /// Bounded context cost shared by both automatic spelling models. Context
+    /// may oppose a confident guess as well as support an ambiguous one.
+    pub(crate) fn automatic_discount(&self, word: &str) -> f32 {
+        (20.0 * self.boost(word).ln() as f32).clamp(-8.0, 8.0)
     }
 }
 
@@ -1525,6 +1540,32 @@ mod tests {
                 .iter()
                 .all(|word| !word.is_empty() && word.chars().all(char::is_alphabetic)));
         }
+    }
+
+    #[test]
+    fn longer_context_changes_completion_and_reset_discards_it() {
+        // Synthetic measured-count fixture, independent of corpus frequencies.
+        let model = "at\t100\t1000\nat the\t100\t100\nat the bank\t12\t100\nband\t20\t1000\nbank\t20\t1000\njoined\t100\t1000\njoined the\t100\t100\njoined the band\t12\t100\nthe\t100\t1000\nthe band\t12\t100\nthe bank\t12\t100\n";
+        let mut context = PhraseContext::with_model(model);
+        let d = dict(&["bank", "band"]);
+        let f = freq(&[("bank", 200), ("band", 100)]);
+        let offers = |context: &PhraseContext| completions_in_context("ban", d, f, Some(context));
+        for word in ["at", "the"] {
+            context.observe(word, false);
+        }
+        assert_eq!(offers(&context)[0], "bank");
+        context.clear();
+        for word in ["joined", "the"] {
+            context.observe(word, false);
+        }
+        assert_eq!(offers(&context)[0], "band");
+        context.observe("sentence.", false);
+        assert_eq!(context.boost("bank"), 1.0);
+        assert_eq!(offers(&context)[0], "band");
+        assert!(
+            context.pairs.is_empty(),
+            "public context needs no personal learning"
+        );
     }
 
     #[test]

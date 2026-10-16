@@ -86,17 +86,42 @@ pub(crate) fn correct(
     assess(word, dict, freq, context).correction
 }
 
+#[cfg(test)]
 pub(crate) fn assess(
     word: &str,
     dict: Dict,
     freq: Freq,
     context: Option<&PhraseContext>,
 ) -> super::Assessment {
-    assess_with(word, dict, freq, context, &Config::global())
+    assess_for_visible(word, word, dict, freq, context)
 }
 
+/// Preserve contextual evidence for the literal source when this Hebrew
+/// reading comes from keys typed under another layout.
+pub(crate) fn assess_for_visible(
+    word: &str,
+    visible: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+) -> super::Assessment {
+    assess_with_visible(word, visible, dict, freq, context, &Config::global())
+}
+
+#[cfg(test)]
 fn assess_with(
     word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&PhraseContext>,
+    config: &Config,
+) -> super::Assessment {
+    assess_with_visible(word, word, dict, freq, context, config)
+}
+
+fn assess_with_visible(
+    word: &str,
+    visible: &str,
     dict: Dict,
     freq: Freq,
     context: Option<&PhraseContext>,
@@ -149,12 +174,17 @@ fn assess_with(
     } else {
         super::COST_EDIT
     };
-    let keep_score = super::score(keep_cost, config.spell_max_rank, word);
-    let beats_original = keep_score - best.evidence.score >= MIN_SCORE_GAP;
+    let keep_score = super::score(keep_cost, config.spell_max_rank, word)
+        - context.map_or(0.0, |context| context.automatic_discount(visible));
     details.push_str(&format!(
         "\nKeep original: score {keep_score:.2}; replacement lead {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", keep_score - best.evidence.score
     ));
-    let accepted = clear_gap && beats_original;
+    let mut scores = vec![keep_score, best.evidence.score];
+    if let Some(second) = result.candidates.get(1) {
+        scores.push(second.evidence.score);
+    }
+    let accepted = crate::intent::select(&scores, MIN_SCORE_GAP) == Some(1);
+    let lead = crate::intent::normalized_lead(&scores, 1, MIN_SCORE_GAP);
     details.push_str(if accepted {
         "\nAccepted the best Hebrew spelling candidate."
     } else if !clear_gap {
@@ -166,6 +196,7 @@ fn assess_with(
         correction: accepted.then(|| best.evidence.text.clone()),
         details,
         best: Some(best.evidence.clone()),
+        lead,
     }
 }
 
@@ -278,12 +309,13 @@ fn search(
             }
             return;
         }
-        let discount = context.map_or(0.0, |context| 20.0 * context.boost(&text).ln() as f32);
-        let discount = if automatic {
-            discount.min(super::MAX_AUTOMATIC_CONTEXT_DISCOUNT)
-        } else {
-            discount
-        };
+        let discount = context.map_or(0.0, |context| {
+            if automatic {
+                context.automatic_discount(&text)
+            } else {
+                20.0 * context.boost(&text).ln() as f32
+            }
+        });
         let cost = cost
             + if stem.is_some() {
                 PREFIX_INFERENCE_COST
@@ -487,6 +519,51 @@ fn valid_finals(word: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_source_controls_context_for_keeping_the_literal_word() {
+        let d = Dict::of(&["מסמך"]);
+        let f = Freq::of(&[("מסמך", 100)]);
+        let mut context = PhraseContext::default();
+        for _ in 0..2 {
+            context.retain("זזמקור");
+            context.retain("מקור");
+        }
+        context.retain("זזמקור");
+        let mut config = Config::global();
+        config.spell_enabled = true;
+        config.spell_min_len = 4;
+        config.spell_max_dist = 1;
+        config.spell_max_rank = 20_000;
+        let literal = assess_with_visible("מסמךך", "מקור", d, f, Some(&context), &config);
+        let unrelated = assess_with_visible("מסמךך", "other", d, f, Some(&context), &config);
+        let keep_score = |assessment: &super::super::Assessment| {
+            assessment
+                .details
+                .split("Keep original: score ")
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .parse::<f32>()
+                .unwrap()
+        };
+        assert_eq!(
+            literal.best.as_ref().unwrap().text,
+            unrelated.best.as_ref().unwrap().text
+        );
+        assert_eq!(
+            literal.best.as_ref().unwrap().score,
+            unrelated.best.as_ref().unwrap().score
+        );
+        assert!(
+            (keep_score(&unrelated) - keep_score(&literal) - 8.0).abs() < 0.01,
+            "{}\n{}",
+            literal.details,
+            unrelated.details,
+        );
+    }
 
     #[test]
     fn cheap_hebrew_repairs_use_the_configured_rank_ceiling() {

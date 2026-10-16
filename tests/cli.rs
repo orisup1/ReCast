@@ -280,9 +280,100 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
         vec!["--explain", "🙂", "--layout", "en"],
         vec!["--explain", "hello", "--layout", "en", "--stop"],
         vec!["--explain", "hello", "--layout", "en", "--layout", "he"],
+        vec!["--context", "data"],
+        vec!["--context", "data", "--layout", "en"],
+        vec!["--explain", "baye", "--layout", "en", "--context"],
+        vec!["--explain", "baye", "--context", "--layout", "en"],
+        vec![
+            "--explain",
+            "baye",
+            "--layout",
+            "en",
+            "--context",
+            "data",
+            "--context",
+            "other",
+        ],
     ] {
         assert_eq!(preview(&args).status.code(), Some(2), "{args:?}");
     }
+    for (context, expected) in [
+        ("data", "base"),
+        ("data\t", "base"),
+        ("data\n", "baye"),
+        ("data\r\n", "baye"),
+        ("data.", "baye"),
+        ("data,", "baye"),
+        ("data .", "baye"),
+        ("data\nhello", "baye"),
+        ("hello\ndata", "base"),
+        ("", "baye"),
+    ] {
+        let output = preview(&["--explain", "baye", "--layout", "en", "--context", context]);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains(&format!("Replacement: {expected:?}")),
+            "context {context:?}: {text}"
+        );
+        assert!(text.contains(&format!("Context: {context:?}")), "{text}");
+        assert!(text.contains("without live app checks"), "{text}");
+        assert!(text.contains("No text is injected or learned"), "{text}");
+    }
+    for (word, layout, expected, context) in [
+        ("akuo", "en", "שלום", "please keep writing in english"),
+        ("יקךךם", "he", "hello", "אני רוצה להמשיך לכתוב בעברית"),
+        (
+            "thbyrbhy.",
+            "en",
+            "אינטרנט.",
+            "please keep writing in english",
+        ),
+        ("רקבןקהק", "he", "receive", "אני רוצה להמשיך לכתוב בעברית"),
+    ] {
+        let output = preview(&["--explain", word, "--layout", layout, "--context", context]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(&format!("Replacement: {expected:?}")),
+            "context {context:?}: {text}"
+        );
+        assert!(
+            text.contains("takes precedence over contextual intent"),
+            "{text}"
+        );
+    }
+    let output = preview(&["--explain", "baye", "--layout", "en"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(text.contains("Replacement: \"baye\""), "{text}");
+    assert!(
+        text.contains("without prior words or live app checks"),
+        "{text}"
+    );
+    assert!(!text.contains("Context:"), "{text}");
+    let too_many = "data ".repeat(17);
+    assert_eq!(
+        preview(&[
+            "--explain",
+            "baye",
+            "--layout",
+            "en",
+            "--context",
+            &too_many
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
     #[cfg(unix)]
     {
         std::fs::write(config.join("config.toml"), "spell = false\n").unwrap();

@@ -21,6 +21,7 @@ mod footprint;
 #[cfg(target_os = "linux")]
 mod gui;
 mod instance;
+mod intent;
 mod keymap;
 mod layout;
 mod notify;
@@ -59,7 +60,7 @@ Options:
                     new ReCast replaces the old one — two at once correct every
                     word twice)
       --status      Print what is running and what is configured, then exit
-      --explain WORD --layout en|he
+      --explain WORD --layout en|he [--context 'prior visible words']
                     Preview one visible word using an explicit layout, then exit
                     (no keyboard capture, layout changes, or typing)
       --write-config  Write a commented config.toml with every setting in it
@@ -177,7 +178,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args
         .iter()
-        .any(|arg| matches!(arg.as_str(), "--explain" | "--layout"))
+        .any(|arg| matches!(arg.as_str(), "--explain" | "--layout" | "--context"))
     {
         if let Err(error) = explain::run(&args) {
             eprintln!("{error}");

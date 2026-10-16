@@ -1,20 +1,44 @@
 //! Offline correction preview. Only the supplied text is inspected.
 
-use crate::dictionary::{self, Fix, Run};
+use crate::complete::PhraseContext;
+use crate::dictionary::{self, Fix, History, Run};
 use crate::types::Language;
+
+const MAX_CONTEXT_WORDS: usize = 16;
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut word = None;
     let mut layout = None;
+    let mut context = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--explain" if word.is_none() => word = args.next(),
-            "--layout" if layout.is_none() => layout = args.next(),
+            "--explain" if word.is_none() => {
+                word = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with("--"))
+                        .ok_or("--explain requires a word")?,
+                );
+            }
+            "--layout" if layout.is_none() => {
+                layout = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with("--"))
+                        .ok_or("--layout requires en|he")?,
+                );
+            }
+            "--context" if context.is_none() => {
+                context = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with("--"))
+                        .ok_or("--context requires preceding visible words")?,
+                );
+            }
             _ => return Err(format!("Unexpected preview option: {arg}")),
         }
     }
-    let word = word.ok_or("Usage: recast --explain WORD --layout en|he")?;
+    let word = word
+        .ok_or("Usage: recast --explain WORD --layout en|he [--context 'prior visible words']")?;
     let current = match layout.map(String::as_str) {
         Some("en") => Language::English,
         Some("he") => Language::Hebrew,
@@ -27,6 +51,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Err(format!(
             "Live correction skips words longer than {} keys",
             crate::types::MAX_WORD_KEYS
+        ));
+    }
+    if context.is_some_and(|text| text.split_whitespace().count() > MAX_CONTEXT_WORDS) {
+        return Err(format!(
+            "--context accepts at most {MAX_CONTEXT_WORDS} preceding words"
         ));
     }
     let keys: Vec<_> = word
@@ -52,16 +81,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
     ) {
         eprintln!("{complaint}");
     }
-    let result = dictionary::check_and_correct(
+    let (phrase, run) = context.map_or_else(
+        || (PhraseContext::default(), Run::default()),
+        |text| preceding_context(text),
+    );
+    let result = dictionary::check_and_correct_in_context(
         &keys,
         |k| Some(k.0),
         |k| Some(k.1),
         |k| k.2,
-        Run::default(),
+        run,
         dictionary::en_dict(),
         dictionary::he_dict(),
         Some(current),
         false,
+        context.map(|_| &phrase),
         |_| crate::layout::LayoutSwitch::Switched,
     );
     let after = match result.fix {
@@ -76,9 +110,52 @@ pub fn run(args: &[String]) -> Result<(), String> {
         layout.unwrap(),
         result.reason
     );
+    if let Some(context) = context {
+        println!("Context: {context:?}");
+    }
     println!("Details:\n{}", result.details);
-    println!("Preview uses this invocation's settings and saved lists, without prior words or live app checks.");
+    if context.is_some() {
+        println!("Preview uses this invocation's settings, saved lists, and supplied prior words, without live app checks.");
+    } else {
+        println!("Preview uses this invocation's settings and saved lists, without prior words or live app checks.");
+    }
+    println!(
+        "No text is injected or learned; supplied context stays in memory for this invocation."
+    );
     Ok(())
+}
+
+fn preceding_context(text: &str) -> (PhraseContext, Run) {
+    let mut phrase = PhraseContext::default();
+    let mut history = History::default();
+    for part in text.split_inclusive(char::is_whitespace) {
+        let word = part.trim_end_matches(char::is_whitespace);
+        if !word.is_empty() {
+            phrase.observe(word, false);
+            let word = word.to_lowercase();
+            let language = if word.chars().all(|c| c.is_ascii_lowercase())
+                && dictionary::en_dict().contains(&word)
+            {
+                Some(Language::English)
+            } else if word.chars().all(|c| ('א'..='ת').contains(&c))
+                && dictionary::he_dict().contains(&word)
+            {
+                Some(Language::Hebrew)
+            } else {
+                None
+            };
+            if let Some(language) = language {
+                history.push(language);
+            } else {
+                history.clear();
+            }
+        }
+        if part.contains(['\r', '\n', '\u{0085}', '\u{2028}', '\u{2029}']) {
+            phrase.clear();
+            history.clear();
+        }
+    }
+    (phrase, history.run())
 }
 
 fn readings(c: char) -> Option<(char, char, bool)> {

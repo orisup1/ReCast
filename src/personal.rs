@@ -444,8 +444,17 @@ fn parse_confusions_at(text: &str, now: u64) -> Confusions {
     outer
 }
 
-/// Record a confusion pair: the user typed `typed` and it was corrected to `corrected`.
+/// Record one vote for an automatic correction retained during later typing.
 pub fn record_confusion(typed: &str, corrected: &str) {
+    record_confusion_with_weight(typed, corrected, 1);
+}
+
+/// An explicitly selected correction provides stronger evidence than retention.
+pub(crate) fn record_explicit_confusion(typed: &str, corrected: &str) {
+    record_confusion_with_weight(typed, corrected, 3);
+}
+
+fn record_confusion_with_weight(typed: &str, corrected: &str, weight: u64) {
     if !enabled() {
         return;
     }
@@ -473,13 +482,13 @@ pub fn record_confusion(typed: &str, corrected: &str) {
                 decayed_at: now,
             });
         evidence.decay(now);
-        increment(&mut evidence.count);
+        evidence.count = evidence.count.saturating_add(weight);
         CONFUSIONS_DIRTY.store(true, Ordering::Relaxed);
     }
 }
 
 /// A snapshot keeps locks and file reads out of the spelling candidate loop.
-/// Only repeatedly retained pairs contribute; a single observation is not evidence.
+/// Repeated passive votes or a stronger explicit selection contribute evidence.
 pub(crate) fn typo_counts() -> [u64; 3] {
     typo_counts_with(crate::spell::typo_class)
 }
@@ -511,8 +520,8 @@ fn typo_counts_with(classify: fn(&str, &str) -> Option<usize>) -> [u64; 3] {
     counts
 }
 
-/// Undo withdraws one retained vote for this replacement. Deriving typo weights
-/// from these counts means rejection also weakens the corresponding edit class.
+/// Undo withdraws three votes for this replacement, outweighing passive retention.
+/// Deriving typo weights from these counts also weakens the rejected edit class.
 pub(crate) fn reject_confusion(typed: &str, corrected: &str) {
     if !enabled() {
         return;
@@ -523,7 +532,7 @@ pub(crate) fn reject_confusion(typed: &str, corrected: &str) {
             .and_then(|inner| inner.get_mut(&corrected.to_lowercase()))
         {
             evidence.decay(confusion_time());
-            evidence.count = evidence.count.saturating_sub(1);
+            evidence.count = evidence.count.saturating_sub(3);
             CONFUSIONS_DIRTY.store(true, Ordering::Relaxed);
         }
     }
@@ -531,14 +540,31 @@ pub(crate) fn reject_confusion(typed: &str, corrected: &str) {
 
 /// Look up the most common correction for `typed` from personal confusions.
 /// Require two votes, twice all competing votes, and a lead of at least two.
+#[cfg(test)]
 pub fn personal_correction(typed: &str) -> Option<String> {
+    personal_candidate(typed).map(|(word, _)| word)
+}
+
+/// Carry the decayed support advantage into the joint decision rather than
+/// giving a barely eligible pair the same weight as a well-established one.
+pub(crate) fn personal_candidate(typed: &str) -> Option<(String, f32)> {
     if !enabled() {
         return None;
     }
     let typed = typed.trim().to_lowercase();
     let map = confusions_map().lock().ok()?;
     let inner = map.get(&typed)?;
-    preferred_confusion(inner, confusion_time()).cloned()
+    let now = confusion_time();
+    let best = preferred_confusion(inner, now)?;
+    let count = inner.get(best)?.count_at(now);
+    let competing = inner
+        .iter()
+        .filter(|(word, _)| *word != best)
+        .fold(0u64, |total, (_, evidence)| {
+            total.saturating_add(evidence.count_at(now))
+        });
+    let lead = (4.0 + 2.0 * (count.saturating_sub(competing) as f32).ln()).min(12.0);
+    Some((best.clone(), lead))
 }
 
 fn preferred_confusion(inner: &HashMap<String, Confusion>, now: u64) -> Option<&String> {
@@ -957,6 +983,65 @@ mod tests {
         }
         assert_eq!(preferred(&[("cake", 3), ("cafe", 1)]), Some("cake".into()));
         assert_eq!(preferred(&[("cake", 4), ("cafe", 2)]), Some("cake".into()));
+    }
+
+    #[test]
+    fn explicit_feedback_outweighs_retention_and_undo_removes_three_votes() {
+        const CHILD: &str = "RECAST_WEIGHTED_FEEDBACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "personal::tests::explicit_feedback_outweighs_retention_and_undo_removes_three_votes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        record_explicit_confusion("typo", "chosen");
+        assert!(confusions_map().lock().unwrap().is_empty());
+        Config::update_live(|config| config.personal_enabled = true);
+
+        record_confusion("typo", "passive");
+        assert_eq!(personal_correction("typo"), None);
+        record_explicit_confusion("typo", "chosen");
+        assert_eq!(personal_correction("typo").as_deref(), Some("chosen"));
+        {
+            let map = confusions_map().lock().unwrap();
+            assert_eq!(map["typo"]["passive"].count, 1);
+            assert_eq!(map["typo"]["chosen"].count, 3);
+        }
+
+        record_explicit_confusion("typo", "chosen");
+        reject_confusion("typo", "chosen");
+        assert_eq!(confusions_map().lock().unwrap()["typo"]["chosen"].count, 3);
+        reject_confusion("typo", "chosen");
+        assert_eq!(personal_correction("typo"), None);
+        assert_eq!(confusions_map().lock().unwrap()["typo"]["chosen"].count, 0);
+        reject_confusion("typo", "passive");
+        assert_eq!(confusions_map().lock().unwrap()["typo"]["passive"].count, 0);
+
+        confusions_map()
+            .lock()
+            .unwrap()
+            .get_mut("typo")
+            .unwrap()
+            .get_mut("chosen")
+            .unwrap()
+            .count = u64::MAX;
+        record_explicit_confusion("typo", "chosen");
+        assert_eq!(
+            confusions_map().lock().unwrap()["typo"]["chosen"].count,
+            u64::MAX
+        );
     }
 
     #[test]

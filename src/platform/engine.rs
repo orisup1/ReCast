@@ -1143,7 +1143,7 @@ impl<P: Platform> Engine<P> {
                     {
                         crate::personal::record_word(&pending.to);
                         if let Some((from, to)) = &pending.manual_pair {
-                            crate::personal::record_confusion(from, to);
+                            crate::personal::record_explicit_confusion(from, to);
                         }
                         st.finish_completion_use(true);
                         st.retain_phrase_word(&pending.to);
@@ -1287,7 +1287,7 @@ impl<P: Platform> Engine<P> {
                         if !st.practice && st.mode == crate::config::AppMode::Full {
                             crate::personal::record_word(chosen);
                             if let Some((from, to)) = &pending.manual_pair {
-                                crate::personal::record_confusion(from, to);
+                                crate::personal::record_explicit_confusion(from, to);
                             }
                         }
                         st.finish_completion_use(true);
@@ -4119,7 +4119,7 @@ mod tests {
         );
 
         // Repeated Hebrew spelling corrections stay in Hebrew, including the
-        // learned fast path. Undo restores the entire original word and language.
+        // learned proposal. Undo restores the entire original word and language.
         ALLOW_LAYOUT_SWITCH.store(false, Ordering::SeqCst);
         for iteration in 0..3 {
             let s = Session::new();
@@ -4158,7 +4158,11 @@ mod tests {
             } else {
                 assert!(s.engine.control.history()[0]
                     .details
-                    .contains("repeatedly retained"));
+                    .contains("takes precedence over contextual intent"));
+                assert_eq!(
+                    crate::personal::personal_correction("thbyrbhy").as_deref(),
+                    Some("אינטרנט")
+                );
                 s.undo();
                 s.pending();
                 s.finish();
@@ -4426,6 +4430,105 @@ mod tests {
         s.finish();
         s.type_text(" ");
         assert_eq!(crate::personal::usefulness_counts(), counts);
+    }
+
+    #[test]
+    fn explicit_feedback_requires_acceptance_and_trusted_focus() {
+        const CHILD: &str = "RECAST_EXPLICIT_FEEDBACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::explicit_feedback_requires_acceptance_and_trusted_focus",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|config| {
+            config.personal_enabled = true;
+            config.spell_enabled = false;
+            config.complete_enabled = false;
+            config.correction_shortcut = "left_shift".into();
+        });
+
+        fn offer(original: &str, wanted: &str) -> Session {
+            let session = Session::new();
+            session.type_text(original);
+            assert!(!session.engine.lock().is_replacing);
+            session.tap(Simulated::SHIFT_LEFT);
+            session.pending();
+            let index = session
+                .engine
+                .lock()
+                .cycle
+                .as_ref()
+                .unwrap()
+                .candidates
+                .iter()
+                .position(|word| word == wanted)
+                .expect("explicit correction missing");
+            session.finish();
+            for _ in 0..index {
+                session.tap(Simulated::SHIFT_LEFT);
+                session.pending();
+                session.finish();
+            }
+            assert_eq!(session.text().trim_end(), wanted);
+            session
+        }
+
+        // Neither a successful offer nor later typing in another field accepts it.
+        for (original, wanted) in [("hte", "the"), ("watre ", "water")] {
+            let session = offer(original, wanted);
+            assert_eq!(crate::personal::personal_correction(original.trim()), None);
+            assert_eq!(crate::personal::personal_count(wanted), None);
+            FOCUS.store(2, Ordering::SeqCst);
+            session.type_text("x");
+            assert_eq!(crate::personal::personal_correction(original.trim()), None);
+            assert_eq!(crate::personal::personal_count(wanted), None);
+            assert!(session.engine.lock().pending_learning.is_none());
+            FOCUS.store(1, Ordering::SeqCst);
+        }
+
+        let session = offer("hte", "the");
+        session.undo();
+        session.pending();
+        session.finish();
+        assert_eq!(crate::personal::personal_correction("hte"), None);
+        assert_eq!(crate::personal::personal_count("the"), None);
+        crate::complete::unlist("hte");
+
+        // One explicit acceptance trains a pair; word counts still count occurrences.
+        let session = offer("hte", "the");
+        session.type_text(" ");
+        assert_eq!(
+            crate::personal::personal_correction("hte").as_deref(),
+            Some("the")
+        );
+        assert_eq!(crate::personal::personal_count("the"), Some(1));
+        session.undo();
+        session.pending();
+        session.finish();
+        assert_eq!(crate::personal::personal_correction("hte"), None);
+        assert_eq!(crate::personal::personal_count("the"), Some(1));
+
+        // A choice made after Space is accepted by advancing to the next word.
+        let session = offer("watre ", "water");
+        session.type_text("x");
+        assert_eq!(
+            crate::personal::personal_correction("watre").as_deref(),
+            Some("water")
+        );
+        assert_eq!(crate::personal::personal_count("water"), Some(1));
     }
 
     #[test]

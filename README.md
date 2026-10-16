@@ -251,6 +251,7 @@ recast --stop          # Linux/macOS; on Windows, quit from the tray
 recast --status        # Running state and configuration diagnostics
 recast --explain "recieve" --layout en  # Preview a correction without typing
 recast --explain "יקךךם" --layout he    # Preview visible Hebrew-layout text
+recast --explain "baye" --layout en --context "data" # Preview with preceding text
 recast --write-config  # Create a commented config without overwriting one
 recast --help          # All options and environment settings
 ```
@@ -278,8 +279,12 @@ recomputed using later settings. Inspecting a correction does not add a word rul
 an explicit `en` or `he` layout. It reports the replacement, planner operation,
 layout evidence, spelling candidates, and protection or rejection reasons,
 using this invocation's settings and saved lists. It never captures keys, changes
-the OS layout, types text, or stops a running instance. It has no prior-word
-history or live application checks; unsupported characters produce an error.
+the OS layout, types text, or stops a running instance. Supply up to 16 preceding
+visible words with `--context` to inspect a contextual decision. The supplied
+words stay in memory for that invocation and never train personalization.
+Punctuation and newlines end the supplied context just as they do while typing.
+Without `--context`, the preview has no prior-word history. Live application
+checks are unavailable; unsupported characters produce an error.
 
 In the terminal dashboard, `e`/Space toggles correction, `p` pauses for 30 minutes,
 `r` reloads lists, and `q` quits. Closing the control window or quitting the dashboard
@@ -543,12 +548,21 @@ are supplemented by 994 measured pairs from two public Leipzig news samples,
 each containing 10,000 sentences. Measured pairs require at least five occurrences,
 conditional frequency of 5%, and association of at least three times the independent
 word-frequency expectation. Weights remain bounded to four; counts and pinned source
-checksums are in `src/phrase_counts.tsv`. Only the previous finished word
-is needed. Personalization additionally boosts pairs retained at least twice in the
+checksums are in `src/phrase_counts.tsv`. These priors use the previous finished
+word. Personalization additionally boosts pairs retained at least twice in the
 current typing context; these pair counts remain in memory. Focus changes, cursor
 moves, deletion, undo, and Enter clear phrase context; punctuation ends the
 previous-word link. Disabling personalization discards learned pair counts while
 keeping the public phrase priors available.
+
+The same context retains at most 16 visible words in memory and supplements the
+one-word priors with a local, smoothed 4-gram model. It scores a candidate against
+up to three preceding words, backing off when longer contexts are sparse. The
+model contains 59,644 measured 1-to-4-grams from the same pinned public news
+samples, stored in about 1.2 MB of read-only executable data. Context counts
+must occur at least four times before influencing ranking. Relative likelihood
+adjustments are bounded; mixed-script transitions do not borrow evidence from
+the other language. Neither context nor the model requires a network service.
 
 Tap the completion shortcut (Right Shift by default) before Space to request an
 English or Hebrew spelling suggestion when the prefix has no exact completion. Repeated taps
@@ -559,14 +573,15 @@ priority. Finishing a selected spelling repair of the same or shorter length can
 train its correction pair when personalization is enabled; unaccepted offers and
 longer prefix completions do not.
 
-Automatic English spelling also uses phrase evidence when it would otherwise
-abstain because candidates are too close. Only candidates within four score units
-of the original best are reconsidered; a phrase weight of at least two can lower
-a candidate's score by at most eight units. The winner must still lead by at least
-four units. Phrase context never changes an already confident spelling decision
-or widens edit-distance and frequency limits. Word protection, ALL CAPS, ignored
-words, and undo exceptions still apply. This also supports a combined layout and
-spelling repair. Recent correction details include the phrase weight and discount.
+Same-layout automatic English spelling applies context to every eligible candidate
+before deciding, allowing sentence evidence to reconsider a previously confident guess.
+Context adjusts each candidate's cost by at most eight units in either direction.
+The winner must still lead both keeping the original and the next candidate by
+at least four units. Context never widens edit-distance or frequency limits.
+Word protection, ALL CAPS, ignored words, and undo exceptions still apply. This
+also supports a combined layout and spelling repair, with independently accepted
+alternate-layout matches taking precedence over contextual intent. Recent correction
+details include the phrase weight and cost adjustment.
 
 Hebrew spelling corrections and manual offers search one letter insertion, deletion,
 substitution, or transposition, favor missing/extra ו and י, enforce final-letter
@@ -591,14 +606,17 @@ Ambiguous candidates remain available through the completion gesture. Hebrew
 repairs preserve the current layout and punctuation, replace only the changed
 suffix, and support the same undo and retained-correction learning as English.
 
-Before a combined layout and spelling repair, both language assessments compete.
-A candidate rejected by its own confidence gate can still veto an ambiguous switch.
+Before a combined layout and spelling repair, both language assessments compete
+under their existing confidence gates. A candidate rejected by its own confidence
+gate can still veto an ambiguous switch.
 Reading source letter keys as alternate-language punctuation adds uncertainty;
 English punctuation is preserved when evaluating a Hebrew repair. Exact layout
-decisions retain their existing word, frequency, and history guards. A supported
-phrase in the preceding word's language can resolve the language choice, without
-bypassing either speller's acceptance gates. Scores are heuristics, not confidence
-percentages.
+decisions retain their existing word, frequency, and history guards. Exact matches
+and alternate-layout typo repairs that pass these checks without context take
+precedence over contextual intent and learned replacements. For unresolved
+alternatives, a supported phrase in the preceding word's language can resolve the
+language choice without bypassing either speller's acceptance gates. Scores are
+heuristics, not confidence percentages.
 
 The completion gesture checks both layouts. Current-language exact matches,
 known words, and explicit abbreviations retain priority; exact alternate-layout
@@ -613,11 +631,18 @@ With personalization enabled, repeatedly retained English and Hebrew correction 
 adjust the ranking cost of transpositions, neighboring-key substitutions, and
 missing letters (including extra letters in Hebrew). Each language trains its own
 counts. The discount is capped at 15 score units, does not widen edit-distance or frequency
-limits, and never trains from a single observation. Undo withdraws one vote for the
-rejected correction, weakening its learned edit-class evidence.
+limits. A retained automatic correction contributes one vote; an explicitly
+selected and retained spelling repair contributes three. Merely displaying an
+offer contributes nothing. Undo withdraws three votes, saturating at zero,
+weakening the rejected pair and its learned edit-class evidence. Ordinary word
+frequency still counts each retained word once.
 
 Learned exact layout pairs switch in either direction, including in layout-only
-mode, and skip spelling search. Configured abbreviations take precedence, unknown
+mode. Accepted exact alternate-layout matches and independently confident
+alternate-layout typo repairs are chosen before learned pairs are considered.
+Otherwise, learned pairs compete with independently inferred actions and preserving
+the original token. Configured
+abbreviations take precedence, unknown
 layouts remain untouched, and single-letter inputs never trigger learned repairs.
 Repeated Hebrew spelling pairs stay in Hebrew. Learning requires `personal = true`.
 
@@ -628,6 +653,22 @@ leads do not trigger a learned replacement. Correction-pair votes halve every
 not reset the aging period. The local `personal/confusions.txt` file stores the
 decay timestamp in a fourth column; existing three-column files remain readable
 and start aging when first loaded by this version.
+
+Before the contextual intent comparison, ReCast accepts exact alternate-layout
+matches and alternate-layout spelling repairs that independently pass its existing
+tolerance and bilingual confidence checks. Context cannot veto or change these
+accepted matches. Source-word, frequency, edit, language-preference, and focus
+protections remain in force. Remaining eligible layout, spelling, and learned
+actions share one intent comparison with keeping the original. Equivalent visible
+actions are deduplicated. Spelling retains its minimum margin over both the original and
+same-language or other-language alternatives, normalized against each model's
+acceptance threshold. Learned evidence uses its decayed support advantage;
+layout eligibility retains its frequency and recent-language checks.
+Conflicting actions or a lead below four policy-cost units leave
+the text unchanged. Existing pipeline eligibility and language-preference gates
+still apply. These scores are heuristics, not calibrated confidence percentages.
+Completion remains an explicit shortcut action and uses the same contextual
+evidence for ranking; it is never inserted automatically while typing a prefix.
 
 With personalization enabled, words retained at least twice also become completion
 candidates even when absent from the bundled dictionary. To clear these files,
@@ -675,13 +716,21 @@ in `src/phrase_counts.tsv`, then running:
 
 ```bash
 python3 scripts/build_phrases.py /path/to/eng_news_2020_10K.tar.gz /path/to/heb_news_2020_10K.tar.gz
+python3 scripts/build_intent.py /path/to/eng_news_2020_10K.tar.gz /path/to/heb_news_2020_10K.tar.gz
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 The builder verifies pinned SHA256 checksums, respects sentence and punctuation
 boundaries, and keeps at most 512 pairs per language. Add `--check` to verify the
 committed output without changing it. Only aggregate phrase counts are bundled;
-the app never downloads corpora or sends typed text to a server.
+the app never downloads corpora or sends typed text to a server. The intent
+builder retains counts observed at least twice, including true context totals
+before pruning, and never trains from the correction evaluation cases. It also
+supports `--check`. Compare contextual and context-free latency with:
+
+```bash
+cargo test --release benchmark_intent_latency_distribution -- --ignored --nocapture
+```
 
 ```bash
 cargo build --locked --release
