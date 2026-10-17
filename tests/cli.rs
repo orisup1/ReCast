@@ -126,6 +126,16 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     };
     for (word, layout, expected, reason) in [
         ("recieve", "en", "receive", "English spelling"),
+        ("hellorecieve", "en", "receive", "Merged-token"),
+        ("helloRecieve!", "en", "Receive!", "Merged-token"),
+        ("helloakuo", "en", "שלום", "Merged-token"),
+        ("helloakuo,", "en", "שלום,", "Merged-token"),
+        ("(hellorecieve)", "en", "(receive)", "Merged-token"),
+        ("שלוםיקךךם", "he", "hello", "Merged-token"),
+        ("שלוםרקבןקהק", "he", "receive", "Merged-token"),
+        ("שלוםמקלדתת", "he", "מקלדת", "Merged-token"),
+        ("helloworld", "en", "helloworld", "Protected word"),
+        ("hellokeyboad", "en", "hellokeyboad", "Protected word"),
         ("enviroment", "en", "environment", "English spelling"),
         ("priviledge", "en", "privilege", "English spelling"),
         (
@@ -231,7 +241,7 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     ] {
         // Windows resolves config through Known Folders, ignoring APPDATA.
         // Fixture-dependent checks run where HOME isolates the files.
-        if cfg!(windows) && matches!(word, "keyboad" | "zztest") {
+        if cfg!(windows) && matches!(word, "keyboad" | "hellokeyboad" | "zztest") {
             continue;
         }
         let output = preview(&["--explain", word, "--layout", layout]);
@@ -376,6 +386,17 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     );
     #[cfg(unix)]
     {
+        std::fs::write(config.join("config.toml"), "split = false\n").unwrap();
+        for (word, layout) in [
+            ("hellorecieve", "en"),
+            ("helloakuo", "en"),
+            ("שלוםמקלדתת", "he"),
+        ] {
+            let output = preview(&["--explain", word, "--layout", layout]);
+            assert!(output.status.success());
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains(&format!("Replacement: {word:?}")), "{text}");
+        }
         std::fs::write(config.join("config.toml"), "spell = false\n").unwrap();
         for word in ["teh", "recieve", "xocmputer", "computerx"] {
             let output = preview(&["--explain", word, "--layout", "en"]);

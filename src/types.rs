@@ -28,7 +28,7 @@ static GLOBAL_CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
 
 impl Config {
     /// Access the global config, falling back to defaults if not yet set
-    /// (matches the `from_env` defaults: short-word switching on, split off,
+    /// (matches the `from_env` defaults: short-word switching on, split on,
     /// spelling autocorrect on).
     pub fn global() -> Config {
         lock_forgiving(GLOBAL_CONFIG.get_or_init(|| {
@@ -43,7 +43,7 @@ impl Config {
                 rule_stats_enabled: false,
                 language_preference: crate::config::LanguagePreference::Balanced,
                 short_enabled: true,
-                split_enabled: false,
+                split_enabled: true,
                 freq_enabled: true,
                 spell_enabled: true,
                 spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
@@ -484,7 +484,7 @@ impl AppControl {
             rule_stats_enabled: false,
             language_preference: crate::config::LanguagePreference::Balanced,
             short_enabled: true,
-            split_enabled: false,
+            split_enabled: true,
             freq_enabled: true,
             spell_enabled: true,
             spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,

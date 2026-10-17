@@ -110,8 +110,8 @@ impl Config {
     /// Load configuration from environment variables.
     /// RECAST_SHORT – set to `0` to restrict short (≤3 char) switches to very
     ///                common words (default: enabled).
-    /// RECAST_SPLIT – set (to anything but `0`) to enable the missing-space
-    ///                split fallback (default: disabled).
+    /// RECAST_SPLIT – set to `0` to disable merged-token last-word correction
+    ///                (default: enabled).
     /// RECAST_FREQ  – set to `0` to disable the homograph frequency tie-break
     ///                (default: enabled).
     /// RECAST_SPELL – set to `0` to disable English and Hebrew spelling autocorrect
@@ -154,7 +154,7 @@ impl Config {
                 .and_then(|value| LanguagePreference::parse(&value))
                 .unwrap_or_default(),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
-            split_enabled: crate::settings::flag("RECAST_SPLIT", false),
+            split_enabled: crate::settings::flag("RECAST_SPLIT", true),
             freq_enabled: crate::settings::flag("RECAST_FREQ", true),
             spell_enabled: crate::settings::flag("RECAST_SPELL", true),
             spell_min_len: env_num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),

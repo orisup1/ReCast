@@ -492,7 +492,7 @@ pub fn sample() -> String {
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
 #rule_stats = false    # persist aggregate correction, undo, and completion-use counts
 #short = true          # short switches: rank <= 30000; false restricts to <= 500
-#split = false         # missing-space split fallback (opt-in; can mis-split)
+#split = true          # correct only the last word of a merged token
 #freq = true           # homograph frequency tie-break
 #spell = true          # English and Hebrew spelling autocorrect
 #spell_min = {spell_min}           # shortest word the speller may fix

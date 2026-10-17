@@ -17,7 +17,7 @@ mod blob;
 pub use blob::{en_dict, en_freq, he_dict, he_freq, Dict, Freq};
 
 use crate::config::{Config, LanguagePreference};
-use crate::types::Language;
+use crate::types::{FixKind, Language};
 
 /// Whether to log every word check and switch decision.
 ///
@@ -30,13 +30,9 @@ fn debug_enabled() -> bool {
     *FLAG.get_or_init(|| crate::settings::flag("RECAST_DEBUG", false))
 }
 
-/// Missing-space split correction is opt-in. It can only ever fire when the
-/// whole buffer is gibberish in both layouts, but even then it cannot reliably
-/// tell "one word we simply don't have in the dictionary" from "two words typed
-/// without a space, the second in the wrong layout" — so by default it stays off
-/// and a single word is never carved up. Set `RECAST_SPLIT=1` to enable it.
+/// Correct only the final word of an unrecognized merged token.
+/// Set `RECAST_SPLIT=0` to disable this fallback.
 fn split_enabled() -> bool {
-    // Enable missing‑space split via RECAST_SPLIT env (exposed through Config).
     Config::global().split_enabled
 }
 
@@ -763,6 +759,14 @@ pub enum Fix {
     /// abbreviation expansion. The layout is untouched; `lang` selects the
     /// keymap for injection, history, and undo.
     Spelling { text: String, lang: Language },
+    /// Replace an entire merged token with its corrected final word.
+    /// `previous_layout` is set only when the layout was switched.
+    Suffix {
+        text: String,
+        lang: Language,
+        previous_layout: Option<Language>,
+        kind: FixKind,
+    },
 }
 
 /// Everything a finished word produced: what to do about it, and what language
@@ -947,7 +951,7 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
 /// Explicit English abbreviation rules precede inference. An accepted exact or
 /// typo-tolerant alternate-layout match takes priority over contextual ranking.
 /// Other spelling and learned proposals compete with leaving the literal token
-/// alone. Layout eligibility checks the whole buffer before the opt-in split;
+/// alone. Layout eligibility checks the whole buffer before the suffix fallback;
 /// spelling evaluates both languages and preserves recognized words and forms.
 /// A confident layout and spelling repair may compose into one atomic plan.
 /// Context adjusts eligible evidence without widening its hard search gates.
@@ -957,7 +961,6 @@ fn plan(
     he: Reading,
     offsets_en: &[usize],
     offsets_he: &[usize],
-    keys_len: usize,
     current: Option<Language>,
     run: Run,
     case: Case,
@@ -968,15 +971,13 @@ fn plan(
     layout_only: bool,
     context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
+    suffix_allowed: &mut bool,
 ) -> Option<Plan> {
     let preference = Config::global().language_preference;
     details.push_str(&format!("\nLanguage preference: {}.", preference.label()));
     let candidate = plan_candidate(
         en,
         he,
-        offsets_en,
-        offsets_he,
-        keys_len,
         current,
         run,
         case,
@@ -988,6 +989,8 @@ fn plan(
         context,
         details,
     )?;
+    // A rejected whole-word proposal must not be retried as a partial word.
+    *suffix_allowed = false;
     // One final gate covers exact, split, learned, and combined spelling switches.
     // Explicit expansions and spelling within the current layout pass unchanged.
     preference_allows_plan(
@@ -1087,9 +1090,6 @@ fn preference_allows_plan(
 fn plan_candidate(
     en: Reading,
     he: Reading,
-    offsets_en: &[usize],
-    offsets_he: &[usize],
-    keys_len: usize,
     current: Option<Language>,
     run: Run,
     case: Case,
@@ -1103,7 +1103,6 @@ fn plan_candidate(
 ) -> Option<Plan> {
     // Every pipeline below asks about the *word* — the punctuation the user
     // finished it with is set aside by `Reading` and put back by the caller.
-    // The split scan is the one exception: its offsets index the full readings.
     let (word_en, word_he) = (en.word, he.word);
     // A word the user has already taken back with the undo gesture is not
     // offered a second opinion. This is checked before everything else,
@@ -1257,17 +1256,6 @@ fn plan_candidate(
     if let Some(learned) = learned {
         details.push_str("\nAdded a candidate from repeatedly retained corrections; it must pass the joint intent comparison.");
         candidates.push(learned);
-    }
-    if let Some(split) = plan_split(
-        en.full, he.full, offsets_en, offsets_he, keys_len, current, run, en_dict, he_dict,
-        en_freq, he_freq,
-    ) {
-        details.push_str("\nThe enabled missing-space rule found a valid prefix and a confident alternate-layout suffix.");
-        candidates.push(Proposal {
-            plan: split,
-            lead: 8.0,
-            context_scored: false,
-        });
     }
     if let Some(spelling) = spelling {
         candidates.push(spelling);
@@ -1705,99 +1693,15 @@ fn compose_spelling(current: Language, target: Language, text: String) -> Plan {
     }
 }
 
-/// Missing-space split: opt-in, and only meaningful when we know the layout.
-/// Carves `helloעולם` into two words by finding a split where the left side is
-/// a real word in the current layout and the right side is a confident word in
-/// the other one.
-#[allow(clippy::too_many_arguments)]
-fn plan_split(
-    full_en: &str,
-    full_he: &str,
-    offsets_en: &[usize],
-    offsets_he: &[usize],
-    keys_len: usize,
-    current: Option<Language>,
-    run: Run,
-    en_dict: Dict,
-    he_dict: Dict,
-    freq_en: Freq,
-    freq_he: Freq,
-) -> Option<Plan> {
-    if !split_enabled() {
-        return None;
-    }
-    let current = current?;
-    let other = current.other();
-
-    // The full buffer must be gibberish in *both* layouts before we even
-    // consider carving it up; if it reads as a real word either way, it is one
-    // word and must be left intact.
-    let (full_cur, full_oth) = match current {
-        Language::English => (full_en, full_he),
-        Language::Hebrew => (full_he, full_en),
-    };
-    if valid_loose(full_cur, current, en_dict, he_dict)
-        || valid_loose(full_oth, other, en_dict, he_dict)
-    {
-        return None;
-    }
-
-    // Scan split points from the longest prefix down — the first match leaves
-    // the most user-typed text intact. Require: a real word (current layout) on
-    // the left, and a confident word (other layout, ≥2 chars) on the right that
-    // is NOT itself a real word in the current layout.
-    for split in (1..keys_len).rev() {
-        let (cur_prefix, cur_suffix) = match current {
-            Language::English => (&full_en[..offsets_en[split]], &full_en[offsets_en[split]..]),
-            Language::Hebrew => (&full_he[..offsets_he[split]], &full_he[offsets_he[split]..]),
-        };
-        if !valid_strict(cur_prefix, current, en_dict, he_dict) {
-            continue;
-        }
-        let oth_suffix = match other {
-            Language::English => &full_en[offsets_en[split]..],
-            Language::Hebrew => &full_he[offsets_he[split]..],
-        };
-        if oth_suffix.chars().count() < 2 {
-            continue;
-        }
-        let enabled = Config::global().short_enabled;
-        if too_short_to_trigger(oth_suffix, other, enabled, freq_en, freq_he) {
-            continue;
-        }
-        if valid_strict(oth_suffix, other, en_dict, he_dict)
-            && !valid_loose(cur_suffix, current, en_dict, he_dict)
-        {
-            // Confirm split only when the other suffix is decisively the common
-            // reading (frequency tie-break), matching the main pipeline.
-            let full_cur = match current {
-                Language::English => full_en,
-                Language::Hebrew => full_he,
-            };
-            if !other_decisively_more_common(
-                full_cur, current, oth_suffix, other, run, freq_en, freq_he,
-            ) {
-                continue;
-            }
-            return Some(Plan::Switch {
-                lang: other,
-                start: split,
-            });
-        }
-    }
-
-    None
-}
-
 /// Run both correction pipelines over a finished key sequence.
 ///
 /// The layout pipeline anchors on the live keyboard layout: a sequence that
 /// already reads as a real word in the current layout is never touched, and we
 /// switch when the *other* layout yields a confident dictionary word. If that
 /// other reading is instead a confident English misspelling, layout switching
-/// and spelling correction are applied together. A missing-space split fallback
-/// exists but is opt-in (`RECAST_SPLIT=1`) because it cannot be made reliably
-/// safe.
+/// and spelling correction are applied together. The missing-space fallback
+/// corrects only the final word after a recognized prefix; `RECAST_SPLIT=0`
+/// disables it.
 ///
 /// Returns the single [`Fix`] to apply — or `None` to leave the word alone —
 /// alongside the language the word turned out to be, which the caller records
@@ -1880,6 +1784,7 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
             layout_only,
             context,
             &switch_layout_to,
+            true,
         );
         if whole.fix.is_some() {
             return whole;
@@ -1897,6 +1802,7 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
         layout_only,
         context,
         switch_layout_to,
+        true,
     );
     if start != 0 {
         let visible = visible.unwrap();
@@ -1921,6 +1827,17 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
             Fix::Spelling { text, lang } => Fix::Spelling {
                 text: format!("{head}{text}{tail}"),
                 lang,
+            },
+            Fix::Suffix {
+                text,
+                lang,
+                previous_layout,
+                kind,
+            } => Fix::Suffix {
+                text: format!("{head}{text}{tail}"),
+                lang,
+                previous_layout,
+                kind,
             },
         });
         result
@@ -1989,6 +1906,7 @@ fn check_unwrapped_in_context<K: Copy>(
     layout_only: bool,
     context: Option<&crate::complete::PhraseContext>,
     switch_layout_to: impl Fn(Language) -> crate::layout::LayoutSwitch,
+    allow_split: bool,
 ) -> Outcome {
     if keys.is_empty() {
         return Outcome {
@@ -2009,10 +1927,9 @@ fn check_unwrapped_in_context<K: Copy>(
     // and `&full_en[offsets_en[k]..]` is the suffix for `keys[k..]`. Same
     // for Hebrew. Length is `keys.len() + 1`.
     //
-    // The offset tables exist only for the missing-space split, which is off by
-    // default — when it is, they are not built at all and a finished word costs
-    // two short string allocations instead of four.
-    let want_offsets = split_enabled();
+    // Suffix checks never split recursively. Explicitly disabling the fallback
+    // also avoids allocating its offset tables.
+    let want_offsets = allow_split && split_enabled();
     let mut full_en = String::with_capacity(keys.len());
     let mut full_he = String::with_capacity(keys.len() * 2);
     let mut offsets_en = Vec::with_capacity(if want_offsets { keys.len() + 1 } else { 0 });
@@ -2087,12 +2004,12 @@ fn check_unwrapped_in_context<K: Copy>(
         },
         run.len
     ));
+    let mut suffix_allowed = want_offsets;
     let Some(plan) = plan(
         en,
         he,
         &offsets_en,
         &offsets_he,
-        keys.len(),
         current,
         run,
         case,
@@ -2103,7 +2020,30 @@ fn check_unwrapped_in_context<K: Copy>(
         layout_only,
         context,
         &mut details,
+        &mut suffix_allowed,
     ) else {
+        if suffix_allowed {
+            if let Some(mut suffix) = check_merged_suffix(
+                keys,
+                &to_en,
+                &to_he,
+                &shift_of,
+                run,
+                en_dict,
+                he_dict,
+                current,
+                layout_only,
+                context,
+                &switch_layout_to,
+                en,
+                he,
+                &offsets_en,
+                &offsets_he,
+            ) {
+                suffix.details = format!("{details}\nMerged-token fallback: {}", suffix.details);
+                return suffix;
+            }
+        }
         debug_log(&full_en, &full_he, None, false);
         return Outcome {
             reason: "Protected word or no confident correction under these settings",
@@ -2224,6 +2164,114 @@ fn check_unwrapped_in_context<K: Copy>(
         reason,
         details,
     }
+}
+
+/// Try suffixes after recognized prefixes, considering the longest prefix first.
+/// Replace the entire merged token with the corrected suffix.
+/// Reuse the normal planner so suffixes retain spelling, case, preference,
+/// application-mode, and undo protections. Never recursively split a suffix.
+#[allow(clippy::too_many_arguments)]
+fn check_merged_suffix<K: Copy>(
+    keys: &[K],
+    to_en: &dyn Fn(K) -> Option<char>,
+    to_he: &dyn Fn(K) -> Option<char>,
+    shift_of: &dyn Fn(K) -> bool,
+    run: Run,
+    en_dict: Dict,
+    he_dict: Dict,
+    current: Option<Language>,
+    layout_only: bool,
+    context: Option<&crate::complete::PhraseContext>,
+    switch_layout_to: &dyn Fn(Language) -> crate::layout::LayoutSwitch,
+    en: Reading,
+    he: Reading,
+    offsets_en: &[usize],
+    offsets_he: &[usize],
+) -> Option<Outcome> {
+    let current = current?;
+    let (visible, offsets) = match current {
+        Language::English => (en, offsets_en),
+        Language::Hebrew => (he, offsets_he),
+    };
+    if en.full.chars().count() != keys.len()
+        || he.full.chars().count() != keys.len()
+        || valid_loose(en.word, Language::English, en_dict, he_dict)
+        || valid_loose(he.word, Language::Hebrew, en_dict, he_dict)
+        || en_freq().rank(en.word).is_some()
+        || he_freq().rank(he.word).is_some()
+        || !visible.word.chars().all(|c| match current {
+            Language::English => c.is_ascii_alphabetic(),
+            Language::Hebrew => ('א'..='ת').contains(&c),
+        })
+        || crate::complete::suppressed(visible.word)
+        || crate::complete::ignored(visible.word)
+        || crate::complete::learned(visible.word)
+    {
+        return None;
+    }
+    let word_keys = visible.word.chars().count();
+    for start in (3..word_keys.saturating_sub(1)).rev() {
+        let prefix = &visible.word[..offsets[start]];
+        if !valid_strict(prefix, current, en_dict, he_dict)
+            || freq_rank(prefix, current, en_freq(), he_freq())
+                .is_none_or(|rank| rank > FREQ_COMMON_MAX_RUN)
+        {
+            continue;
+        }
+        let suffix = &visible.word[offsets[start]..];
+        if valid_loose(suffix, current, en_dict, he_dict)
+            || crate::complete::suppressed(suffix)
+            || crate::complete::ignored(suffix)
+            || crate::complete::learned(suffix)
+        {
+            return None;
+        }
+        let mut outcome = check_unwrapped_in_context(
+            &keys[start..word_keys],
+            to_en,
+            to_he,
+            shift_of,
+            run,
+            en_dict,
+            he_dict,
+            Some(current),
+            layout_only,
+            context,
+            switch_layout_to,
+            false,
+        );
+        let Some(fix) = outcome.fix.take() else {
+            continue;
+        };
+        outcome.fix = Some(match fix {
+            Fix::Layout { text, lang, .. } => Fix::Suffix {
+                text: format!("{text}{}", visible.tail),
+                lang,
+                previous_layout: Some(current),
+                kind: FixKind::Layout,
+            },
+            Fix::Spelling { text, lang } => Fix::Suffix {
+                text: format!("{text}{}", visible.tail),
+                lang,
+                previous_layout: None,
+                kind: FixKind::Spelling,
+            },
+            Fix::LayoutSpelling { text, lang } => Fix::Suffix {
+                text: format!("{text}{}", visible.tail),
+                lang,
+                previous_layout: Some(current),
+                kind: FixKind::LayoutSpelling,
+            },
+            Fix::Suffix { .. } => unreachable!("suffix splitting is disabled"),
+        });
+        outcome.reason = "Merged-token last-word correction";
+        outcome.rule = Some("split");
+        outcome.details.push_str(&format!(
+            "\nFound a recognized prefix ({prefix:?}, {start} keys); replaced the entire merged token with its corrected final word."
+        ));
+        return Some(outcome);
+    }
+    None
 }
 
 /// The word `keys` spells, if the pipelines left it alone *only* because the
@@ -2583,7 +2631,6 @@ mod tests {
                         Reading::of(he_word),
                         &[],
                         &[],
-                        0,
                         Some(current),
                         Run::default(),
                         Case::Lower,
@@ -2594,6 +2641,7 @@ mod tests {
                         false,
                         history,
                         &mut details,
+                        &mut true,
                     ),
                     Some(expected.clone()),
                     "{en_word:?} / {he_word:?}: {details}",
@@ -3332,7 +3380,11 @@ mod tests {
                         Some(Fix::Layout { start, text, .. }) => {
                             format!("{}{text}", visible.chars().take(start).collect::<String>())
                         }
-                        Some(Fix::Spelling { text, .. } | Fix::LayoutSpelling { text, .. }) => text,
+                        Some(
+                            Fix::Spelling { text, .. }
+                            | Fix::LayoutSpelling { text, .. }
+                            | Fix::Suffix { text, .. },
+                        ) => text,
                         None => panic!(
                             "wrapped layout miss: {target:?} {word:?} {head:?}; {}",
                             result.details
@@ -3733,7 +3785,6 @@ mod tests {
                 Reading::of("קמהןרםצקמא"),
                 &[],
                 &[],
-                10,
                 Some(Language::Hebrew),
                 Run::default(),
                 Case::Lower,
@@ -3744,6 +3795,7 @@ mod tests {
                 layout_only,
                 None,
                 &mut String::new(),
+                &mut true,
             )
         };
         assert_eq!(
@@ -3888,10 +3940,11 @@ mod tests {
                 Some(
                     Fix::Layout { text, start: 0, .. }
                     | Fix::Spelling { text, .. }
-                    | Fix::LayoutSpelling { text, .. },
+                    | Fix::LayoutSpelling { text, .. }
+                    | Fix::Suffix { text, .. },
                 ) => text,
-                Some(Fix::Layout { start, .. }) => {
-                    panic!("unexpected split at {start}: splitting is disabled")
+                Some(Fix::Layout { start, text, .. }) => {
+                    before.chars().take(start).collect::<String>() + &text
                 }
             };
             if layout_only {
@@ -4710,8 +4763,8 @@ mod tests {
     }
 
     /// Run the planner on an already-folded pair of readings. The offset tables
-    /// and key count only matter to the missing-space split, which is off by
-    /// default, so tests that don't exercise it can pass empty ones.
+    /// only matter to suffix preference checks, so whole-word tests can pass
+    /// empty ones.
     fn plan_for(
         en_text: &str,
         he_text: &str,
@@ -4737,7 +4790,6 @@ mod tests {
             Reading::of(he_text),
             &[],
             &[],
-            0,
             current,
             Run::default(),
             case,
@@ -4748,6 +4800,7 @@ mod tests {
             false,
             None,
             &mut String::new(),
+            &mut true,
         )
     }
 
@@ -4817,7 +4870,6 @@ mod tests {
                     Reading::new("שלומ,", "שלומ".len()),
                     &[],
                     &[],
-                    5,
                     current,
                     Run::default(),
                     Case::Lower,
@@ -4828,6 +4880,7 @@ mod tests {
                     layout_only,
                     None,
                     &mut String::new(),
+                    &mut true,
                 ),
                 expected
             );
@@ -4842,7 +4895,6 @@ mod tests {
                 Reading::of("שלומץ"),
                 &[],
                 &[],
-                5,
                 current,
                 Run::default(),
                 case,
@@ -4853,6 +4905,7 @@ mod tests {
                 layout_only,
                 None,
                 &mut String::new(),
+                &mut true,
             )
         };
         assert_eq!(
@@ -4957,7 +5010,6 @@ mod tests {
                 Reading::of("בשסק"),
                 &[],
                 &[],
-                0,
                 current,
                 Run::default(),
                 case,
@@ -4968,6 +5020,7 @@ mod tests {
                 layout_only,
                 context,
                 &mut String::new(),
+                &mut true,
             )
         };
         let empty_he = dict(&[]);
@@ -5308,7 +5361,6 @@ mod tests {
             read("שלום.", false, &[]),
             &[],
             &[],
-            0,
             Some(Language::English),
             Run::default(),
             Case::Lower,
@@ -5319,6 +5371,7 @@ mod tests {
             false,
             None,
             &mut String::new(),
+            &mut true,
         );
         assert_eq!(
             plan,
@@ -5351,7 +5404,6 @@ mod tests {
                 read("יקךם,", false, &[]),
                 &[],
                 &[],
-                0,
                 Some(Language::English),
                 Run::default(),
                 Case::Lower,
@@ -5362,6 +5414,7 @@ mod tests {
                 false,
                 None,
                 &mut String::new(),
+                &mut true,
             ),
             Some(Plan::Spell {
                 text: "hello".to_string()

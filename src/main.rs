@@ -82,7 +82,7 @@ Settings:
   ReCast is started the way it is meant to be.
 
   RECAST_DEBUG=1      Print every word check and switch decision
-  RECAST_SPLIT=1      Enable the opt-in missing-space split fallback
+  RECAST_SPLIT=0      Disable merged-token last-word correction
   RECAST_SHORT=0      Restrict short (≤3 char) switches to very common words
   RECAST_FREQ=0       Disable the homograph frequency tie-break
   RECAST_PREFER=      balanced (default), english, or hebrew. Require stronger

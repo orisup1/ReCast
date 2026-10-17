@@ -332,9 +332,16 @@ Keys are environment names lowercased without `RECAST_`; for example,
 prefer = "balanced" # balanced (default), english, or hebrew
 spell_dist = 1      # Single-edit spelling fixes (default ceiling: 3)
 complete = true    # Completion and abbreviations (default: true)
-split = false      # Missing-space splitting (default: false)
+split = true       # Merged-token last-word correction (default: true)
 personal = false   # Persistent personalization (default: false)
 ```
+
+When two words run together, ReCast can recognize a common prefix of at least
+three letters and replace the entire merged token with its corrected final word.
+For example, `hellorecieve` becomes `receive`, and `helloakuo` becomes `שלום`.
+Trailing punctuation and the final word's capitalization are preserved. Undo
+restores the entire original token. Recognized whole tokens take priority. Set
+`split = false` or `RECAST_SPLIT=0` to disable this fallback.
 
 Spelling defaults to words of at least 4 characters and suggestions ranked within
 50,000 for words of at least eight letters (20,000 for shorter words). Completion

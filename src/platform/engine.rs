@@ -450,6 +450,7 @@ struct RetryContext<P: Platform> {
     finish_completion_on_commit: bool,
     clear_phrase_on_commit: bool,
     keys: Vec<Typed<P::Key>>,
+    deletion_tail: Option<Vec<Typed<P::Key>>>,
     no_fix: bool,
     last_action: Option<LastAction<P>>,
     cycle: Option<Cycle<P>>,
@@ -488,6 +489,7 @@ impl<P: Platform> RetryContext<P> {
             finish_completion_on_commit: false,
             clear_phrase_on_commit: false,
             keys: st.keys.to_vec(),
+            deletion_tail: st.deletion_tail.clone(),
             no_fix: st.no_fix,
             last_action,
             cycle: st.cycle.clone(),
@@ -593,6 +595,10 @@ pub struct AppState<P: Platform> {
     revision: u64,
     focus: Option<P::Focus>,
     no_fix: bool,
+    /// Known finished text immediately before the cursor, retained for deletion.
+    /// Some(empty) means the tracked word was fully erased; repeated Backspace
+    /// must not suppress the next freshly captured word. None means unknown text.
+    deletion_tail: Option<Vec<Typed<P::Key>>>,
 }
 
 impl<P: Platform> AppState<P> {
@@ -626,6 +632,7 @@ impl<P: Platform> AppState<P> {
             revision: 0,
             focus: None,
             no_fix: false,
+            deletion_tail: None,
         }
     }
 
@@ -740,6 +747,7 @@ impl<P: Platform> AppState<P> {
         self.buffered_keys.clear();
         self.forget_gestures();
         self.pending_learning = None;
+        self.deletion_tail = None;
         self.phrase.clear();
         self.history.clear();
         self.no_fix = true;
@@ -1198,15 +1206,39 @@ impl<P: Platform> Engine<P> {
         }
 
         if key == P::BACKSPACE {
-            // Beyond the tracked word, its unknown prefix may still be on screen.
-            if st.focus != focus || st.keys.is_empty() {
+            if st.focus != focus {
                 st.invalidate_text();
-            } else {
+            } else if !st.keys.is_empty() {
                 st.keys.pop();
+                if st.keys.is_empty() && !st.no_fix {
+                    st.deletion_tail = Some(Vec::new());
+                }
+            } else if let Some(mut tail) = st.deletion_tail.take() {
+                tail.pop();
+                // Re-enter the known word only after its separators are gone.
+                // Until then the current word is still empty.
+                if tail
+                    .last()
+                    .is_some_and(|typed| !P::is_terminator(typed.key))
+                {
+                    let start = tail
+                        .iter()
+                        .rposition(|typed| P::is_terminator(typed.key))
+                        .map_or(0, |index| index + 1);
+                    st.keys.replace_with(tail.drain(start..));
+                    st.deletion_tail = None;
+                } else {
+                    st.deletion_tail = Some(tail);
+                }
+                st.no_fix = false;
+            } else {
+                // A cursor move, shortcut, or unknown prefix still requires a boundary.
+                st.invalidate_text();
             }
         } else if P::is_terminator(key) {
             self.word_finished(st, key, shift, focus);
         } else if is_text {
+            st.deletion_tail = None;
             if st.keys.is_empty() && !st.is_replacing {
                 // A new target starts a new capture. Keep this separate from
                 // action focus checks: undo must still reject the old target.
@@ -1276,6 +1308,13 @@ impl<P: Platform> Engine<P> {
                     spaces.push(Typed { key, shift });
                 }
             }
+            if let Some(tail) = &mut st.deletion_tail {
+                if tail.len() < crate::types::MAX_WORD_KEYS + MAX_UNDO_SPACES {
+                    tail.push(Typed { key, shift });
+                } else {
+                    st.deletion_tail = None;
+                }
+            }
             return;
         }
         if std::mem::take(&mut st.no_fix) || !self.control.is_enabled() {
@@ -1295,6 +1334,7 @@ impl<P: Platform> Engine<P> {
                 });
             }
             st.keys.clear();
+            st.deletion_tail = None;
             st.phrase.clear();
             if P::is_line_break(key) {
                 st.invalidate_text();
@@ -1328,6 +1368,9 @@ impl<P: Platform> Engine<P> {
                         }
                         st.finish_completion_use(true);
                         st.retain_phrase_word(chosen);
+                        let mut tail = st.keys.to_vec();
+                        tail.push(Typed { key, shift });
+                        st.deletion_tail = Some(tail);
                         if P::is_line_break(key) {
                             st.invalidate_text();
                             st.no_fix = false;
@@ -1350,6 +1393,9 @@ impl<P: Platform> Engine<P> {
         }
 
         st.finish_completion_use(false);
+        let mut tail = st.keys.to_vec();
+        tail.push(Typed { key, shift });
+        st.deletion_tail = Some(tail);
         let outcome = self.check(&st.keys, st.history.run(), st.mode, &st.phrase);
         // Record what this word turned out to be before anything else happens
         // to it: the next word is decided with this one behind it. A word whose
@@ -2609,6 +2655,17 @@ impl<P: Platform> Engine<P> {
             } else {
                 None
             };
+            st.deletion_tail = match &st.last_action {
+                Some(LastAction::Fixed(fix))
+                    if fix.terminator.is_some() && !fix.visible.is_empty() =>
+                {
+                    let mut tail = fix.visible.clone();
+                    tail.extend(fix.terminator.map(|key| Typed { key, shift: false }));
+                    tail.extend_from_slice(&fix.trailing_spaces);
+                    Some(tail)
+                }
+                _ => None,
+            };
             st.last_key = None;
         }
         drop(st);
@@ -2661,6 +2718,7 @@ impl<P: Platform> Engine<P> {
                 && self.control.is_enabled()
         }) {
             st.keys.replace_with(retry.keys);
+            st.deletion_tail = retry.deletion_tail;
             st.no_fix = retry.no_fix;
             st.last_action = retry.last_action;
             st.cycle = retry.cycle;
@@ -2736,6 +2794,18 @@ fn replacement<P: Platform>(keys: &[Typed<P::Key>], fix: Option<Fix>) -> Option<
             previous_layout: Some(lang.other()),
             target_layout: lang,
             original_start: start,
+        }),
+        Fix::Suffix {
+            text,
+            lang,
+            previous_layout,
+            ..
+        } => Some(Replacement {
+            erase: keys.len(),
+            retype: P::retype_completion(&text, lang)?,
+            previous_layout,
+            target_layout: lang,
+            original_start: 0,
         }),
         Fix::LayoutSpelling { text, lang } => Some(Replacement {
             erase: keys.len(),
@@ -2848,6 +2918,16 @@ fn note_of<P: Platform>(keys: &[Typed<P::Key>], fix: &Fix) -> (String, String, F
             reading::<P>(&keys[*start..], lang.other()),
             text.clone(),
             FixKind::Layout,
+        ),
+        Fix::Suffix {
+            text,
+            lang,
+            previous_layout,
+            kind,
+        } => (
+            reading::<P>(keys, previous_layout.unwrap_or(*lang)),
+            text.clone(),
+            *kind,
         ),
         Fix::LayoutSpelling { text, lang } => (
             reading::<P>(keys, lang.other()),
@@ -4100,6 +4180,151 @@ mod tests {
         assert!(st.keys.is_empty() && st.no_fix);
         assert_eq!(st.held_keys, HashSet::from(['x']));
         assert!(st.action_down.is_none() && st.completion_down.is_none());
+    }
+
+    #[test]
+    fn delete_and_retype_corrects_without_an_empty_field_probe() {
+        const CHILD: &str = "RECAST_DELETE_RETYPE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::engine::tests::delete_and_retype_corrects_without_an_empty_field_probe", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        let mut cycles = 0;
+        for (source, typed, corrected) in [
+            (0, "recieve", "receive"),
+            (0, "adress", "address"),
+            (0, "hellorecieve", "receive"),
+            (0, "akuo", "שלום"),
+            (1, "hello", "hello"),
+            (1, "recieve", "receive"),
+        ] {
+            for spaces in [1, 3] {
+                for extra_backspaces in [0, 4] {
+                    let s = Session::new();
+                    for round in 0..10 {
+                        SIMULATED_LAYOUT.store(source, Ordering::SeqCst);
+                        s.type_text(&format!("{typed} "));
+                        assert!(s.engine.lock().is_replacing,
+                            "{typed}, round {round}, spaces {spaces}, extra Backspaces {extra_backspaces}: first Space must correct; text {:?}", s.text());
+                        s.pending();
+                        s.type_text(&" ".repeat(spaces - 1));
+                        s.finish();
+                        assert_eq!(s.text(), format!("{corrected}{}", " ".repeat(spaces)));
+                        for _ in 0..corrected.chars().count() + spaces + extra_backspaces {
+                            s.backspace();
+                        }
+                        assert_eq!(s.text(), "");
+                        assert!(
+                            !s.engine.lock().no_fix,
+                            "deleting known text must preserve a fresh capture"
+                        );
+                        cycles += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "Completed {cycles} correct/Space/delete/retype cycles without an empty-field probe."
+        );
+        // Accepting an explicit completion also leaves a known finished word.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        let completed = s.text();
+        assert!(completed.starts_with("keyb") && completed.len() > 4);
+        s.type_text(" ");
+        for _ in 0..completed.chars().count() + 1 {
+            s.backspace();
+        }
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive ");
+
+        // Navigation still invalidates the known tail; it cannot justify editing
+        // a new suffix attached to text that was never captured.
+        let s = Session::new();
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.tap('\x10');
+        s.backspace();
+        s.type_text("recieve ");
+        assert!(!s.engine.lock().is_replacing);
+    }
+
+    #[test]
+    fn merged_tokens_reinsert_only_the_final_word_and_undo_restores_both() {
+        const CHILD: &str = "RECAST_MERGED_TOKEN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::engine::tests::merged_tokens_reinsert_only_the_final_word_and_undo_restores_both", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for (layout, physical, expected) in [
+            (0, "hellorecieve", "receive "),
+            (0, "helloakuo,", "שלום, "),
+            (1, "akuohello", "hello "),
+            (1, "akuorecieve", "receive "),
+            (1, "akuoneks,,", "מקלדת "),
+        ] {
+            SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+            let s = Session::new();
+            s.type_text(physical);
+            let original = s.text();
+            s.type_text(" ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), expected, "{physical}");
+            assert_eq!(
+                s.engine.injector.erasures.lock().unwrap()[0],
+                physical.len() + 1,
+                "replacement must erase the entire merged token: {physical}"
+            );
+            s.undo();
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), format!("{original} "), "undo: {physical}");
+            assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), layout);
+            assert!(
+                crate::complete::suppressed(&original),
+                "undo should protect the entire original token: {original:?}"
+            );
+            crate::complete::unlist(&original);
+        }
+        // A layout switch refused by the OS must not erase either word.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        REFUSE_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("helloakuo ");
+        assert_eq!(s.text(), "helloakuo ");
+        assert!(s.ready.try_recv().is_err());
     }
 
     #[test]
