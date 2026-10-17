@@ -148,6 +148,12 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// buffer cannot leak into the next one.
     fn is_reset(key: Self::Key) -> bool;
 
+    /// Mouse buttons may arrive on a keyboard event stream, as on Linux.
+    /// A click starts fresh capture instead of marking the next word incomplete.
+    fn is_mouse_button(_key: Self::Key) -> bool {
+        false
+    }
+
     /// Whether this key is a modifier: shift, control, alt, super, caps lock.
     ///
     /// Used for one thing — spotting the *shape* of a keyboard-layout hotkey, so
@@ -738,6 +744,13 @@ impl<P: Platform> AppState<P> {
         self.history.clear();
         self.no_fix = true;
     }
+
+    /// Cancel everything tied to the old cursor while accepting newly typed
+    /// text immediately. No pre-existing text is included in the new buffer.
+    fn start_new_context(&mut self) {
+        self.invalidate_text();
+        self.no_fix = false;
+    }
 }
 
 impl<P: Platform> Replaceable for AppState<P> {
@@ -905,7 +918,7 @@ impl<P: Platform> Engine<P> {
 
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn mouse_click(&self) {
-        self.forget_everything();
+        self.lock().start_new_context();
     }
 
     /// Synchronize a native lock-state snapshot, including startup and reconnect.
@@ -977,6 +990,10 @@ impl<P: Platform> Engine<P> {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             st.invalidate_text();
+            return;
+        }
+        if P::is_mouse_button(key) {
+            st.start_new_context();
             return;
         }
 
@@ -1086,7 +1103,21 @@ impl<P: Platform> Engine<P> {
             || P::is_reset(key)
             || (st.is_replacing && self.control.has_app_rules())
         {
-            st.invalidate_text();
+            // A modifier+Space layout shortcut at an already known boundary
+            // changes no captured word. Cancel old actions without suppressing
+            // the first word typed under the newly selected layout.
+            if chorded_shortcut
+                && P::is_terminator(key)
+                && !P::is_line_break(key)
+                && st.keys.is_empty()
+                && !st.no_fix
+                && !st.is_replacing
+                && !during_injection
+            {
+                st.start_new_context();
+            } else {
+                st.invalidate_text();
+            }
             return;
         }
 
@@ -1177,6 +1208,11 @@ impl<P: Platform> Engine<P> {
             self.word_finished(st, key, shift, focus);
         } else if is_text {
             if st.keys.is_empty() && !st.is_replacing {
+                // A new target starts a new capture. Keep this separate from
+                // action focus checks: undo must still reject the old target.
+                if st.focus.is_some() && focus.is_some() && st.focus != focus {
+                    st.start_new_context();
+                }
                 st.focus = focus;
                 let revision = st.revision;
                 let suppressed = st.no_fix;
@@ -2885,7 +2921,10 @@ mod tests {
             key == '\n'
         }
         fn is_reset(key: char) -> bool {
-            matches!(key, '\x1b' | '\x10'..='\x14')
+            matches!(key, '\x1b' | '\x10'..='\x15')
+        }
+        fn is_mouse_button(key: char) -> bool {
+            key == '\x15'
         }
         fn is_modifier(key: char) -> bool {
             ('\x01'..='\x05').contains(&key)
@@ -3146,6 +3185,99 @@ mod tests {
     }
 
     #[test]
+    fn first_word_after_click_or_new_focus_corrects_without_a_warmup_word() {
+        const CHILD: &str = "RECAST_FIRST_WORD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::engine::tests::first_word_after_click_or_new_focus_corrects_without_a_warmup_word", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Linux and Windows cannot confirm that the input field is empty.
+        // Reproduce a missed first word even when that probe is unavailable.
+        EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        for context in ["click", "button", "focus", "layout shortcut"] {
+            for previous in ["", "existing ", "prefix"] {
+                for (layout, typed, expected) in [
+                    (0, "recieve", "receive"),
+                    (0, "akuo", "שלום"),
+                    (1, "hello", "hello"),
+                    (1, "neks,,", "מקלדת"),
+                ] {
+                    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+                    FOCUS.store(1, Ordering::SeqCst);
+                    let s = Session::new();
+                    s.type_text("old ");
+                    *s.engine.injector.text.lock().unwrap() = previous.into();
+                    match context {
+                        "click" => s.engine.mouse_click(),
+                        "button" => s.tap('\x15'),
+                        "focus" => {
+                            s.tap('\x1b');
+                            FOCUS.store(2, Ordering::SeqCst);
+                        }
+                        _ => {
+                            s.engine.key_press(Simulated::CTRL_LEFT);
+                            s.tap(' ');
+                            s.engine.key_release(Simulated::CTRL_LEFT);
+                        }
+                    }
+                    SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+                    s.type_text(&format!("{typed} "));
+                    s.pending();
+                    s.finish();
+                    assert_eq!(
+                        s.text(),
+                        format!("{previous}{expected} "),
+                        "{context}: {typed}"
+                    );
+
+                    // The identical word must not depend on having been typed once.
+                    SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+                    s.type_text(&format!("{typed} "));
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{previous}{expected} {expected} "));
+                    s.undo();
+                    s.pending();
+                    s.finish();
+                    let original = if layout == 0 {
+                        typed.into()
+                    } else {
+                        crate::keymap::convert_selection(typed)
+                    };
+                    assert_eq!(s.text(), format!("{previous}{expected} {original} "));
+                    crate::complete::unlist(&original);
+                }
+            }
+        }
+        // Clicking still cancels an older pending edit. It must not poison
+        // the first word captured after that canceled worker has stopped.
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        FOCUS.store(1, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.engine.mouse_click();
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve receive ");
+    }
+
+    #[test]
     fn explicit_requests_and_continued_typing_work_across_native_boundaries() {
         const CHILD: &str = "RECAST_BOUNDARY_COVERAGE_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -3170,7 +3302,6 @@ mod tests {
                 s.engine.injector.text.lock().unwrap().push_str(previous);
                 s.engine.mouse_click();
                 s.type_text(prefix);
-                assert!(s.engine.lock().no_fix);
                 s.tap(key);
                 s.pending();
                 s.finish();
@@ -3184,9 +3315,9 @@ mod tests {
                 crate::complete::unlist(prefix);
             }
         }
-        // Automatic correction still waits for a known boundary after navigation.
+        // Keyboard navigation still protects an incomplete editing fragment.
         let s = Session::new();
-        s.engine.mouse_click();
+        s.tap('\x10');
         s.type_text("recieve ");
         assert!(!s.engine.lock().is_replacing);
         s.type_text("recieve ");
@@ -3278,7 +3409,9 @@ mod tests {
         for source in [0, 1] {
             SIMULATED_LAYOUT.store(source, Ordering::SeqCst);
             let s = Session::new();
-            s.engine.mouse_click();
+            // Navigation leaves an untracked prefix, so only explicit
+            // conversion may act on this first captured word.
+            s.tap('\x10');
             s.type_text("akuo ");
             let original = s.text();
             assert!(!s.engine.lock().is_replacing);

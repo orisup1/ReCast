@@ -121,6 +121,8 @@ const COST_ADJACENT_DIAG: u32 = 72;
 const COST_STRAY_KEY: u32 = 70;
 /// Two letters typed in the wrong order.
 const COST_TRANSPOSE: u32 = 60;
+/// Moving a letter across two neighbours is two overlapping transpositions.
+const COST_ROTATE: u32 = 2 * COST_TRANSPOSE;
 /// Half of a double letter dropped (`hello` → `helo`) or a single letter typed
 /// twice (`help` → `hellp`). The most frequent real-world typo there is.
 const COST_DOUBLE: u32 = 55;
@@ -182,6 +184,13 @@ const MIN_SCORE_GAP: f32 = 4.0;
 const CONFIDENCE_WINDOW: f32 = 4.0 * MIN_SCORE_GAP;
 /// Bound contextual influence without widening the edit or frequency gates.
 const MAX_AUTOMATIC_CONTEXT_DISCOUNT: f32 = 8.0;
+
+/// Only reviewed three-letter transpositions bypass the default length guard.
+pub(crate) fn is_reviewed_short_transposition(word: &str) -> bool {
+    word.len() == 3
+        && lexicon::reviewed_misspelling(word)
+            .is_some_and(|target| typo_class(word, target) == Some(0))
+}
 
 /// Posterior score of a candidate: the channel cost of the slip plus the
 /// improbability of the word, both as negative log probabilities, so lower is
@@ -300,6 +309,7 @@ pub(crate) fn correction_suggestions(
     search.manual = true;
     search.context = context;
     freq.for_each_with_prefix("", |candidate, rank| search.consider(candidate, rank, dict));
+    search.consider_derivatives(word, dict, freq);
     search
         .offers
         .unwrap_or_default()
@@ -474,6 +484,11 @@ fn assess_with_visible_context(
     if let Some((stem, suffix)) =
         crate::dictionary::english_form(word).filter(|_| word.len() <= MAX_LEN)
     {
+        if stem.len() < min_len {
+            return Assessment::unchanged(
+                "The apostrophe stem is shorter than the configured spelling minimum.",
+            );
+        }
         let folded = word.replace('\'', "");
         if (lexicon::reviewed_misspelling(stem).is_none()
             && (en_dict.contains(stem)
@@ -510,30 +525,13 @@ fn assess_with_visible_context(
         assessment.details.push_str("\nPreserved the apostrophe suffix and required dictionary and frequency evidence for the resulting form.");
         return assessment;
     }
-    // A curated transposition, not permission to guess at other three-letter tokens.
-    if word == "teh"
-        && !en_dict.contains(word)
-        && min_len <= crate::config::DEFAULT_SPELL_MIN_LEN
-        && max_dist > 0
-        && en_dict.contains("the")
-        && en_freq.rank("the").is_some_and(|rank| rank <= max_rank)
+    let min_len = if min_len <= crate::config::DEFAULT_SPELL_MIN_LEN
+        && is_reviewed_short_transposition(word)
     {
-        return Assessment {
-            correction: Some("the".into()),
-            details: "Recognized the curated transposition teh / the.".into(),
-            best: Some(Candidate {
-                text: "the".into(),
-                score: score(
-                    COST_TRANSPOSE,
-                    en_freq.rank("the").unwrap_or_default(),
-                    "the",
-                ),
-                cost: COST_TRANSPOSE,
-                rank: en_freq.rank("the").unwrap_or_default(),
-            }),
-            lead: 16.0,
-        };
-    }
+        min_len.min(3)
+    } else {
+        min_len
+    };
     let Some(mut budget) = budget_for(word, min_len, max_dist) else {
         return Assessment::unchanged(if max_dist == 0 {
             "English spelling is disabled by the edit-distance limit."
@@ -545,11 +543,7 @@ fn assess_with_visible_context(
             "Spelling requires lowercase English letters; digits and internal punctuation are protected."
         });
     };
-    let mut max_rank = if word.len() < DIST3_MIN_LEN {
-        max_rank.min(20_000)
-    } else {
-        max_rank
-    };
+    let mut max_rank = max_rank;
     // Layout dictionaries are intentionally permissive. Reviewed nonwords do
     // not become trusted spellings merely because an imported list contains them.
     match lexicon::trust(word, en_dict, en_freq) {
@@ -559,15 +553,19 @@ fn assess_with_visible_context(
             );
         }
         lexicon::Trust::ReviewedMisspelling(target) => {
+            // A missing letter may put the typed form below a length boundary.
+            // Reviewed targets can supply that boundary, but never exceed the
+            // user's configured edit ceiling or relax the typed minimum length.
+            let budget = budget.max(budget_for(&target, min_len, max_dist).unwrap_or(budget));
             let candidate = en_freq
-                .rank(target)
-                .filter(|_| en_dict.contains(target))
+                .rank(&target)
+                .filter(|_| en_dict.contains(&target))
                 .and_then(|rank| {
                     let cost =
                         Dp::default().distance(word.as_bytes(), target.as_bytes(), budget)?;
                     (rank <= rank_budget(cost, max_rank, word.len())).then(|| Candidate {
-                        text: target.into(),
-                        score: score(cost, rank, target),
+                        text: target.clone(),
+                        score: score(cost, rank, &target),
                         cost,
                         rank,
                     })
@@ -587,6 +585,9 @@ fn assess_with_visible_context(
             max_rank = max_rank.min(1_000);
         }
         lexicon::Trust::Unknown => {}
+    }
+    if word.len() < DIST3_MIN_LEN {
+        max_rank = max_rank.min(20_000);
     }
     // Not in the dictionary, but common enough in the corpus that people
     // clearly type it on purpose: names and internet spellings ("sami", "ori",
@@ -643,12 +644,22 @@ fn assess_with_visible_context(
     }
     let confident = crate::intent::select(&scores, MIN_SCORE_GAP) == Some(1);
     let lead = crate::intent::normalized_lead(&scores, 1, MIN_SCORE_GAP);
+    let rank_evidence = if en_freq.rank(&fixed).is_some() {
+        "frequency rank"
+    } else {
+        "inferred rank from a dictionary stem"
+    };
     let mut details = format!(
-        "Spelling candidates (lower score is better; scores are not confidence percentages):\n  {fixed}: score {best_score:.2}, edit cost {cost}, frequency rank {rank}\nLimits: weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits."
+        "Spelling candidates (lower score is better; scores are not confidence percentages):\n  {fixed}: score {best_score:.2}, edit cost {cost}, {rank_evidence} {rank}\nLimits: weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits."
     );
     if let Some((second, second_cost, second_rank, word)) = search.runner_up {
+        let rank_evidence = if en_freq.rank(&word).is_some() {
+            "frequency rank"
+        } else {
+            "inferred rank from a dictionary stem"
+        };
         details.push_str(&format!(
-            "\nOther evaluated candidate: {word}: score {second:.2}, edit cost {second_cost}, frequency rank {second_rank}\nScore gap: {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", second - best_score
+            "\nOther evaluated candidate: {word}: score {second:.2}, edit cost {second_cost}, {rank_evidence} {second_rank}\nScore gap: {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", second - best_score
         ));
     } else {
         details.push_str("\nNo competing candidate was found within the confidence window.");
@@ -733,7 +744,39 @@ impl<'a> Search<'a> {
                 }
             });
         }
+        self.consider_derivatives(word, dict, freq);
         self.consider_edited_openings(dict, freq);
+    }
+
+    /// Cheap exact dictionary derivatives can be absent from the frequency
+    /// sample. Search only doubled letters and transpositions, using ranked
+    /// stems as weaker evidence, before accepting a distant unrelated word.
+    fn consider_derivatives(&mut self, word: &str, dict: Dict, freq: Freq) {
+        if word.len() < 8 {
+            return;
+        }
+        let mut consider = |bytes: &[u8]| {
+            let candidate = std::str::from_utf8(bytes).expect("ASCII spelling candidate");
+            if let Some(rank) = lexicon::derived_rank(candidate, dict, freq) {
+                self.consider(candidate, rank, dict);
+            }
+        };
+        let mut candidate = word.as_bytes().to_vec();
+        for index in 0..word.len() {
+            candidate.insert(index, word.as_bytes()[index]);
+            consider(&candidate);
+            candidate.remove(index);
+            if index + 1 < word.len() {
+                candidate.swap(index, index + 1);
+                consider(&candidate);
+                candidate.swap(index, index + 1);
+            }
+            if index > 0 && candidate[index] == candidate[index - 1] {
+                let letter = candidate.remove(index);
+                consider(&candidate);
+                candidate.insert(index, letter);
+            }
+        }
     }
 
     fn discount(&self, cand: &str) -> f32 {
@@ -804,6 +847,9 @@ impl<'a> Search<'a> {
             return;
         }
         let candidate = score(cost, rank, cand) - self.discount(cand);
+        if lexicon::reviewed_repair(cand, en_dict).is_some() {
+            return;
+        }
         if let Some(offers) = &mut self.offers {
             if en_dict.contains(cand) {
                 offers.push((candidate, rank, cand.to_owned()));
@@ -940,6 +986,8 @@ enum Why {
     /// opening, so nothing else is scored — which is what stops a second full
     /// run of the list from costing anything.
     Transposed,
+    /// A letter moved across the next two letters.
+    Rotated([u8; 3]),
     /// A word-initial rule, e.g. `f` → `ph`: the candidate has to actually
     /// begin with what the rule intended.
     Rule(&'static str),
@@ -953,6 +1001,7 @@ impl Opening {
             Why::Transposed => {
                 cand.len() >= 2 && typed.len() >= 2 && cand[0] == typed[1] && cand[1] == typed[0]
             }
+            Why::Rotated(opening) => cand.starts_with(&opening),
             Why::Rule(to) => cand.starts_with(to.as_bytes()),
         }
     }
@@ -983,6 +1032,16 @@ fn openings(word: &str) -> Vec<Opening> {
             why: Why::Transposed,
         });
     }
+    if typed.len() >= DIST2_MIN_LEN {
+        for rotated in rotations(&typed[..3]) {
+            if rotated[0] != typed[0] {
+                openings.push(Opening {
+                    letter: rotated[0],
+                    why: Why::Rotated(rotated),
+                });
+            }
+        }
+    }
     for rule in RULES {
         if !word.starts_with(rule.from) {
             continue;
@@ -999,6 +1058,13 @@ fn openings(word: &str) -> Vec<Opening> {
         });
     }
     openings
+}
+
+fn rotations(letters: &[u8]) -> [[u8; 3]; 2] {
+    [
+        [letters[1], letters[2], letters[0]],
+        [letters[2], letters[0], letters[1]],
+    ]
 }
 
 /// The channel-cost budget for `word`, or `None` if the word is not the kind of
@@ -1492,6 +1558,23 @@ impl Dp {
                         best =
                             best.min(self.cells[at(i - 2, j - 1)].saturating_add(COST_TRANSPOSE));
                     }
+                    if i >= 3 {
+                        for rotated in rotations(&a[i - 3..i]) {
+                            let lengths = if prefix && j == m {
+                                1..=3.min(j)
+                            } else {
+                                3..=3
+                            };
+                            for length in lengths {
+                                if j >= length && b[j - length..j] == rotated[..length] {
+                                    best = best.min(
+                                        self.cells[at(i - 3, j - length)]
+                                            .saturating_add(COST_ROTATE),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     best
                 };
 
@@ -1607,6 +1690,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reviewed_short_transpositions_keep_settings_and_dictionary_gates() {
+        let d = Dict::of(&["the"]);
+        let f = Freq::of(&[("the", 2)]);
+        for typed in ["teh", "hte"] {
+            assert_eq!(
+                correct_with(typed, d, f, 4, 50_000, 1).as_deref(),
+                Some("the")
+            );
+            assert_eq!(correct_with(typed, d, f, 5, 50_000, 3), None);
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 0), None);
+            assert_eq!(correct_with(typed, d, f, 4, 1, 3), None);
+            assert_eq!(correct_with(typed, Dict::of(&[]), f, 4, 50_000, 3), None);
+        }
+        for word in ["nad", "adn", "yeh", "idk", "brb"] {
+            assert_eq!(correct_with(word, d, f, 4, 50_000, 3), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn reviewed_inflections_require_dictionary_rank_and_edit_evidence() {
+        for (typed, corrected) in [
+            ("seperated", "separated"),
+            ("accomodating", "accommodating"),
+            ("committments", "commitments"),
+            ("langauges", "languages"),
+        ] {
+            let d = Dict::of(&[typed, corrected]);
+            let f = Freq::of(&[(typed, 100), (corrected, 500)]);
+            assert_eq!(
+                correct_with(typed, d, f, 4, 50_000, 3).as_deref(),
+                Some(corrected),
+                "{typed}"
+            );
+            assert_eq!(correct_with(typed, d, f, 4, 499, 3), None);
+            assert_eq!(
+                correct_with(typed, Dict::of(&[typed]), f, 4, 50_000, 3),
+                None
+            );
+            assert_eq!(correct_with(typed, d, Freq::EMPTY, 4, 50_000, 3), None);
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 0), None);
+        }
+    }
+
+    #[test]
+    fn unranked_derivatives_need_a_cheap_edit_and_an_attested_dictionary_stem() {
+        let d = Dict::of(&["spelling", "misspelling", "missing"]);
+        let f = Freq::of(&[("spelling", 9_938), ("missing", 728)]);
+        let result = assess_with("mispelling", d, f, 4, 50_000, 3);
+        assert_eq!(
+            result.correction.as_deref(),
+            Some("misspelling"),
+            "{}",
+            result.details
+        );
+        assert!(result.details.contains("inferred rank"));
+        assert_eq!(
+            correction_suggestions("mispelling", d, f, None)[0],
+            "misspelling"
+        );
+        assert_eq!(correct_with("mispelling", d, f, 4, 20_000, 1), None);
+        assert_eq!(
+            correct_with("mispelling", d, Freq::EMPTY, 4, 50_000, 3),
+            None
+        );
+        assert_eq!(
+            correct_with("mispelling", Dict::of(&["misspelling"]), f, 4, 50_000, 3),
+            None
+        );
+        assert_eq!(
+            correct_with("mispelling", d, f, 4, 50_000, 1).as_deref(),
+            Some("misspelling")
+        );
+
+        // Two equally supported derivatives remain ambiguous.
+        let d = Dict::of(&["abcdde", "abdced", "unabcdde", "unabdced"]);
+        let f = Freq::of(&[("abcdde", 100), ("abdced", 100)]);
+        assert_eq!(correct_with("unabdcde", d, f, 4, 50_000, 3), None);
+    }
+
     fn dict(words: &[&str]) -> Dict {
         Dict::of(words)
     }
@@ -1666,7 +1829,11 @@ mod tests {
             assert!(!offers.iter().any(|word| word == typed));
             assert!(offers.len() <= crate::complete::MAX_CANDIDATES);
             assert_eq!(offers, correction_suggestions(typed, d, f, None));
-            assert_eq!(fix(typed, d, f), None, "automatic protections for {typed}");
+            if typed == "hte" {
+                assert_eq!(fix(typed, d, f).as_deref(), Some("the"));
+            } else {
+                assert_eq!(fix(typed, d, f), None, "automatic protections for {typed}");
+            }
         }
         assert!(suggestions("form", d, f, None).is_empty());
         assert!(suggestions("hte", d, f, None).is_empty());
@@ -2301,6 +2468,8 @@ mod tests {
             ("omputer".into(), "computer".into()),
             ("computerx".into(), "computer".into()),
             ("comittee".into(), "committee".into()),
+            ("tounge".into(), "tongue".into()),
+            ("ropblem".into(), "problem".into()),
         ];
         pairs.extend(RULES.iter().map(|rule| {
             (
@@ -2594,7 +2763,13 @@ mod tests {
     fn base_opening_runs_stay_narrow_for_mistyped_first_keys() {
         // The broader changed-opening search is separate, so the original
         // unchanged, transposed and phonetic runs retain their narrow scope.
-        let letters = |w: &str| openings(w).iter().map(|o| o.letter).collect::<Vec<_>>();
+        let letters = |w: &str| {
+            openings(w)
+                .iter()
+                .filter(|o| !matches!(o.why, Why::Rotated(_)))
+                .map(|o| o.letter)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(letters("beed"), vec![b'b', b'e']);
         assert_eq!(letters("vusiness"), vec![b'v', b'u']);
     }
@@ -2634,6 +2809,50 @@ mod tests {
 mod real_data {
     use crate::dictionary::{en_dict, en_freq};
     use crate::spell::correct_with;
+
+    #[test]
+    fn repairs_reviewed_misses_inflections_and_unranked_derivatives() {
+        for (typed, intended) in [
+            ("hte", "the"),
+            ("cemetary", "cemetery"),
+            ("committment", "commitment"),
+            ("happend", "happened"),
+            ("immediatly", "immediately"),
+            ("indispensible", "indispensable"),
+            ("irresistable", "irresistible"),
+            ("langauge", "language"),
+            ("millenium", "millennium"),
+            ("noticable", "noticeable"),
+            ("prefered", "preferred"),
+            ("refered", "referred"),
+            ("relevent", "relevant"),
+            ("rythm", "rhythm"),
+            ("seige", "siege"),
+            ("tounge", "tongue"),
+            ("twelth", "twelfth"),
+            ("withdrawl", "withdrawal"),
+            ("seperated", "separated"),
+            ("accomodating", "accommodating"),
+            ("committments", "commitments"),
+            ("langauges", "languages"),
+            ("mispelling", "misspelling"),
+            ("mispelled", "misspelled"),
+            ("unhelpfull", "unhelpful"),
+            ("probeml", "problem"),
+            ("ropblem", "problem"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+        }
+        for word in [
+            "publically",
+            "miniscule",
+            "calender",
+            "dependant",
+            "misspelling",
+        ] {
+            assert_eq!(fix(word), None, "valid word: {word}");
+        }
+    }
 
     /// The shipped defaults (`Config::from_env`).
     fn fix(word: &str) -> Option<String> {

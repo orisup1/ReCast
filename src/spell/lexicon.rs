@@ -2,11 +2,11 @@
 
 use crate::dictionary::{Dict, Freq};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Trust {
     Technical,
     Attested,
-    ReviewedMisspelling(&'static str),
+    ReviewedMisspelling(String),
     Unattested,
     Unknown,
 }
@@ -20,20 +20,35 @@ const MISSPELLINGS: &[(&str, &str)] = &[
     ("adress", "address"),
     ("arguement", "argument"),
     ("becuase", "because"),
+    ("cemetary", "cemetery"),
+    ("committment", "commitment"),
     ("definately", "definitely"),
     ("enviroment", "environment"),
     ("existance", "existence"),
     ("freind", "friend"),
     ("goverment", "government"),
+    ("happend", "happened"),
+    ("hte", "the"),
+    ("immediatly", "immediately"),
+    ("indispensible", "indispensable"),
+    ("irresistable", "irresistible"),
+    ("langauge", "language"),
+    ("millenium", "millennium"),
+    ("noticable", "noticeable"),
     ("occassion", "occasion"),
     ("occassionally", "occasionally"),
     ("occurance", "occurrence"),
+    ("prefered", "preferred"),
     ("priviledge", "privilege"),
     ("recieve", "receive"),
     ("recieved", "received"),
     ("recieving", "receiving"),
     ("recomend", "recommend"),
+    ("refered", "referred"),
+    ("relevent", "relevant"),
     ("resistence", "resistance"),
+    ("rythm", "rhythm"),
+    ("seige", "siege"),
     ("seperate", "separate"),
     ("seperately", "separately"),
     ("seperatly", "separately"),
@@ -43,6 +58,9 @@ const MISSPELLINGS: &[(&str, &str)] = &[
     ("thier", "their"),
     ("tommorow", "tomorrow"),
     ("tomorow", "tomorrow"),
+    ("tounge", "tongue"),
+    ("twelth", "twelfth"),
+    ("withdrawl", "withdrawal"),
 ];
 
 pub(super) fn reviewed_misspelling(word: &str) -> Option<&'static str> {
@@ -52,6 +70,52 @@ pub(super) fn reviewed_misspelling(word: &str) -> Option<&'static str> {
         .map(|index| MISSPELLINGS[index].1)
 }
 
+/// Reuse reviewed errors in regular inflections, requiring a real target word.
+/// This does not make arbitrary dictionary entries into reviewed misspellings.
+pub(super) fn reviewed_repair(word: &str, dict: Dict) -> Option<String> {
+    if let Some(target) = reviewed_misspelling(word) {
+        return Some(target.into());
+    }
+    for suffix in ["s", "es", "d", "ed", "ing", "ly"] {
+        let Some(stem) = word.strip_suffix(suffix).filter(|stem| stem.len() >= 4) else {
+            continue;
+        };
+        if let Some(target) = reviewed_misspelling(stem) {
+            let target = format!("{target}{suffix}");
+            if dict.contains(&target) {
+                return Some(target);
+            }
+        }
+        if matches!(suffix, "ed" | "ing") {
+            if let Some(target) = reviewed_misspelling(&format!("{stem}e")) {
+                if let Some(target) = target.strip_suffix('e') {
+                    let target = format!("{target}{suffix}");
+                    if dict.contains(&target) {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// An unranked derivative needs an attested dictionary stem. Discount its
+/// frequency evidence instead of borrowing the stem's full rank.
+pub(super) fn derived_rank(word: &str, dict: Dict, freq: Freq) -> Option<u32> {
+    if word.len() < 8 || !dict.contains(word) || freq.rank(word).is_some() {
+        return None;
+    }
+    ["mis", "un", "re", "dis", "non", "over", "under"]
+        .iter()
+        .filter_map(|prefix| word.strip_prefix(prefix))
+        .filter(|stem| stem.len() >= 4 && dict.contains(stem))
+        .filter(|stem| reviewed_repair(stem, dict).is_none())
+        .filter_map(|stem| freq.rank(stem).filter(|rank| *rank <= 10_000))
+        .map(|rank| rank.saturating_mul(4).max(10_000))
+        .min()
+}
+
 fn technical() -> Dict {
     Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_tech.blob")))
 }
@@ -59,7 +123,7 @@ fn technical() -> Dict {
 pub(super) fn trust(word: &str, dict: Dict, freq: Freq) -> Trust {
     if technical().contains(word) {
         Trust::Technical
-    } else if let Some(target) = reviewed_misspelling(word) {
+    } else if let Some(target) = reviewed_repair(word, dict) {
         Trust::ReviewedMisspelling(target)
     } else if dict.contains(word) {
         if freq.rank(word).is_some() {

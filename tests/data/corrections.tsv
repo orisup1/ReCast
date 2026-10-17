@@ -898,3 +898,89 @@ en	recieve_1's	רקבןקהק_1,ד	recieve_1's
 en	https://recieve's	יאאפד:..רקבןקהק,ד	https://recieve's
 en	recieve's	רקבןקהק,ד	recieve's			layout-only
 he	recieve's	רקבןקהק,ד	רקבןקהק,ד			layout-only
+
+# Reviewed spelling families, unranked derivatives, and three-letter ordering slips.
+en	cemetary	בקצקאשרט	cemetery
+he	cemetary	בקצקאשרט	cemetery
+en	committment	בםצצןאאצקמא	commitment
+he	committment	בםצצןאאצקמא	commitment
+en	happend	ישפפקמג	happened
+he	happend	ישפפקמג	happened
+en	immediatly	ןצצקגןשאךט	immediately
+he	immediatly	ןצצקגןשאךט	immediately
+en	indispensible	ןמגןדפקמדןנךק	indispensable
+he	indispensible	ןמגןדפקמדןנךק	indispensable
+en	irresistable	ןררקדןדאשנךק	irresistible
+he	irresistable	ןררקדןדאשנךק	irresistible
+en	langauge	ךשמעשועק	language
+he	langauge	ךשמעשועק	language
+en	millenium	צןךךקמןוצ	millennium
+he	millenium	צןךךקמןוצ	millennium
+en	noticable	מםאןבשנךק	noticeable
+he	noticable	מםאןבשנךק	noticeable
+en	prefered	פרקכקרקג	preferred
+he	prefered	פרקכקרקג	preferred
+en	refered	רקכקרקג	referred
+he	refered	רקכקרקג	referred
+en	relevent	רקךקהקמא	relevant
+he	relevent	רקךקהקמא	relevant
+en	rythm	רטאיצ	rhythm
+he	rythm	רטאיצ	rhythm
+en	seige	דקןעק	siege
+he	seige	דקןעק	siege
+en	tounge	אםומעק	tongue
+he	tounge	אםומעק	tongue
+en	twelth	א'קךאי	twelfth
+he	twelth	א'קךאי	twelfth
+en	withdrawl	'ןאיגרש'ך	withdrawal
+he	withdrawl	'ןאיגרש'ך	withdrawal
+en	seperated	דקפקרשאקג	separated
+he	seperated	דקפקרשאקג	separated
+en	accomodating	שבבםצםגשאןמע	accommodating
+he	accomodating	שבבםצםגשאןמע	accommodating
+en	committments	בםצצןאאצקמאד	commitments
+he	committments	בםצצןאאצקמאד	commitments
+en	langauges	ךשמעשועקד	languages
+he	langauges	ךשמעשועקד	languages
+en	mispelling	צןדפקךךןמע	misspelling
+he	mispelling	צןדפקךךןמע	misspelling
+en	mispelled	צןדפקךךקג	misspelled
+he	mispelled	צןדפקךךקג	misspelled
+en	unhelpfull	ומיקךפכוךך	unhelpful
+he	unhelpfull	ומיקךפכוךך	unhelpful
+en	probeml	פרםנקצך	problem
+he	probeml	פרםנקצך	problem
+en	ropblem	רםפנךקצ	problem
+he	ropblem	רםפנךקצ	problem
+en	Mispelling!	צןדפקךךןמע!	Misspelling!
+he	Mispelling!	צןדפקךךןמע!	Misspelling!
+en	Langauges,	ךשמעשועקדת	Languages,
+he	Langauges,	ךשמעשועקדת	Languages,
+
+# Reviewed short transpositions apply only in the English layout.
+en	hte	יאק	the
+en	Hte!	יאק!	The!
+he	hte	יאק	יאק
+en	hte	יאק	hte			layout-only
+
+# Valid variants, names, identifiers, and capitalized initialisms stay protected.
+en	publically	פונךןבשךךט	publically
+en	miniscule	צןמןדבוךק	miniscule
+en	calender	בשךקמגקר	calender
+en	dependant	גקפקמגשמא	dependant
+en	nad	משג	nad
+en	adn	שגמ	adn
+en	hte_id	יאק_ןג	hte_id
+en	MISPELLING	צןדפקךךןמע	MISPELLING
+en	LANGAUGE	ךשמעשועק	LANGAUGE
+en	misspelling	צןדדפקךךןמע	misspelling
+
+# Long Hebrew stems recover two cheap slips, including prefixed forms.
+he	thbyrrbyy	אינטררנטט	אינטרנט
+en	thbyrrbyy	אינטררנטט	אינטרנט
+he	ngfru,,	מעכרותת	מערכות
+en	ngfru,,	מעכרותת	ngfru,,
+he	ufanjaaccho	וכשמחששבבים	וכשמחשבים
+en	ufanjaaccho	וכשמחששבבים	וכשמחשבים
+he	njaaccho	מחששבבים	מחששבבים
+he	thbyrrbbyy	אינטררננטט	אינטררננטט

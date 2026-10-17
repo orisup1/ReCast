@@ -1128,9 +1128,9 @@ fn plan_candidate(
             details.push_str("\nApplied the configured abbreviation before inferred corrections.");
             return Some(Plan::Expand { text });
         }
-        // In English this exact transposition beats an accidental Hebrew name.
+        // In English these reviewed transpositions beat accidental Hebrew words.
         // The same keys in Hebrew retain the valid Hebrew reading.
-        if word_en == "teh" {
+        if crate::spell::is_reviewed_short_transposition(word_en) {
             if layout_only
                 || case == Case::Upper
                 || crate::complete::ignored(word_en)

@@ -123,6 +123,12 @@ impl Platform for Linux {
                 | K::BTN_MIDDLE
         )
     }
+    fn is_mouse_button(key: KeyCode) -> bool {
+        matches!(
+            key,
+            KeyCode::BTN_LEFT | KeyCode::BTN_RIGHT | KeyCode::BTN_MIDDLE
+        )
+    }
     fn is_modifier(key: KeyCode) -> bool {
         use KeyCode as K;
         matches!(

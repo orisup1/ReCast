@@ -81,6 +81,8 @@ fn benchmark_spelling_latency_distribution() {
         "independance",
         "zzzzzzzzzzzzzzzzzzzzzzzz",
         "communication",
+        "mispelling",
+        "ropblem",
     ];
     let mut samples = Vec::with_capacity(1_000);
     for word in words {
@@ -274,6 +276,8 @@ fn benchmark_intent_latency_distribution() {
         case(&["אני", "מקליד", "באמצעות"], "מקל", "מקלדתת"),
         case(&["אני", "עובד", "עכשיו", "עם"], "מחש", "מחששב"),
         case(&["אני", "רוצה", "לומר"], "שלו", "שלוום"),
+        case(&["אני", "משתמש"], "אינ", "אינטררנטט"),
+        case(&["אני", "מפתח"], "מער", "מעכרותת"),
     ];
     measure("English", &english, en_dict(), en_freq(), false);
     measure("Hebrew", &hebrew, he_dict(), he_freq(), true);

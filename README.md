@@ -33,6 +33,9 @@ stray ending letter can recover the unchanged base (`computerx` → `computer`).
 Words of eight or more letters can use the three-edit budget; six-letter words
 can recover multiple cheap slips. Shorter tokens keep their existing limits.
 These fixes also work when typed in the Hebrew layout.
+Three-letter ordering slips such as `tounge` → `tongue` and `probeml` → `problem`
+use the two-edit budget. The reviewed short transpositions `teh` and `hte` become
+`the` in English; valid Hebrew readings remain protected when typing in Hebrew.
 Layout correction also recognizes English contractions and possessives such as
 `don't`, `I'm`, and `keyboard's`, preserving capitalization and punctuation.
 Layout correction recognizes unlisted Hebrew words with supported
@@ -52,7 +55,13 @@ evidence. Keeping the original token also competes with a replacement: frequency
 evidence, short unknown words, and trusted compound components can prevent an
 otherwise unique suggestion from winning. Reviewed nonword misspellings remain
 repairable even when the broad layout dictionary contains them; valid rare words
-and regional variants are not added to that reviewed list. Unfamiliar names or
+and regional variants are not added to that reviewed list. Regular inflections
+reuse those reviewed errors only when the corrected form has dictionary and
+frequency evidence (`langauges` → `languages`, `accomodating` → `accommodating`).
+Long dictionary derivatives missing from the frequency sample can use a discounted
+rank from a common dictionary stem, restricted to a doubled-letter repair or
+transposition (`mispelling` → `misspelling`). Correction details identify this
+inferred rank separately from observed frequency ranks. Unfamiliar names or
 jargon can still get unwanted fixes. When competing candidates remain too close,
 ReCast leaves the word unchanged. Undo, ignored words,
 and Conservative spelling give you control.
@@ -173,7 +182,10 @@ If a layout query or requested switch temporarily fails before editing starts,
 the same gesture can retry the tracked word without retyping it.
 After cursor movement, an explicit request can complete, correct, or convert the
 keys typed since that movement. Previously existing text stays untouched;
-automatic correction still waits for a trusted word boundary.
+clicking or starting in a newly focused target allows the first freshly typed
+word to be corrected automatically. No warmup word or Ctrl double tap is needed.
+Keyboard navigation and deletion into untracked text still suspend automatic
+correction until a word boundary, protecting incomplete editing fragments.
 
 | Action | Gesture or control |
 | --- | --- |
@@ -588,6 +600,13 @@ substitution, or transposition, favor missing/extra ו and י, enforce final-let
 positions, and recognize the layout planner's supported prefix stacks. Candidates
 need a ranked dictionary word or stem. Existing words and saved exceptions are
 preserved; the spelling enable, minimum-length, and rank settings still apply.
+Balanced and Flexible spelling also recover two cheap edits in plain stems with
+at least six letters, preserving the first two stem letters. The total edit cost
+cannot exceed 150, and the target rank cannot exceed half the configured limit
+or 10,000, whichever is smaller. Supported prefixes do not count toward that
+minimum stem length. For example, `אינטררנטט` becomes `אינטרנט` and `מעכרותת`
+becomes `מערכות`. Conservative spelling keeps one-edit search; explicit correction
+requests can offer these long-stem repairs regardless of automatic settings.
 Automatic Hebrew corrections require at least four letters and a 20-point lead
 over both the next candidate and keeping the original; phrase context contributes
 at most eight points to candidate ranking. Neighboring physical keys and repeated

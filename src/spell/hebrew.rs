@@ -15,12 +15,15 @@ enum Request {
 
 const MIN_SCORE_GAP: f32 = 20.0;
 const PREFIX_INFERENCE_COST: u32 = 12;
+const TWO_EDIT_MIN_LEN: usize = 6;
+const TWO_EDIT_BUDGET: u32 = 150;
 
 struct RankedCandidate {
     evidence: super::Candidate,
     stem: Option<String>,
     context_discount: f32,
     learned_discount: f32,
+    edits: u8,
 }
 
 #[derive(Default)]
@@ -30,8 +33,8 @@ struct SearchResult {
     protection: Option<&'static str>,
 }
 
-/// Search one Unicode-letter edit, including transpositions. Prefix forms reuse
-/// the planner's supported prefix stacks and require a ranked dictionary stem.
+/// Search Unicode-letter edits, including transpositions. Long plain stems can
+/// recover two cheap slips when enabled; prefix forms require a ranked stem.
 pub(crate) fn suggestions(
     word: &str,
     dict: Dict,
@@ -53,7 +56,7 @@ pub(crate) fn suggestions(
 }
 
 /// Explicit correction reconsiders real and short words independently of
-/// automatic spelling settings, while keeping the existing one-edit search.
+/// automatic spelling settings, including bounded two-edit repairs of long stems.
 pub(crate) fn correction_suggestions(
     word: &str,
     dict: Dict,
@@ -132,7 +135,7 @@ fn assess_with_visible(
         return super::Assessment::unchanged(reason);
     }
     let mut details = format!(
-        "Hebrew spelling candidates (lower score is better; scores are not confidence percentages):\nLimits: one letter edit, configured maximum frequency rank {}; edits without a keyboard or repetition explanation are limited to rank 20000.", config.spell_max_rank
+        "Hebrew spelling candidates (lower score is better; scores are not confidence percentages):\nLimits: one letter edit; when enabled, two cheap edits in stems of at least {TWO_EDIT_MIN_LEN} letters with their first two letters intact, cost at most {TWO_EDIT_BUDGET}, and rank at most {}. Configured maximum frequency rank {}; unexplained single edits are limited to rank 20000.", config.spell_max_rank.min(20_000) / 2, config.spell_max_rank
     );
     for (text, rank, cost) in &result.rejected_rank {
         details.push_str(&format!(
@@ -171,6 +174,8 @@ fn assess_with_visible(
     // original. Do not let a frequent neighbor substitute for that uncertainty.
     let keep_cost = if unranked_repeat_base(word, dict, freq) {
         super::COST_DOUBLE
+    } else if best.edits == 2 {
+        TWO_EDIT_BUDGET
     } else {
         super::COST_EDIT
     };
@@ -277,7 +282,7 @@ fn search(
     }
     let mut candidates = HashMap::<String, RankedCandidate>::new();
     let typo_counts = crate::personal::hebrew_typo_counts();
-    let mut consider = |candidate: Vec<(char, String)>, cost: u32| {
+    let mut consider = |candidate: Vec<(char, String)>, cost: u32, edits: u8| {
         let chars: Vec<char> = candidate.iter().map(|(letter, _)| *letter).collect();
         let text: String = chars.iter().collect();
         if text == plain || !valid_finals(&chars) {
@@ -338,6 +343,7 @@ fn search(
             stem: stem.map(|(stem, _)| stem.to_owned()),
             context_discount: discount,
             learned_discount,
+            edits,
         };
         if candidates
             .get(&visible)
@@ -351,17 +357,17 @@ fn search(
         if letters[index].1.is_empty() {
             let mut deleted = letters.clone();
             deleted.remove(index);
-            consider(deleted, deletion_cost(&letters, index));
+            consider(deleted, deletion_cost(&letters, index), 1);
         }
         for letter in 'א'..='ת' {
             let mut replaced = letters.clone();
             replaced[index].0 = letter;
-            consider(replaced, substitution_cost(letters[index].0, letter));
+            consider(replaced, substitution_cost(letters[index].0, letter), 1);
         }
         if index + 1 < letters.len() {
             let mut swapped = letters.clone();
             swapped.swap(index, index + 1);
-            consider(swapped, 60);
+            consider(swapped, 60, 1);
         }
     }
     for index in 0..=letters.len() {
@@ -377,8 +383,24 @@ fn search(
                 } else {
                     vowel_cost(letter)
                 },
+                1,
             );
         }
+    }
+    if (explicit || config.spell_max_dist >= 2) && letters.iter().all(|(_, marks)| marks.is_empty())
+    {
+        let max_rank = if explicit {
+            50_000
+        } else {
+            config.spell_max_rank
+        };
+        search_two_edits(&plain, dict, freq, max_rank, |text, cost| {
+            consider(
+                text.chars().map(|letter| (letter, String::new())).collect(),
+                cost,
+                2,
+            );
+        });
     }
     result.candidates = candidates.into_values().collect();
     result.candidates.sort_by(|a, b| {
@@ -388,6 +410,104 @@ fn search(
             .then_with(|| a.evidence.text.cmp(&b.evidence.text))
     });
     result
+}
+
+/// Scan narrow frequency runs rather than expanding a quadratic ring of
+/// generated strings. Inferred prefixes do not count toward the stem length.
+fn search_two_edits(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    max_rank: u32,
+    mut consider: impl FnMut(String, u32),
+) {
+    let max_rank = max_rank.min(20_000) / 2;
+    for (prefix, stem) in
+        std::iter::once(("", word)).chain(crate::dictionary::hebrew_prefix_splits(word))
+    {
+        let typed: Vec<_> = stem.chars().map(|letter| (letter, String::new())).collect();
+        if typed.len() < TWO_EDIT_MIN_LEN {
+            continue;
+        }
+        let anchor: String = typed.iter().take(2).map(|(letter, _)| letter).collect();
+        freq.for_each_with_prefix(&anchor, |candidate, rank| {
+            if rank > max_rank || !dict.contains(candidate) {
+                return;
+            }
+            let intended: Vec<_> = candidate.chars().collect();
+            if intended.len() < TWO_EDIT_MIN_LEN
+                || intended.len() + prefix.chars().count() > 24
+                || intended.len().abs_diff(typed.len()) > 2
+            {
+                return;
+            }
+            if let Some(cost) = two_edit_cost(&typed, &intended) {
+                consider(format!("{prefix}{candidate}"), cost);
+            }
+        });
+    }
+}
+
+/// Weighted alignment with exactly two edit events. Tracking the event count
+/// prevents three cheap repetitions or final-letter repairs from slipping in.
+fn two_edit_cost(typed: &[(char, String)], intended: &[char]) -> Option<u32> {
+    let (n, m) = (typed.len(), intended.len());
+    if n > 24 || m > 24 || n.abs_diff(m) > 2 {
+        return None;
+    }
+    let mut costs = [[[u32::MAX; 3]; 25]; 25];
+    costs[0][0][0] = 0;
+    for i in 0..=n {
+        for j in i.saturating_sub(2)..=m.min(i + 2) {
+            for edits in 0..=2 {
+                let cost = costs[i][j][edits];
+                if cost > TWO_EDIT_BUDGET {
+                    continue;
+                }
+                if i < n && j < m {
+                    let changed = usize::from(typed[i].0 != intended[j]);
+                    if edits + changed <= 2 {
+                        let next = &mut costs[i + 1][j + 1][edits + changed];
+                        *next = (*next).min(
+                            cost + if changed == 0 {
+                                0
+                            } else {
+                                substitution_cost(typed[i].0, intended[j])
+                            },
+                        );
+                    }
+                }
+                if edits == 2 {
+                    continue;
+                }
+                if i < n {
+                    let next = &mut costs[i + 1][j][edits + 1];
+                    *next = (*next).min(cost + deletion_cost(typed, i));
+                }
+                if j < m {
+                    let repeated = j.checked_sub(1).is_some_and(|k| intended[k] == intended[j])
+                        || intended.get(j + 1) == Some(&intended[j]);
+                    let next = &mut costs[i][j + 1][edits + 1];
+                    *next = (*next).min(
+                        cost + if repeated {
+                            super::COST_DOUBLE
+                        } else {
+                            vowel_cost(intended[j])
+                        },
+                    );
+                }
+                if i + 1 < n
+                    && j + 1 < m
+                    && typed[i].0 == intended[j + 1]
+                    && typed[i + 1].0 == intended[j]
+                {
+                    let next = &mut costs[i + 2][j + 2][edits + 1];
+                    *next = (*next).min(cost + super::COST_TRANSPOSE);
+                }
+            }
+        }
+    }
+    (costs[n][m][2] <= TWO_EDIT_BUDGET).then_some(costs[n][m][2])
 }
 
 fn deletion_cost(letters: &[(char, String)], index: usize) -> u32 {
@@ -835,6 +955,91 @@ mod tests {
         assert_eq!(suggestions("שלוב", tied, ranks, None).len(), 2);
         assert_eq!(correct("שלוב", tied, ranks, None), None);
         assert_eq!(correct("שלומ", dict, Freq::EMPTY, None), None);
+    }
+
+    #[test]
+    fn long_hebrew_stems_recover_two_cheap_slips_without_widening_short_words() {
+        let dict = Dict::of(&["אינטרנט", "מחשבים", "מערכות", "מחשב"]);
+        let freq = Freq::of(&[
+            ("אינטרנט", 500),
+            ("מחשבים", 600),
+            ("מערכות", 700),
+            ("מחשב", 20),
+        ]);
+        let mut config = Config::global();
+        for (typed, expected) in [
+            ("אינטררנטט", "אינטרנט"),
+            ("מחששבבים", "מחשבים"),
+            ("מעכרותת", "מערכות"),
+            ("וכשמחששבבים", "וכשמחשבים"),
+        ] {
+            let result = assess_with(typed, dict, freq, None, &config);
+            assert_eq!(
+                result.correction.as_deref(),
+                Some(expected),
+                "{typed}: {}",
+                result.details
+            );
+            config.spell_max_dist = 1;
+            assert_eq!(
+                assess_with(typed, dict, freq, None, &config).correction,
+                None,
+                "{typed}"
+            );
+            config.spell_max_dist = 3;
+            config.spell_max_rank = 100;
+            assert_eq!(
+                assess_with(typed, dict, freq, None, &config).correction,
+                None,
+                "{typed}"
+            );
+            config.spell_max_rank = 50_000;
+        }
+        for typed in [
+            "מחששבב",
+            "אינטררננטט",
+            "מחשבים",
+            "במחשבים",
+            "מחששבבים1",
+            "מַחששבבים",
+        ] {
+            assert_eq!(
+                assess_with(typed, dict, freq, None, &config).correction,
+                None,
+                "{typed}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_edit_hebrew_repairs_keep_ambiguity_and_explicit_request_independence() {
+        let dict = Dict::of(&["מערכות", "מערכים"]);
+        let freq = Freq::of(&[("מערכות", 100), ("מערכים", 100)]);
+        let mut config = Config::global();
+        assert_eq!(
+            assess_with("מעכרותת", dict, freq, None, &config)
+                .correction
+                .as_deref(),
+            Some("מערכות")
+        );
+        config.spell_enabled = false;
+        config.spell_max_dist = 0;
+        config.spell_max_rank = 0;
+        assert!(
+            ranked_candidates("מעכרותת", dict, freq, None, Request::Correction, &config)
+                .iter()
+                .any(|(word, _)| word == "מערכות")
+        );
+
+        let dict = Dict::of(&["מחשבים", "מחשבום"]);
+        let freq = Freq::of(&[("מחשבים", 100), ("מחשבום", 100)]);
+        config.spell_enabled = true;
+        config.spell_max_dist = 3;
+        config.spell_max_rank = 50_000;
+        assert_eq!(
+            assess_with("מחששבם", dict, freq, None, &config).correction,
+            None
+        );
     }
 
     #[test]
