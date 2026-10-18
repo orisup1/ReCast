@@ -41,8 +41,11 @@ fn language_preference_supports_file_environment_status_and_preview() {
     ] {
         std::fs::write(config.join("config.toml"), format!("prefer = \"{mode}\"\n")).unwrap();
         let status = invoke(&["--status"], None);
-        assert!(String::from_utf8_lossy(&status.stdout)
-            .contains(&format!("language preference  {label}")));
+        let stdout = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            stdout.contains(&format!("language preference  {label}")),
+            "{stdout}"
+        );
         for (word, layout, after) in [
             ("ndhrv", "en", english_after),
             ("כךואק", "he", hebrew_after),
@@ -79,9 +82,10 @@ fn language_preference_supports_file_environment_status_and_preview() {
 // A unique executable name keeps status tests from discovering a developer's
 // actual ReCast instance or another CLI test running in parallel.
 fn isolated_binary(name: &str) -> std::path::PathBuf {
-    // Keep the link on the binary's filesystem. A hard link gives the process a
-    // distinct name without opening an executable for writing while other
-    // tests spawn children, which can intermittently cause ETXTBSY on Linux.
+    // Keep the fixture on the binary's filesystem. Linux needs a hard link to
+    // avoid ETXTBSY while other tests spawn children of the source executable.
+    // macOS derives proc_pidpath from the executable's vnode, so hard links can
+    // all report the same name. A copy gives each fixture its own identity.
     let source = std::path::Path::new(env!("CARGO_BIN_EXE_recast"));
     let dir = source
         .parent()
@@ -93,8 +97,98 @@ fn isolated_binary(name: &str) -> std::path::PathBuf {
         std::process::id(),
         std::env::consts::EXE_SUFFIX
     ));
+    #[cfg(target_os = "macos")]
+    std::fs::copy(source, &path).unwrap();
+    #[cfg(not(target_os = "macos"))]
     std::fs::hard_link(source, &path).unwrap();
     path
+}
+
+#[cfg(unix)]
+#[test]
+fn status_does_not_discover_another_isolated_cli_binary() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    struct HeldChild(std::process::Child);
+    impl Drop for HeldChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let held_binary = isolated_binary("held");
+    let viewer_binary = isolated_binary("view");
+    let dir = std::env::temp_dir().join(format!("recast-cli-peers-{}", std::process::id()));
+    let held_home = dir.join("held");
+    let viewer_home = dir.join("viewer");
+    let config = if cfg!(target_os = "macos") {
+        held_home.join("Library/Application Support/recast/config.toml")
+    } else {
+        held_home.join("recast/config.toml")
+    };
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&viewer_home).unwrap();
+    nix::unistd::mkfifo(
+        &config,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let mut held = HeldChild(
+        Command::new(&held_binary)
+            .arg("--status")
+            .env("HOME", &held_home)
+            .env("XDG_CONFIG_HOME", &held_home)
+            .env("RECAST_LAYOUT_BACKEND", "none")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    // Opening the FIFO writer proves the child is reading its configuration.
+    // Hold it open without sending data so the child stays alive throughout
+    // the second status query, without starting either keyboard listener.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let writer = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&config)
+        {
+            Ok(writer) => break writer,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                assert!(
+                    held.0.try_wait().unwrap().is_none(),
+                    "fixture exited before reading config"
+                );
+                assert!(Instant::now() < deadline, "fixture did not read config");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("opening config FIFO: {error}"),
+        }
+    };
+    let output = Command::new(&viewer_binary)
+        .arg("--status")
+        .env("HOME", &viewer_home)
+        .env("XDG_CONFIG_HOME", &viewer_home)
+        .env("RECAST_LAYOUT_BACKEND", "none")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("not the running daemon"), "{stdout}");
+    assert!(held.0.try_wait().unwrap().is_none());
+    drop(held);
+    drop(writer);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(held_binary.parent().unwrap()).unwrap();
+    std::fs::remove_dir_all(viewer_binary.parent().unwrap()).unwrap();
 }
 
 #[test]

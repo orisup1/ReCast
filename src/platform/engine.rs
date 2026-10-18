@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::dictionary::{
     all_completion_candidates, check_and_correct_in_context, correction_candidates,
@@ -585,10 +585,10 @@ pub struct AppState<P: Platform> {
     /// finished, and cleared alongside the gestures whenever the cursor moves
     /// somewhere else: the run is a claim about the text being written *here*.
     pub history: History,
-    /// The last key seen and when — the multi-node deduplication guard. Only
-    /// read where [`Platform::DEDUP_WINDOW`] is set, which is Linux.
+    /// The last key seen and its source timestamp, for multi-node deduplication.
+    /// Only read where [`Platform::DEDUP_WINDOW`] is set, which is Linux.
     last_key: Option<P::Key>,
-    last_key_at: Instant,
+    last_key_at: SystemTime,
     /// Incremented whenever the cursor or text can no longer be trusted.
     generation: u64,
     /// Every input event, including releases, invalidates an in-flight query.
@@ -627,7 +627,7 @@ impl<P: Platform> AppState<P> {
             completion_use: None,
             history: History::default(),
             last_key: None,
-            last_key_at: Instant::now(),
+            last_key_at: SystemTime::now(),
             generation: 0,
             revision: 0,
             focus: None,
@@ -660,6 +660,29 @@ impl<P: Platform> AppState<P> {
                 config.correction_shortcut.clone(),
             ));
         }
+    }
+
+    /// Ignore mirrored device reports using their event timestamps. Delivery
+    /// can be delayed or reordered between readers; processing time would make
+    /// genuine repeated letters and spaces in a queued batch look duplicated.
+    fn duplicate_press(
+        &mut self,
+        key: P::Key,
+        repeat: bool,
+        timestamp: SystemTime,
+        window: Option<Duration>,
+    ) -> bool {
+        if let Some(window) = window.filter(|_| !repeat) {
+            let separation = timestamp
+                .duration_since(self.last_key_at)
+                .unwrap_or_else(|error| error.duration());
+            if self.last_key == Some(key) && separation < window {
+                return true;
+            }
+        }
+        self.last_key_at = timestamp;
+        self.last_key = Some(key);
+        false
     }
 
     /// A successful offer is resolved once, independently of the visual cycle
@@ -963,18 +986,25 @@ impl<P: Platform> Engine<P> {
     // ── capture ─────────────────────────────────────────────────────────────
 
     /// A key went down.
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn key_press(self: &Arc<Self>, key: P::Key) {
-        self.press(key, false);
+        self.press(key, false, SystemTime::now());
+    }
+
+    /// Preserve the kernel timestamp when queued evdev events are delivered.
+    #[cfg(target_os = "linux")]
+    pub fn key_press_at(self: &Arc<Self>, key: P::Key, timestamp: SystemTime) {
+        self.press(key, false, timestamp);
     }
 
     /// Kernel repeats can be delivered together after a slow desktop reply.
     /// Their delivery spacing must not be mistaken for duplicate device reports.
     #[cfg(target_os = "linux")]
-    pub fn key_repeat(self: &Arc<Self>, key: P::Key) {
-        self.press(key, true);
+    pub fn key_repeat_at(self: &Arc<Self>, key: P::Key, timestamp: SystemTime) {
+        self.press(key, true, timestamp);
     }
 
-    fn press(self: &Arc<Self>, key: P::Key, repeat: bool) {
+    fn press(self: &Arc<Self>, key: P::Key, repeat: bool, timestamp: SystemTime) {
         let config = crate::config::Config::global();
         let mut st = self.lock();
         st.sync_shortcuts(&config);
@@ -982,15 +1012,9 @@ impl<P: Platform> Engine<P> {
             st.phrase.forget_learning();
         }
 
-        // One physical press arrives on several evdev nodes; the same key again
-        // inside the window is that, not a second press.
-        if let Some(window) = P::DEDUP_WINDOW.filter(|_| !repeat) {
-            if st.last_key == Some(key) && st.last_key_at.elapsed() < window {
-                return;
-            }
+        if st.duplicate_press(key, repeat, timestamp, P::DEDUP_WINDOW) {
+            return;
         }
-        st.last_key_at = Instant::now();
-        st.last_key = Some(key);
         st.revision = st.revision.wrapping_add(1);
         if self
             .control
@@ -3184,6 +3208,60 @@ mod tests {
         ready: mpsc::Receiver<()>,
         proceed: mpsc::SyncSender<()>,
     }
+
+    #[test]
+    fn queued_native_letters_and_spaces_use_source_timestamps_for_deduplication() {
+        let mut state = AppState::<Simulated>::new();
+        let window = Some(Duration::from_millis(5));
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let mut captured = String::new();
+        // Dispatch immediately, as when a delayed reader drains one batch.
+        // The physical presses were spaced apart by an ordinary typing interval.
+        for (index, key) in "address   ".chars().enumerate() {
+            let timestamp = start + Duration::from_millis(index as u64 * 20);
+            if !state.duplicate_press(key, false, timestamp, window) {
+                captured.push(key);
+            }
+        }
+        assert_eq!(captured, "address   ");
+    }
+
+    #[test]
+    fn mirrored_native_presses_deduplicate_across_releases_and_reader_order() {
+        let mut state = AppState::<Simulated>::new();
+        let window = Some(Duration::from_millis(5));
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert!(!state.duplicate_press('s', false, timestamp, window));
+        state.held_keys.insert('s');
+        state.held_keys.remove(&'s');
+        // Another device reader may deliver its duplicate after the release,
+        // with an identical, slightly later, or slightly earlier timestamp.
+        for mirrored in [
+            timestamp,
+            timestamp + Duration::from_millis(1),
+            timestamp - Duration::from_millis(1),
+        ] {
+            assert!(state.duplicate_press('s', false, mirrored, window));
+        }
+        let next_press = timestamp + Duration::from_millis(5);
+        assert!(!state.duplicate_press('s', false, next_press, window));
+    }
+
+    #[test]
+    fn queued_native_auto_repeat_bypasses_deduplication() {
+        let mut state = AppState::<Simulated>::new();
+        let window = Some(Duration::from_millis(5));
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert!(!state.duplicate_press('s', false, timestamp, window));
+        for _ in 0..3 {
+            assert!(!state.duplicate_press('s', true, timestamp, window));
+        }
+        let next_press = timestamp + Duration::from_millis(20);
+        assert!(!state.duplicate_press('s', false, next_press, window));
+        // Single-stream platforms do not apply a deduplication window.
+        assert!(!state.duplicate_press('s', false, timestamp, None));
+    }
+
     impl Session {
         fn new() -> Self {
             let (ready_tx, ready) = mpsc::sync_channel(1);

@@ -432,13 +432,14 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                     };
 
                     for event in events {
+                        let timestamp = event.timestamp();
                         match event.destructure() {
                             EventSummary::Key(_, keycode, value) => {
                                 capture_key_event(&mut held, keycode, value, |key, pressed| {
                                     if pressed && value == 2 {
-                                        engine.key_repeat(key);
+                                        engine.key_repeat_at(key, timestamp);
                                     } else if pressed {
-                                        engine.key_press(key);
+                                        engine.key_press_at(key, timestamp);
                                     } else {
                                         engine.key_release(key);
                                     }
@@ -517,7 +518,7 @@ fn native_repeats_preserve_text_and_physical_key_state() {
         }
     }
     assert_eq!(events.len(), 12);
-    for group in events.chunks_exact(4) {
+    for group in events.as_chunks::<4>().0 {
         assert_eq!(
             group.iter().map(|(_, down)| *down).collect::<Vec<_>>(),
             [true, true, true, false]

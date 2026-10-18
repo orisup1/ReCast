@@ -135,11 +135,18 @@ mod tests {
             for image in &images {
                 assert_eq!(image.len(), PIXELS);
                 assert_eq!(&image[..16 * SIZE * 4], &BASE[..16 * SIZE * 4]);
-                assert!(image.chunks_exact(4).any(|pixel| pixel[3] > 0));
+                assert!(image.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 0));
             }
             let silhouettes: Vec<Vec<_>> = images
                 .iter()
-                .map(|image| image.chunks_exact(4).map(|pixel| pixel[3]).collect())
+                .map(|image| {
+                    image
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|pixel| pixel[3])
+                        .collect()
+                })
                 .collect();
             for (index, silhouette) in silhouettes.iter().enumerate() {
                 for other in &silhouettes[index + 1..] {
