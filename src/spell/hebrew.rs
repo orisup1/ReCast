@@ -321,7 +321,7 @@ fn search(
             if automatic {
                 context.automatic_discount(&text)
             } else {
-                20.0 * context.boost(&text).ln() as f32
+                20.0 * context.offer_boost(&text).ln() as f32
             }
         });
         let cost = cost

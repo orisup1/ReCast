@@ -791,10 +791,11 @@ impl<'a> Search<'a> {
     }
 
     fn context_discount(&self, cand: &str) -> f32 {
-        let boost = self.context.map_or(1.0, |context| context.boost(cand));
-        let discount = 20.0 * boost.ln() as f32;
         if self.offers.is_some() {
-            discount
+            20.0 * self
+                .context
+                .map_or(1.0, |context| context.offer_boost(cand))
+                .ln() as f32
         } else {
             self.context
                 .map_or(0.0, |context| context.automatic_discount(cand))

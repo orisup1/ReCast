@@ -404,6 +404,8 @@ fn explain_previews_both_layouts_and_rejects_invalid_arguments() {
     for (context, expected) in [
         ("data", "base"),
         ("data\t", "base"),
+        ("the data", "base"),
+        ("we store all the data", "base"),
         ("data\n", "baye"),
         ("data\r\n", "baye"),
         ("data.", "baye"),

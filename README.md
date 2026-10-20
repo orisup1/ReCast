@@ -572,9 +572,14 @@ are supplemented by 994 measured pairs from two public Leipzig news samples,
 each containing 10,000 sentences. Measured pairs require at least five occurrences,
 conditional frequency of 5%, and association of at least three times the independent
 word-frequency expectation. Weights remain bounded to four; counts and pinned source
-checksums are in `src/phrase_counts.tsv`. These priors use the previous finished
-word. Personalization additionally boosts pairs retained at least twice in the
-current typing context; these pair counts remain in memory. Focus changes, cursor
+checksums are in `src/phrase_counts.tsv`. Explicit completion and manual spelling
+offers also use 560 additional English pairs from `src/intent_counts.tsv`, with
+the same evidence thresholds and raw dictionary/top-20,000 frequency trust.
+For example, `for` after `task` ranks `force` ahead of `forget`. Eligible weights
+are prepared at build time and cached for the previous finished word; overlapping
+phrase sources use their maximum weight. Automatic rewriting keeps its existing
+phrase evidence policy. Personalization additionally boosts pairs retained at least
+twice in the current typing context; these pair counts remain in memory. Focus changes, cursor
 moves, deletion, undo, and Enter clear phrase context; punctuation ends the
 previous-word link. Disabling personalization discards learned pair counts while
 keeping the public phrase priors available.
@@ -582,7 +587,13 @@ keeping the public phrase priors available.
 The same context retains at most 16 visible words in memory and supplements the
 one-word priors with a local, smoothed 4-gram model. It scores a candidate against
 up to three preceding words, backing off when longer contexts are sparse. The
-model contains 59,644 measured 1-to-4-grams from the same pinned public news
+interpolation returns counts lost to pruning or phrase boundaries to the shorter
+context. A history with no retained continuations contributes no new evidence.
+Longer-context likelihood is compared with the previous-word distribution, so it
+adds evidence without counting the one-word phrase prior twice. This preserves
+useful phrase evidence when extra history is sparse: `baye` after `the data` or
+`we store all the data` can still resolve to `base`, as it does after `data`.
+The model contains 59,644 measured 1-to-4-grams from the same pinned public news
 samples, stored in about 1.2 MB of read-only executable data. Context counts
 must occur at least four times before influencing ranking. Relative likelihood
 adjustments are bounded; mixed-script transitions do not borrow evidence from

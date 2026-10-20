@@ -2578,14 +2578,16 @@ mod tests {
             } else {
                 (he_word, "קודם", "הקשר")
             };
+            // The longer phrase strongly favors the literal reading beyond
+            // the diffuse evidence already available from the previous word.
             let mut rows = [
-                format!("{visible}\t1\t1000"),
-                format!("{target}\t1\t1000"),
-                format!("{first}\t100\t1000"),
-                format!("{last}\t100\t1000"),
+                format!("{visible}\t90\t10000"),
+                format!("{target}\t2\t10000"),
+                format!("{first}\t100\t10000"),
+                format!("{last}\t1000\t10000"),
                 format!("{first} {last}\t100\t100"),
                 format!("{first} {last} {visible}\t90\t100"),
-                format!("{last} {visible}\t90\t100"),
+                format!("{last} {visible}\t90\t1000"),
             ];
             rows.sort_unstable();
             let model = Box::leak(rows.join("\n").into_boxed_str());

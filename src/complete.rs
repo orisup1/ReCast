@@ -110,7 +110,7 @@ impl PhraseContext {
         self.history.observe(word);
     }
 
-    pub(crate) fn boost(&self, word: &str) -> f64 {
+    fn previous_word_boost(&self, word: &str) -> f64 {
         let count = if self.pairs.is_empty() {
             0
         } else {
@@ -127,7 +127,22 @@ impl PhraseContext {
         let bundled = self
             .previous_word()
             .map_or(1.0, |previous| phrase_boost(previous, word));
-        (personal.max(bundled) * self.history.factor(word)).clamp(0.25, 16.0)
+        personal.max(bundled)
+    }
+
+    /// Preserve the established context evidence for automatic decisions.
+    pub(crate) fn boost(&self, word: &str) -> f64 {
+        (self.previous_word_boost(word) * self.history.factor(word)).clamp(0.25, 16.0)
+    }
+
+    /// Explicit offers can use all eligible measured bigrams. Overlapping
+    /// one-word evidence is combined once before applying longer history.
+    pub(crate) fn offer_boost(&self, word: &str) -> f64 {
+        (self
+            .previous_word_boost(word)
+            .max(self.history.phrase_prior(word))
+            * self.history.factor(word))
+        .clamp(0.25, 16.0)
     }
 
     /// Bounded context cost shared by both automatic spelling models. Context
@@ -367,7 +382,9 @@ fn completions_from(
         };
         let weight = penalty
             * f64::from(crate::personal::personal_boost(word))
-            * ranking.context.map_or(1.0, |context| context.boost(word))
+            * ranking
+                .context
+                .map_or(1.0, |context| context.offer_boost(word))
             / (f64::from(rank) + 1.0);
         candidates.insert(
             word.to_owned(),
@@ -586,7 +603,9 @@ fn apostrophe_completions(
             continue;
         };
         let weight = f64::from(crate::personal::personal_boost(&word))
-            * ranking.context.map_or(1.0, |context| context.boost(&word))
+            * ranking
+                .context
+                .map_or(1.0, |context| context.offer_boost(&word))
             / (f64::from(rank) + 1.0);
         candidates.push(Candidate {
             saved: word.len() - prefix.len(),
@@ -621,7 +640,9 @@ fn apostrophe_completions(
             saved: word.len() - prefix.len(),
             word: word.clone(),
             weight: f64::from(crate::personal::personal_boost(word))
-                * ranking.context.map_or(1.0, |context| context.boost(word))
+                * ranking
+                    .context
+                    .map_or(1.0, |context| context.offer_boost(word))
                 / (f64::from(rank) + 1.0),
             rank,
             fallback: false,
@@ -1632,7 +1653,8 @@ mod tests {
         let model = "at\t100\t1000\nat the\t100\t100\nat the bank\t12\t100\nband\t20\t1000\nbank\t20\t1000\njoined\t100\t1000\njoined the\t100\t100\njoined the band\t12\t100\nthe\t100\t1000\nthe band\t12\t100\nthe bank\t12\t100\n";
         let mut context = PhraseContext::with_model(model);
         let d = dict(&["bank", "band"]);
-        let f = freq(&[("bank", 200), ("band", 100)]);
+        // Equal unigram ranks isolate the evidence added by longer history.
+        let f = freq(&[("bank", 100), ("band", 100)]);
         let offers = |context: &PhraseContext| completions_in_context("ban", d, f, Some(context));
         for word in ["at", "the"] {
             context.observe(word, false);
@@ -1650,6 +1672,109 @@ mod tests {
             context.pairs.is_empty(),
             "public context needs no personal learning"
         );
+    }
+
+    #[test]
+    fn additional_measured_pairs_rank_explicit_offers_without_changing_automatic_spelling() {
+        // "worry about" is measured eight times but falls outside the capped
+        // public phrase list. Equal edit costs isolate its new ranking evidence.
+        let d = dict(&["above", "about"]);
+        let f = freq(&[("above", 100), ("about", 180)]);
+        let mut context = PhraseContext::default();
+        context.observe("worry", false);
+        assert_eq!(phrase_boost("worry", "about"), 1.0);
+        assert_eq!(context.boost("about"), 1.0);
+        assert_eq!(context.offer_boost("about"), 4.0);
+        assert_eq!(completions_in_context("abo", d, f, None)[0], "above");
+        assert_eq!(
+            completions_in_context("abo", d, f, Some(&context))[0],
+            "about"
+        );
+        assert_eq!(
+            crate::spell::correction_suggestions("abovt", d, f, None)[0],
+            "above"
+        );
+        assert_eq!(
+            crate::spell::correction_suggestions("abovt", d, f, Some(&context))[0],
+            "about"
+        );
+        assert_eq!(
+            crate::spell::suggestions("abovt", d, f, Some(&context))[0],
+            "about"
+        );
+        let automatic = crate::spell::assess("abovt", d, f, None);
+        let contextual = crate::spell::assess("abovt", d, f, Some(&context));
+        assert_eq!(automatic.correction, contextual.correction);
+        assert_eq!(automatic.lead, contextual.lead);
+        let original = automatic.best.unwrap();
+        let unchanged = contextual.best.unwrap();
+        assert_eq!(original.text, unchanged.text);
+        assert_eq!(original.score, unchanged.score);
+        assert!(context.pairs.is_empty());
+
+        context.observe("שלום", false);
+        assert_eq!(context.offer_boost("about"), 1.0);
+        context.observe("worry", false);
+        assert_eq!(context.offer_boost("about"), 4.0);
+        context.observe("word.", false);
+        assert_eq!(context.offer_boost("about"), 1.0);
+        context.observe("worry", false);
+        context.clear();
+        assert_eq!(context.offer_boost("about"), 1.0);
+        assert_eq!(
+            completions_in_context("abo", d, f, Some(&context))[0],
+            "above"
+        );
+    }
+
+    #[test]
+    fn newly_covered_pair_changes_completion_with_embedded_word_lists() {
+        let mut context = PhraseContext::default();
+        context.observe("task", false);
+        let dictionary = crate::dictionary::en_dict();
+        let frequency = crate::dictionary::en_freq();
+        assert_eq!(phrase_boost("task", "force"), 1.0);
+        assert_eq!(
+            completions_in_context("for", dictionary, frequency, None)[0],
+            "forget"
+        );
+        assert_eq!(
+            completions_in_context("for", dictionary, frequency, Some(&context))[0],
+            "force"
+        );
+        assert_eq!(context.automatic_discount("force"), 0.0);
+        assert!(context.pairs.is_empty());
+    }
+
+    #[test]
+    fn offer_priors_combine_overlaps_once_and_preserve_longer_history() {
+        let mut context = PhraseContext::default();
+        for _ in 0..4 {
+            context.observe("good", true);
+            context.observe("morning", true);
+        }
+        context.observe("good", true);
+        assert_eq!(context.offer_boost("morning"), 4.0);
+        context.clear();
+        for _ in 0..4 {
+            context.observe("worry", true);
+            context.observe("about", true);
+        }
+        context.observe("worry", true);
+        assert_eq!(context.boost("about"), 3.0);
+        assert_eq!(context.offer_boost("about"), 4.0);
+        context.forget_learning();
+        assert_eq!(context.boost("about"), 1.0);
+        assert_eq!(context.offer_boost("about"), 4.0);
+
+        let model = "about\t20\t1000\nnever\t100\t1000\nnever worry\t100\t100\nnever worry about\t12\t100\nworry\t100\t1000\nworry about\t12\t100\n";
+        let mut context = PhraseContext::with_model(model);
+        for word in ["never", "worry"] {
+            context.observe(word, false);
+        }
+        assert!(context.boost("about") > 1.0);
+        assert_eq!(context.offer_boost("about"), 4.0 * context.boost("about"));
+        assert!(context.pairs.is_empty());
     }
 
     #[test]

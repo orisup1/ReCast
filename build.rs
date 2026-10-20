@@ -30,12 +30,13 @@
 // cross-compiling with the GNU (mingw-w64) toolchain we point it at the
 // prefixed windres/ar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     prepare_dictionaries();
+    prepare_offer_phrases();
     embed_windows_resources();
 }
 
@@ -117,6 +118,71 @@ fn prepare_dictionaries() {
         blob.pop(); // no trailing newline: every line is a real entry
         write_blob(&out_dir.join(dst), &blob, src);
     }
+}
+
+/// Derive additional explicit-offer priors from already bundled measured counts.
+/// Lexical trust matches build_phrases.py before technical additions or folding.
+fn prepare_offer_phrases() {
+    println!("cargo:rerun-if-changed=src/intent_counts.tsv");
+    let mut allowed = HashSet::new();
+    for language in ["en", "he"] {
+        let dictionary = read(&format!("{language}_dict.txt")).to_lowercase();
+        let dictionary: HashSet<_> = dictionary.lines().collect();
+        let frequency = read(&format!("{language}_freq.txt")).to_lowercase();
+        allowed.extend(
+            frequency
+                .lines()
+                .take(20_000)
+                .filter(|word| {
+                    dictionary.contains(word) && (2..=20).contains(&word.chars().count())
+                })
+                .map(str::to_owned),
+        );
+    }
+    let data = read("src/intent_counts.tsv");
+    let counts: HashMap<_, _> = data
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 3, "invalid intent count row");
+            (
+                fields[0],
+                (
+                    fields[1].parse::<u32>().expect("intent count"),
+                    fields[2].parse::<u32>().expect("intent denominator"),
+                ),
+            )
+        })
+        .collect();
+    let mut phrases = Vec::new();
+    for (&key, &(count, previous_count)) in &counts {
+        let Some((previous, next)) = key.split_once(' ') else {
+            continue;
+        };
+        if count < 5
+            || u64::from(count) * 20 < u64::from(previous_count)
+            || !allowed.contains(previous)
+            || !allowed.contains(next)
+        {
+            continue;
+        }
+        let Some(&(_, total)) = counts.get(previous) else {
+            continue;
+        };
+        let Some(&(next_count, _)) = counts.get(next) else {
+            continue;
+        };
+        let association = f64::from(count) * f64::from(total)
+            / (f64::from(previous_count) * f64::from(next_count));
+        if association >= 3.0 {
+            let weight = (1.0 + association.log2()).min(4.0);
+            phrases.push(format!("{key}\t{weight}"));
+        }
+    }
+    phrases.sort_unstable();
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    write(&out_dir.join("offer_phrases.blob"), &phrases.join("\n"));
 }
 
 /// The apostrophe/quote-free variant of `word`, or `None` when there is nothing
