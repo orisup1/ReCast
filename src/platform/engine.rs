@@ -6718,7 +6718,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .candidates
-                .len();
+                .len()
+                .min(crate::complete::MAX_CANDIDATES);
             session.finish();
             for _ in 0..choices {
                 session.tap(second);

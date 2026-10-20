@@ -184,6 +184,9 @@ const MIN_SCORE_GAP: f32 = 4.0;
 const CONFIDENCE_WINDOW: f32 = 4.0 * MIN_SCORE_GAP;
 /// Bound contextual influence without widening the edit or frequency gates.
 const MAX_AUTOMATIC_CONTEXT_DISCOUNT: f32 = 8.0;
+/// A wider candidate pool must not make the literal token less plausible solely
+/// because more target words are admitted to the search.
+const KEEP_ORIGINAL_MAX_RANK: u32 = 50_000;
 
 /// Only reviewed three-letter transpositions bypass the default length guard.
 pub(crate) fn is_reviewed_short_transposition(word: &str) -> bool {
@@ -381,7 +384,7 @@ fn keep_original(
         )
     } else {
         (
-            score(budget, max_rank, word),
+            score(budget, max_rank.min(KEEP_ORIGINAL_MAX_RANK), word),
             "the configured edit and rank budget",
         )
     }
@@ -924,7 +927,7 @@ impl<'a> Search<'a> {
             .map(|rule| rule.to.as_bytes())
             .collect();
         let max_rank =
-            (self.max_rank.min(20_000) / DIST2_RANK_FACTOR).max(self.max_rank / DIST3_RANK_FACTOR);
+            (self.max_rank.min(30_000) / DIST2_RANK_FACTOR).max(self.max_rank / DIST3_RANK_FACTOR);
         for first in b'a'..=b'z' {
             if first == self.typed[0] {
                 continue; // the ordinary opening scan already covers this run
@@ -1136,7 +1139,7 @@ fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
         if len >= LONG_ENOUGH_FOR_TWO && cost <= CHEAPLY_EXPLAINED {
             max_rank
         } else {
-            max_rank.min(20_000) / DIST2_RANK_FACTOR
+            max_rank.min(30_000) / DIST2_RANK_FACTOR
         }
     } else {
         max_rank / DIST3_RANK_FACTOR
@@ -1145,10 +1148,10 @@ fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
 
 /// Length past which a two-edit correction stops being treated as speculative.
 ///
-/// Three more than [`DIST2_MIN_LEN`], which is the shortest word allowed two edits
+/// Two more than [`DIST2_MIN_LEN`], which is the shortest word allowed two edits
 /// at all: right at that floor two edits are still a third of the word, and the
 /// tighter rank budget is what stands between a name and a rewrite.
-const LONG_ENOUGH_FOR_TWO: usize = 9;
+const LONG_ENOUGH_FOR_TWO: usize = 8;
 
 /// Total channel cost past which two edits stop counting as cheaply explained.
 ///
@@ -2160,6 +2163,34 @@ mod tests {
         assert_eq!(fix("wonqerqxl", d, f).as_deref(), Some("wonderful"));
         assert_eq!(correct_with("wonqerqxl", d, f, 4, 20_000, 2), None);
         assert_eq!(correct_with("wonqerqxl", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn broader_spelling_recovers_less_common_long_words_with_multiple_slips() {
+        for (typed, intended, rank) in [
+            ("baloonsz", "balloons", 65_000),
+            ("keybozrp", "keyboard", 12_000),
+        ] {
+            let d = dict(&[intended]);
+            let f = freq(&[(intended, rank)]);
+            let result = assess_with(
+                typed,
+                d,
+                f,
+                crate::config::DEFAULT_SPELL_MIN_LEN,
+                crate::config::DEFAULT_SPELL_MAX_RANK,
+                crate::config::DEFAULT_SPELL_MAX_DIST,
+            );
+            assert_eq!(
+                result.correction.as_deref(),
+                Some(intended),
+                "{}",
+                result.details
+            );
+            assert_eq!(correct_with(typed, d, f, 4, 75_000, 1), None);
+            assert_eq!(correct_with(typed, d, f, 4, 1_000, 3), None);
+            assert_eq!(correct_with(typed, d, f, typed.len() + 1, 75_000, 3), None);
+        }
     }
 
     #[test]

@@ -235,6 +235,8 @@ const SHORT_COMMON_MAX: u32 = 500;
 // Fixed corpus-rank cutoff can miss uncommon words; tune against an
 // expanded accuracy corpus if short-word recall becomes a problem.
 const SHORT_ENABLED_MAX: u32 = 30_000;
+/// An established run in the target language supports less common short words.
+const SHORT_RUN_MAX: u32 = 50_000;
 
 /// Whether `text`, read as `lang`, is too short to be believed as a trigger.
 ///
@@ -260,6 +262,20 @@ fn too_short_to_trigger(
         SHORT_COMMON_MAX
     };
     freq_rank(text, lang, en_freq, he_freq).is_none_or(|rank| rank > max_rank)
+}
+
+fn too_short_in_run(
+    text: &str,
+    lang: Language,
+    short_enabled: bool,
+    run: Run,
+    en_freq: Freq,
+    he_freq: Freq,
+) -> bool {
+    too_short_to_trigger(text, lang, short_enabled, en_freq, he_freq)
+        && (!short_enabled
+            || !run.favours(lang)
+            || freq_rank(text, lang, en_freq, he_freq).is_none_or(|rank| rank > SHORT_RUN_MAX))
 }
 
 /// One-letter inflectional prefixes that Hebrew attaches to nouns/verbs:
@@ -296,7 +312,7 @@ const HE_STEM_MIN: usize = 2;
 
 /// Inferred inflections need a stem people actually use, in either language.
 // ponytail: fixed stem-rank cutoff; tune against more real typing reports.
-const INFERRED_STEM_MAX_RANK: u32 = 50_000;
+const INFERRED_STEM_MAX_RANK: u32 = 75_000;
 
 /// A single English apostrophe joining a productive possessive or contraction.
 /// Reject other punctuation, digits, and multiple apostrophes before lookup.
@@ -541,10 +557,11 @@ fn decide_known(
     let oth_strict = valid_strict(oth_text, other, en_dict, he_dict);
     // Short words need frequency evidence for both plain switches and the
     // homograph tie-break. RECAST_SHORT=0 tightens that confidence threshold.
-    let short_block = too_short_to_trigger(
+    let short_block = too_short_in_run(
         oth_text,
         other,
         Config::global().short_enabled,
+        run,
         en_freq,
         he_freq,
     );
@@ -620,7 +637,7 @@ fn decide_unknown(
     // Short-word gate: when disabled, a short uncommon reading never counts as a
     // trigger — the same collision guard as in `decide_known`.
     let enabled = Config::global().short_enabled;
-    let short_ok = |text: &str, lang| !too_short_to_trigger(text, lang, enabled, en_freq, he_freq);
+    let short_ok = |text: &str, lang| !too_short_in_run(text, lang, enabled, run, en_freq, he_freq);
     let en_target = short_ok(text_en, Language::English)
         && valid_target(
             text_en,
@@ -1176,10 +1193,11 @@ fn plan_candidate(
                 "\nLayout preserved: the current reading is a dictionary word; the alternate did not win the decisive frequency and language-history comparison."
             });
         } else if whole.is_none()
-            && too_short_to_trigger(
+            && too_short_in_run(
                 alternate,
                 current.other(),
                 Config::global().short_enabled,
+                run,
                 en_freq,
                 he_freq,
             )
@@ -4228,11 +4246,11 @@ mod tests {
                     en,
                     he,
                     nofreq(),
-                    freq(&[("מקלדת", 32_000)])
+                    freq(&[("מקלדת", 65_000)])
                 ),
                 Some(Language::Hebrew)
             );
-            for he_freq in [nofreq(), freq(&[("מקלדת", 50_001)])] {
+            for he_freq in [nofreq(), freq(&[("מקלדת", 75_001)])] {
                 assert_eq!(
                     decide_known(
                         english,
@@ -5685,6 +5703,122 @@ mod tests {
             nofreq(),
             nofreq()
         ));
+    }
+
+    #[test]
+    fn less_common_short_layout_targets_need_ranked_unambiguous_evidence() {
+        let en = dict(&["mat"]);
+        let he = dict(&["סלב"]);
+        let english = freq(&[("mat", 40_000)]);
+        let hebrew = freq(&[("סלב", 40_000)]);
+        let he_run = Run {
+            lang: Some(Language::Hebrew),
+            len: 2,
+        };
+        let en_run = Run {
+            lang: Some(Language::English),
+            len: 2,
+        };
+        assert_eq!(
+            decide_known(
+                "xkc",
+                "סלב",
+                Language::English,
+                he_run,
+                en,
+                he,
+                english,
+                hebrew
+            ),
+            Some(Language::Hebrew)
+        );
+        assert_eq!(
+            decide_known(
+                "mat",
+                "צשא",
+                Language::Hebrew,
+                en_run,
+                en,
+                he,
+                english,
+                hebrew
+            ),
+            Some(Language::English)
+        );
+        assert_eq!(
+            decide_unknown("xkc", "סלב", he_run, en, he, english, hebrew),
+            Some(Language::Hebrew)
+        );
+        assert_eq!(
+            decide_known(
+                "xkc",
+                "סלב",
+                Language::English,
+                he_run,
+                en,
+                he,
+                english,
+                nofreq()
+            ),
+            None
+        );
+        assert_eq!(
+            decide_known(
+                "xkc",
+                "סלב",
+                Language::English,
+                he_run,
+                en,
+                he,
+                english,
+                freq(&[("סלב", 50_001)])
+            ),
+            None
+        );
+        assert!(too_short_in_run(
+            "סלב",
+            Language::Hebrew,
+            false,
+            he_run,
+            english,
+            hebrew
+        ));
+        assert_eq!(
+            decide_known(
+                "mat",
+                "סלב",
+                Language::English,
+                he_run,
+                en,
+                he,
+                english,
+                hebrew
+            ),
+            None,
+            "a wider short-word cutoff does not relax homograph protection"
+        );
+        for run in [
+            Run::default(),
+            Run {
+                lang: Some(Language::Hebrew),
+                len: 1,
+            },
+            en_run,
+        ] {
+            assert_eq!(
+                decide_known(
+                    "xkc",
+                    "סלב",
+                    Language::English,
+                    run,
+                    en,
+                    he,
+                    english,
+                    hebrew
+                ),
+                None
+            );
+        }
     }
 
     #[test]

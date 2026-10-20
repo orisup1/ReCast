@@ -16,7 +16,7 @@ enum Request {
 const MIN_SCORE_GAP: f32 = 20.0;
 const PREFIX_INFERENCE_COST: u32 = 12;
 const TWO_EDIT_MIN_LEN: usize = 6;
-const TWO_EDIT_BUDGET: u32 = 150;
+const TWO_EDIT_BUDGET: u32 = 180;
 
 struct RankedCandidate {
     evidence: super::Candidate,
@@ -135,7 +135,7 @@ fn assess_with_visible(
         return super::Assessment::unchanged(reason);
     }
     let mut details = format!(
-        "Hebrew spelling candidates (lower score is better; scores are not confidence percentages):\nLimits: one letter edit; when enabled, two cheap edits in stems of at least {TWO_EDIT_MIN_LEN} letters with their first two letters intact, cost at most {TWO_EDIT_BUDGET}, and rank at most {}. Configured maximum frequency rank {}; unexplained single edits are limited to rank 20000.", config.spell_max_rank.min(20_000) / 2, config.spell_max_rank
+        "Hebrew spelling candidates (lower score is better; scores are not confidence percentages):\nLimits: one letter edit; when enabled, two cheap edits in stems of at least {TWO_EDIT_MIN_LEN} letters with their first two letters intact, cost at most {TWO_EDIT_BUDGET}, and rank at most {}. Configured maximum frequency rank {}; unexplained single edits are limited to rank 30000.", config.spell_max_rank.min(20_000) / 2, config.spell_max_rank
     );
     for (text, rank, cost) in &result.rejected_rank {
         details.push_str(&format!(
@@ -179,8 +179,11 @@ fn assess_with_visible(
     } else {
         super::COST_EDIT
     };
-    let keep_score = super::score(keep_cost, config.spell_max_rank, word)
-        - context.map_or(0.0, |context| context.automatic_discount(visible));
+    let keep_score = super::score(
+        keep_cost,
+        config.spell_max_rank.min(super::KEEP_ORIGINAL_MAX_RANK),
+        word,
+    ) - context.map_or(0.0, |context| context.automatic_discount(visible));
     details.push_str(&format!(
         "\nKeep original: score {keep_score:.2}; replacement lead {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", keep_score - best.evidence.score
     ));
@@ -302,7 +305,7 @@ fn search(
         } else if automatic && cost <= super::COST_ADJACENT_DIAG {
             config.spell_max_rank
         } else {
-            config.spell_max_rank.min(20_000)
+            config.spell_max_rank.min(30_000)
         };
         if rank > max_rank {
             if !result.rejected_rank.iter().any(|(word, ..)| word == &text) {
@@ -1008,6 +1011,35 @@ mod tests {
                 None,
                 "{typed}"
             );
+        }
+    }
+
+    #[test]
+    fn two_edit_hebrew_repairs_allow_costlier_slips_within_configured_limits() {
+        let dict = Dict::of(&["אינטרנט"]);
+        let freq = Freq::of(&[("אינטרנט", 5_000)]);
+        let mut config = Config::global();
+        for (typed, expected) in [("אינרטנ", "אינטרנט"), ("וכשאינרטנ", "וכשאינטרנט")]
+        {
+            let result = assess_with(typed, dict, freq, None, &config);
+            assert_eq!(
+                result.correction.as_deref(),
+                Some(expected),
+                "{}",
+                result.details
+            );
+            config.spell_max_dist = 1;
+            assert_eq!(
+                assess_with(typed, dict, freq, None, &config).correction,
+                None
+            );
+            config.spell_max_dist = 3;
+            config.spell_max_rank = 1_000;
+            assert_eq!(
+                assess_with(typed, dict, freq, None, &config).correction,
+                None
+            );
+            config.spell_max_rank = crate::config::DEFAULT_SPELL_MAX_RANK;
         }
     }
 

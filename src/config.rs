@@ -15,7 +15,8 @@ pub struct Config {
     pub rule_stats_enabled: bool,
     /// Require stronger evidence before switching away from the preferred language.
     pub language_preference: LanguagePreference,
-    /// Allow short (≤3 char) switches up to frequency rank 30,000.
+    /// Allow short (≤3 char) switches up to frequency rank 30,000, or 50,000
+    /// with an established run in the target language.
     /// Turning this off restricts them to very common words (rank ≤500).
     pub short_enabled: bool,
     /// Enable missing‑space split fallback.
@@ -37,15 +38,15 @@ pub struct Config {
     pub spell_max_rank: u32,
     /// Maximum edit distance for a spelling suggestion (0 disables, 1 = only
     /// single-typo fixes, 2–3 = also badly mangled words). The word's own
-    /// length caps this further: two edits need 7 characters and three need 10,
-    /// so raising it only ever affects words long enough to survive it.
+    /// length caps this further: two cheap edits need 6 characters, full two-edit
+    /// repairs need 7, and three edits need 8.
     pub spell_max_dist: u8,
     /// Enable auto-complete: the completion key finishes the word being typed,
     /// and abbreviations from `<config>/recast/abbrev.txt` expand when a word
     /// is finished.
     pub complete_enabled: bool,
-    /// Shortest partial word the completer will finish. One or two letters
-    /// match too many words for the most common one to be a good guess.
+    /// Shortest partial word the completer will finish. Two-letter prefixes
+    /// use exact matches; edited-prefix recovery requires more letters.
     pub complete_min_len: usize,
     /// Worst frequency rank a completion may have — the same idea as
     /// `spell_max_rank`, but looser, because a completion is asked for.
@@ -54,12 +55,12 @@ pub struct Config {
 
 /// Shipped spelling defaults balance broader recall with word-length and cost gates.
 pub const DEFAULT_SPELL_MIN_LEN: usize = 4;
-pub const DEFAULT_SPELL_MAX_RANK: u32 = 50_000;
+pub const DEFAULT_SPELL_MAX_RANK: u32 = 75_000;
 pub const DEFAULT_SPELL_MAX_DIST: u8 = 3;
 
 /// Shipped defaults for completion, which requires an explicit user gesture.
-pub const DEFAULT_COMPLETE_MIN_LEN: usize = 3;
-pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
+pub const DEFAULT_COMPLETE_MIN_LEN: usize = 2;
+pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 100_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LanguagePreference {
@@ -118,13 +119,13 @@ impl Config {
     ///                (default: enabled).
     /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
     /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
-    ///                     (default: 50000).
+    ///                     (default: 75000).
     /// RECAST_SPELL_DIST – maximum edit distance, 0 to 3 (default: 3; 0 disables).
     /// RECAST_COMPLETE   – set to `0` to disable auto-complete (default:
     ///                     enabled).
-    /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 3).
+    /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 2).
     /// RECAST_COMPLETE_RANK – worst frequency rank a completion may have
-    ///                        (default: 30000).
+    ///                        (default: 100000).
     /// RECAST_PERSONAL – set to `1` to persist local personalization data
     ///                   (default: disabled).
     /// RECAST_PREFER – balanced (default), english, or hebrew.

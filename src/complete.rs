@@ -38,6 +38,9 @@ use crate::dictionary::{Dict, Freq};
 /// stays shorter; dictionary membership still protects long identifiers/URLs.
 const MAX_PREFIX_LEN: usize = crate::types::MAX_WORD_KEYS - 1;
 const MAX_EDITED_PREFIX_LEN: usize = 20;
+/// Two-error recovery keeps the first two letters and at least four more typed
+/// letters. Shorter prefixes remain exact or single-edit requests.
+const TWO_EDIT_PREFIX_MIN: usize = 6;
 
 /// Guesses per completion page before the caller can restore the typed prefix.
 /// The bounded API returns one page; repeated explicit requests can use the full
@@ -170,8 +173,8 @@ struct Ranking<'a> {
     all: bool,
 }
 
-/// Frequency and retained personal evidence estimate likelihood. Prefix edits
-/// receive a tenfold penalty. Letters saved give a small, bounded benefit after
+/// Frequency and retained personal evidence estimate likelihood. Each prefix edit
+/// receives a tenfold penalty. Letters saved give a small, bounded benefit after
 /// accounting for cycle taps. Even one-letter completions retain their frequency
 /// weight, so long suffixes cannot overwhelm common short words.
 struct Candidate {
@@ -320,7 +323,7 @@ fn completions_from(
         return Vec::new();
     }
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
-    // Exact and one-edit matches compete in the same pool. A typo needs much
+    // Exact and edited matches compete in the same pool. A typo needs much
     // stronger frequency evidence to beat an equally useful exact match.
     // Editing a three-letter prefix is too ambiguous to compete with an exact
     // offer. Keep short-prefix recovery only when there is no exact candidate.
@@ -341,13 +344,13 @@ fn completions_from(
     } else {
         false
     };
-    let mut prefixes = if exact || len > MAX_EDITED_PREFIX_LEN {
+    let mut prefixes = if len < 3 || exact || len > MAX_EDITED_PREFIX_LEN {
         HashSet::new()
     } else {
         edited_prefixes(prefix, english)
     };
     prefixes.insert(prefix.to_owned());
-    let mut consider = |word: &str, rank: u32, explicit: bool, fallback: bool| {
+    let mut consider = |word: &str, rank: u32, explicit: bool, fallback: bool, penalty: f64| {
         let word_len = word.chars().count();
         if word_len <= len
             || word_len > crate::types::MAX_WORD_KEYS
@@ -357,7 +360,11 @@ fn completions_from(
         {
             return;
         }
-        let penalty = if word.starts_with(prefix) { 1.0 } else { 0.1 };
+        let penalty = if word.starts_with(prefix) {
+            1.0
+        } else {
+            penalty
+        };
         let weight = penalty
             * f64::from(crate::personal::personal_boost(word))
             * ranking.context.map_or(1.0, |context| context.boost(word))
@@ -374,7 +381,9 @@ fn completions_from(
         );
     };
     for matching in &prefixes {
-        freq.for_each_with_prefix(matching, |word, rank| consider(word, rank, false, false));
+        freq.for_each_with_prefix(matching, |word, rank| {
+            consider(word, rank, false, false, 0.1);
+        });
     }
     for word in saved {
         let valid = word.chars().all(|c| {
@@ -385,7 +394,7 @@ fn completions_from(
             }
         });
         if valid && prefixes.iter().any(|p| word.starts_with(p)) {
-            consider(word, freq.rank(word).unwrap_or(1_000), true, false);
+            consider(word, freq.rank(word).unwrap_or(1_000), true, false, 0.1);
         }
     }
     if english {
@@ -394,7 +403,39 @@ fn completions_from(
         for matching in &prefixes {
             technical_words().for_each_with_prefix(matching, |word| {
                 if dict.contains(word) {
-                    consider(word, freq.rank(word).unwrap_or(20_000), false, true);
+                    consider(word, freq.rank(word).unwrap_or(20_000), false, true, 0.1);
+                }
+            });
+        }
+    }
+    if (TWO_EDIT_PREFIX_MIN..=MAX_EDITED_PREFIX_LEN).contains(&len) {
+        // Search one narrow run rather than generating every pair of edits.
+        // The intact opening bounds both ambiguity and work for explicit requests.
+        let typed: Vec<_> = prefix.chars().collect();
+        let anchor: String = typed.iter().take(2).collect();
+        freq.for_each_with_prefix(&anchor, |word, rank| {
+            if rank <= max_rank && within_two_prefix_edits(&typed, word) {
+                consider(word, rank, false, false, 0.01);
+            }
+        });
+        for word in saved {
+            if word.starts_with(&anchor)
+                && word.chars().all(|c| {
+                    if english {
+                        c.is_ascii_graphic()
+                    } else {
+                        ('א'..='ת').contains(&c)
+                    }
+                })
+                && within_two_prefix_edits(&typed, word)
+            {
+                consider(word, freq.rank(word).unwrap_or(1_000), true, false, 0.01);
+            }
+        }
+        if english {
+            technical_words().for_each_with_prefix(&anchor, |word| {
+                if dict.contains(word) && within_two_prefix_edits(&typed, word) {
+                    consider(word, freq.rank(word).unwrap_or(20_000), false, true, 0.01);
                 }
             });
         }
@@ -415,7 +456,7 @@ fn completions_from(
                     }
                 })
             {
-                consider(word, freq.rank(word).unwrap_or(50_000), false, true);
+                consider(word, freq.rank(word).unwrap_or(50_000), false, true, 1.0);
             }
         });
     }
@@ -430,7 +471,7 @@ fn completions_from(
             }
             let mut inferred = |stem: &str, rank: u32| {
                 if stem.chars().count() >= 3 && stem.chars().all(|c| ('א'..='ת').contains(&c)) {
-                    consider(&format!("{attached}{stem}"), rank, false, true);
+                    consider(&format!("{attached}{stem}"), rank, false, true, 1.0);
                 }
             };
             freq.for_each_with_prefix(stem_prefix, |stem, rank| {
@@ -460,6 +501,49 @@ fn completions_from(
         ranking.offset,
         ranking.all,
     )
+}
+
+/// Banded Damerau alignment of the typed prefix against a candidate's opening.
+/// The unfinished suffix is free; insertions, deletions, substitutions, and
+/// adjacent transpositions each cost one. Only the next two letters can belong
+/// to the aligned prefix, so long completion suffixes do not enlarge the search.
+fn within_two_prefix_edits(typed: &[char], word: &str) -> bool {
+    const WIDTH: usize = MAX_EDITED_PREFIX_LEN + 3;
+    let mut intended = ['\0'; WIDTH - 1];
+    let mut len = 0;
+    for (slot, letter) in intended.iter_mut().zip(word.chars()).take(typed.len() + 2) {
+        *slot = letter;
+        len += 1;
+    }
+    if len < typed.len().saturating_sub(2) {
+        return false;
+    }
+    let mut previous = [3u8; WIDTH];
+    let mut before_previous = previous;
+    for (index, cost) in previous.iter_mut().take(len + 1).enumerate() {
+        *cost = index.min(3) as u8;
+    }
+    for i in 1..=typed.len() {
+        let mut current = [3u8; WIDTH];
+        current[0] = i.min(3) as u8;
+        for j in i.saturating_sub(2).max(1)..=len.min(i + 2) {
+            current[j] = (previous[j] + 1)
+                .min(current[j - 1] + 1)
+                .min(previous[j - 1] + u8::from(typed[i - 1] != intended[j - 1]));
+            if i >= 2
+                && j >= 2
+                && typed[i - 1] == intended[j - 2]
+                && typed[i - 2] == intended[j - 1]
+            {
+                current[j] = current[j].min(before_previous[j - 2] + 1);
+            }
+        }
+        before_previous = previous;
+        previous = current;
+    }
+    previous[typed.len().saturating_sub(2)..=len]
+        .iter()
+        .any(|&cost| cost <= 2)
 }
 
 fn technical_words() -> Dict {
@@ -1709,10 +1793,89 @@ mod tests {
     }
 
     #[test]
-    fn a_rare_completion_is_not_offered() {
+    fn configured_completion_rank_limit_is_respected() {
         let d = dict(&["helot"]);
         let f = freq(&[("helot", 45_000)]);
-        assert_eq!(finish("hel", d, f), None);
+        assert!(completions_with("hel", d, f, 3, 30_000).is_empty());
+        assert_eq!(finish("hel", d, f).as_deref(), Some("helot"));
+    }
+
+    #[test]
+    fn short_explicit_prefixes_complete_exactly_with_broader_rank_coverage() {
+        let d = dict(&["helium", "שלום"]);
+        let f = freq(&[("helium", 80_000), ("שלום", 80_000)]);
+        for (prefix, word, typo) in [("he", "helium", "hx"), ("של", "שלום", "שז")] {
+            assert_eq!(finish(prefix, d, f).as_deref(), Some(word));
+            assert!(offers(typo, d, f).is_empty(), "two-letter typo {typo}");
+            assert!(completions_with(prefix, d, f, 3, 100_000).is_empty());
+            assert!(completions_with(prefix, d, f, 2, 75_000).is_empty());
+        }
+    }
+
+    #[test]
+    fn long_prefixes_recover_two_errors_in_both_languages() {
+        let d = dict(&["keyboard", "אוניברסיטה"]);
+        let f = freq(&[("keyboard", 1_000), ("אוניברסיטה", 1_000)]);
+        for (prefix, word) in [
+            ("keybaot", "keyboard"),
+            ("keybbax", "keyboard"),
+            ("keyord", "keyboard"),
+            ("keybxxoard", "keyboard"),
+            ("אוניבסוט", "אוניברסיטה"),
+        ] {
+            let typed: Vec<_> = prefix.chars().collect();
+            assert!(within_two_prefix_edits(&typed, word), "{prefix} / {word}");
+            if word.chars().count() > typed.len() {
+                assert!(
+                    offers(prefix, d, f).iter().any(|offer| offer == word),
+                    "{prefix}"
+                );
+            } else {
+                assert!(offers(prefix, d, f).is_empty(), "must lengthen {prefix}");
+            }
+        }
+        for prefix in [
+            "keyxxxx",
+            "kexbxx",
+            "xeybaor",
+            "keyxx",
+            "אוניבxxx",
+            "אוניבסוט1",
+        ] {
+            assert!(offers(prefix, d, f).is_empty(), "{prefix}");
+        }
+        // Very short candidate words and the longest edited prefix stay bounded.
+        assert!(!within_two_prefix_edits(
+            &['a'; MAX_EDITED_PREFIX_LEN],
+            "ab"
+        ));
+        assert!(within_two_prefix_edits(
+            &"abcdefghijklmnopqrxx".chars().collect::<Vec<_>>(),
+            "abcdefghijklmnopqrstuv"
+        ));
+    }
+
+    #[test]
+    fn two_error_completion_preserves_exact_ranking_and_saved_vocabulary() {
+        let d = dict(&["keybaotter", "keyboard"]);
+        let f = freq(&[("keybaotter", 500), ("keyboard", 1_000)]);
+        assert_eq!(offers("keybaot", d, f), ["keybaotter", "keyboard"]);
+        let saved = vec!["keyboard".to_owned()];
+        assert_eq!(
+            completions_from(
+                "keybaot",
+                dict(&[]),
+                Freq::EMPTY,
+                2,
+                100_000,
+                &saved,
+                Ranking::default()
+            ),
+            ["keyboard"]
+        );
+        assert!(!completions_with("keybaot", d, f, 2, 400)
+            .iter()
+            .any(|word| word == "keyboard"));
     }
 
     #[test]

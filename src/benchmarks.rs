@@ -6,7 +6,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use crate::dictionary::{en_dict, en_freq, he_dict, Dict};
+use crate::dictionary::{en_dict, en_freq, he_dict, he_freq, Dict};
 
 fn report(name: &str, iterations: usize, started: Instant) {
     let elapsed = started.elapsed();
@@ -133,13 +133,28 @@ fn benchmark_spelling_correction() {
 #[test]
 #[ignore = "microbenchmark; run with `make bench`"]
 fn benchmark_completion_candidates() {
-    let (dict, freq) = (en_dict(), en_freq());
-    let prefixes = ["hel", "keyb", "corr", "comp", "zzz"];
+    let prefixes = [
+        "he",
+        "hel",
+        "keyb",
+        "keybaot",
+        "commnuic",
+        "אוניבסוט",
+        "corr",
+        "comp",
+        "zzz",
+    ];
     let iterations = 20_000;
     let started = Instant::now();
     for i in 0..iterations {
+        let prefix = prefixes[i % prefixes.len()];
+        let (dict, freq) = if prefix.is_ascii() {
+            (en_dict(), en_freq())
+        } else {
+            (he_dict(), he_freq())
+        };
         black_box(crate::complete::completions_with(
-            black_box(prefixes[i % prefixes.len()]),
+            black_box(prefix),
             dict,
             freq,
             crate::config::DEFAULT_COMPLETE_MIN_LEN,

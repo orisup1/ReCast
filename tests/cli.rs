@@ -564,7 +564,7 @@ fn status_reports_numeric_fallbacks_and_application_exclusions() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stdout.contains("not the running daemon"), "{stdout}");
         assert!(stdout.contains("max distance 3)"), "{stdout}");
-        assert!(stdout.contains("max rank 30000)"), "{stdout}");
+        assert!(stdout.contains("max rank 100000)"), "{stdout}");
         assert!(stdout.contains("code.exe, com.apple.terminal"), "{stdout}");
         assert!(stderr.contains("RECAST_SPELL_DIST="), "{stderr}");
         assert!(stderr.contains("RECAST_COMPLETE_RANK="), "{stderr}");

@@ -344,9 +344,12 @@ restores the entire original token. Recognized whole tokens take priority. Set
 `split = false` or `RECAST_SPLIT=0` to disable this fallback.
 
 Spelling defaults to words of at least 4 characters and suggestions ranked within
-50,000 for words of at least eight letters (20,000 for shorter words). Completion
-defaults to prefixes of at least 3 characters and rank 30,000.
-Short layout switches accept ranks up to 30,000; `short = false` restricts them
+75,000 for English words of at least eight letters (20,000 for shorter words).
+Cheap two-edit repairs can use the full rank limit from eight letters; more
+speculative two-edit repairs of long words are limited to rank 15,000. Completion
+defaults to prefixes of at least 2 characters and rank 100,000.
+Short layout switches accept ranks up to 30,000, or 50,000 after at least two
+confirmed words in the target language; `short = false` restricts them
 to ranks up to 500. Homograph overrides accept alternate readings ranked up to
 5,000, requiring a tenfold frequency advantage without language history;
 `freq = false` disables the frequency tie-break between valid readings in both layouts.
@@ -414,9 +417,10 @@ Requests stay bounded to four choices and preserve capitalization and trailing
 punctuation. Choosing an alternative to a valid dictionary word does not train
 an automatic replacement for that word.
 
-Word completion uses the active English or Hebrew layout. It first offers exact
-prefix matches; if there are none, it tries one missing, extra, wrong, or swapped
-prefix letter. Cycling and undo always restore your original prefix. Prefix
+Word completion uses the active English or Hebrew layout. Two-letter prefixes
+use exact matches. Longer prefixes can recover a missing, extra, wrong, or swapped
+letter; prefixes of 6–20 characters can recover two such errors when their first
+two letters are intact. Cycling and undo always restore your original prefix. Prefix
 length limits count characters in either language. English apostrophe prefixes
 such as `don'` can complete to `don't`; saved apostrophe words are also candidates.
 Saved words in `ignore.txt` and persistent undo exceptions are also completion candidates, including names
@@ -552,8 +556,9 @@ pairs only after subsequent typing retains the result; undo, deletion, and detec
 focus changes cancel pending learning. Completion offers do not train replacement
 pairs merely by being displayed: only a retained choice, finished with Space or
 Enter, can train word frequency or a manual spelling repair.
-Completion ranks exact and single-typo prefix matches together, penalizing edits
-and accounting for the taps needed to reach each choice. Frequency and context
+Completion ranks exact and edited prefix matches together, penalizing each edit
+tenfold (a hundredfold for two-error recovery) and accounting for the taps needed
+to reach each choice. Frequency and context
 lead; saved keystrokes add at most a 60% ranking benefit, so long words cannot
 dominate merely by having a long suffix. One-letter completions retain their
 frequency weight. Otherwise equal capped scores prefer the shorter word.
@@ -609,7 +614,7 @@ need a ranked dictionary word or stem. Existing words and saved exceptions are
 preserved; the spelling enable, minimum-length, and rank settings still apply.
 Balanced and Flexible spelling also recover two cheap edits in plain stems with
 at least six letters, preserving the first two stem letters. The total edit cost
-cannot exceed 150, and the target rank cannot exceed half the configured limit
+cannot exceed 180, and the target rank cannot exceed half the configured limit
 or 10,000, whichever is smaller. Supported prefixes do not count toward that
 minimum stem length. For example, `אינטררנטט` becomes `אינטרנט` and `מעכרותת`
 becomes `מערכות`. Conservative spelling keeps one-edit search; explicit correction
@@ -618,7 +623,7 @@ Automatic Hebrew corrections require at least four letters and a 20-point lead
 over both the next candidate and keeping the original; phrase context contributes
 at most eight points to candidate ranking. Neighboring physical keys and repeated
 letters receive lower costs. These cheap repairs use the configured spelling rank
-ceiling; speculative edits retain a ceiling of 20,000. Inferred prefixes receive
+ceiling; speculative single edits retain a ceiling of 30,000. Inferred prefixes receive
 a score surcharge rather than inheriting the stem's full confidence. Correction
 details show candidates, costs, frequency rejections, prefix evidence, learned
 discounts, and the keep-original comparison.
@@ -802,7 +807,7 @@ or promoting jargon into general-purpose spelling suggestions. Their unchanged E
 Spelling correction also considers missing, extra, or wrong first letters
 on longer words, including later typos when the edit budget permits. Layout
 correction recognizes supported Hebrew prefix stacks when the dictionary stem
-has at least three letters and frequency rank at most 50,000; the full word must
+has at least three letters and frequency rank at most 75,000; the full word must
 have at least five letters. These inferred forms never override an exact
 current-layout word when the layout is known.
 
