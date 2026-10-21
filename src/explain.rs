@@ -61,15 +61,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let keys: Vec<_> = word
         .chars()
         .map(|c| {
-            let key = match current {
-                Language::English => readings(c),
-                // Search unshifted US keys first: Hebrew letters have no case.
-                Language::Hebrew => (' '..='~')
-                    .filter(|c| !c.is_ascii_uppercase())
-                    .filter_map(readings)
-                    .find(|key| key.1 == c && !key.2),
-            };
-            key.ok_or_else(|| format!("Unsupported character {c:?} for this layout"))
+            readings_for_layout(c, current)
+                .ok_or_else(|| format!("Unsupported character {c:?} for this layout"))
         })
         .collect::<Result<_, _>>()?;
     crate::require_readable_config();
@@ -162,6 +155,18 @@ fn preceding_context(text: &str) -> (PhraseContext, Run) {
     (phrase, history.run())
 }
 
+fn readings_for_layout(c: char, current: Language) -> Option<(char, char, bool)> {
+    match current {
+        Language::English => readings(c),
+        // Prefer unshifted keys for letters, while allowing shifted symbols.
+        Language::Hebrew => (' '..='~')
+            .filter(|c| !c.is_ascii_uppercase())
+            .filter_map(readings)
+            .filter(|key| key.1 == c)
+            .min_by_key(|key| key.2),
+    }
+}
+
 fn readings(c: char) -> Option<(char, char, bool)> {
     #[cfg(target_os = "linux")]
     let (hebrew, shift) = {
@@ -173,5 +178,72 @@ fn readings(c: char) -> Option<(char, char, bool)> {
         let (key, shift) = crate::keymap::english_char_to_key(c)?;
         (crate::keymap::key_to_hebrew_char(key)?, shift)
     };
+    let hebrew = crate::keymap::hebrew_char_shifted(Some(c), Some(hebrew), shift)?;
     Some((c.to_ascii_lowercase(), hebrew, shift))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shifted_hebrew_preview_symbols_keep_their_actual_readings() {
+        for c in "~!@#$%^&*()_+{}|:\"<>?".chars() {
+            let key = readings_for_layout(c, Language::Hebrew).unwrap();
+            assert_eq!(key.1, c);
+            assert!(key.2, "{c:?}");
+        }
+        for c in "שלום0123456789[]\\/.,;'".chars() {
+            let key = readings_for_layout(c, Language::Hebrew).unwrap();
+            assert_eq!(key.1, c);
+            assert!(!key.2, "{c:?}");
+        }
+        assert_eq!(
+            readings_for_layout('(', Language::Hebrew),
+            Some((')', '(', true))
+        );
+        assert_eq!(
+            readings_for_layout('A', Language::English),
+            Some(('a', 'ש', true))
+        );
+        assert!(readings_for_layout('🙂', Language::Hebrew).is_none());
+    }
+
+    #[test]
+    fn shifted_punctuation_preview_preserves_corrections_and_wrappers() {
+        for (word, current, expected) in [
+            ("akuo!", Language::English, "שלום!"),
+            ("שלום!", Language::Hebrew, "שלום!"),
+            ("תודדה?", Language::Hebrew, "תודה?"),
+            ("(תודדה!)", Language::Hebrew, "(תודה!)"),
+            ("{רקבןקהק?}", Language::Hebrew, "{receive?}"),
+        ] {
+            let keys: Vec<_> = word
+                .chars()
+                .map(|c| readings_for_layout(c, current).unwrap())
+                .collect();
+            let result = dictionary::check_and_correct_in_context(
+                &keys,
+                |key| Some(key.0),
+                |key| Some(key.1),
+                |key| key.2,
+                Run::default(),
+                dictionary::en_dict(),
+                dictionary::he_dict(),
+                Some(current),
+                false,
+                None,
+                |_| crate::layout::LayoutSwitch::Switched,
+            );
+            let after = match result.fix {
+                None => word.to_owned(),
+                Some(Fix::Layout { start, text, .. }) => {
+                    word.chars().take(start).collect::<String>() + &text
+                }
+                Some(Fix::Spelling { text, .. } | Fix::LayoutSpelling { text, .. }) => text,
+                other => panic!("{word:?}: {other:?}"),
+            };
+            assert_eq!(after, expected, "{word:?}; {}", result.details);
+        }
+    }
 }

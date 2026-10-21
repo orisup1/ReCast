@@ -830,9 +830,12 @@ fn clear_dir(dir: &std::path::Path) -> Result<(), String> {
         USEFULNESS_FILE,
     ] {
         let path = dir.join(name);
-        if let Err(error) = std::fs::remove_file(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(format!("{}: {error}", path.display()));
+        // Interrupted saves can leave the same private data in their snapshot.
+        for path in [path.clone(), path.with_extension("txt.tmp")] {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("{}: {error}", path.display()));
+                }
             }
         }
     }
@@ -1108,13 +1111,23 @@ mod tests {
             RULE_STATS_FILE,
             USEFULNESS_FILE,
         ] {
-            write_private(&dir.join(name), "sensitive\n").expect("write owned file");
+            let path = dir.join(name);
+            write_private(&path, "sensitive\n").expect("write owned file");
+            write_private(&path.with_extension("txt.tmp"), "sensitive snapshot\n")
+                .expect("write interrupted save");
         }
-        let keep = dir.join("keep.txt");
-        std::fs::write(&keep, "user-owned\n").expect("write unexpected file");
+        let keep = ["keep.txt", "keep.txt.tmp", "freq.txt.tmp.backup"];
+        for name in keep {
+            std::fs::write(dir.join(name), "user-owned\n").expect("write unexpected file");
+        }
 
         clear_dir(&dir).expect("clear personal data");
-        assert!(keep.exists(), "an unexpected file must be preserved");
+        for name in keep {
+            assert_eq!(
+                std::fs::read_to_string(dir.join(name)).expect("preserve unexpected file"),
+                "user-owned\n"
+            );
+        }
         for name in [
             PERSONAL_FREQ_FILE,
             CONFUSIONS_FILE,
@@ -1123,10 +1136,18 @@ mod tests {
             USEFULNESS_FILE,
         ] {
             assert!(!dir.join(name).exists(), "{name} was not removed");
+            assert!(
+                !dir.join(name).with_extension("txt.tmp").exists(),
+                "{name} snapshot was not removed"
+            );
         }
 
-        std::fs::remove_file(keep).expect("remove test file");
-        std::fs::remove_dir(dir).expect("remove test directory");
+        for name in keep {
+            std::fs::remove_file(dir.join(name)).expect("remove test file");
+        }
+        clear_dir(&dir).expect("remove empty personal data directory");
+        assert!(!dir.exists());
+        clear_dir(&dir).expect("clearing missing data remains harmless");
     }
 
     #[cfg(unix)]

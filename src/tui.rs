@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -84,8 +84,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Res
     loop {
         terminal.draw(|f| ui(f, &app))?;
         if crossterm::event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = crossterm::event::read()? {
-                match key.code {
+            if let Some(key) = command_key(crossterm::event::read()?) {
+                match key {
                     KeyCode::Char('q') => break,
                     KeyCode::Esc => break,
                     KeyCode::Left | KeyCode::Char('h') => {
@@ -132,6 +132,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Res
         }
     }
     Ok(())
+}
+
+fn command_key(event: Event) -> Option<KeyCode> {
+    // Releases must not execute a command twice; retain existing repeat behavior.
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => Some(key.code),
+        _ => None,
+    }
 }
 
 fn ui(f: &mut Frame, app: &App) {
@@ -447,6 +455,38 @@ struct App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_release_does_not_dispatch_another_command_and_repeat_is_preserved() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        for code in [
+            KeyCode::Char('e'),
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+            KeyCode::Char('b'),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('q'),
+        ] {
+            let commands: Vec<_> = [
+                KeyEventKind::Press,
+                KeyEventKind::Repeat,
+                KeyEventKind::Release,
+            ]
+            .into_iter()
+            .filter_map(|kind| {
+                command_key(Event::Key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    kind,
+                )))
+            })
+            .collect();
+            assert_eq!(commands, [code, code]);
+        }
+        assert_eq!(command_key(Event::Resize(80, 24)), None);
+    }
 
     #[test]
     fn uptime_reads_as_a_duration_rather_than_a_number() {

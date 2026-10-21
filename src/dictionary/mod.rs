@@ -852,14 +852,14 @@ struct Reading<'a> {
 /// than to the punctuation trailing it.
 ///
 /// `trusted_shift` says whether the map that produced `c` knows about shift.
-/// The English map does, so `!` arrives as `!` and can be set aside. The Hebrew
-/// map does not — every key gives its unshifted character — so a character
-/// typed with shift held is *not* known to be what is on screen, and stripping
-/// it would mean putting something else back in its place. There it counts as
-/// part of the word, which at worst leaves the word unrecognised: the same
-/// outcome as before any of this existed.
+/// The English map does, so `!` arrives as `!` and can be set aside. Hebrew
+/// callbacks may supply either mapped shifted symbols or unshifted readings.
+/// Trust supported shifted punctuation when it is supplied explicitly; keep
+/// other shifted readings in the word because their visible character is
+/// unknown. This preserves the conservative handling of shifted letter keys
+/// and callbacks that still return `1` for Shift+1 or `.` for Shift+Slash.
 fn in_word(c: char, shift: bool, trusted_shift: bool) -> bool {
-    c.is_alphanumeric() || (shift && !trusted_shift)
+    c.is_alphanumeric() || (shift && !trusted_shift && !"~!@#$%^&*()_+{}|:\"<>?".contains(c))
 }
 
 impl<'a> Reading<'a> {
@@ -5366,7 +5366,108 @@ mod tests {
         // Under a map with no shifted forms (Hebrew), a character typed with
         // shift is kept: we don't know it is really the character on screen.
         assert_eq!(read("שלום1", false, &['1']).word, "שלום1");
+        assert_eq!(read("שלום.", false, &['.']).word, "שלום.");
+        assert_eq!(read("שלום'", false, &['\'']).word, "שלום'");
+        assert_eq!(read("שלוםש", false, &['ש']).word, "שלוםש");
+        // Already mapped shifted symbols have a known visible reading.
+        assert_eq!(read("שלום!", false, &['!']).word, "שלום");
+        assert_eq!(read("שלום?", false, &['?']).tail, "?");
         assert_eq!(read("שלום.", false, &[]).word, "שלום");
+    }
+
+    #[test]
+    fn shifted_punctuation_preserves_automatic_layout_and_spelling_fixes() {
+        let physical_keys = |text: &str| {
+            text.chars()
+                .map(|c| {
+                    #[cfg(target_os = "linux")]
+                    let (en, he, shift) = {
+                        let (key, shift) = crate::keymap::english_char_to_evkey_shifted(c).unwrap();
+                        (
+                            crate::keymap::evkey_to_english_char_shifted(key, shift),
+                            crate::keymap::evkey_to_hebrew_char(key),
+                            shift,
+                        )
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let (en, he, shift) = {
+                        let (key, shift) = crate::keymap::english_char_to_key(c).unwrap();
+                        (
+                            crate::keymap::key_to_english_char_shifted(key, shift),
+                            crate::keymap::key_to_hebrew_char(key),
+                            shift,
+                        )
+                    };
+                    (en.unwrap(), he.unwrap(), shift)
+                })
+                .collect::<Vec<_>>()
+        };
+        let shifted_hebrew = |key: (char, char, bool)| {
+            crate::keymap::hebrew_char_shifted(Some(key.0), Some(key.1), key.2)
+        };
+        for (physical, current, expected) in [
+            ("akuo!", Language::English, "שלום!"),
+            ("akuo?", Language::English, "שלום?"),
+            ("akuo:", Language::English, "שלום:"),
+            (",ussv!", Language::Hebrew, "תודה!"),
+            (",ussv?", Language::Hebrew, "תודה?"),
+            (",ussv:", Language::Hebrew, "תודה:"),
+            ("recieve!", Language::Hebrew, "receive!"),
+            ("recieve?", Language::Hebrew, "receive?"),
+            ("(akuo!)", Language::English, "(שלום!)"),
+            ("\"akuo?\"", Language::English, "\"שלום?\""),
+            ("),ussv!(", Language::Hebrew, "(תודה!)"),
+            ("\"recieve!\"", Language::Hebrew, "\"receive!\""),
+        ] {
+            let keys = physical_keys(physical);
+            let visible: String = keys
+                .iter()
+                .map(|&key| match current {
+                    Language::English => key.0,
+                    Language::Hebrew => shifted_hebrew(key).unwrap(),
+                })
+                .collect();
+            let result = check_and_correct(
+                &keys,
+                |key| Some(key.0),
+                shifted_hebrew,
+                |key| key.2,
+                Run::default(),
+                en_dict(),
+                he_dict(),
+                Some(current),
+                false,
+                |_| crate::layout::LayoutSwitch::Switched,
+            );
+            let after = match result.fix {
+                Some(Fix::Layout { start, text, .. }) => {
+                    visible.chars().take(start).collect::<String>() + &text
+                }
+                Some(Fix::Spelling { text, .. } | Fix::LayoutSpelling { text, .. }) => text,
+                other => panic!("{visible:?}: {other:?}; {}", result.details),
+            };
+            assert_eq!(after, expected, "{visible:?}");
+        }
+
+        // Generic callers may still supply unshifted Hebrew mappings. Their
+        // unresolved shifted characters must not become replacement text.
+        for (physical, current) in [("akuo!", Language::English), (",ussv!", Language::Hebrew)] {
+            let keys = physical_keys(physical);
+            assert!(check_and_correct(
+                &keys,
+                |key| Some(key.0),
+                |key| Some(key.1),
+                |key| key.2,
+                Run::default(),
+                en_dict(),
+                he_dict(),
+                Some(current),
+                false,
+                |_| crate::layout::LayoutSwitch::Switched,
+            )
+            .fix
+            .is_none());
+        }
     }
 
     #[test]

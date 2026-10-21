@@ -91,8 +91,9 @@ fn write_user_file(name: &str, contents: &str) {
 // `make service` / `deploy.ps1 -Target service` already register ReCast at
 // login, but they are the install path — someone who was handed the binary, or
 // who ran it once to try it, has no way to say "keep doing this" without going
-// back to a shell. That is the gap the tray checkbox fills, so it writes the
-// same launchd agent / Run entry those scripts do.
+// back to a shell. The tray checkbox writes the same launchd agent or toggles
+// the Windows installer's existing task. Windows copies installed without a
+// task use the per-user Run entry instead.
 
 /// Whether ReCast is registered to start at login. `None` on platforms where
 /// this isn't wired up, which is how the tray knows to leave the item out.
@@ -131,6 +132,46 @@ pub fn set_autostart(enable: bool) -> bool {
     {
         false
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn update_windows_registration<T>(
+    task_exists: bool,
+    enabled: bool,
+    previous: Option<&T>,
+    desired: Option<&T>,
+    mut write_run: impl FnMut(Option<&T>) -> bool,
+    set_task_enabled: impl FnOnce(bool) -> bool,
+) -> bool {
+    if !write_run(if task_exists { None } else { desired }) {
+        return false;
+    }
+    if !task_exists || set_task_enabled(enabled) {
+        return true;
+    }
+    // A failed task update must not discard the previous login registration.
+    let _ = write_run(previous);
+    false
+}
+
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_TASK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(any(target_os = "windows", test))]
+fn cached_windows_task_enabled(
+    cached: &mut Option<(std::time::Instant, bool)>,
+    now: impl Fn() -> std::time::Instant,
+    query: impl FnOnce() -> Result<Option<bool>, ()>,
+) -> bool {
+    if let Some((updated, enabled)) = *cached {
+        if now().saturating_duration_since(updated) < WINDOWS_TASK_CACHE_TTL {
+            return enabled;
+        }
+    }
+    let enabled = query().is_ok_and(|state| state == Some(true));
+    // Timestamp completion so a slow query does not expire its own result.
+    *cached = Some((now(), enabled));
+    enabled
 }
 
 #[cfg(target_os = "macos")]
@@ -214,7 +255,139 @@ mod macos_autostart {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_enabled;
+    use super::{
+        cached_windows_task_enabled, parse_enabled, update_windows_registration,
+        WINDOWS_TASK_CACHE_TTL,
+    };
+
+    #[test]
+    fn windows_task_cache_refreshes_external_changes_and_recovers_from_errors() {
+        use std::{cell::Cell, time::Instant};
+
+        let clock = Cell::new(Instant::now());
+        let task = Cell::new(Ok(None));
+        let queries = Cell::new(0);
+        let read = |cache: &mut Option<(Instant, bool)>| {
+            cached_windows_task_enabled(
+                cache,
+                || clock.get(),
+                || {
+                    queries.set(queries.get() + 1);
+                    task.get()
+                },
+            )
+        };
+        let mut cache = None;
+        assert!(!read(&mut cache));
+        assert_eq!(queries.get(), 1);
+
+        for (state, expected) in [(Ok(Some(true)), true), (Ok(Some(false)), false)] {
+            let previous = !expected;
+            task.set(state);
+            let before = queries.get();
+            clock.set(clock.get() + WINDOWS_TASK_CACHE_TTL - std::time::Duration::from_millis(1));
+            assert_eq!(read(&mut cache), previous);
+            assert_eq!(queries.get(), before, "rendering must reuse a fresh result");
+            clock.set(clock.get() + std::time::Duration::from_millis(1));
+            assert_eq!(read(&mut cache), expected);
+            assert_eq!(queries.get(), before + 1);
+        }
+
+        task.set(Err(()));
+        clock.set(clock.get() + WINDOWS_TASK_CACHE_TTL);
+        assert!(!read(&mut cache));
+        let before = queries.get();
+        task.set(Ok(Some(true)));
+        assert!(!read(&mut cache));
+        assert_eq!(queries.get(), before);
+        clock.set(clock.get() + WINDOWS_TASK_CACHE_TTL);
+        assert!(read(&mut cache), "a query failure must expire too");
+        assert_eq!(queries.get(), before + 1);
+    }
+
+    #[test]
+    fn failed_task_updates_restore_the_previous_run_value() {
+        for enabled in [false, true] {
+            let previous = Some("previous executable");
+            let mut saved = previous;
+            let mut writes = Vec::new();
+            assert!(!update_windows_registration(
+                true,
+                enabled,
+                previous.as_ref(),
+                Some(&"new executable"),
+                |value| {
+                    saved = value.copied();
+                    writes.push(saved);
+                    true
+                },
+                |_| false,
+            ));
+            assert_eq!(saved, previous);
+            assert_eq!(writes, [None, previous]);
+        }
+    }
+
+    #[test]
+    fn a_failed_run_update_preserves_the_scheduled_registration() {
+        assert!(!update_windows_registration(
+            true,
+            false,
+            Some(&"previous executable"),
+            Some(&"new executable"),
+            |_| false,
+            |_| panic!("the scheduled task must survive a failed registry write"),
+        ));
+    }
+
+    #[test]
+    fn an_existing_task_keeps_its_definition_and_running_instance() {
+        for initial_enabled in [false, true] {
+            for enabled in [false, true] {
+                let definition = ("installed executable", "logon", 3, 60);
+                let mut task = (initial_enabled, definition, true);
+                let previous = Some("duplicate Run entry");
+                let mut saved = previous;
+                assert!(update_windows_registration(
+                    true,
+                    enabled,
+                    previous.as_ref(),
+                    Some(&"new executable"),
+                    |value| {
+                        saved = value.copied();
+                        true
+                    },
+                    |enabled| {
+                        task.0 = enabled;
+                        true
+                    },
+                ));
+                assert_eq!(saved, None);
+                assert_eq!(task, (enabled, definition, true));
+            }
+        }
+    }
+
+    #[test]
+    fn an_install_without_a_task_keeps_using_the_run_entry() {
+        for enabled in [false, true] {
+            let previous = Some("previous executable");
+            let desired = enabled.then_some("new executable");
+            let mut saved = previous;
+            assert!(update_windows_registration(
+                false,
+                enabled,
+                previous.as_ref(),
+                desired.as_ref(),
+                |value| {
+                    saved = value.copied();
+                    true
+                },
+                |_| panic!("the UI must not create a scheduled task"),
+            ));
+            assert_eq!(saved, desired);
+        }
+    }
 
     #[test]
     fn reads_the_switch_back() {
@@ -236,20 +409,63 @@ mod tests {
 mod windows_autostart {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::process::CommandExt;
     use std::ptr;
+    use std::sync::Mutex;
+    use std::time::Instant;
 
-    use winapi::shared::winerror::ERROR_SUCCESS;
+    use winapi::shared::winerror::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use winapi::um::winbase::CREATE_NO_WINDOW;
     use winapi::um::winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ};
     use winapi::um::winreg::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-        HKEY_CURRENT_USER,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY_CURRENT_USER,
     };
 
-    /// The per-user Run key: entries here start at logon without needing
-    /// administrator rights or a scheduled task, which is what makes this
-    /// something a menu checkbox can do at all.
+    /// Copies installed without a Scheduled Task use the per-user Run key.
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const VALUE_NAME: &str = "ReCast";
+    static TASK_ENABLED: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+
+    // Enumerate instead of treating every failed GetTask as "not found". Access
+    // errors must fail a change rather than leave a second active registration.
+    const SCHEDULED_TASK: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    $service = New-Object -ComObject 'Schedule.Service'
+    $service.Connect()
+    $folder = $service.GetFolder('\')
+    $task = $folder.GetTasks(1) | Where-Object { $_.Name -eq 'recast' } | Select-Object -First 1
+    if ($null -eq $task) {
+        if ($env:RECAST_TASK_ACTION -ne 'query') { exit 1 }
+        Write-Output 'absent'; exit 0
+    }
+    $principal = $task.Definition.Principal.UserId
+    $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($principal -match '^S-\d-') {
+        $owner = $principal
+    } else {
+        $owner = ([System.Security.Principal.NTAccount]::new($principal)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }
+    if ($owner -ne $current) {
+        if ($env:RECAST_TASK_ACTION -ne 'query') { exit 1 }
+        Write-Output 'absent'; exit 0
+    }
+    if ($env:RECAST_TASK_ACTION -eq 'enable') { $task.Enabled = $true }
+    elseif ($env:RECAST_TASK_ACTION -eq 'disable') { $task.Enabled = $false }
+    if ($task.Enabled) {
+        Write-Output 'enabled'
+    } else {
+        Write-Output 'disabled'
+    }
+    exit 0
+} catch { exit 1 }
+"#;
+
+    struct RunValue {
+        kind: u32,
+        bytes: Vec<u8>,
+    }
 
     fn wide(s: &str) -> Vec<u16> {
         OsStr::new(s)
@@ -258,72 +474,178 @@ mod windows_autostart {
             .collect()
     }
 
-    pub fn is_enabled() -> bool {
+    fn read_run() -> Result<Option<RunValue>, ()> {
         let subkey = wide(RUN_KEY);
         let name = wide(VALUE_NAME);
         unsafe {
             let mut hkey = ptr::null_mut();
-            if RegOpenKeyExW(
+            let opened = RegOpenKeyExW(
                 HKEY_CURRENT_USER,
                 subkey.as_ptr(),
                 0,
                 KEY_QUERY_VALUE,
                 &mut hkey,
-            ) != ERROR_SUCCESS as i32
-            {
-                return false;
+            );
+            if opened == ERROR_FILE_NOT_FOUND as i32 {
+                return Ok(None);
             }
-            let mut size = 0u32;
-            let found = RegQueryValueExW(
-                hkey,
-                name.as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut size,
-            ) == ERROR_SUCCESS as i32;
+            if opened != ERROR_SUCCESS as i32 {
+                return Err(());
+            }
+            let result = (|| {
+                let mut size = 0u32;
+                let mut kind = 0u32;
+                let found = RegQueryValueExW(
+                    hkey,
+                    name.as_ptr(),
+                    ptr::null_mut(),
+                    &mut kind,
+                    ptr::null_mut(),
+                    &mut size,
+                );
+                if found == ERROR_FILE_NOT_FOUND as i32 {
+                    return Ok(None);
+                }
+                if found != ERROR_SUCCESS as i32 || size > 1024 * 1024 {
+                    return Err(());
+                }
+                let mut bytes = vec![0; size as usize];
+                if RegQueryValueExW(
+                    hkey,
+                    name.as_ptr(),
+                    ptr::null_mut(),
+                    &mut kind,
+                    bytes.as_mut_ptr(),
+                    &mut size,
+                ) != ERROR_SUCCESS as i32
+                {
+                    return Err(());
+                }
+                bytes.truncate(size as usize);
+                Ok(Some(RunValue { kind, bytes }))
+            })();
             RegCloseKey(hkey);
-            found
+            result
         }
     }
 
-    pub fn set(enable: bool) -> bool {
+    fn write_run(value: Option<&RunValue>) -> bool {
         let subkey = wide(RUN_KEY);
         let name = wide(VALUE_NAME);
         unsafe {
             let mut hkey = ptr::null_mut();
-            if RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                subkey.as_ptr(),
-                0,
-                KEY_SET_VALUE | KEY_QUERY_VALUE,
-                &mut hkey,
-            ) != ERROR_SUCCESS as i32
-            {
+            let opened = if value.is_some() {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    KEY_SET_VALUE,
+                    ptr::null_mut(),
+                    &mut hkey,
+                    ptr::null_mut(),
+                )
+            } else {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    0,
+                    KEY_SET_VALUE,
+                    &mut hkey,
+                )
+            };
+            if opened == ERROR_FILE_NOT_FOUND as i32 && value.is_none() {
+                return true;
+            }
+            if opened != ERROR_SUCCESS as i32 {
                 return false;
             }
-            let ok = if enable {
-                // Quoted: a path with spaces ("C:\Program Files\...") is one
-                // argument, and the Run key hands the value to the shell.
-                match std::env::current_exe() {
-                    Ok(exe) => {
-                        let value = wide(&format!("\"{}\"", exe.display()));
-                        RegSetValueExW(
-                            hkey,
-                            name.as_ptr(),
-                            0,
-                            REG_SZ,
-                            value.as_ptr() as *const u8,
-                            (value.len() * std::mem::size_of::<u16>()) as u32,
-                        ) == ERROR_SUCCESS as i32
-                    }
-                    Err(_) => false,
-                }
+            let ok = if let Some(value) = value {
+                RegSetValueExW(
+                    hkey,
+                    name.as_ptr(),
+                    0,
+                    value.kind,
+                    value.bytes.as_ptr(),
+                    value.bytes.len() as u32,
+                ) == ERROR_SUCCESS as i32
             } else {
-                RegDeleteValueW(hkey, name.as_ptr()) == ERROR_SUCCESS as i32
+                matches!(
+                    RegDeleteValueW(hkey, name.as_ptr()) as u32,
+                    ERROR_SUCCESS | ERROR_FILE_NOT_FOUND
+                )
             };
             RegCloseKey(hkey);
             ok
         }
+    }
+
+    fn scheduled_task(enabled: Option<bool>) -> Result<Option<bool>, ()> {
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", SCHEDULED_TASK])
+            .env(
+                "RECAST_TASK_ACTION",
+                match enabled {
+                    Some(true) => "enable",
+                    Some(false) => "disable",
+                    None => "query",
+                },
+            )
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|_| ())?;
+        if !output.status.success() {
+            return Err(());
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "enabled" if enabled != Some(false) => Ok(Some(true)),
+            "disabled" if enabled != Some(true) => Ok(Some(false)),
+            "absent" if enabled.is_none() => Ok(None),
+            _ => Err(()),
+        }
+    }
+
+    pub fn is_enabled() -> bool {
+        if read_run().is_ok_and(|value| value.is_some()) {
+            return true;
+        }
+        // Limit per-frame queries while still noticing external task changes.
+        let mut cached = crate::types::lock_forgiving(&TASK_ENABLED);
+        super::cached_windows_task_enabled(&mut cached, Instant::now, || scheduled_task(None))
+    }
+
+    pub fn set(enable: bool) -> bool {
+        let Ok(task) = scheduled_task(None) else {
+            return false;
+        };
+        let Ok(previous) = read_run() else {
+            return false;
+        };
+        let desired = if enable && task.is_none() {
+            let Ok(exe) = std::env::current_exe() else {
+                return false;
+            };
+            Some(RunValue {
+                kind: REG_SZ,
+                bytes: wide(&format!("\"{}\"", exe.display()))
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        let saved = super::update_windows_registration(
+            task.is_some(),
+            enable,
+            previous.as_ref(),
+            desired.as_ref(),
+            write_run,
+            |enabled| scheduled_task(Some(enabled)).is_ok(),
+        );
+        *crate::types::lock_forgiving(&TASK_ENABLED) =
+            saved.then(|| (Instant::now(), task.is_some() && enable));
+        saved
     }
 }

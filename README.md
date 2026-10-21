@@ -147,14 +147,19 @@ systemctl --user restart recast
 make service-uninstall
 ```
 
-Layout backends support Hyprland, Sway, KDE, GNOME, and X11. Native GNOME/KDE
-Wayland cannot identify the focused application; see [Application exclusions](#application-exclusions).
+Layout backends support Hyprland, Sway, KDE, GNOME on X11, and X11. GNOME uses
+the live XKB group on X11; stock GNOME Wayland exposes no supported live input-source
+API, so ReCast declines layout-dependent edits there instead of trusting obsolete
+GSettings values. Native GNOME/KDE Wayland cannot identify the focused application;
+see [Application exclusions](#application-exclusions).
 Disconnected keyboards are detected automatically; ReCast waits for reconnection.
 
 ### Windows
 
 Run `ReCast.exe` for the tray app. **Settings > General > Start at login** registers it in the per-user
-Run key. To build, install, and register a logon Scheduled Task from source:
+Run key. The checkbox also recognizes and toggles the Scheduled Task installed
+from source, preserving its recovery settings. To build, install, and register a
+logon Scheduled Task from source:
 
 ```powershell
 .\deploy.ps1 -Target service

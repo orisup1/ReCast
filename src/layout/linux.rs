@@ -27,9 +27,8 @@
 //! **6.3 ms** against **0.11 ms** for the same question over Hyprland's socket,
 //! and a correction that changes layout asks twice. Hyprland, sway and X11
 //! therefore talk to the session directly — two socket protocols and a bit of
-//! Xlib. GNOME and KDE do shell out, because their answer lives behind D-Bus
-//! and a D-Bus client is a great deal more code than these two calls are worth;
-//! the cache is what makes that survivable.
+//! Xlib. GNOME on X11 also uses live XKB; its configured-source diagnostics and
+//! KDE's D-Bus backend use subprocesses. The cache bounds those query costs.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -49,7 +48,7 @@ enum Backend {
     Sway,
     /// KDE Plasma's `org.kde.KeyboardLayouts` D-Bus interface, via a helper.
     Kde,
-    /// GNOME's `org.gnome.desktop.input-sources` GSettings keys.
+    /// GNOME's live XKB group on X11, with source diagnostics on Wayland.
     Gnome,
     /// The XKB group, for any X11 session — including GNOME and KDE on X11,
     /// and every window manager that has no opinion of its own.
@@ -118,9 +117,8 @@ fn auto_backend(
 /// Order is specificity, not preference: a compositor that owns the keymap has
 /// to be asked in its own language, and X11 is the catch-all underneath because
 /// XKB works under any X server whatever is drawing the windows. GNOME and KDE
-/// come before it even on X11, because they manage input sources *above* XKB —
-/// setting the group under GNOME works for exactly as long as it takes
-/// gnome-shell to set it back.
+/// retain their own backend identities even on X11. GNOME uses the live XKB
+/// group there, while KDE exposes its layout policy over D-Bus.
 fn backend() -> Backend {
     backend_state().0
 }
@@ -260,7 +258,8 @@ impl Backend {
             Backend::Hyprland => "Hyprland (control socket)",
             Backend::Sway => "sway (i3 IPC socket)",
             Backend::Kde => "KDE Plasma (D-Bus)",
-            Backend::Gnome => "GNOME (GSettings input-sources)",
+            Backend::Gnome if gnome::uses_x11() => "GNOME (live XKB group)",
+            Backend::Gnome => "GNOME (live layout access unavailable on native Wayland)",
             Backend::X11 => "X11 (XKB group)",
             Backend::None => "none — layout switching unavailable",
         }
@@ -429,7 +428,7 @@ fn watch_forever() {
     let mut retry = Duration::from_secs(1);
     loop {
         let (backend, disabled) = backend_state();
-        if backend == Backend::X11 || disabled {
+        if matches!(backend, Backend::X11 | Backend::Gnome) || disabled {
             return;
         }
         if let Some(signals) = backend.subscribe() {
@@ -597,9 +596,8 @@ const INJECTOR: &str = "recast-injector";
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal JSON field access, shared by the Hyprland and sway backends.
 //
-// Both speak JSON and neither reply needs more than a flat field out of an
-// object: pulling in a JSON crate to read three keys would be the largest
-// dependency in the program.
+// Both speak JSON. Small scalar fields are read from keyboard slices; arrays
+// use the existing JSON parser to preserve delimiters inside quoted names.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The value of a flat `"key": "value"` string field inside one JSON object.
@@ -627,23 +625,17 @@ fn json_num(block: &str, key: &str) -> Option<usize> {
 /// The elements of a flat `"key": ["a", "b"]` string-array field.
 fn json_str_array(block: &str, key: &str) -> Option<Vec<String>> {
     let at = block.find(&format!("\"{key}\""))?;
-    let rest = &block[at..];
-    let open = rest.find('[')?;
-    let close = rest.find(']')?;
-    if close < open {
-        return None;
-    }
-    Some(
-        rest[open + 1..close]
-            .split(',')
-            .filter_map(|item| {
-                let item = item.trim();
-                item.strip_prefix('"')?
-                    .strip_suffix('"')
-                    .map(str::to_string)
-            })
-            .collect(),
-    )
+    let rest = block[at + key.len() + 2..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    // Keyboard blocks are slices of a larger reply, so deserialize one value
+    // without requiring the following fields to form a complete JSON document.
+    // Delimiters inside quoted layout names must not change their indices.
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<Vec<String>>()
+        .next()?
+        .ok()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1085,7 +1077,7 @@ mod kde {
                     ("qdbus6", Style::Qdbus),
                     ("qdbus", Style::Qdbus),
                 ] {
-                    if super::command_output(Command::new(bin).arg("--version")).is_some() {
+                    if client_available(bin, style) {
                         return Some((bin, style));
                     }
                 }
@@ -1099,6 +1091,14 @@ mod kde {
         Gdbus,
         Busctl,
         Qdbus,
+    }
+
+    pub(super) fn client_available(bin: &str, style: Style) -> bool {
+        let argument = match style {
+            Style::Gdbus => "help",
+            Style::Busctl | Style::Qdbus => "--version",
+        };
+        super::command_output(Command::new(bin).arg(argument)).is_some()
     }
 
     /// Call one method on `/Layouts` and return stdout, whatever client is
@@ -1237,17 +1237,13 @@ mod kde {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GNOME — org.gnome.desktop.input-sources
+// GNOME — live XKB on X11; configured sources for diagnostics on Wayland
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// GNOME manages input sources itself, above XKB, on both Wayland and X11: the
-/// list is `sources` and the live one is the index in `current`. Writing
-/// `current` is what gnome-shell watches, so it is a supported switch rather
-/// than a trick — the XKB group underneath is set back by the shell within a
-/// keystroke.
-///
-/// `gsettings` is part of GLib and therefore of GNOME itself, so unlike the KDE
-/// backend there is no client to choose between.
+/// GSettings `current` is deprecated and ignored, and `mru-sources` can lag
+/// non-interactive/per-window changes. Neither can confirm a live layout.
+/// XKB is authoritative only in an explicitly identified X11 session; native
+/// Wayland has no supported Shell API for this and must decline layout edits.
 mod gnome {
     use std::process::Command;
 
@@ -1263,9 +1259,8 @@ mod gnome {
     ///
     /// The value is `[('xkb', 'us'), ('xkb', 'il')]`, and an IBus entry —
     /// `('ibus', 'mozc-jp')` — is a real input source that is not an xkb layout.
-    /// It is kept in the list rather than dropped, because `current` is an index
-    /// into the whole thing and skipping an entry would shift every index after
-    /// it; `language_of_keymap` returns `None` for it, which is the right answer.
+    /// Keep the full configured list for diagnostics; an IBus entry does not
+    /// identify the compositor's live XKB group.
     pub fn parse_names(reply: &str) -> Option<Vec<String>> {
         let mut out = Vec::new();
         for pair in reply.split("('").skip(1) {
@@ -1279,38 +1274,39 @@ mod gnome {
     }
 
     pub fn names() -> Option<Vec<String>> {
-        parse_names(&get("sources")?)
+        if uses_x11() {
+            // Names and indices must describe the same live XKB group list.
+            super::x11::names()
+        } else {
+            // Configuration is useful for --status, but never confirms a switch.
+            parse_names(&get("sources")?)
+        }
     }
 
-    /// `gsettings monitor` prints a line every time the key is written, and
-    /// keeps running until it is killed — one process for the life of the
-    /// daemon, in place of one per word that misses the cache.
     pub fn subscribe() -> Option<super::Signals> {
-        super::watch_command(
-            "gsettings",
-            &["monitor", "org.gnome.desktop.input-sources", "current"],
-            // Every line is about the key we asked to be told about, so the only
-            // thing to exclude is the blank one at the end.
-            |line| !line.trim().is_empty(),
-        )
+        None
     }
 
     pub fn current_index() -> Option<usize> {
-        // `uint32 1`
-        get("current")?
-            .split_whitespace()
-            .last()
-            .and_then(|t| t.parse().ok())
+        on_x11(
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            super::x11::current_index,
+        )
     }
 
     pub fn set_index(index: usize) -> bool {
-        super::command_output(Command::new("gsettings").args([
-            "set",
-            "org.gnome.desktop.input-sources",
-            "current",
-            &format!("uint32 {index}"),
-        ]))
-        .is_some()
+        on_x11(std::env::var("XDG_SESSION_TYPE").ok().as_deref(), || {
+            Some(super::x11::set_index(index))
+        })
+        .unwrap_or(false)
+    }
+
+    pub(super) fn uses_x11() -> bool {
+        std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("x11")
+    }
+
+    pub(super) fn on_x11<T>(session: Option<&str>, query: impl FnOnce() -> Option<T>) -> Option<T> {
+        (session == Some("x11")).then(query).flatten()
     }
 }
 
@@ -1331,6 +1327,7 @@ mod gnome {
 /// installed, to provide a backend such a system cannot use anyway.
 mod x11 {
     use std::ffi::{c_char, c_int, c_long, c_ulong, c_void, CString};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use nix::libc::{dlclose, dlopen, dlsym, RTLD_LAZY};
@@ -1342,6 +1339,65 @@ mod x11 {
     type Window = c_ulong;
     type Atom = c_ulong;
     type Bool = c_int;
+
+    #[repr(C)]
+    struct XErrorEvent {
+        event_type: c_int,
+        display: *mut Display,
+        resource_id: c_ulong,
+        serial: c_ulong,
+        error_code: u8,
+        request_code: u8,
+        minor_code: u8,
+    }
+
+    type XErrorHandler = unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int;
+    type XSetErrorHandlerFn = unsafe extern "C" fn(Option<XErrorHandler>) -> XErrorHandler;
+
+    struct ErrorState {
+        display: AtomicPtr<Display>,
+        bad_window: AtomicBool,
+        previous: OnceLock<XErrorHandler>,
+    }
+
+    impl ErrorState {
+        const fn new() -> Self {
+            Self {
+                display: AtomicPtr::new(std::ptr::null_mut()),
+                bad_window: AtomicBool::new(false),
+                previous: OnceLock::new(),
+            }
+        }
+
+        unsafe fn handle(&self, display: *mut Display, event: *mut XErrorEvent) -> c_int {
+            const BAD_WINDOW: u8 = 3;
+            if !display.is_null()
+                && display == self.display.load(Ordering::Acquire)
+                && !event.is_null()
+                && (*event).error_code == BAD_WINDOW
+            {
+                self.bad_window.store(true, Ordering::Release);
+                return 0;
+            }
+            // Xlib's handler is process-wide. Forward every other error,
+            // including errors from the control window's separate connection.
+            // XSetErrorHandler does not dispatch errors itself; another thread
+            // can only race the short interval before its return is published.
+            let previous = loop {
+                if let Some(previous) = self.previous.get() {
+                    break previous;
+                }
+                std::hint::spin_loop();
+            };
+            previous(display, event)
+        }
+    }
+
+    static ERRORS: ErrorState = ErrorState::new();
+
+    unsafe extern "C" fn handle_error(display: *mut Display, event: *mut XErrorEvent) -> c_int {
+        ERRORS.handle(display, event)
+    }
 
     /// The subset of `XkbStateRec` up to the field this needs. Xlib writes the
     /// whole struct, so the buffer handed to it has to be the whole size — the
@@ -1404,6 +1460,7 @@ mod x11 {
     type XFlushFn = unsafe extern "C" fn(*mut Display) -> c_int;
 
     struct Lib {
+        set_error_handler: XSetErrorHandlerFn,
         open_display: XOpenDisplayFn,
         default_root_window: XDefaultRootWindowFn,
         intern_atom: XInternAtomFn,
@@ -1471,6 +1528,7 @@ mod x11 {
                 }};
             }
             let lib = Lib {
+                set_error_handler: sym!("XSetErrorHandler", XSetErrorHandlerFn),
                 open_display: sym!("XOpenDisplay", XOpenDisplayFn),
                 default_root_window: sym!("XDefaultRootWindow", XDefaultRootWindowFn),
                 intern_atom: sym!("XInternAtom", XInternAtomFn),
@@ -1487,6 +1545,9 @@ mod x11 {
                 dlclose(handle);
                 return None;
             }
+            ERRORS.display.store(display, Ordering::Release);
+            let previous = (lib.set_error_handler)(Some(handle_error));
+            let _ = ERRORS.previous.set(previous);
             Some(Mutex::new(Conn { lib, display }))
         })()?;
         let _ = CONN.set(connection);
@@ -1499,25 +1560,33 @@ mod x11 {
 
     pub fn focused_target() -> Option<super::Focus> {
         let c = conn()?.lock().ok()?;
+        ERRORS.bad_window.store(false, Ordering::Release);
         let mut window = 0;
         let mut revert = 0;
         unsafe {
             (c.lib.get_input_focus)(c.display, &mut window, &mut revert);
         }
         // None and PointerRoot do not identify a text target.
-        (window > 1).then(|| super::Focus {
+        if window <= 1 {
+            return None;
+        }
+        let app = window_class(&c, window).ok()?;
+        if ERRORS.bad_window.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        Some(super::Focus {
             id: window.to_string(),
-            app: window_class(&c, window),
+            app,
         })
     }
 
     /// Child controls often have no WM_CLASS; walk to their owning window.
-    fn window_class(c: &Conn, mut window: Window) -> Option<String> {
+    fn window_class(c: &Conn, mut window: Window) -> Result<Option<String>, ()> {
         unsafe {
-            let name = CString::new("WM_CLASS").ok()?;
+            let name = CString::new("WM_CLASS").map_err(|_| ())?;
             let atom = (c.lib.intern_atom)(c.display, name.as_ptr(), 1);
             if atom == 0 {
-                return None;
+                return Ok(None);
             }
             for _ in 0..32 {
                 let (mut actual_type, mut format, mut count, mut remaining) = (0, 0, 0, 0);
@@ -1549,8 +1618,14 @@ mod x11 {
                 if !data.is_null() {
                     (c.lib.free)(data.cast());
                 }
+                // The GUI toolkit can replace Xlib's process-wide handler.
+                // A failed property request must still invalidate this focus,
+                // rather than look like a valid window with no application ID.
+                if status != 0 {
+                    return Err(());
+                }
                 if class.is_some() {
-                    return class;
+                    return Ok(class);
                 }
                 let (mut root, mut parent, mut count) = (0, 0, 0);
                 let mut children = std::ptr::null_mut();
@@ -1565,12 +1640,15 @@ mod x11 {
                 if !children.is_null() {
                     (c.lib.free)(children.cast());
                 }
-                if ok == 0 || parent == 0 || parent == window {
-                    return None;
+                if ok == 0 {
+                    return Err(());
+                }
+                if parent == 0 || parent == window {
+                    return Ok(None);
                 }
                 window = parent;
             }
-            None
+            Ok(None)
         }
     }
 
@@ -1655,6 +1733,49 @@ mod x11 {
             // correction can wait on.
             (c.lib.flush)(c.display);
             ok
+        }
+    }
+
+    #[cfg(test)]
+    mod error_tests {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        static FORWARDED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn previous_handler(_: *mut Display, _: *mut XErrorEvent) -> c_int {
+            FORWARDED.fetch_add(1, Ordering::SeqCst);
+            7
+        }
+
+        #[test]
+        fn disappearing_focus_is_nonfatal_without_swallowing_other_x11_errors() {
+            let mut displays = [0u8; 2];
+            let owned = displays.as_mut_ptr().cast();
+            let other = unsafe { displays.as_mut_ptr().add(1).cast() };
+            let state = ErrorState::new();
+            state.display.store(owned, Ordering::Release);
+            state.previous.set(previous_handler).unwrap();
+            let mut event = XErrorEvent {
+                event_type: 0,
+                display: owned,
+                resource_id: 42,
+                serial: 1,
+                error_code: 3,
+                request_code: 20,
+                minor_code: 0,
+            };
+            assert_eq!(unsafe { state.handle(owned, &mut event) }, 0);
+            assert!(state.bad_window.swap(false, Ordering::AcqRel));
+            assert_eq!(FORWARDED.load(Ordering::SeqCst), 0);
+
+            // A control-window connection retains its existing error policy.
+            assert_eq!(unsafe { state.handle(other, &mut event) }, 7);
+            assert!(!state.bad_window.load(Ordering::Acquire));
+            event.error_code = 2;
+            assert_eq!(unsafe { state.handle(owned, &mut event) }, 7);
+            assert!(!state.bad_window.load(Ordering::Acquire));
+            assert_eq!(FORWARDED.load(Ordering::SeqCst), 2);
         }
     }
 }
@@ -2035,6 +2156,63 @@ mod tests {
         );
         assert_eq!(json_str(block, "absent"), None);
         assert_eq!(json_num(block, "absent"), None);
+    }
+
+    #[test]
+    fn sway_layout_names_keep_json_delimiters_and_layout_indices() {
+        let inputs = r#"[{"type":"keyboard","identifier":"kbd","name":"kbd",
+            "xkb_layout_names":["English (US, intl., with dead keys)","Hebrew"],
+            "xkb_active_layout_index":1}]"#;
+        let names = sway::parse_names(inputs).unwrap();
+        assert_eq!(names, ["English (US, intl., with dead keys)", "Hebrew"]);
+        assert_eq!(sway::parse_index(inputs), Some(1));
+        assert_eq!(
+            language_of_keymap(&names[sway::parse_index(inputs).unwrap()]),
+            Some(Language::Hebrew)
+        );
+        assert_eq!(
+            json_str_array(
+                r#""list": ["name, with ] and \"quotes\"", "il"], "next": 1"#,
+                "list"
+            ),
+            Some(vec!["name, with ] and \"quotes\"".into(), "il".into()])
+        );
+        assert_eq!(json_str_array(r#""list": ["us", 1, "il"]"#, "list"), None);
+    }
+
+    #[test]
+    fn kde_accepts_gdbus_with_its_supported_help_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recast-gdbus-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("gdbus");
+        // Match the real client's availability contract: --version is an error.
+        std::fs::write(&bin, "#!/bin/sh\n[ \"$1\" = help ]\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(kde::client_available(
+            bin.to_str().unwrap(),
+            kde::Style::Gdbus
+        ));
+        assert!(!kde::client_available(
+            bin.to_str().unwrap(),
+            kde::Style::Busctl
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gnome_never_uses_xwayland_or_saved_settings_to_confirm_a_layout() {
+        for session in [Some("wayland"), Some("tty"), Some(""), None] {
+            assert_eq!(
+                gnome::on_x11(session, || -> Option<usize> {
+                    panic!("unverified sessions must not query or change XWayland")
+                }),
+                None
+            );
+        }
+        assert_eq!(gnome::on_x11(Some("x11"), || Some(2)), Some(2));
+        assert_eq!(gnome::on_x11(Some("x11"), || None::<usize>), None);
     }
 
     /// Against the session that is actually running, when it is one we can

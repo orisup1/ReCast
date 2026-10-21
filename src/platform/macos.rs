@@ -380,6 +380,7 @@ fn key_from_code(code: u16) -> Key {
         58 => Key::Alt,
         59 => Key::ControlLeft,
         60 => Key::ShiftRight,
+        61 => Key::AltGr,
         62 => Key::ControlRight,
         63 => Key::Function,
         96 => Key::F5,
@@ -414,6 +415,24 @@ static CTX: OnceLock<Arc<Engine<Mac>>> = OnceLock::new();
 fn navigation_keycodes_reset_text() {
     for code in [114, 115, 116, 117, 119, 121, 123, 124, 125, 126] {
         assert!(textkeys::is_reset(key_from_code(code)), "keycode {code}");
+    }
+}
+
+#[test]
+fn modifier_keycodes_preserve_sides_and_native_flags() {
+    for (code, key, flag) in [
+        (56, Key::ShiftLeft, 0x0000_0002),
+        (60, Key::ShiftRight, 0x0000_0004),
+        (59, Key::ControlLeft, 0x0000_0001),
+        (62, Key::ControlRight, 0x0000_2000),
+        (58, Key::Alt, 0x0000_0020),
+        (61, Key::AltGr, 0x0000_0040),
+        (55, Key::MetaLeft, 0x0000_0008),
+        (54, Key::MetaRight, 0x0000_0010),
+    ] {
+        assert_eq!(key_from_code(code), key, "keycode {code}");
+        assert!(Mac::is_modifier(key), "keycode {code}");
+        assert_eq!(device_flag(key), Some(flag), "keycode {code}");
     }
 }
 

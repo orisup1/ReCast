@@ -411,6 +411,11 @@ pub fn run(control: Arc<AppControl>) {
             } else if event.id == *about_item.id() {
                 show_about();
             } else if event.id == *quit_item.id() {
+                #[cfg(target_os = "macos")]
+                if let Err(error) = crate::daemon::stop_launch_agent(process::id()) {
+                    crate::notify::notify("Could not quit ReCast", &error.to_string());
+                    continue;
+                }
                 #[cfg(target_os = "windows")]
                 if let Some(tray) = &tray {
                     windows_balloon(tray, None);

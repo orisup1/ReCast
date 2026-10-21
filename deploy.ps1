@@ -42,6 +42,8 @@ $BinSrc   = Join-Path 'target\release' $BinName
 $BinDir   = $Prefix
 $BinDst   = Join-Path $BinDir $BinName
 $TaskName = 'recast'
+$RunSubkey = 'Software\Microsoft\Windows\CurrentVersion\Run'
+$RunValueName = 'ReCast'
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
@@ -92,35 +94,58 @@ function Invoke-Deploy {
     Invoke-Install
 }
 
+function Invoke-WithoutRunRegistration([scriptblock]$TaskOperation) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RunSubkey, $true)
+    try {
+        $hadPrevious = $null -ne $key -and ($key.GetValueNames() -contains $RunValueName)
+        if ($hadPrevious) {
+            $previous = $key.GetValue($RunValueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $previousKind = $key.GetValueKind($RunValueName)
+        }
+        try {
+            # The Scheduled Task and tray-created Run entry must not launch two copies.
+            if ($hadPrevious) { $key.DeleteValue($RunValueName, $false) }
+            & $TaskOperation
+        } catch {
+            if ($hadPrevious) { $key.SetValue($RunValueName, $previous, $previousKind) }
+            throw
+        }
+    } finally {
+        if ($null -ne $key) { $key.Close() }
+    }
+}
+
 function Invoke-ServiceInstall {
     Invoke-Install
 
     Write-Step "Registering Scheduled Task '$TaskName' (runs at logon)"
 
-    # Tear down any prior version so we always end up with a fresh definition.
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    Invoke-WithoutRunRegistration {
+        # Tear down any prior version so we always end up with a fresh definition.
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        }
+
+        $action    = New-ScheduledTaskAction -Execute $BinDst
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+        $principal = New-ScheduledTaskPrincipal `
+                        -UserId $env:USERNAME `
+                        -LogonType Interactive `
+                        -RunLevel Limited
+        $settings  = New-ScheduledTaskSettingsSet `
+                        -AllowStartIfOnBatteries `
+                        -DontStopIfGoingOnBatteries `
+                        -RestartCount 3 `
+                        -RestartInterval (New-TimeSpan -Minutes 1) `
+                        -ExecutionTimeLimit (New-TimeSpan -Hours 0)
+
+        Register-ScheduledTask `
+            -TaskName  $TaskName `
+            -Action    $action `
+            -Trigger   $trigger `
+            -Principal $principal `
+            -Settings  $settings | Out-Null
     }
-
-    $action    = New-ScheduledTaskAction -Execute $BinDst
-    $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-    $principal = New-ScheduledTaskPrincipal `
-                    -UserId $env:USERNAME `
-                    -LogonType Interactive `
-                    -RunLevel Limited
-    $settings  = New-ScheduledTaskSettingsSet `
-                    -AllowStartIfOnBatteries `
-                    -DontStopIfGoingOnBatteries `
-                    -RestartCount 3 `
-                    -RestartInterval (New-TimeSpan -Minutes 1) `
-                    -ExecutionTimeLimit (New-TimeSpan -Hours 0)
-
-    Register-ScheduledTask `
-        -TaskName  $TaskName `
-        -Action    $action `
-        -Trigger   $trigger `
-        -Principal $principal `
-        -Settings  $settings | Out-Null
 
     Start-ScheduledTask -TaskName $TaskName
 
@@ -131,12 +156,14 @@ function Invoke-ServiceInstall {
 }
 
 function Invoke-ServiceUninstall {
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Host "Scheduled Task '$TaskName' removed."
-    } else {
-        Write-Host "No Scheduled Task '$TaskName' found; nothing to remove."
+    Invoke-WithoutRunRegistration {
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+            Write-Host "Scheduled Task '$TaskName' removed."
+        } else {
+            Write-Host "No Scheduled Task '$TaskName' found; login registration removed."
+        }
     }
 }
 
@@ -158,7 +185,7 @@ Targets:
   uninstall          remove installed bin
   deploy             clean + build + install (default)
   service            install + register Scheduled Task (logon autostart)
-  service-uninstall  remove the Scheduled Task
+  service-uninstall  remove the Scheduled Task and any tray-created Run entry
   run                cargo run --release
   help               show this message
 

@@ -1225,7 +1225,7 @@ pub fn spawn_watcher() {
 /// Block until one of the watched files changes, reload, repeat.
 #[cfg(target_os = "linux")]
 fn watch_forever() {
-    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+    use nix::sys::inotify::{InitFlags, Inotify};
 
     // The *directory*, not the two files. Editors overwhelmingly save by
     // writing a temporary file and renaming it over the target, which replaces
@@ -1244,35 +1244,68 @@ fn watch_forever() {
     let Ok(inotify) = Inotify::init(InitFlags::empty()) else {
         return poll_watch();
     };
-    // CLOSE_WRITE catches an in-place save, MOVED_TO the rename-over kind,
-    // CREATE a first-ever write, DELETE a list emptied by removing the file.
-    let flags = AddWatchFlags::IN_CLOSE_WRITE
-        | AddWatchFlags::IN_MOVED_TO
-        | AddWatchFlags::IN_CREATE
-        | AddWatchFlags::IN_DELETE;
-    if inotify.add_watch(&dir, flags).is_err() {
+    if inotify.add_watch(&dir, watch_flags()).is_err() {
+        drop(inotify);
         return poll_watch();
     }
 
     loop {
         // Blocks. No timer, no wakeups, nothing scheduled — the whole point of
         // this over the poll it replaces.
-        let Ok(events) = inotify.read_events() else {
-            // The watch descriptor is gone (the directory was deleted, or the
-            // filesystem does not support inotify after all). Polling still
-            // works on whatever replaces it.
-            return poll_watch();
-        };
-        let ours = events.iter().any(|e| {
-            e.name
-                .as_ref()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| WATCHED.contains(&n))
-        });
-        if ours {
-            reload_user_files();
+        match watch_once(&inotify) {
+            Ok(WatchEvent::Reload) => reload_user_files(),
+            Ok(WatchEvent::Unrelated) => {}
+            // Directory lifecycle events have no filename and are returned as
+            // successful reads. A moved watch still follows the old inode.
+            Ok(WatchEvent::Lost) | Err(_) => {
+                drop(inotify);
+                return poll_watch();
+            }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn watch_flags() -> nix::sys::inotify::AddWatchFlags {
+    use nix::sys::inotify::AddWatchFlags as Flags;
+    // Track both ordinary file saves and loss of the directory's pathname.
+    Flags::IN_CLOSE_WRITE
+        | Flags::IN_MOVED_TO
+        | Flags::IN_CREATE
+        | Flags::IN_DELETE
+        | Flags::IN_DELETE_SELF
+        | Flags::IN_MOVE_SELF
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum WatchEvent {
+    Unrelated,
+    Reload,
+    Lost,
+}
+
+#[cfg(target_os = "linux")]
+fn watch_once(inotify: &nix::sys::inotify::Inotify) -> nix::Result<WatchEvent> {
+    use nix::sys::inotify::AddWatchFlags as Flags;
+    let events = inotify.read_events()?;
+    let lost = Flags::IN_IGNORED | Flags::IN_DELETE_SELF | Flags::IN_MOVE_SELF | Flags::IN_UNMOUNT;
+    if events.iter().any(|event| event.mask.intersects(lost)) {
+        return Ok(WatchEvent::Lost);
+    }
+    let changed = events.iter().any(|event| {
+        event.mask.contains(Flags::IN_Q_OVERFLOW)
+            || event
+                .name
+                .as_ref()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| WATCHED.contains(&name))
+    });
+    Ok(if changed {
+        WatchEvent::Reload
+    } else {
+        WatchEvent::Unrelated
+    })
 }
 
 /// Modification-time polling, for the platforms without a watch this cheap.
@@ -1289,22 +1322,28 @@ fn watch_forever() {
 }
 
 fn poll_watch() {
-    let stamp = || {
-        WATCHED.map(|name| {
-            user_path(name)
-                .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok())
-        })
-    };
-    let mut last = stamp();
+    let mut last = poll_once(None);
     loop {
         std::thread::sleep(WATCH_INTERVAL);
-        let now = stamp();
-        if now != last {
-            last = now;
-            reload_user_files();
-        }
+        last = poll_once(Some(last));
     }
+}
+
+type FileStamps = [Option<std::time::SystemTime>; WATCHED.len()];
+
+fn poll_once(last: Option<FileStamps>) -> FileStamps {
+    let now = WATCHED.map(|name| {
+        user_path(name)
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+    });
+    // Capture the baseline before reloading, so an edit during that reload
+    // remains visible on the next poll. Always reload when taking over a lost
+    // watch: its replacement directory may already contain the user's edits.
+    if last != Some(now) {
+        reload_user_files();
+    }
+    now
 }
 
 /// Parse the abbreviation file: one `abbreviation = expansion` per line, `=` or
@@ -2614,7 +2653,8 @@ mod real_data {
 
 #[cfg(all(test, target_os = "linux"))]
 mod watch_tests {
-    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+    use super::*;
+    use nix::sys::inotify::{InitFlags, Inotify};
 
     /// The flag set in `watch_forever` is the whole design decision there, and
     /// getting it wrong fails silently — the watcher runs, blocks, and simply
@@ -2626,11 +2666,7 @@ mod watch_tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
 
         let inotify = Inotify::init(InitFlags::empty()).expect("inotify");
-        let flags = AddWatchFlags::IN_CLOSE_WRITE
-            | AddWatchFlags::IN_MOVED_TO
-            | AddWatchFlags::IN_CREATE
-            | AddWatchFlags::IN_DELETE;
-        inotify.add_watch(&dir, flags).expect("watch");
+        inotify.add_watch(&dir, watch_flags()).expect("watch");
 
         let named = |events: Vec<nix::sys::inotify::InotifyEvent>| -> Vec<String> {
             events
@@ -2663,6 +2699,80 @@ mod watch_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nameless_ignored_event_retires_the_watch() {
+        let dir = std::env::temp_dir().join(format!("recast-ignored-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+        let watch = inotify.add_watch(&dir, watch_flags()).unwrap();
+        inotify.rm_watch(watch).unwrap();
+        assert_eq!(watch_once(&inotify).unwrap(), WatchEvent::Lost);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replacement_directories_reload_existing_lists_and_keep_polling() {
+        // Reloading process-global tables must not interfere with other tests.
+        const CHILD: &str = "RECAST_DIRECTORY_WATCH_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "complete::watch_tests::replacement_directories_reload_existing_lists_and_keep_polling",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = config_dir().unwrap();
+        let moved = dir.with_extension("moved");
+        for move_old in [false, true] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("abbrev.txt"), "btw = old expansion\n").unwrap();
+            std::fs::write(dir.join("ignore.txt"), "oldword\n").unwrap();
+            reload_user_files();
+            assert_eq!(abbreviation("btw").as_deref(), Some("old expansion"));
+            assert!(ignored("oldword"));
+
+            let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+            inotify.add_watch(&dir, watch_flags()).unwrap();
+            if move_old {
+                std::fs::rename(&dir, &moved).unwrap();
+            } else {
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            // All edits precede fallback initialization: accepting them as its
+            // baseline without reloading would leave the old tables forever.
+            std::fs::write(dir.join("abbrev.txt"), "btw = new expansion\n").unwrap();
+            std::fs::write(dir.join("ignore.txt"), "newword\n").unwrap();
+            assert_eq!(watch_once(&inotify).unwrap(), WatchEvent::Lost);
+
+            let last = poll_once(None);
+            assert_eq!(abbreviation("btw").as_deref(), Some("new expansion"));
+            assert!(!ignored("oldword"));
+            assert!(ignored("newword"));
+            std::fs::remove_file(dir.join("ignore.txt")).unwrap();
+            let last = poll_once(Some(last));
+            assert!(!ignored("newword"));
+            std::fs::write(dir.join("ignore.txt"), "restoredword\n").unwrap();
+            poll_once(Some(last));
+            assert!(ignored("restoredword"));
+
+            std::fs::remove_dir_all(&dir).unwrap();
+            if move_old {
+                std::fs::remove_dir_all(&moved).unwrap();
+            }
+        }
     }
 }
 

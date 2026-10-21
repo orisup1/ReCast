@@ -216,7 +216,7 @@ pub fn forget_pidfile(pid: u32) {
 #[derive(Debug, PartialEq)]
 #[allow(dead_code)]
 pub enum Stopped {
-    /// SIGTERM was sent to a live daemon.
+    /// A live daemon was asked to stop, directly or through its supervisor.
     Signalled(u32),
     /// The pidfile named a process that is gone; the stale file was removed.
     Stale,
@@ -225,6 +225,62 @@ pub enum Stopped {
     /// This platform never writes one, so this is not how ReCast is stopped
     /// here. Carries the way that it is.
     Unsupported(&'static str),
+}
+
+/// Stop a matching LaunchAgent for this login session, preserving its plist
+/// and enabled state so it can start again at the next login.
+#[cfg(target_os = "macos")]
+pub fn stop_launch_agent(pid: u32) -> std::io::Result<bool> {
+    stop_launch_agent_with(pid, unsafe { nix::libc::getuid() }, |args| {
+        let output = std::process::Command::new("/bin/launchctl")
+            .args(args)
+            .output()?;
+        Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn stop_launch_agent_with(
+    pid: u32,
+    uid: u32,
+    mut run: impl FnMut(&[&str]) -> std::io::Result<Option<String>>,
+) -> std::io::Result<bool> {
+    let target = format!("gui/{uid}/org.recast");
+    let Some(listing) = run(&["print", &target])? else {
+        return Ok(false);
+    };
+    if launch_agent_pid(&listing) != Some(pid) {
+        return Ok(false);
+    }
+    if run(&["bootout", &target])?.is_none() {
+        return Err(std::io::Error::other(format!(
+            "could not stop LaunchAgent {target}; ReCast was left running"
+        )));
+    }
+    Ok(true)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_pid(listing: &str) -> Option<u32> {
+    let mut depth = 0usize;
+    for line in listing.lines().map(str::trim) {
+        if depth == 1 {
+            if let Some(("pid", value)) =
+                line.split_once('=').map(|(key, value)| (key.trim(), value))
+            {
+                return value.trim().parse().ok();
+            }
+        }
+        if line.ends_with("= {") || line == "{" {
+            depth += 1;
+        } else if line == "}" {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    None
 }
 
 /// Stop a running daemon, if this platform has one and it is really there.
@@ -248,6 +304,11 @@ pub fn stop_daemon() -> std::io::Result<Stopped> {
     if !is_our_process(pid) {
         let _ = fs::remove_file(&pidfile);
         return Ok(Stopped::Stale);
+    }
+    #[cfg(target_os = "macos")]
+    if stop_launch_agent(pid)? {
+        forget_pidfile(pid);
+        return Ok(Stopped::Signalled(pid));
     }
     // SIGTERM directly. This used to fork and exec `/bin/kill` — a whole
     // process, a PATH lookup and a wait, to make one syscall we can make here.
@@ -282,4 +343,74 @@ pub fn stop_daemon() -> std::io::Result<Stopped> {
     #[cfg(not(target_os = "windows"))]
     let how = "this platform has no daemon mode";
     Ok(Stopped::Unsupported(how))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AGENT: &str = "gui/501/org.recast = {\n\tstate = running\n\tenvironment = {\n\t\tpid = 99\n\t}\n\tpid = 123\n}\n";
+
+    #[test]
+    fn intentional_stop_removes_only_the_matching_login_job() {
+        let mut calls = Vec::new();
+        let stopped = stop_launch_agent_with(123, 501, |args| {
+            calls.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+            Ok(Some(if args[0] == "print" {
+                AGENT.to_string()
+            } else {
+                String::new()
+            }))
+        });
+        assert!(stopped.unwrap());
+        assert_eq!(
+            calls,
+            [
+                ["print", "gui/501/org.recast"],
+                ["bootout", "gui/501/org.recast"],
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_instances_and_missing_jobs_do_not_change_launchd() {
+        for listing in [None, Some(AGENT.to_string()), Some("pid = 99".to_string())] {
+            let mut calls = 0;
+            let stopped = stop_launch_agent_with(99, 501, |args| {
+                calls += 1;
+                assert_eq!(args, ["print", "gui/501/org.recast"]);
+                Ok(listing.clone())
+            });
+            assert!(!stopped.unwrap());
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn failed_bootout_does_not_report_a_successful_stop() {
+        let result = stop_launch_agent_with(123, 501, |args| {
+            Ok((args[0] == "print").then(|| AGENT.to_string()))
+        });
+        assert!(result.unwrap_err().to_string().contains("left running"));
+    }
+
+    #[test]
+    fn launchctl_execution_errors_are_reported() {
+        for failing_command in ["print", "bootout"] {
+            let result = stop_launch_agent_with(123, 501, |args| {
+                if args[0] == failing_command {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "launchctl denied",
+                    ))
+                } else {
+                    Ok(Some(AGENT.to_string()))
+                }
+            });
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
 }

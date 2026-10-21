@@ -1154,6 +1154,13 @@ impl<P: Platform> Engine<P> {
         }
 
         let is_text = P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some();
+        // Unmapped keys can insert text (for example, keypad digits) or invoke
+        // application commands. Their effects cannot be counted or replayed,
+        // so cancel pending edits before querying focus and await a boundary.
+        if !is_text && !is_modifier_key && key != P::BACKSPACE && !P::is_terminator(key) {
+            st.invalidate_text();
+            return;
+        }
         let needs_focus = self.control.has_app_rules()
             || self
                 .control
@@ -3340,6 +3347,105 @@ mod tests {
         fn text(&self) -> String {
             self.engine.injector.text.lock().unwrap().clone()
         }
+    }
+
+    #[test]
+    fn unmapped_keys_cancel_capture_and_pending_edits_until_a_boundary() {
+        const CHILD: &str = "RECAST_UNMAPPED_KEYS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "platform::engine::tests::unmapped_keys_cancel_capture_and_pending_edits_until_a_boundary", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+        let type_unmapped = |session: &Session, visible: char| {
+            // This simulated key is neither mapped text nor a reset/modifier.
+            // The application still receives its printable keypad character.
+            session.engine.key_press('\x16');
+            session.engine.injector.text.lock().unwrap().push(visible);
+            session.engine.key_release('\x16');
+        };
+        for (before, after, visible) in [
+            ("recieve", "", '1'),
+            ("recie", "ve", '1'),
+            ("", "recieve", '+'),
+        ] {
+            let s = Session::new();
+            s.type_text(before);
+            type_unmapped(&s, visible);
+            s.type_text(&format!("{after} "));
+            let untouched = format!("{before}{visible}{after} ");
+            assert_eq!(s.text(), untouched);
+            assert!(!s.engine.lock().is_replacing);
+            assert_eq!(s.engine.control.fixed_count(), 0);
+            assert!(s.ready.try_recv().is_err());
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), format!("{untouched}receive "));
+        }
+
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        let generation = s.engine.lock().generation;
+        type_unmapped(&s, '1');
+        assert_ne!(s.engine.lock().generation, generation);
+        s.finish();
+        assert_eq!(s.text(), "recieve 1");
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        assert!(s.engine.control.history().is_empty());
+        assert!(s.engine.lock().last_action.is_none());
+        s.type_text(" recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve 1 receive ");
+
+        // An unclassified function/media key also invalidates a captured token,
+        // even when the application happens to leave its visible text intact.
+        let s = Session::new();
+        s.type_text("recieve");
+        s.tap('\x17');
+        s.type_text(" ");
+        assert_eq!(s.text(), "recieve ");
+        assert!(!s.engine.lock().is_replacing);
+
+        // Known modifiers and Backspace retain their existing capture paths.
+        crate::config::Config::update_live(|config| {
+            config.action_shortcut = "none".into();
+            config.undo_shortcut = "none".into();
+            config.completion_shortcut = "none".into();
+            config.correction_shortcut = "none".into();
+        });
+        for modifier in [
+            Simulated::SHIFT_LEFT,
+            Simulated::SHIFT_RIGHT,
+            Simulated::CTRL_LEFT,
+            Simulated::CTRL_RIGHT,
+            Simulated::CAPS_LOCK,
+        ] {
+            let s = Session::new();
+            s.type_text("recie");
+            s.tap(modifier);
+            assert_eq!(s.engine.lock().keys.len(), 5);
+            assert!(!s.engine.lock().no_fix);
+        }
+        let s = Session::new();
+        s.type_text("recieve");
+        s.backspace();
+        s.type_text("e ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive ");
     }
 
     #[test]
