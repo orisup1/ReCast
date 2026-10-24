@@ -13,11 +13,13 @@ use winapi::shared::minwindef::{LPARAM, LRESULT, WPARAM};
 use winapi::shared::windef::HHOOK;
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::winuser::{
-    CallNextHookEx, DispatchMessageW, GetKeyState, GetMessageW, SendInput, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, HC_ACTION, INPUT, INPUT_KEYBOARD, KBDLLHOOKSTRUCT,
-    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LLKHF_EXTENDED, LLKHF_INJECTED, MSG, VK_BACK,
-    VK_CAPITAL, VK_RETURN, VK_SHIFT, VK_SPACE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    CallNextHookEx, DispatchMessageW, GetAsyncKeyState, GetKeyState, GetMessageW, SendInput,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, INPUT, INPUT_KEYBOARD,
+    KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LLKHF_EXTENDED,
+    LLKHF_INJECTED, MSG, VK_BACK, VK_CAPITAL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
+    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
 };
 type Typed = engine::Typed<Key>;
 const RECAST_EVENT: usize = 0x5243_5354;
@@ -276,6 +278,7 @@ fn listen(engine: Arc<Engine<Windows>>, control: &AppControl) -> std::io::Result
         mouse_callback as unsafe extern "system" fn(_, _, _) -> _,
     )?;
     engine.caps_lock_changed(unsafe { GetKeyState(VK_CAPITAL) } & 1 != 0);
+    engine.sync_modifiers(modifier_snapshot(|key| unsafe { GetAsyncKeyState(key) }));
     CAPTURE_ENGINE.with(|slot| *slot.borrow_mut() = Some(engine));
     control.listener_ready.store(true, Ordering::Relaxed);
     let result = loop {
@@ -292,6 +295,22 @@ fn listen(engine: Arc<Engine<Windows>>, control: &AppControl) -> std::io::Result
     control.listener_ready.store(false, Ordering::Relaxed);
     CAPTURE_ENGINE.with(|slot| slot.borrow_mut().take());
     result
+}
+
+/// Seed modifiers pressed before the hook existed without inventing tap events.
+/// Query only at startup: a hook callback runs before its key's async state updates.
+fn modifier_snapshot(mut state: impl FnMut(c_int) -> i16) -> [(Key, bool); 8] {
+    [
+        (Key::ShiftLeft, VK_LSHIFT),
+        (Key::ShiftRight, VK_RSHIFT),
+        (Key::ControlLeft, VK_LCONTROL),
+        (Key::ControlRight, VK_RCONTROL),
+        (Key::Alt, VK_LMENU),
+        (Key::AltGr, VK_RMENU),
+        (Key::MetaLeft, VK_LWIN),
+        (Key::MetaRight, VK_RWIN),
+    ]
+    .map(|(key, vk)| (key, state(vk) < 0))
 }
 
 #[derive(Debug, PartialEq)]
@@ -550,45 +569,48 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
     }
     engine.injector.store(true, Ordering::Relaxed);
     let buf = engine.buffered();
-    let delete_count = erase + buf.len();
-    let mut inputs: Vec<INPUT> = Vec::with_capacity((delete_count + text.len() + 1) * 2);
-    for _ in 0..delete_count {
-        press(VK_BACK as u16, &mut inputs);
-    }
-    type_text(&text, &mut inputs);
-    // Explicit offers already include any tracked trailing spaces.
-    if terminator.is_some() {
-        type_text(" ", &mut inputs);
-    }
+    let mut inputs = replacement_inputs(erase, &text, terminator, &buf);
     if !engine.replacement_valid(generation) {
         return None;
     }
+    // Deletion, replacement, and the deleted suffix must be submitted together.
+    // A cancellation between separate sends could otherwise lose that suffix.
     send(&mut inputs)?;
-
-    // Keys the user managed to type while we were replacing: replayed as keys
-    // (they are physical key positions, not text) once the word is back.
-    if !buf.is_empty() {
-        let mut replay: Vec<INPUT> = Vec::with_capacity(buf.len() * 4);
-        for t in &buf {
-            let Some(vk) = vk_of(t.key) else { continue };
-            // Replay the shift too, or a capital comes back lowercase.
-            if t.shift {
-                replay.push(key_input(VK_SHIFT as u16, None, false));
-                press(vk, &mut replay);
-                replay.push(key_input(VK_SHIFT as u16, None, true));
-            } else {
-                press(vk, &mut replay);
-            }
-        }
-        if !engine.replacement_valid(generation) {
-            return None;
-        }
-        send(&mut replay)?;
-    }
 
     crate::timing::pause(gaps.settle);
     Some(buf)
 }
+fn replacement_inputs(
+    erase: usize,
+    text: &str,
+    terminator: Option<Key>,
+    buffered: &[Typed],
+) -> Vec<INPUT> {
+    let delete_count = erase + buffered.len();
+    let mut inputs = Vec::with_capacity((delete_count + text.len() + 1) * 2 + buffered.len() * 4);
+    for _ in 0..delete_count {
+        press(VK_BACK as u16, &mut inputs);
+    }
+    type_text(text, &mut inputs);
+    // Explicit offers already include any tracked trailing spaces.
+    if terminator.is_some() {
+        type_text(" ", &mut inputs);
+    }
+    // Buffered keys are physical positions. Preserve their Shift state in the
+    // same transaction that erases their already-visible original characters.
+    for t in buffered {
+        let Some(vk) = vk_of(t.key) else { continue };
+        if t.shift {
+            inputs.push(key_input(VK_SHIFT as u16, None, false));
+            press(vk, &mut inputs);
+            inputs.push(key_input(VK_SHIFT as u16, None, true));
+        } else {
+            press(vk, &mut inputs);
+        }
+    }
+    inputs
+}
+
 fn vk_of(key: Key) -> Option<u16> {
     use winapi::um::winuser::{
         VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
@@ -630,6 +652,35 @@ fn focused_target() -> Option<Focus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_modifier_snapshot_preserves_sides_and_ignores_recent_press_bits() {
+        let expected = [
+            (Key::ShiftLeft, VK_LSHIFT),
+            (Key::ShiftRight, VK_RSHIFT),
+            (Key::ControlLeft, VK_LCONTROL),
+            (Key::ControlRight, VK_RCONTROL),
+            (Key::Alt, VK_LMENU),
+            (Key::AltGr, VK_RMENU),
+            (Key::MetaLeft, VK_LWIN),
+            (Key::MetaRight, VK_RWIN),
+        ];
+        for (held, vk) in expected {
+            for held_state in [i16::MIN, i16::MIN | 1] {
+                let mut queried = Vec::new();
+                let snapshot = modifier_snapshot(|key| {
+                    queried.push(key);
+                    if key == vk {
+                        held_state
+                    } else {
+                        1
+                    }
+                });
+                assert_eq!(queried, expected.map(|(_, vk)| vk));
+                assert_eq!(snapshot, expected.map(|(key, _)| (key, key == held)));
+            }
+        }
+    }
 
     fn native_key(vk: u32, scan: u32, flags: u32, extra: usize) -> KBDLLHOOKSTRUCT {
         KBDLLHOOKSTRUCT {
@@ -716,6 +767,57 @@ mod tests {
             (0x2e, Key::Delete),
         ] {
             assert_eq!(key_from_code(vk, 0, 0), expected);
+        }
+    }
+
+    #[test]
+    fn replacement_transaction_includes_deleted_buffered_typing() {
+        let buffered = [
+            Typed {
+                key: Key::KeyA,
+                shift: true,
+            },
+            Typed {
+                key: Key::SemiColon,
+                shift: false,
+            },
+            Typed {
+                key: Key::Space,
+                shift: false,
+            },
+        ];
+        for terminator in [None, Some(Key::Space)] {
+            let inputs = replacement_inputs(2, "ש🙂", terminator, &buffered);
+            let events: Vec<_> = inputs
+                .iter()
+                .map(|input| unsafe {
+                    let key = input.u.ki();
+                    assert_eq!(key.dwExtraInfo, RECAST_EVENT);
+                    (key.wVk, key.wScan, key.dwFlags)
+                })
+                .collect();
+            // The exact payload passed to the single SendInput call contains
+            // every erased buffered character, including Shift and punctuation.
+            let mut expected =
+                [(VK_BACK as u16, 0, 0), (VK_BACK as u16, 0, KEYEVENTF_KEYUP)].repeat(5);
+            for unit in "ש🙂"
+                .encode_utf16()
+                .chain(terminator.map(|_| u16::from(b' ')))
+            {
+                expected.push((0, unit, KEYEVENTF_UNICODE));
+                expected.push((0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+            }
+            expected.extend([
+                (VK_SHIFT as u16, 0, 0),
+                (0x41, 0, 0),
+                (0x41, 0, KEYEVENTF_KEYUP),
+                (VK_SHIFT as u16, 0, KEYEVENTF_KEYUP),
+                (0xba, 0, 0),
+                (0xba, 0, KEYEVENTF_KEYUP),
+                (VK_SPACE as u16, 0, 0),
+                (VK_SPACE as u16, 0, KEYEVENTF_KEYUP),
+            ]);
+            assert_eq!(events, expected);
         }
     }
 

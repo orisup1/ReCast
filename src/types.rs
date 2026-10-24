@@ -118,28 +118,47 @@ pub trait Replaceable {
 pub struct ReplaceGuard<'a, S: Replaceable> {
     state: &'a Mutex<S>,
     injecting: Option<&'a AtomicBool>,
+    armed: bool,
 }
 
 impl<'a, S: Replaceable> ReplaceGuard<'a, S> {
     /// Arm the guard for a replacement that is about to start. `injecting` is
     /// `None` on Linux, which gates on `is_replacing` alone.
     pub fn new(state: &'a Mutex<S>, injecting: Option<&'a AtomicBool>) -> Self {
-        Self { state, injecting }
+        Self {
+            state,
+            injecting,
+            armed: true,
+        }
+    }
+
+    /// Reopen capture under the same lock that commits the final text state.
+    /// Consuming the guard prevents its destructor from clearing a later rewrite.
+    pub fn finish(mut self, state: &mut S) {
+        self.armed = false;
+        self.clear(state);
+    }
+
+    fn clear(&self, state: &mut S) {
+        if let Some(flag) = self.injecting {
+            flag.store(false, Ordering::Relaxed);
+        }
+        state.set_replacing(false);
+        state.clear_buffered();
     }
 }
 
 impl<S: Replaceable> Drop for ReplaceGuard<'_, S> {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         // `lock_forgiving`, not `lock().unwrap()`: unwinding through a second
         // panic would abort the process, and this runs precisely when the first
         // one may already have poisoned this lock.
         {
             let mut st = lock_forgiving(self.state);
-            if let Some(flag) = self.injecting {
-                flag.store(false, Ordering::Relaxed);
-            }
-            st.set_replacing(false);
-            st.clear_buffered();
+            self.clear(&mut st);
         }
     }
 }
@@ -686,6 +705,11 @@ impl AppControl {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn lock_history_for_test(&self) -> std::sync::MutexGuard<'_, VecDeque<Correction>> {
+        self.history.lock().unwrap()
+    }
+
     /// A nudge to tighten the speller, once enough of its work has been thrown
     /// away to say so. The ratio is the honest quality signal — a user undoing
     /// a third of what they get is being served badly by the default budget —
@@ -766,6 +790,29 @@ mod tests {
         }
         assert!(!lock_forgiving(&state).replacing);
         assert!(!injecting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn finishing_under_the_state_lock_cannot_clear_the_next_replacement() {
+        let state = Mutex::new(FakeState {
+            replacing: true,
+            buffered: 2,
+        });
+        let injecting = AtomicBool::new(true);
+        let gate = ReplaceGuard::new(&state, Some(&injecting));
+        {
+            let mut st = lock_forgiving(&state);
+            gate.finish(&mut st);
+            assert!(!st.replacing);
+            assert_eq!(st.buffered, 0);
+            assert!(!injecting.load(Ordering::Relaxed));
+            st.replacing = true;
+            st.buffered = 1;
+            injecting.store(true, Ordering::Relaxed);
+        }
+        assert!(lock_forgiving(&state).replacing);
+        assert_eq!(lock_forgiving(&state).buffered, 1);
+        assert!(injecting.load(Ordering::Relaxed));
     }
 
     #[test]

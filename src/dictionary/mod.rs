@@ -11,6 +11,7 @@
 //! than ~100 MB of resident heap.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::OnceLock;
 
 mod blob;
@@ -939,9 +940,11 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
     if !debug_enabled() {
         return;
     }
-    println!("{}", word_en);
-    println!("{}", word_he);
-    println!(
+    // A full or disconnected log must not stop the keyboard listener.
+    let _ = writeln!(std::io::stdout(), "{}", word_en);
+    let _ = writeln!(std::io::stdout(), "{}", word_he);
+    let _ = writeln!(
+        std::io::stdout(),
         "English: {}",
         if matches!(target, Some(Language::English)) {
             "True"
@@ -949,7 +952,8 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
             "False"
         }
     );
-    println!(
+    let _ = writeln!(
+        std::io::stdout(),
         "Hebrew: {}",
         if matches!(target, Some(Language::Hebrew)) {
             "True"
@@ -957,7 +961,11 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
             "False"
         }
     );
-    println!("Switch: {}", if switched { "True" } else { "False" });
+    let _ = writeln!(
+        std::io::stdout(),
+        "Switch: {}",
+        if switched { "True" } else { "False" }
+    );
 }
 
 /// Pure planning step: decide what to do with the word, given the folded
@@ -2091,7 +2099,7 @@ fn check_unwrapped_in_context<K: Copy>(
         Plan::Switch { lang, start } => {
             let switched = switch_layout_to(lang);
             if debug_enabled() && start > 0 {
-                println!("split @ {}", start);
+                let _ = writeln!(std::io::stdout(), "split @ {}", start);
             }
             debug_log(&full_en, &full_he, Some(lang), switched.changed());
             // The corrected word, already spelled in the target language, for
@@ -2141,7 +2149,13 @@ fn check_unwrapped_in_context<K: Copy>(
             // letters change.
             debug_log(&full_en, &full_he, None, false);
             if debug_enabled() {
-                println!("spell: {} -> {}{}", full_en, text, en.tail);
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "spell: {} -> {}{}",
+                    full_en,
+                    text,
+                    en.tail
+                );
             }
             (
                 Some(Fix::Spelling {
@@ -2164,7 +2178,7 @@ fn check_unwrapped_in_context<K: Copy>(
                 en.tail,
             );
             if debug_enabled() {
-                println!("layout+spell: {} -> {}", full_he, text);
+                let _ = writeln!(std::io::stdout(), "layout+spell: {} -> {}", full_he, text);
             }
             (
                 switched
@@ -2445,7 +2459,12 @@ fn completion_offers<K: Copy>(
         }
     }
     if debug_enabled() && !words.is_empty() {
-        println!("complete: {} -> {}", prefix, words.join(" | "));
+        let _ = writeln!(
+            std::io::stdout(),
+            "complete: {} -> {}",
+            prefix,
+            words.join(" | ")
+        );
     }
     let case = if current == Some(Language::Hebrew) {
         Case::Lower

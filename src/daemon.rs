@@ -116,19 +116,32 @@ fn pidfile_path() -> Option<std::path::PathBuf> {
 /// PIDs are reused, so a pidfile left behind by a daemon that was killed (or
 /// that crashed before it could clean up) eventually names somebody else's
 /// process — and acting on that number is how a stop command turns into
-/// killing an unrelated program. `/proc/<pid>/comm` settles it for free.
+/// killing an unrelated program. Read the kernel's executable link rather
+/// than `comm`, which is mutable and truncated to 15 bytes.
 ///
 /// Compared against our own executable name rather than a hardcoded "recast",
-/// so a renamed binary still recognises itself; `comm` is truncated to 15
-/// bytes by the kernel, which is what the shortened comparison is for.
+/// so renamed and replaced installations still recognise earlier copies.
 #[cfg(target_os = "linux")]
 pub fn is_our_process(pid: u32) -> bool {
-    let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
-        return false; // no such process
+    let Ok(executable) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
     };
-    let comm = comm.trim();
-    let truncated: String = our_name().chars().take(15).collect();
-    comm == our_name() || comm == truncated
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    linux_executable_matches(&executable, &current)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_executable_matches(executable: &std::path::Path, current: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    fn name(path: &std::path::Path) -> Option<&[u8]> {
+        let bytes = path.file_name()?.as_bytes();
+        // /proc keeps identifying a running binary after an upgrade unlinks it.
+        Some(bytes.strip_suffix(b" (deleted)").unwrap_or(bytes))
+    }
+    matches!((name(executable), name(current)), (Some(a), Some(b)) if a == b)
 }
 
 /// The macOS half of the same question, asked of `libproc` because there is no
@@ -170,8 +183,8 @@ pub fn is_our_process(pid: u32) -> bool {
 
 /// The file name of our own executable, which is what a process is recognised
 /// by. Taken from the running binary rather than hardcoded, so a renamed copy
-/// still recognises itself and an unrelated `recast` does not.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// still recognises earlier instances using that name.
+#[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
 fn our_name() -> String {
     std::env::current_exe()
         .ok()
@@ -348,6 +361,54 @@ pub fn stop_daemon() -> std::io::Result<Stopped> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn matching_process_names_do_not_identify_unrelated_executables() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("recast-process-identity-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join(our_name());
+        symlink("/bin/sleep", &executable).unwrap();
+        let mut child = process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let recognized = is_our_process(child.id());
+        let _ = child.kill();
+        child.wait().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(
+            !recognized,
+            "a matching comm must not identify another executable"
+        );
+        assert!(is_our_process(process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_identity_preserves_upgrades_and_full_names() {
+        use std::path::Path;
+        let current = Path::new("/new/recast-long-binary-name");
+        for (executable, expected) in [
+            ("/old/recast-long-binary-name", true),
+            ("/old/recast-long-binary-name (deleted)", true),
+            ("/old/recast-long-bin", false),
+            ("/old/recast-long-binary-other", false),
+            ("/usr/bin/python3", false),
+            ("/", false),
+        ] {
+            assert_eq!(
+                linux_executable_matches(Path::new(executable), current),
+                expected
+            );
+        }
+        assert!(linux_executable_matches(
+            Path::new("/old/recast"),
+            Path::new("/new/recast (deleted)")
+        ));
+    }
 
     const AGENT: &str = "gui/501/org.recast = {\n\tstate = running\n\tenvironment = {\n\t\tpid = 99\n\t}\n\tpid = 123\n}\n";
 

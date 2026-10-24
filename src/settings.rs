@@ -50,7 +50,7 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "spell" | "complete" if parse_flag(value).is_some() => (),
         "spell_dist" if parse_number("RECAST_SPELL_DIST", value).is_ok() => (),
         "prefer" if crate::config::LanguagePreference::parse(value).is_some() => (),
-        "exclude_apps" | "layout_only_apps" if !value.contains(['\n', '\r', '"', '#', '\\']) => (),
+        "exclude_apps" | "layout_only_apps" if !value.contains(['\n', '\r', '"', '\\']) => (),
         "undo_shortcut" if crate::config::valid_undo_shortcut(value) => (),
         "action_shortcut" if crate::config::valid_action_shortcut(value) => (),
         "completion_shortcut" if crate::config::valid_completion_shortcut(value) => (),
@@ -170,7 +170,7 @@ pub fn set_app_mode(
     mode: crate::config::AppMode,
 ) -> Result<(), String> {
     use crate::config::AppMode;
-    if id.trim().is_empty() || id.contains([',', '\n', '\r', '"', '#', '\\']) {
+    if id.trim().is_empty() || id.contains([',', '\n', '\r', '"', '\\']) {
         return Err("This application identifier cannot be saved".into());
     }
     for key in ["RECAST_EXCLUDE_APPS", "RECAST_LAYOUT_ONLY_APPS"] {
@@ -181,6 +181,24 @@ pub fn set_app_mode(
     let id = id.trim().to_lowercase();
     let mut excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
     let mut layout = crate::types::lock_forgiving(&control.layout_only_apps).clone();
+    let path = file_path().ok_or("No config directory available")?;
+    let saved = load_file(&path);
+    if let Some(error) = saved.read_error {
+        return Err(format!("Could not read application modes: {error}"));
+    }
+    // Configuration edits wait for a restart. Never replace pending app-list
+    // changes with the running process's older snapshot when editing another ID.
+    let same_apps = |live: &[String], key: &str| {
+        let saved = saved
+            .settings
+            .get(key)
+            .map(|value| crate::config::parse_excluded_apps(value))
+            .unwrap_or_default();
+        live.iter().all(|app| saved.contains(app)) && saved.iter().all(|app| live.contains(app))
+    };
+    if !same_apps(&excluded, "exclude_apps") || !same_apps(&layout, "layout_only_apps") {
+        return Err("Application modes changed in config.toml. Relaunch ReCast to load those changes before saving here.".into());
+    }
     excluded.retain(|app| app != &id);
     layout.retain(|app| app != &id);
     match mode {
@@ -188,7 +206,6 @@ pub fn set_app_mode(
         AppMode::LayoutOnly => layout.push(id),
         AppMode::Full => {}
     }
-    let path = file_path().ok_or("No config directory available")?;
     save_values(
         &path,
         &[
@@ -286,12 +303,8 @@ fn parse(text: &str) -> Parsed {
             out.malformed.push(n + 1);
             continue;
         };
-        // Values are scalars, so `#` can only begin the inline explanation
-        // used by the generated sample file.
-        let value = value
-            .split_once('#')
-            .map_or(value, |(value, _)| value)
-            .trim();
+        // String settings can contain literal # characters, including app IDs.
+        let value = without_inline_comment(value).trim();
         // Quotes are stripped so `spell = "0"` and `spell = 0` mean the same
         // thing. A TOML string is what an editor's autocomplete will offer, and
         // the difference between the two is not one worth having an opinion
@@ -304,6 +317,24 @@ fn parse(text: &str) -> Parsed {
             .insert(key.trim().to_lowercase(), value.to_string());
     }
     out
+}
+
+fn without_inline_comment(value: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else {
+            match character {
+                '\\' if quoted => escaped = true,
+                '"' => quoted = !quoted,
+                '#' if !quoted => return &value[..index],
+                _ => (),
+            }
+        }
+    }
+    value
 }
 
 /// Where a value came from, so a complaint about it can say where to fix it.
@@ -583,6 +614,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn application_mode_changes_preserve_pending_external_edits() {
+        const CHILD: &str = "RECAST_APP_MODE_EXTERNAL_EDITS_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "settings::tests::application_mode_changes_preserve_pending_external_edits",
+                ])
+                .env(CHILD, "1")
+                .env_remove("RECAST_EXCLUDE_APPS")
+                .env_remove("RECAST_LAYOUT_ONLY_APPS")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use crate::config::AppMode;
+        let control = crate::types::AppControl::new_for_test();
+        set_app_mode(&control, "Editor", AppMode::Off).unwrap();
+        let path = file_path().unwrap();
+        for pending in [
+            "exclude_apps = \"Editor, Secret\"\nlayout_only_apps = \"\"\n",
+            "exclude_apps = \"Editor\"\nlayout_only_apps = \"Secret\"\n",
+            "exclude_apps = \"\"\nlayout_only_apps = \"\"\n",
+        ] {
+            std::fs::write(&path, pending).unwrap();
+            assert!(set_app_mode(&control, "Terminal", AppMode::LayoutOnly).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), pending);
+            assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));
+            assert_eq!(control.app_mode(Some("Secret")), Some(AppMode::Full));
+            assert_eq!(control.app_mode(Some("Terminal")), Some(AppMode::Full));
+            assert_eq!(crate::config::Config::global().excluded_apps, ["editor"]);
+            assert!(crate::config::Config::global().layout_only_apps.is_empty());
+        }
+        // Equivalent formatting and unrelated settings must not block a save
+        // or apply restart-only changes to the running process.
+        std::fs::write(&path, "exclude_apps = \"EDITOR, editor\"\nspell = false\n").unwrap();
+        set_app_mode(&control, "Terminal", AppMode::LayoutOnly).unwrap();
+        assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));
+        assert_eq!(
+            control.app_mode(Some("Terminal")),
+            Some(AppMode::LayoutOnly)
+        );
+        assert_eq!(load_file(&path).settings["spell"], "false");
+        assert!(crate::config::Config::global().spell_enabled);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inline_comments_preserve_quoted_application_ids() {
+        let parsed = parse(
+            "exclude_apps = \"org.example#client, עורך#פרטי\" # protected apps\n\
+             layout_only_apps = \"layout#client\"\n\
+             spell = false # disabled\n\
+             spell_dist = 1 # conservative\n",
+        );
+        assert_eq!(
+            parsed.settings["exclude_apps"],
+            "org.example#client, עורך#פרטי"
+        );
+        assert_eq!(parsed.settings["layout_only_apps"], "layout#client");
+        assert_eq!(parsed.settings["spell"], "false");
+        assert_eq!(parsed.settings["spell_dist"], "1");
+        let excluded = crate::config::parse_excluded_apps(&parsed.settings["exclude_apps"]);
+        assert!(!crate::config::app_allowed(
+            &excluded,
+            Some("org.example#client")
+        ));
+        assert!(!crate::config::app_allowed(&excluded, Some("עורך#פרטי")));
+        assert!(crate::config::app_allowed(&excluded, Some("other-client")));
+
+        // Escaped quotes must not end a quoted value when locating its comment.
+        let parsed = parse(r##"exclude_apps = "app\"#client" # comment"##);
+        assert_eq!(parsed.settings["exclude_apps"], r##"app\"#client"##);
+    }
+
+    #[test]
     fn live_menu_changes_apply_and_persist() {
         // Isolate process-global config from the parallel dictionary tests.
         if std::env::var_os("RECAST_MENU_TEST_CHILD").is_none() {
@@ -714,6 +827,31 @@ mod tests {
         assert_eq!(
             load_file(&file_path().unwrap()).settings["exclude_apps"],
             "editor"
+        );
+        set_app_mode(&control, "Org.Example#Client", AppMode::Off).unwrap();
+        set_app_mode(&control, "Layout#Client", AppMode::LayoutOnly).unwrap();
+        assert_eq!(
+            control.app_mode(Some("Org.Example#Client")),
+            Some(AppMode::Off)
+        );
+        assert_eq!(
+            control.app_mode(Some("Layout#Client")),
+            Some(AppMode::LayoutOnly)
+        );
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["layout_only_apps"],
+            "layout#client"
+        );
+        set_live(
+            &control,
+            "exclude_apps",
+            "Editor, Org.Example#Client, CLI#Client",
+        )
+        .unwrap();
+        assert_eq!(control.app_mode(Some("CLI#Client")), Some(AppMode::Off));
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["exclude_apps"],
+            "Editor, Org.Example#Client, CLI#Client"
         );
         set_live(&control, "undo_shortcut", "right_ctrl").unwrap();
         assert_eq!(crate::config::Config::global().undo_shortcut, "right_ctrl");

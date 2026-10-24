@@ -88,8 +88,10 @@ impl BackendProbe {
 
 /// Session hints remain authoritative while the compositor creates its socket;
 /// an already-running XWayland server cannot manage its Wayland layout state.
+/// Unknown Wayland sessions must not fall back to XWayland's unrelated XKB state.
 fn auto_backend(
     desktop: &str,
+    session: Option<&str>,
     hyprland: bool,
     sway: bool,
     kde: bool,
@@ -104,7 +106,7 @@ fn auto_backend(
         Some(Backend::Kde)
     } else if desktop.contains("GNOME") || desktop.contains("UNITY") {
         Some(Backend::Gnome)
-    } else if x11() {
+    } else if session != Some("wayland") && x11() {
         Some(Backend::X11)
     } else {
         None
@@ -158,14 +160,15 @@ fn backend_state() -> (Backend, bool) {
         }
 
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let session = std::env::var("XDG_SESSION_TYPE").ok();
         let configured = |key| std::env::var_os(key).is_some_and(|value| !value.is_empty());
         let hyprland = hypr::available() || configured("HYPRLAND_INSTANCE_SIGNATURE");
         let sway = sway::available()
             || configured("SWAYSOCK")
-            || (configured("I3SOCK")
-                && std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland"));
+            || (configured("I3SOCK") && session.as_deref() == Some("wayland"));
         auto_backend(
             &desktop,
+            session.as_deref(),
             hyprland,
             sway,
             std::env::var_os("KDE_FULL_SESSION").is_some(),
@@ -594,51 +597,6 @@ fn command_output(command: &mut std::process::Command) -> Option<String> {
 const INJECTOR: &str = "recast-injector";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Minimal JSON field access, shared by the Hyprland and sway backends.
-//
-// Both speak JSON. Small scalar fields are read from keyboard slices; arrays
-// use the existing JSON parser to preserve delimiters inside quoted names.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The value of a flat `"key": "value"` string field inside one JSON object.
-fn json_str<'a>(block: &'a str, key: &str) -> Option<&'a str> {
-    let at = block.find(&format!("\"{key}\""))?;
-    let rest = &block[at + key.len() + 2..];
-    let open = rest.find('"')?;
-    let rest = &rest[open + 1..];
-    let close = rest.find('"')?;
-    Some(&rest[..close])
-}
-
-/// The value of a flat `"key": 3` numeric field inside one JSON object.
-fn json_num(block: &str, key: &str) -> Option<usize> {
-    let at = block.find(&format!("\"{key}\""))?;
-    let rest = &block[at + key.len() + 2..];
-    let digits: String = rest
-        .trim_start_matches([':', ' '])
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
-}
-
-/// The elements of a flat `"key": ["a", "b"]` string-array field.
-fn json_str_array(block: &str, key: &str) -> Option<Vec<String>> {
-    let at = block.find(&format!("\"{key}\""))?;
-    let rest = block[at + key.len() + 2..]
-        .trim_start()
-        .strip_prefix(':')?
-        .trim_start();
-    // Keyboard blocks are slices of a larger reply, so deserialize one value
-    // without requiring the following fields to form a complete JSON document.
-    // Delimiters inside quoted layout names must not change their indices.
-    serde_json::Deserializer::from_str(rest)
-        .into_iter::<Vec<String>>()
-        .next()?
-        .ok()
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Hyprland — the control socket
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -659,7 +617,7 @@ mod hypr {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{json_str, language_of_keymap, Language, INJECTOR};
+    use super::{language_of_keymap, Language, INJECTOR};
 
     /// A wedged compositor must not wedge the injection thread with it: this
     /// runs on the thread a correction is waiting on.
@@ -734,44 +692,48 @@ mod hypr {
     /// Each keyboard block of a `j/devices` reply, in order, with our own
     /// injector left out.
     ///
-    /// Splitting on `{` rather than parsing is enough because the blocks are
-    /// flat, and stopping at the end of the keyboards array is what keeps the
-    /// mice and tablets below it out of the answer.
-    fn keyboards(devices_json: &str) -> impl Iterator<Item = &str> {
-        let keyboards = devices_json
-            .find("\"keyboards\"")
-            .map(|at| &devices_json[at..])
-            .unwrap_or("");
-        keyboards
-            .split('{')
-            .skip(1)
-            .take_while(|block| !block.starts_with(']'))
-            .filter(|block| json_str(block, "name") != Some(INJECTOR))
+    /// Decode the array before selecting devices: braces and escaped quotes
+    /// inside names are text, and other device arrays are not keyboards.
+    fn keyboards(devices_json: &str) -> Option<impl Iterator<Item = serde_json::Value>> {
+        let mut reply: serde_json::Value = serde_json::from_str(devices_json).ok()?;
+        let keyboards = reply.get_mut("keyboards")?.as_array_mut()?;
+        Some(
+            std::mem::take(keyboards)
+                .into_iter()
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+        )
     }
 
     /// Choose one keyboard for both the live layout and its configured list.
     /// Input methods can mark their virtual keyboard as `main` while retaining
     /// a different layout. Prefer physical keyboards, then those configured for
     /// both supported languages; keep virtual-only sessions usable as a fallback.
-    fn preferred_keyboard(devices_json: &str) -> Option<&str> {
-        keyboards(devices_json)
+    fn preferred_keyboard(devices_json: &str) -> Option<serde_json::Value> {
+        keyboards(devices_json)?
             .filter(|block| {
                 ["layout", "active_keymap"].iter().any(|field| {
-                    json_str(block, field).is_some_and(|value| !value.trim().is_empty())
+                    block
+                        .get(*field)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|value| !value.trim().is_empty())
                 })
             })
             .max_by_key(|block| {
-                let name = json_str(block, "name").unwrap_or("").to_lowercase();
+                let name = block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
                 let virtual_keyboard =
                     name.contains("virtual") || name.contains("fcitx") || name.contains("ibus");
-                let layout = json_str(block, "layout").unwrap_or("");
+                let layout = block.get("layout").and_then(|v| v.as_str()).unwrap_or("");
                 let english = layout
                     .split(',')
                     .any(|name| language_of_keymap(name) == Some(Language::English));
                 let hebrew = layout
                     .split(',')
                     .any(|name| language_of_keymap(name) == Some(Language::Hebrew));
-                let main = block.contains("\"main\": true") || block.contains("\"main\":true");
+                let main = block.get("main").and_then(|v| v.as_bool()) == Some(true);
                 (
                     !virtual_keyboard,
                     english && hebrew,
@@ -784,7 +746,10 @@ mod hypr {
     /// The selected keyboard's actual layout, including `None` for a third
     /// language rather than another device's unrelated supported layout.
     pub fn parse_layout(devices_json: &str) -> Option<Language> {
-        json_str(preferred_keyboard(devices_json)?, "active_keymap").and_then(language_of_keymap)
+        preferred_keyboard(devices_json)?
+            .get("active_keymap")?
+            .as_str()
+            .and_then(language_of_keymap)
     }
 
     /// The configured layout list, as the comma-separated xkb codes Hyprland
@@ -794,7 +759,9 @@ mod hypr {
     /// current layout and language-index lookup anchored to one keyboard.
     pub fn parse_names(devices_json: &str) -> Option<Vec<String>> {
         Some(
-            json_str(preferred_keyboard(devices_json)?, "layout")?
+            preferred_keyboard(devices_json)?
+                .get("layout")?
+                .as_str()?
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
@@ -866,7 +833,7 @@ mod sway {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use super::{json_num, json_str, json_str_array, INJECTOR};
+    use super::INJECTOR;
 
     const MAGIC: &[u8; 6] = b"i3-ipc";
     const RUN_COMMAND: u32 = 0;
@@ -990,22 +957,36 @@ mod sway {
     }
 
     /// The keyboard entries of a `GET_INPUTS` reply, our own injector left out.
-    fn keyboards(inputs_json: &str) -> impl Iterator<Item = &str> {
-        inputs_json
-            .split('{')
-            .skip(1)
-            .filter(|block| json_str(block, "type") == Some("keyboard"))
-            .filter(|block| json_str(block, "identifier") != Some(INJECTOR))
-            .filter(|block| json_str(block, "name") != Some(INJECTOR))
+    fn keyboards(inputs_json: &str) -> Option<impl Iterator<Item = serde_json::Value>> {
+        let inputs: Vec<serde_json::Value> = serde_json::from_str(inputs_json).ok()?;
+        Some(
+            inputs
+                .into_iter()
+                .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("keyboard"))
+                .filter(|block| block.get("identifier").and_then(|v| v.as_str()) != Some(INJECTOR))
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+        )
+    }
+
+    fn preferred_keyboard(inputs_json: &str) -> Option<(Vec<String>, serde_json::Value)> {
+        keyboards(inputs_json)?
+            .filter_map(|block| {
+                let names: Option<Vec<String>> = block
+                    .get("xkb_layout_names")?
+                    .as_array()?
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_owned))
+                    .collect();
+                Some((names?, block))
+            })
+            .max_by_key(|(names, _)| names.len())
     }
 
     /// The configured layouts, from the keyboard that lists the most of them —
     /// a virtual device with a single-layout list must not be what decides
     /// Hebrew is unavailable.
     pub fn parse_names(inputs_json: &str) -> Option<Vec<String>> {
-        keyboards(inputs_json)
-            .filter_map(|block| json_str_array(block, "xkb_layout_names"))
-            .max_by_key(Vec::len)
+        preferred_keyboard(inputs_json).map(|(names, _)| names)
     }
 
     /// Which layout is live, as an index into [`parse_names`].
@@ -1013,14 +994,13 @@ mod sway {
     /// Read off the same keyboard the names came from: a device with its own
     /// shorter list indexes into that list, not into this one.
     pub fn parse_index(inputs_json: &str) -> Option<usize> {
-        keyboards(inputs_json)
-            .filter_map(|block| {
-                let names = json_str_array(block, "xkb_layout_names")?;
-                let index = json_num(block, "xkb_active_layout_index")?;
-                Some((names.len(), index))
-            })
-            .max_by_key(|(len, _)| *len)
-            .map(|(_, index)| index)
+        let (names, block) = preferred_keyboard(inputs_json)?;
+        let index = block
+            .get("xkb_active_layout_index")?
+            .as_u64()?
+            .try_into()
+            .ok()?;
+        (index < names.len()).then_some(index)
     }
 
     fn inputs() -> Option<String> {
@@ -1106,6 +1086,15 @@ mod kde {
     /// is why this takes one rather than a general argument list.
     fn call(method: &str, arg: Option<usize>) -> Option<String> {
         let (bin, style) = *client()?;
+        call_with_client(bin, style, method, arg)
+    }
+
+    pub(super) fn call_with_client(
+        bin: &str,
+        style: Style,
+        method: &str,
+        arg: Option<usize>,
+    ) -> Option<String> {
         let mut cmd = Command::new(bin);
         match style {
             Style::Gdbus => {
@@ -1142,6 +1131,10 @@ mod kde {
                 }
             }
             Style::Qdbus => {
+                // Qt cannot print the a(sss) reply in its default scalar mode.
+                if method == "getLayoutsList" {
+                    cmd.arg("--literal");
+                }
                 cmd.args([
                     "org.kde.keyboard",
                     "/Layouts",
@@ -1158,19 +1151,32 @@ mod kde {
     /// The display names out of a `getLayoutsList` reply.
     ///
     /// Each entry is a `(shortName, displayName, longName)` triple —
-    /// `('us', '', 'English (US)')` — and the long name is the one worth
-    /// matching, because the short name is missing on some entries and the
-    /// display name is the two-letter badge KDE draws in the tray. Every
+    /// `('us', '', 'English (US)')`. Prefer the long name when recognizable,
+    /// falling back to a supported XKB code when KDE translates the long name.
+    /// The short name is missing on some entries, and the display name is a
+    /// user-defined badge rather than a language identifier. Every
     /// client's output is quoted differently, so the shared shape is what is
     /// parsed: quoted strings in order, three per layout.
     pub fn parse_names(reply: &str) -> Option<Vec<String>> {
-        let quoted = quoted_strings(reply);
-        (quoted.len() >= 3 && quoted.len().is_multiple_of(3))
-            .then(|| quoted.chunks(3).map(|t| t[2].clone()).collect())
+        let quoted = quoted_strings(reply)?;
+        (quoted.len() >= 3 && quoted.len().is_multiple_of(3)).then(|| {
+            quoted
+                .chunks(3)
+                .map(|t| {
+                    if super::language_of_keymap(&t[2]).is_none()
+                        && matches!(t[0].as_str(), "us" | "il")
+                    {
+                        t[0].clone()
+                    } else {
+                        t[2].clone()
+                    }
+                })
+                .collect()
+        })
     }
 
     /// Every quoted string in a reply, in order, single or double quotes.
-    fn quoted_strings(reply: &str) -> Vec<String> {
+    fn quoted_strings(reply: &str) -> Option<Vec<String>> {
         let mut out = Vec::new();
         let mut chars = reply.chars().peekable();
         while let Some(c) = chars.next() {
@@ -1178,15 +1184,35 @@ mod kde {
                 continue;
             }
             let mut value = String::new();
-            for inner in chars.by_ref() {
+            let mut closed = false;
+            while let Some(inner) = chars.next() {
                 if inner == c {
+                    closed = true;
                     break;
                 }
-                value.push(inner);
+                if inner == '\\' {
+                    // Both GVariant and Qt quote backslashes and delimiters.
+                    // An escaped quote belongs to this field, not the next one.
+                    match chars.next()? {
+                        quote @ ('\'' | '"' | '\\') => value.push(quote),
+                        'n' => value.push('\n'),
+                        'r' => value.push('\r'),
+                        't' => value.push('\t'),
+                        other => {
+                            value.push('\\');
+                            value.push(other);
+                        }
+                    }
+                } else {
+                    value.push(inner);
+                }
+            }
+            if !closed {
+                return None;
             }
             out.push(value);
         }
-        out
+        Some(out)
     }
 
     /// The first bare integer in a reply — `(uint32 1,)`, `u 1`, or `1`.
@@ -1793,7 +1819,7 @@ mod tests {
             ("", false, true, Backend::Sway),
         ] {
             assert_eq!(
-                auto_backend(desktop, hyprland, sway, false, || {
+                auto_backend(desktop, Some("wayland"), hyprland, sway, false, || {
                     panic!("XWayland must not override a known Wayland session")
                 }),
                 Some(expected)
@@ -1802,11 +1828,29 @@ mod tests {
         // An ordinary X11/i3 session retains the existing XKB fallback.
         for desktop in ["", "i3"] {
             assert_eq!(
-                auto_backend(desktop, false, false, false, || true),
+                auto_backend(desktop, Some("x11"), false, false, false, || true),
                 Some(Backend::X11)
             );
         }
-        assert_eq!(auto_backend("", false, false, false, || false), None);
+        assert_eq!(auto_backend("", None, false, false, false, || false), None);
+    }
+
+    #[test]
+    fn unsupported_wayland_sessions_never_probe_xwayland_as_a_layout_backend() {
+        for desktop in ["", "river", "labwc", "niri"] {
+            assert_eq!(
+                auto_backend(desktop, Some("wayland"), false, false, false, || {
+                    panic!("XWayland must not be probed for an unsupported Wayland session")
+                }),
+                None,
+                "XWayland cannot confirm native Wayland layouts for {desktop:?}"
+            );
+        }
+        // Missing session metadata retains the established X11 discovery path.
+        assert_eq!(
+            auto_backend("", None, false, false, false, || true),
+            Some(Backend::X11)
+        );
     }
 
     #[test]
@@ -1958,6 +2002,38 @@ mod tests {
     }
 
     #[test]
+    fn compositor_json_strings_do_not_split_or_reclassify_keyboards() {
+        for virtual_name in ["virtual-{fcitx5", "USB \"virtual-fcitx5\""] {
+            let virtual_name = serde_json::to_string(virtual_name).unwrap();
+            let devices = format!(
+                r#"{{"keyboards":[
+                    {{"name":"physical","layout":"us,il","active_keymap":"Hebrew","main":false}},
+                    {{"name":{virtual_name},"layout":"us,il","active_keymap":"English (US)","main":true}}
+                ]}}"#
+            );
+            serde_json::from_str::<serde_json::Value>(&devices).unwrap();
+            assert_eq!(hypr::parse_layout(&devices), Some(Language::Hebrew));
+            assert_eq!(
+                hypr::parse_names(&devices),
+                Some(vec!["us".into(), "il".into()])
+            );
+        }
+
+        let inputs = r#"[
+            {"identifier":"1:1:kbd","name":"physical","type":"keyboard",
+             "xkb_layout_names":["English (US) {custom}","Hebrew"],"xkb_active_layout_index":1},
+            {"identifier":"virtual","name":"virtual","type":"keyboard",
+             "xkb_layout_names":["English (US)"],"xkb_active_layout_index":0}
+        ]"#;
+        serde_json::from_str::<serde_json::Value>(inputs).unwrap();
+        assert_eq!(
+            sway::parse_names(inputs),
+            Some(vec!["English (US) {custom}".into(), "Hebrew".into()])
+        );
+        assert_eq!(sway::parse_index(inputs), Some(1));
+    }
+
+    #[test]
     fn hyprland_prefers_a_bilingual_physical_keyboard_and_keeps_virtual_fallback() {
         let devices = r#"{"keyboards": [
             {"name": "at-keyboard", "layout": "il,us", "active_keymap": "Hebrew", "main": false},
@@ -2100,12 +2176,46 @@ mod tests {
     }
 
     #[test]
+    fn kde_escaped_badges_do_not_change_layout_triples() {
+        for reply in [
+            r#"([('us', 'A\'B\\C', 'English (US)'), ('il', 'D"E', 'Hebrew')],)"#,
+            r#"a(sss) 2 "us" "A\"B\\C" "English (US)" "il" "D'E" "Hebrew""#,
+            r#"[Argument: a(sss) {[Argument: (sss) "us", "A\"B\\C", "English (US)"], [Argument: (sss) "il", "D'E", "Hebrew"]}]"#,
+        ] {
+            assert_eq!(
+                kde::parse_names(reply),
+                Some(vec!["English (US)".into(), "Hebrew".into()])
+            );
+        }
+        assert_eq!(
+            kde::parse_names(r#"'us' '' 'English (US)' 'il' '' 'Hebrew"#),
+            None
+        );
+    }
+
+    #[test]
     fn kde_reports_the_live_layout_as_an_index() {
         assert_eq!(
             kde::parse_index("(uint32 1,)".replace("uint32", " ").as_str()),
             Some(1)
         );
         assert_eq!(kde::parse_index("0"), Some(0));
+    }
+
+    #[test]
+    fn kde_localized_names_keep_languages_and_third_layout_indices() {
+        for reply in [
+            "([('ru', 'us', 'Русский'), ('us', '', 'אנגלית (ארה״ב)'), ('il', '', 'עברית'), ('', '', 'Hebrew')],)",
+            r#"a(sss) 4 "ru" "us" "Русский" "us" "" "אנגלית (ארה״ב)" "il" "" "עברית" "" "" "Hebrew""#,
+            r#"[Argument: a(sss) {[Argument: (sss) "ru", "us", "Русский"], [Argument: (sss) "us", "", "אנגלית (ארה״ב)"], [Argument: (sss) "il", "", "עברית"], [Argument: (sss) "", "", "Hebrew"]}]"#,
+        ] {
+            let names = kde::parse_names(reply).unwrap();
+            assert_eq!(names, ["Русский", "us", "il", "Hebrew"]);
+            assert_eq!(language_of_keymap(&names[0]), None);
+            assert_eq!(language_of_keymap(&names[1]), Some(Language::English));
+            assert_eq!(language_of_keymap(&names[2]), Some(Language::Hebrew));
+            assert_eq!(language_of_keymap(&names[3]), Some(Language::Hebrew));
+        }
     }
 
     // ── GNOME ────────────────────────────────────────────────────────────────
@@ -2146,16 +2256,39 @@ mod tests {
     }
 
     #[test]
-    fn json_helpers_read_what_the_compositors_send() {
-        let block = r#""name": "kbd", "index": 12, "list": ["a", "b c"], "flag": true"#;
-        assert_eq!(json_str(block, "name"), Some("kbd"));
-        assert_eq!(json_num(block, "index"), Some(12));
-        assert_eq!(
-            json_str_array(block, "list"),
-            Some(vec!["a".to_string(), "b c".to_string()])
-        );
-        assert_eq!(json_str(block, "absent"), None);
-        assert_eq!(json_num(block, "absent"), None);
+    fn malformed_compositor_replies_cannot_supply_partial_layouts() {
+        for devices in [
+            "",
+            "[]",
+            r#"{"keyboards":null}"#,
+            r#"{"keyboards":[{"name":"kbd","layout":"us,il","active_keymap":"Hebrew"}"#,
+        ] {
+            assert_eq!(hypr::parse_names(devices), None);
+            assert_eq!(hypr::parse_layout(devices), None);
+        }
+        for inputs in [
+            "",
+            "{}",
+            r#"[{"type":"keyboard","xkb_layout_names":["English (US)","Hebrew"],"xkb_active_layout_index":1}"#,
+            r#"[{"type":"keyboard","xkb_layout_names":["us",1,"il"],"xkb_active_layout_index":1}]"#,
+        ] {
+            assert_eq!(sway::parse_names(inputs), None);
+            assert_eq!(sway::parse_index(inputs), None);
+        }
+        // Never combine one keyboard's list with another keyboard's live index.
+        for index in ["null", "3", "-1", "1.5"] {
+            let inputs = format!(
+                r#"[
+                {{"type":"keyboard","name":"physical","xkb_layout_names":["English (US)","Hebrew"],"xkb_active_layout_index":{index}}},
+                {{"type":"keyboard","name":"virtual","xkb_layout_names":["English (US)"],"xkb_active_layout_index":0}}
+            ]"#
+            );
+            assert_eq!(
+                sway::parse_names(&inputs),
+                Some(vec!["English (US)".into(), "Hebrew".into()])
+            );
+            assert_eq!(sway::parse_index(&inputs), None);
+        }
     }
 
     #[test]
@@ -2170,14 +2303,12 @@ mod tests {
             language_of_keymap(&names[sway::parse_index(inputs).unwrap()]),
             Some(Language::Hebrew)
         );
+        let quoted = r#"[{"type":"keyboard","xkb_layout_names":["name, with ] and \"quotes\"","il"],"xkb_active_layout_index":1}]"#;
         assert_eq!(
-            json_str_array(
-                r#""list": ["name, with ] and \"quotes\"", "il"], "next": 1"#,
-                "list"
-            ),
+            sway::parse_names(quoted),
             Some(vec!["name, with ] and \"quotes\"".into(), "il".into()])
         );
-        assert_eq!(json_str_array(r#""list": ["us", 1, "il"]"#, "list"), None);
+        assert_eq!(sway::parse_index(quoted), Some(1));
     }
 
     #[test]
@@ -2199,6 +2330,56 @@ mod tests {
             kde::Style::Busctl
         ));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn kde_qdbus_reads_structured_layouts_without_changing_scalar_calls() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recast-qdbus-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("qdbus6");
+        // Qt requires --literal for a(sss); its default diagnostic still exits successfully.
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+literal=
+if [ "$1" = --literal ]; then literal=yes; shift; fi
+[ "$1" = org.kde.keyboard ] && [ "$2" = /Layouts ] || exit 64
+case "$3" in
+    org.kde.KeyboardLayouts.getLayoutsList)
+        if [ "$literal" = yes ]; then
+            printf '%s\n' '[Argument: a(sss) {[Argument: (sss) "us", "", "English (US)"], [Argument: (sss) "il", "", "Hebrew"]}]'
+        else
+            printf "%s\n" "qdbus: I don't know how to display an argument of type 'a(sss)', run with --literal."
+        fi
+        ;;
+    org.kde.KeyboardLayouts.getLayout)
+        [ -z "$literal" ] && [ "$#" = 3 ] || exit 65
+        printf '1\n'
+        ;;
+    org.kde.KeyboardLayouts.setLayout)
+        [ -z "$literal" ] && [ "$#" = 4 ] && [ "$4" = 1 ] || exit 66
+        printf 'true\n'
+        ;;
+    *) exit 67 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let call = |method, arg| {
+            kde::call_with_client(bin.to_str().unwrap(), kde::Style::Qdbus, method, arg)
+                .expect("the fake client should accept the production command")
+        };
+        let names = kde::parse_names(&call("getLayoutsList", None));
+        // Clean up before assertions so the failing regression leaves no executable behind.
+        let index = kde::parse_index(&call("getLayout", None));
+        let switched = call("setLayout", Some(1));
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(names, Some(vec!["English (US)".into(), "Hebrew".into()]));
+        assert_eq!(index, Some(1));
+        assert_eq!(switched.trim(), "true");
     }
 
     #[test]

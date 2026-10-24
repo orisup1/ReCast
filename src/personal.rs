@@ -7,7 +7,6 @@
 //! they never leave the machine.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -120,9 +119,7 @@ fn flush_usefulness() -> std::io::Result<()> {
     for (name, count) in USE_NAMES.iter().zip(counts) {
         text.push_str(&format!("{name}\t{count}\n"));
     }
-    let tmp = path.with_extension("txt.tmp");
-    write_private(&tmp, &text)?;
-    std::fs::rename(tmp, path)
+    write_private(&path, &text)
 }
 
 /// Max entries kept in each file. Kept bounded so a long-running daemon
@@ -209,9 +206,7 @@ fn flush_rule_stats() -> std::io::Result<()> {
         .lock()
         .map_err(|_| std::io::Error::other("rule statistics lock poisoned"))?;
     let out = rule_stats_text(counts);
-    let tmp = path.with_extension("txt.tmp");
-    write_private(&tmp, &out)?;
-    std::fs::rename(tmp, path)
+    write_private(&path, &out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -337,9 +332,7 @@ fn flush_personal_freq() -> std::io::Result<()> {
         out.push_str(&count.to_string());
         out.push('\n');
     }
-    let tmp = path.with_extension("txt.tmp");
-    write_private(&tmp, &out)?;
-    std::fs::rename(&tmp, &path)
+    write_private(&path, &out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -592,9 +585,7 @@ fn flush_confusions() -> std::io::Result<()> {
         Err(_) => return Err(std::io::Error::other("personal confusions lock poisoned")),
     };
     let out = confusions_text(&map);
-    let tmp = path.with_extension("txt.tmp");
-    write_private(&tmp, &out)?;
-    std::fs::rename(&tmp, &path)
+    write_private(&path, &out)
 }
 
 fn confusions_text(map: &Confusions) -> String {
@@ -749,9 +740,7 @@ fn flush_profile() -> std::io::Result<()> {
             out.push_str(&format!("{} {}: {}\n", prev, key, v[v.len() / 2]));
         }
     }
-    let tmp = path.with_extension("txt.tmp");
-    write_private(&tmp, &out)?;
-    std::fs::rename(&tmp, &path)
+    write_private(&path, &out)
 }
 
 /// Only the background writer calls this. Clear before snapshotting so changes
@@ -811,9 +800,13 @@ pub fn data_dir() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join(PERSONAL_DIR))
 }
 
-/// Delete only files ReCast owns. The directory removal is
-/// non-recursive, so an unexpected user file can never be erased with them.
+/// Delete only files ReCast owns after all other instances have stopped.
+/// A live instance retains its loaded maps and could write deleted data back.
+/// The directory removal is non-recursive, so unexpected files are preserved.
 pub fn clear_data() -> Result<Option<PathBuf>, String> {
+    if !crate::instance::running_pids().is_empty() {
+        return Err("Stop ReCast first (quit it from the tray or stop its login service), then rerun --clear-personal-data. A running instance can restore deleted data from memory.".into());
+    }
     let Some(dir) = data_dir() else {
         return Ok(None);
     };
@@ -822,16 +815,50 @@ pub fn clear_data() -> Result<Option<PathBuf>, String> {
 }
 
 fn clear_dir(dir: &std::path::Path) -> Result<(), String> {
-    for name in [
+    let names = [
         PERSONAL_FREQ_FILE,
         CONFUSIONS_FILE,
         PROFILE_FILE,
         RULE_STATS_FILE,
         USEFULNESS_FILE,
-    ] {
+    ];
+    for name in names {
         let path = dir.join(name);
         // Interrupted saves can leave the same private data in their snapshot.
         for path in [path.clone(), path.with_extension("txt.tmp")] {
+            if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("{}: {error}", path.display()));
+                }
+            }
+        }
+    }
+    // The atomic writer includes its PID in snapshot names. A crashed process
+    // can leave those behind, so clear snapshots from previous runs as well.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("{}: {error}", dir.display())),
+    };
+    for entry in entries.into_iter().flatten() {
+        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some((stem, pid)) = name
+            .strip_suffix(".tmp")
+            .and_then(|name| name.rsplit_once('.'))
+        else {
+            continue;
+        };
+        let owned_snapshot = pid.bytes().all(|c| c.is_ascii_digit())
+            && pid.parse::<u32>().is_ok_and(|pid| pid > 0)
+            && names
+                .iter()
+                .any(|name| name.strip_suffix(".txt") == Some(stem));
+        if owned_snapshot {
+            let path = entry.path();
             if let Err(error) = std::fs::remove_file(&path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     return Err(format!("{}: {error}", path.display()));
@@ -869,25 +896,76 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(content.as_bytes())
+    crate::settings::write_atomic(path, content)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn personal_saves_preserve_unrelated_symlink_targets() {
+        const CHILD: &str = "RECAST_PERSONAL_SYMLINK_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "personal::tests::personal_saves_preserve_unrelated_symlink_targets",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = data_dir().unwrap();
+        create_private_dir(&dir).unwrap();
+        for (name, flush) in [
+            (
+                PERSONAL_FREQ_FILE,
+                flush_personal_freq as fn() -> std::io::Result<()>,
+            ),
+            (CONFUSIONS_FILE, flush_confusions),
+            (PROFILE_FILE, flush_profile),
+            (RULE_STATS_FILE, flush_rule_stats),
+            (USEFULNESS_FILE, flush_usefulness),
+        ] {
+            let path = dir.join(name);
+            let unrelated = dir.join(format!("unrelated-{name}"));
+            std::fs::write(&unrelated, "keep this file\n").unwrap();
+            let old_temp = path.with_extension("txt.tmp");
+            std::os::unix::fs::symlink(&unrelated, &old_temp).unwrap();
+            flush().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&unrelated).unwrap(),
+                "keep this file\n"
+            );
+            assert!(std::fs::symlink_metadata(&old_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(path.is_file());
+
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&unrelated, &path).unwrap();
+            assert!(flush().is_err());
+            assert!(std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                std::fs::read_to_string(&unrelated).unwrap(),
+                "keep this file\n"
+            );
+        }
+        std::fs::remove_dir_all(config_dir().unwrap()).unwrap();
+    }
 
     #[test]
     fn usefulness_counts_accept_only_known_aggregate_fields() {
@@ -1115,8 +1193,23 @@ mod tests {
             write_private(&path, "sensitive\n").expect("write owned file");
             write_private(&path.with_extension("txt.tmp"), "sensitive snapshot\n")
                 .expect("write interrupted save");
+            for pid in [std::process::id(), u32::MAX] {
+                write_private(
+                    &path.with_extension(format!("{pid}.tmp")),
+                    "sensitive snapshot\n",
+                )
+                .expect("write interrupted atomic save");
+            }
         }
-        let keep = ["keep.txt", "keep.txt.tmp", "freq.txt.tmp.backup"];
+        let keep = [
+            "keep.txt",
+            "keep.txt.tmp",
+            "freq.txt.tmp.backup",
+            "freq.user.tmp",
+            "freq.123.tmp.backup",
+            "unknown.123.tmp",
+            "freq.0.tmp",
+        ];
         for name in keep {
             std::fs::write(dir.join(name), "user-owned\n").expect("write unexpected file");
         }
@@ -1140,6 +1233,12 @@ mod tests {
                 !dir.join(name).with_extension("txt.tmp").exists(),
                 "{name} snapshot was not removed"
             );
+            for pid in [std::process::id(), u32::MAX] {
+                assert!(
+                    !dir.join(name).with_extension(format!("{pid}.tmp")).exists(),
+                    "{name} atomic snapshot was not removed"
+                );
+            }
         }
 
         for name in keep {

@@ -154,17 +154,17 @@ fn update_windows_registration<T>(
     false
 }
 
-#[cfg(any(target_os = "windows", test))]
-const WINDOWS_TASK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+const AUTOSTART_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[cfg(any(target_os = "windows", test))]
-fn cached_windows_task_enabled(
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn cached_autostart_enabled(
     cached: &mut Option<(std::time::Instant, bool)>,
     now: impl Fn() -> std::time::Instant,
     query: impl FnOnce() -> Result<Option<bool>, ()>,
 ) -> bool {
     if let Some((updated, enabled)) = *cached {
-        if now().saturating_duration_since(updated) < WINDOWS_TASK_CACHE_TTL {
+        if now().saturating_duration_since(updated) < AUTOSTART_CACHE_TTL {
             return enabled;
         }
     }
@@ -174,9 +174,10 @@ fn cached_windows_task_enabled(
     enabled
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 mod macos_autostart {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "macos")]
     use std::process::Command;
 
     /// Same label the Makefile's `service-macos` target uses, so the checkbox
@@ -184,6 +185,7 @@ mod macos_autostart {
     /// would both launch a copy.
     const LABEL: &str = "org.recast";
 
+    #[cfg(target_os = "macos")]
     fn plist_path() -> Option<PathBuf> {
         Some(
             dirs::home_dir()?
@@ -192,30 +194,97 @@ mod macos_autostart {
         )
     }
 
-    pub fn is_enabled() -> bool {
-        plist_path().is_some_and(|p| p.exists())
+    #[cfg(target_os = "macos")]
+    fn cached_state() -> &'static std::sync::Mutex<Option<(std::time::Instant, bool)>> {
+        static STATE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
+            std::sync::Mutex::new(None);
+        &STATE
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn is_enabled() -> bool {
+        if !plist_path().is_some_and(|path| path.exists()) {
+            return false;
+        }
+        let Ok(mut cached) = cached_state().lock() else {
+            return true;
+        };
+        super::cached_autostart_enabled(&mut cached, std::time::Instant::now, || {
+            let domain = format!("gui/{}", unsafe { nix::libc::getuid() });
+            let disabled = Command::new("/bin/launchctl")
+                .args(["print-disabled", &domain])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| launch_agent_disabled(&String::from_utf8_lossy(&out.stdout)));
+            // Keep the previous file-based answer if launchd cannot be queried.
+            Ok(Some(disabled != Some(true)))
+        })
+    }
+
+    fn launch_agent_disabled(listing: &str) -> Option<bool> {
+        let mut lines = listing.lines().map(str::trim);
+        if lines.next()? != "disabled services = {" {
+            return None;
+        }
+        for line in lines {
+            if line == "}" {
+                return Some(false);
+            }
+            if let Some((key, value)) = line.split_once("=>") {
+                if key.trim() == format!("\"{LABEL}\"") {
+                    return match value.trim().trim_end_matches([',', ';']) {
+                        "true" | "disabled" => Some(true),
+                        "false" | "enabled" => Some(false),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn set(enable: bool) -> bool {
         let Some(path) = plist_path() else {
             return false;
         };
-        if !enable {
-            let _ = Command::new("launchctl")
-                .arg("unload")
-                .arg("-w")
-                .arg(&path)
-                .status();
-            return std::fs::remove_file(&path).is_ok();
-        }
         let Ok(exe) = std::env::current_exe() else {
             return false;
         };
-        if let Some(dir) = path.parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                return false;
-            }
+        let changed = set_with(
+            &path,
+            &exe,
+            unsafe { nix::libc::getuid() },
+            enable,
+            |args| {
+                Command::new("/bin/launchctl")
+                    .args(args)
+                    .status()
+                    .is_ok_and(|status| status.success())
+            },
+        );
+        if let Ok(mut cached) = cached_state().lock() {
+            *cached = changed.then(|| (std::time::Instant::now(), enable));
         }
+        changed
+    }
+
+    fn set_with(
+        path: &Path,
+        exe: &Path,
+        uid: u32,
+        enable: bool,
+        mut run: impl FnMut(&[&str]) -> bool,
+    ) -> bool {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return false;
+        }
+        let previous = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return false,
+        };
         // KeepAlive matches the Makefile's agent: the point of asking for this
         // is that ReCast is running, and a tap the OS tore down should come
         // back rather than quietly stay dead until the next login.
@@ -236,28 +305,171 @@ mod macos_autostart {
 </dict>
 </plist>
 "#,
-            exe.display()
+            exe.to_string_lossy()
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
         );
-        if std::fs::write(&path, plist).is_err() {
+        let changed = if enable {
+            crate::settings::write_atomic(path, &plist)
+        } else {
+            match std::fs::remove_file(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+        };
+        if changed.is_err() {
             return false;
         }
-        // Already-loaded is the normal case when the running copy *is* the
-        // agent, so an unload failure says nothing and is ignored.
-        let _ = Command::new("launchctl").arg("unload").arg(&path).status();
-        Command::new("launchctl")
-            .arg("load")
-            .arg("-w")
-            .arg(&path)
-            .status()
-            .is_ok_and(|s| s.success())
+        // Change future login registration without stopping this process or
+        // starting another copy. Loading/unloading the agent would do both.
+        let target = format!("gui/{uid}/{LABEL}");
+        if run(&[if enable { "enable" } else { "disable" }, &target]) {
+            return true;
+        }
+        // A failed launchd update must not replace or discard the old plist.
+        if let Some(previous) = previous {
+            let _ = crate::settings::write_atomic(path, &previous);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn test_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "recast-macos-autostart-{name}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn disabled_overrides_match_only_the_recast_service() {
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => disabled\n}\n"),
+                Some(true)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => enabled\n}\n"),
+                Some(false)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => true\n}\n"),
+                Some(true)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => false\n}\n"),
+                Some(false)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast.other\" => true\n}\n"),
+                Some(false)
+            );
+            assert_eq!(launch_agent_disabled("unrecognized response"), None);
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => invalid\n}\n"),
+                None
+            );
+        }
+
+        #[test]
+        fn toggling_registration_preserves_the_running_launch_agent() {
+            let dir = test_dir("toggle");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/ReCast.app/Contents/MacOS/recast");
+            for enable in [true, true, false, false] {
+                let mut commands = Vec::new();
+                assert!(set_with(&path, exe, 501, enable, |args| {
+                    commands.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+                    true
+                }));
+                assert_eq!(
+                    commands,
+                    [vec![
+                        if enable { "enable" } else { "disable" }.to_string(),
+                        "gui/501/org.recast".into()
+                    ]]
+                );
+                assert_eq!(path.exists(), enable);
+                if enable {
+                    assert!(std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains("<key>KeepAlive</key><true/>"));
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn failed_registration_commands_preserve_the_previous_plist() {
+            let dir = test_dir("failure");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/new-recast");
+            for previous in [None, Some("previous registration\n")] {
+                for enable in [false, true] {
+                    match previous {
+                        Some(text) => std::fs::write(&path, text).unwrap(),
+                        None => {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                    assert!(!set_with(&path, exe, 501, enable, |_| false));
+                    assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), previous);
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn failed_file_updates_do_not_change_launchd_registration() {
+            let dir = test_dir("file-failure");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/recast");
+            std::fs::create_dir(&path).unwrap();
+            for enable in [false, true] {
+                assert!(!set_with(&path, exe, 501, enable, |_| {
+                    panic!("unreadable registration must leave launchd untouched")
+                }));
+            }
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, "previous registration\n").unwrap();
+            let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&temp, "occupied").unwrap();
+            assert!(!set_with(&path, exe, 501, true, |_| {
+                panic!("failed save must leave launchd untouched")
+            }));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "previous registration\n"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn launch_agent_paths_escape_xml_metacharacters() {
+            let dir = test_dir("xml");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/Work & <Play>/ReCast.app/Contents/MacOS/recast");
+            assert!(set_with(&path, exe, 501, true, |_| true));
+            let plist = std::fs::read_to_string(path).unwrap();
+            assert!(plist.contains(
+                "/Applications/Work &amp; &lt;Play&gt;/ReCast.app/Contents/MacOS/recast"
+            ));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cached_windows_task_enabled, parse_enabled, update_windows_registration,
-        WINDOWS_TASK_CACHE_TTL,
+        cached_autostart_enabled, parse_enabled, update_windows_registration, AUTOSTART_CACHE_TTL,
     };
 
     #[test]
@@ -268,7 +480,7 @@ mod tests {
         let task = Cell::new(Ok(None));
         let queries = Cell::new(0);
         let read = |cache: &mut Option<(Instant, bool)>| {
-            cached_windows_task_enabled(
+            cached_autostart_enabled(
                 cache,
                 || clock.get(),
                 || {
@@ -285,7 +497,7 @@ mod tests {
             let previous = !expected;
             task.set(state);
             let before = queries.get();
-            clock.set(clock.get() + WINDOWS_TASK_CACHE_TTL - std::time::Duration::from_millis(1));
+            clock.set(clock.get() + AUTOSTART_CACHE_TTL - std::time::Duration::from_millis(1));
             assert_eq!(read(&mut cache), previous);
             assert_eq!(queries.get(), before, "rendering must reuse a fresh result");
             clock.set(clock.get() + std::time::Duration::from_millis(1));
@@ -294,13 +506,13 @@ mod tests {
         }
 
         task.set(Err(()));
-        clock.set(clock.get() + WINDOWS_TASK_CACHE_TTL);
+        clock.set(clock.get() + AUTOSTART_CACHE_TTL);
         assert!(!read(&mut cache));
         let before = queries.get();
         task.set(Ok(Some(true)));
         assert!(!read(&mut cache));
         assert_eq!(queries.get(), before);
-        clock.set(clock.get() + WINDOWS_TASK_CACHE_TTL);
+        clock.set(clock.get() + AUTOSTART_CACHE_TTL);
         assert!(read(&mut cache), "a query failure must expire too");
         assert_eq!(queries.get(), before + 1);
     }
@@ -612,7 +824,7 @@ try {
         }
         // Limit per-frame queries while still noticing external task changes.
         let mut cached = crate::types::lock_forgiving(&TASK_ENABLED);
-        super::cached_windows_task_enabled(&mut cached, Instant::now, || scheduled_task(None))
+        super::cached_autostart_enabled(&mut cached, Instant::now, || scheduled_task(None))
     }
 
     pub fn set(enable: bool) -> bool {

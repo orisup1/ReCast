@@ -183,6 +183,16 @@ fn set_layout_cache(lang: Language) {
     guard.value = Some((Instant::now(), lang));
 }
 
+/// Seed and inspect the real cache in isolated engine regression tests.
+#[cfg(test)]
+pub(crate) fn swap_cached_layout_for_test(lang: Option<Language>) -> Option<Language> {
+    let mut guard = crate::types::lock_forgiving(&LAYOUT_CACHE);
+    let previous = guard.value.map(|(_, lang)| lang);
+    guard.revision = guard.revision.wrapping_add(1);
+    guard.value = lang.map(|lang| (Instant::now(), lang));
+    previous
+}
+
 /// Forget the cached layout, so the next question goes to the OS.
 ///
 /// The cache exists because a per-word query can be a socket round trip or a

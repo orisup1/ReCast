@@ -103,7 +103,8 @@ pub fn retype_len(text: &str) -> usize {
 pub fn buffer_after(text: &str) -> Vec<Typed<Key>> {
     let word = text.rsplit(char::is_whitespace).next().unwrap_or_default();
     let physical = if word.chars().any(|c| ('א'..='ת').contains(&c)) {
-        crate::keymap::convert_selection(word)
+        crate::keymap::hebrew_text_to_physical_english(word)
+            .unwrap_or_else(|| crate::keymap::convert_selection(word))
     } else {
         word.to_owned()
     };
@@ -137,4 +138,67 @@ fn hebrew_completion_buffer_preserves_physical_keys() {
     assert_eq!(english, "way");
     assert_eq!(buffer_after("hello\nworld").len(), 5);
     assert!(buffer_after("hello🙂").is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn hebrew_inserted_symbols_reconstruct_their_actual_physical_keys() {
+    for text in [
+        "(שלום)",
+        "[שלום]",
+        "{שלום}",
+        "<שלום>",
+        "שלום!?",
+        "שלום,.;'/'",
+    ] {
+        let keys = buffer_after(text);
+        let visible: String = keys
+            .iter()
+            .map(|typed| {
+                crate::keymap::hebrew_char_shifted(
+                    english_char(typed.key, typed.shift),
+                    hebrew_char(typed.key),
+                    typed.shift,
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(visible, text);
+    }
+
+    // A second manual conversion must restore the exact English wrappers.
+    for original in ["(hello)", "[hello]", "{hello}", "<hello>"] {
+        let converted: String = original
+            .chars()
+            .map(|c| {
+                let (key, shift) = english_char_to_key(c).unwrap();
+                crate::keymap::hebrew_char_shifted(
+                    english_char(key, shift),
+                    hebrew_char(key),
+                    shift,
+                )
+                .unwrap()
+            })
+            .collect();
+        let restored: String = buffer_after(&converted)
+            .iter()
+            .filter_map(|typed| english_char(typed.key, typed.shift))
+            .collect();
+        assert_eq!(restored, original);
+    }
+
+    // Mixed or unsupported text keeps its existing conservative fallback.
+    for text in ["helloשלום", "שלוםhello", "שלום🙂"] {
+        let previous = crate::keymap::convert_selection(text)
+            .chars()
+            .map(|c| english_char_to_key(c).map(|(key, shift)| Typed { key, shift }))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        let actual = buffer_after(text);
+        assert_eq!(actual.len(), previous.len());
+        for (actual, previous) in actual.iter().zip(previous) {
+            assert_eq!(actual.key, previous.key);
+            assert_eq!(actual.shift, previous.shift);
+        }
+    }
 }

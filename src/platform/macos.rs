@@ -718,9 +718,22 @@ unsafe extern "C" fn tap_callback(
 unsafe fn capture_event(ctx: &Arc<Engine<Mac>>, event_type: u32, cg_event: CGEventRef) {
     match event_type {
         KCG_EVENT_KEY_DOWN => {
-            ctx.caps_lock_changed(CGEventGetFlags(cg_event) & FLAG_ALPHA_SHIFT != 0);
+            let flags = CGEventGetFlags(cg_event);
+            ctx.caps_lock_changed(flags & FLAG_ALPHA_SHIFT != 0);
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
-            ctx.key_press(key_from_code(code));
+            let key = key_from_code(code);
+            if !Mac::is_modifier(key) {
+                match modifier_snapshot(flags) {
+                    Some(modifiers) => ctx.sync_modifiers(modifiers),
+                    // Other software can post aggregate flags without identifying a side.
+                    // Keep tracked holds but discard text that cannot be interpreted safely.
+                    None => {
+                        ctx.forget_everything();
+                        return;
+                    }
+                }
+            }
+            ctx.key_press(key);
         }
         KCG_EVENT_KEY_UP => {
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
@@ -781,6 +794,28 @@ fn device_flag(key: Key) -> Option<u64> {
         Key::MetaRight => 0x0000_0010,
         _ => return None,
     })
+}
+
+/// Ordinary key events carry modifier state even after capture missed a release.
+/// Aggregate-only synthetic flags cannot identify which physical side is held.
+fn modifier_snapshot(flags: u64) -> Option<[(Key, bool); 8]> {
+    let pairs = [
+        (Key::ShiftLeft, Key::ShiftRight, 0x0002_0000),
+        (Key::ControlLeft, Key::ControlRight, 0x0004_0000),
+        (Key::Alt, Key::AltGr, 0x0008_0000),
+        (Key::MetaLeft, Key::MetaRight, 0x0010_0000),
+    ];
+    let mut snapshot = [(Key::ShiftLeft, false); 8];
+    for (index, (left, right, aggregate)) in pairs.into_iter().enumerate() {
+        let left_down = flags & device_flag(left)? != 0;
+        let right_down = flags & device_flag(right)? != 0;
+        if flags & aggregate != 0 && !left_down && !right_down {
+            return None;
+        }
+        snapshot[index * 2] = (left, left_down);
+        snapshot[index * 2 + 1] = (right, right_down);
+    }
+    Some(snapshot)
 }
 
 pub struct EventTapHandle {
@@ -1115,21 +1150,15 @@ fn post_key(key: Key, down: bool, shift: bool) -> Option<()> {
 }
 
 fn paste_text(text: &str) -> Option<()> {
-    if text.is_empty() {
-        return Some(());
-    }
-    let utf16: Vec<u16> = text.encode_utf16().collect();
-    unsafe {
+    super::unicode_text_events(text, |utf16, down| unsafe {
         // A press/release pair: some applications only act on one of the two,
         // and the string is attached to both so either order works.
-        for down in [true, false] {
-            let event = keyboard_event(0, down, false)?;
-            CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
-            CGEventPost(KCG_HID_EVENT_TAP, event);
-            CFRelease(event as *const c_void);
-        }
-    }
-    Some(())
+        let event = keyboard_event(0, down, false)?;
+        CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
+        CGEventPost(KCG_HID_EVENT_TAP, event);
+        CFRelease(event as *const c_void);
+        Some(())
+    })
 }
 
 fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<Typed>> {
@@ -1148,8 +1177,8 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     begin_injection(engine, generation)?;
     let buf = engine.buffered();
     // Press + release a single key with pacing that macOS won't drop. Only the
-    // backspaces and the odd replayed key go through this now; the word itself
-    // is one event.
+    // backspaces and the odd replayed key go through this; the replacement
+    // text uses bounded Unicode event payloads.
     let tap_key = |k: Key, shift: bool| {
         post_key(k, true, shift)?;
         crate::timing::pause(gaps.press_gap);
@@ -1400,6 +1429,33 @@ fn focused_target() -> Option<Focus> {
 mod setup_tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn modifier_snapshots_preserve_sides_and_reject_aggregate_only_flags() {
+        let empty = modifier_snapshot(FLAG_ALPHA_SHIFT).unwrap();
+        assert_eq!(modifier_snapshot(0), Some(empty));
+        assert!(empty.iter().all(|(_, down)| !down));
+        assert!(empty.iter().all(|(key, _)| *key != Key::CapsLock));
+        for (left, right, aggregate) in [
+            (Key::ShiftLeft, Key::ShiftRight, 0x0002_0000),
+            (Key::ControlLeft, Key::ControlRight, 0x0004_0000),
+            (Key::Alt, Key::AltGr, 0x0008_0000),
+            (Key::MetaLeft, Key::MetaRight, 0x0010_0000),
+        ] {
+            assert!(modifier_snapshot(aggregate).is_none());
+            for held in [left, right] {
+                let snapshot = modifier_snapshot(aggregate | device_flag(held).unwrap()).unwrap();
+                assert!(snapshot.contains(&(held, true)));
+                assert_eq!(snapshot.iter().filter(|(_, down)| *down).count(), 1);
+            }
+            let snapshot = modifier_snapshot(
+                aggregate | device_flag(left).unwrap() | device_flag(right).unwrap(),
+            )
+            .unwrap();
+            assert!(snapshot.contains(&(left, true)));
+            assert!(snapshot.contains(&(right, true)));
+        }
+    }
 
     #[test]
     fn deferred_input_waits_for_the_latest_replacement_and_keeps_event_order() {

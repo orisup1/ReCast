@@ -15,6 +15,28 @@ type Typed = engine::Typed<KeyCode>;
 
 pub struct Linux;
 
+/// Release a reader's ownership even when it unwinds before normal disconnect.
+pub(super) struct InputDeviceGuard<P: Platform> {
+    engine: Arc<Engine<P>>,
+    device: usize,
+}
+
+impl<P: Platform> InputDeviceGuard<P> {
+    pub(super) fn new(engine: &Arc<Engine<P>>, device: usize) -> Self {
+        Self {
+            engine: Arc::clone(engine),
+            device,
+        }
+    }
+}
+
+impl<P: Platform> Drop for InputDeviceGuard<P> {
+    fn drop(&mut self) {
+        self.engine
+            .input_device_removed(self.device, &HashSet::new());
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn completion_keys_match_the_active_language() {
@@ -380,8 +402,12 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
 
     let engine = Engine::<Linux>::new(en_dict, he_dict, control, injector);
     let mut readers = HashMap::new();
+    // Reopened devices get new identities, distinct from any retiring reader.
+    let mut next_device = 0usize;
     loop {
         refresh_readers(&mut readers, input_device_paths(), |path_clone| {
+            let device = next_device;
+            next_device = next_device.wrapping_add(1);
             let engine = Arc::clone(&engine);
             thread::spawn(move || {
                 let mut dev = match Device::open(&path_clone) {
@@ -395,7 +421,16 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                         return;
                     }
                 };
-                engine.forget_everything();
+                let mut held = match dev.get_key_state() {
+                    Ok(keys) => keys.iter().collect(),
+                    Err(error) => {
+                        engine.forget_everything();
+                        eprintln!("Could not read key state for {path_clone:?}: {error}");
+                        return;
+                    }
+                };
+                engine.input_device_added(device, &held);
+                let _device_guard = InputDeviceGuard::new(&engine, device);
                 if dev
                     .supported_leds()
                     .is_some_and(|leds| leds.contains(LedCode::LED_CAPSL))
@@ -404,7 +439,6 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                         engine.caps_lock_changed(leds.contains(LedCode::LED_CAPSL));
                     }
                 }
-                let mut held = HashSet::new();
                 // Retry transient failures, but retire disconnected readers at once.
                 const GIVE_UP_AFTER: u32 = 10;
                 let mut failures = 0u32;
@@ -437,11 +471,11 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                             EventSummary::Key(_, keycode, value) => {
                                 capture_key_event(&mut held, keycode, value, |key, pressed| {
                                     if pressed && value == 2 {
-                                        engine.key_repeat_at(key, timestamp);
+                                        engine.key_repeat_at(device, key, timestamp);
                                     } else if pressed {
-                                        engine.key_press_at(key, timestamp);
+                                        engine.key_press_at(device, key, timestamp);
                                     } else {
-                                        engine.key_release(key);
+                                        engine.key_release_from(device, key);
                                     }
                                 });
                             }
@@ -452,7 +486,6 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                         }
                     }
                 }
-                engine.input_device_removed(&held);
             })
         });
         engine
@@ -571,17 +604,64 @@ fn readers_survive_hotplug_without_duplicates() {
     readers.remove(&path).unwrap().join().unwrap();
 }
 
+fn release_injected(held: &[u16], emit: &mut impl FnMut(&[evdev::InputEvent]) -> Option<()>) {
+    use evdev::{EventType, InputEvent};
+    let releases: Vec<_> = held
+        .iter()
+        .rev()
+        .flat_map(|&key| {
+            [
+                InputEvent::new(EventType::KEY.0, key, 0),
+                InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+            ]
+        })
+        .collect();
+    if !releases.is_empty() {
+        let _ = emit(&releases);
+    }
+}
+
 fn emit_paced(
-    injector: &Arc<Mutex<VirtualDevice>>,
     evs: &[evdev::InputEvent],
     gap: Duration,
+    mut valid: impl FnMut() -> bool,
+    mut emit: impl FnMut(&[evdev::InputEvent]) -> Option<()>,
 ) -> Option<()> {
-    let mut dev = injector.lock().ok()?;
+    use evdev::EventType;
+    let mut held = Vec::new();
     let mut chunks = evs.chunks(crate::timing::EVENTS_PER_WRITE).peekable();
     while let Some(chunk) = chunks.next() {
-        dev.emit(chunk).ok()?;
-        // Only *between* writes. A gap after the last one would delay nothing
-        // but the release of the injector lock.
+        if !valid() {
+            // A chunk may end inside a shifted character. On an interrupted
+            // batch, emit only releases for keys this injector still owns.
+            release_injected(&held, &mut emit);
+            return None;
+        }
+        if emit(chunk).is_none() {
+            // An I/O error may leave only part of this chunk delivered. Release
+            // every key that could have gone down, including previous holds.
+            for event in chunk {
+                if event.event_type() == EventType::KEY
+                    && event.value() != 0
+                    && !held.contains(&event.code())
+                {
+                    held.push(event.code());
+                }
+            }
+            release_injected(&held, &mut emit);
+            return None;
+        }
+        // Process transitions in order: a key may be released and re-pressed
+        // within one chunk, with its final release in the following chunk.
+        for event in chunk {
+            if event.event_type() == EventType::KEY {
+                if event.value() == 0 {
+                    held.retain(|&key| key != event.code());
+                } else if !held.contains(&event.code()) {
+                    held.push(event.code());
+                }
+            }
+        }
         if chunks.peek().is_some() {
             crate::timing::pause(gap);
         }
@@ -630,10 +710,8 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     //     ourselves would be a duplicate of it.
     retyped_keys.insert(KC::KEY_LEFTSHIFT);
     retyped_keys.insert(KC::KEY_RIGHTSHIFT);
-    engine.wait_for_release(
-        &retyped_keys.into_iter().collect::<Vec<_>>(),
-        gaps.held_release_timeout,
-    );
+    let mut retyped_keys: Vec<_> = retyped_keys.into_iter().collect();
+    engine.wait_for_release(&retyped_keys, gaps.held_release_timeout);
 
     // 1b. The terminator gets its own, much longer ceiling, because it is the
     //     one key that is *always* still down here: pressing it is what asked
@@ -644,28 +722,23 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     //
     //     This is the one wait the user can feel, and it ends when they lift a
     //     key they were lifting anyway to type the next word.
-    let terminator_key: HashSet<KeyCode> = terminator.into_iter().collect();
-    engine.wait_for_release(
-        &terminator_key.into_iter().collect::<Vec<_>>(),
-        gaps.terminator_release_timeout,
-    );
+    let terminator_keys: Vec<_> = terminator.into_iter().collect();
+    engine.wait_for_release(&terminator_keys, gaps.terminator_release_timeout);
+    retyped_keys.extend(terminator_keys);
 
-    // Clone buffered keys while holding the lock, then release it before injecting
-    // any keys. The injected keystrokes re-enter handle_key which also needs the
-    // state lock, so holding it here would cause a deadlock that silently drops
-    // the injected space/terminator.
+    // Input may arrive during either wait, including a held suffix key absent
+    // from the correction. Wait for the complete replay before taking its
+    // snapshot; if any key stays held, leave the original text untouched.
+    let buffered = engine.replay_snapshot(&retyped_keys, generation, gaps.held_release_timeout)?;
     if !engine.replacement_valid(generation) {
         return None;
     }
-    let buffered = engine.buffered();
     let caps_lock = crate::types::lock_forgiving(&engine.state).caps_lock;
     let active_layout = crate::layout::current_layout();
 
-    // Build the whole erase+retype sequence as one event batch and emit it in
-    // a single locked write. Each key is press / SYN / release / SYN so the
-    // compositor still sees distinct keystroke frames, but there are no
-    // inter-key sleeps and the injector lock is taken once instead of twice
-    // per event — the dominant cost of retyping.
+    // Build the whole erase+retype sequence before emitting bounded writes.
+    // Each key is press / SYN / release / SYN so the compositor sees distinct
+    // keystroke frames. Revalidate focus and physical input between writes.
     let delete_count = erase + buffered.len();
     let total_keys = delete_count + retype.len() * 3 + 1 + buffered.len();
     let mut evs: Vec<InputEvent> = Vec::with_capacity(total_keys * 4);
@@ -705,10 +778,145 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
         push_char(t.key, t.shift);
     }
 
-    if !engine.replacement_valid(generation) {
-        return None;
-    }
-    emit_paced(&engine.injector, &evs, gaps.batch_gap)?;
+    emit_paced(
+        &evs,
+        gaps.batch_gap,
+        || engine.replay_valid(&retyped_keys, generation, buffered.len()),
+        |chunk| engine.injector.lock().ok()?.emit(chunk).ok(),
+    )?;
 
     Some(buffered)
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use evdev::{EventType, InputEvent};
+
+    fn frame(events: &mut Vec<InputEvent>, key: KeyCode, down: bool) {
+        events.push(InputEvent::new(EventType::KEY.0, key.0, i32::from(down)));
+        events.push(InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0));
+    }
+
+    fn split_shifted_sequence() -> Vec<InputEvent> {
+        let mut events = Vec::new();
+        for _ in 0..5 {
+            frame(&mut events, KeyCode::KEY_BACKSPACE, true);
+            frame(&mut events, KeyCode::KEY_BACKSPACE, false);
+        }
+        for key in [KeyCode::KEY_A, KeyCode::KEY_B] {
+            frame(&mut events, KeyCode::KEY_LEFTSHIFT, true);
+            frame(&mut events, key, true);
+            frame(&mut events, key, false);
+            frame(&mut events, KeyCode::KEY_LEFTSHIFT, false);
+        }
+        frame(&mut events, KeyCode::KEY_C, true);
+        frame(&mut events, KeyCode::KEY_C, false);
+        events
+    }
+
+    #[test]
+    fn cancellation_between_writes_releases_held_keys_without_typing_more() {
+        let events = split_shifted_sequence();
+        let writes = Mutex::new(Vec::new());
+        let mut checks = 0;
+        assert!(emit_paced(
+            &events,
+            Duration::ZERO,
+            || {
+                // Validation may acquire other locks; no emit lock may be held.
+                assert!(writes.try_lock().is_ok());
+                checks += 1;
+                checks == 1
+            },
+            |chunk| {
+                writes.lock().unwrap().push(chunk.to_vec());
+                Some(())
+            },
+        )
+        .is_none());
+        let writes = writes.into_inner().unwrap();
+        assert_eq!(checks, 2);
+        assert_eq!(writes[0], events[..crate::timing::EVENTS_PER_WRITE]);
+        // Shift went down, up, then down again within the first write. Both it
+        // and the letter straddle the boundary and must be released on abort.
+        let cleanup: Vec<_> = writes[1]
+            .iter()
+            .filter(|event| event.event_type() == EventType::KEY)
+            .map(|event| (event.code(), event.value()))
+            .collect();
+        assert_eq!(
+            cleanup,
+            [(KeyCode::KEY_B.0, 0), (KeyCode::KEY_LEFTSHIFT.0, 0)]
+        );
+        assert_eq!(writes.len(), 2);
+    }
+
+    #[test]
+    fn cancelled_batch_before_first_write_emits_nothing() {
+        assert!(emit_paced(
+            &split_shifted_sequence(),
+            Duration::ZERO,
+            || false,
+            |_| panic!("cancelled replacement emitted input"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn failed_write_releases_every_key_that_may_have_gone_down() {
+        let mut writes = Vec::new();
+        assert!(emit_paced(
+            &split_shifted_sequence(),
+            Duration::ZERO,
+            || true,
+            |chunk| {
+                writes.push(chunk.to_vec());
+                (writes.len() > 1).then_some(())
+            },
+        )
+        .is_none());
+        assert_eq!(writes.len(), 2);
+        let cleanup: Vec<_> = writes[1]
+            .iter()
+            .filter(|event| event.event_type() == EventType::KEY)
+            .map(|event| {
+                assert_eq!(event.value(), 0);
+                event.code()
+            })
+            .collect();
+        for key in [
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_A,
+            KeyCode::KEY_B,
+        ] {
+            assert!(cleanup.contains(&key.0));
+        }
+    }
+
+    #[test]
+    fn valid_batch_preserves_all_events_and_checks_each_write() {
+        let events = split_shifted_sequence();
+        let mut emitted = Vec::new();
+        let mut checks = 0;
+        assert!(emit_paced(
+            &events,
+            Duration::ZERO,
+            || {
+                checks += 1;
+                true
+            },
+            |chunk| {
+                emitted.extend_from_slice(chunk);
+                Some(())
+            },
+        )
+        .is_some());
+        assert_eq!(events, emitted);
+        assert_eq!(
+            checks,
+            events.len().div_ceil(crate::timing::EVENTS_PER_WRITE)
+        );
+    }
 }

@@ -77,8 +77,8 @@ BIN_DST  := $(BINDIR)/$(BIN_NAME)
 # fast on a no-op rebuild, but the explicit list lets `make install` skip
 # the cargo invocation when nothing has changed.
 SRC := Cargo.toml Cargo.lock build.rs \
-        en_dict.txt he_dict.txt en_freq.txt he_freq.txt \
-        src/phrases.tsv src/phrase_counts.tsv \
+        en_dict.txt he_dict.txt en_freq.txt he_freq.txt en_tech.txt \
+        src/phrases.tsv src/phrase_counts.tsv src/intent_counts.tsv \
         assets/tray-icon.rgba assets/recast.ico \
         $(shell find src -type f -name '*.rs' 2>/dev/null)
 

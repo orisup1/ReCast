@@ -30,6 +30,8 @@
 //! * Platform safety differences, spelled out as associated constants rather
 //!   than left implicit.
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -547,6 +549,9 @@ pub struct AppState<P: Platform> {
     /// otherwise the OS sees the synthetic press as a duplicate of the
     /// still-held physical key and drops it.
     pub held_keys: HashSet<P::Key>,
+    /// Per-reader ownership: several keyboards may hold the same key.
+    #[cfg(target_os = "linux")]
+    device_keys: HashMap<usize, HashSet<P::Key>>,
     /// Caps Lock latch. Together with the held shifts it is what decides
     /// whether a letter came out capitalized.
     pub caps_lock: bool,
@@ -611,6 +616,8 @@ impl<P: Platform> AppState<P> {
             selection_replacing: false,
             buffered_keys: WordBuffer::new(),
             held_keys: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            device_keys: HashMap::new(),
             caps_lock: false,
             completion_down: None,
             action_down: None,
@@ -677,6 +684,9 @@ impl<P: Platform> AppState<P> {
                 .duration_since(self.last_key_at)
                 .unwrap_or_else(|error| error.duration());
             if self.last_key == Some(key) && separation < window {
+                // A delayed mirror can arrive after another reader's release.
+                // Deduplicate text without losing this source's physical hold.
+                self.held_keys.insert(key);
                 return true;
             }
         }
@@ -708,6 +718,19 @@ impl<P: Platform> AppState<P> {
         } else {
             self.phrase.clear();
         }
+    }
+
+    /// Physical replay keys and modifiers must be up before a keycode batch.
+    #[cfg(target_os = "linux")]
+    fn replay_keys_held(&self, keys: &[P::Key]) -> bool {
+        keys.iter()
+            .copied()
+            .chain(self.buffered_keys.iter().map(|typed| typed.key))
+            .any(|key| self.held_keys.contains(&key))
+            || self
+                .held_keys
+                .iter()
+                .any(|&key| P::is_modifier(key) && key != P::CAPS_LOCK)
     }
 
     /// Whether a letter pressed right now would come out capitalized.
@@ -780,6 +803,8 @@ impl<P: Platform> AppState<P> {
     /// text immediately. No pre-existing text is included in the new buffer.
     fn start_new_context(&mut self) {
         self.invalidate_text();
+        self.action_down = None;
+        self.completion_down = None;
         self.no_fix = false;
     }
 }
@@ -875,6 +900,8 @@ impl<P: Platform> Engine<P> {
             st.invalidate_text();
         }
         if st.focus != focus {
+            // Foreground targets can have different layouts without a hotkey.
+            crate::layout::invalidate();
             st.phrase.clear();
         }
         st.mode = mode;
@@ -920,26 +947,96 @@ impl<P: Platform> Engine<P> {
         }
     }
 
+    /// Snapshot the replay suffix only after replay keys and modifiers are up.
+    /// The suffix can grow during a release wait, so inspect it together with
+    /// held keys under one lock. A timeout must leave the visible text intact.
+    #[cfg(target_os = "linux")]
+    pub fn replay_snapshot(
+        &self,
+        keys: &[P::Key],
+        generation: u64,
+        ceiling: Duration,
+    ) -> Option<Vec<Typed<P::Key>>> {
+        let poll = crate::timing::injection().held_poll;
+        let start = Instant::now();
+        loop {
+            let st = self.lock();
+            if st.generation != generation {
+                return None;
+            }
+            let held = st.replay_keys_held(keys);
+            if !held {
+                return Some(st.buffered_keys.to_vec());
+            }
+            drop(st);
+            if start.elapsed() >= ceiling {
+                return None;
+            }
+            crate::timing::pause(poll);
+        }
+    }
+
+    /// Revalidate a Linux batch between writes, including physical input that
+    /// arrived after its replay suffix was frozen. Focus queries run without
+    /// holding either the typing-state lock or the injector lock.
+    #[cfg(target_os = "linux")]
+    pub fn replay_valid(&self, keys: &[P::Key], generation: u64, buffered_len: usize) -> bool {
+        if !self.replacement_valid(generation) {
+            return false;
+        }
+        let st = self.lock();
+        st.generation == generation
+            && st.buffered_keys.len() == buffered_len
+            && !st.replay_keys_held(keys)
+    }
+
     /// Keys the user managed to type while a correction was landing. Read while
     /// holding the lock and returned by value: the injected keystrokes re-enter
     /// the listener, which needs the same lock, so holding it across an
     /// injection is a deadlock.
+    #[cfg(any(target_os = "macos", target_os = "windows", test))]
     pub fn buffered(&self) -> Vec<Typed<P::Key>> {
         self.lock().buffered_keys.to_vec()
     }
 
     /// Cancel pending work and discard text whose cursor is no longer known.
     pub fn forget_everything(&self) {
-        self.lock().invalidate_text();
+        let mut st = self.lock();
+        st.invalidate_text();
+        st.action_down = None;
+        st.completion_down = None;
+    }
+
+    /// Keys already held when a device opens will not arrive as fresh presses.
+    /// Seed physical state without inventing modifier taps or changing Caps Lock.
+    #[cfg(target_os = "linux")]
+    pub fn input_device_added(&self, device: usize, held: &HashSet<P::Key>) {
+        let mut st = self.lock();
+        st.invalidate_text();
+        st.device_keys.insert(device, held.clone());
+        st.held_keys.extend(held.iter().copied());
+        st.action_down = None;
+        st.completion_down = None;
+        st.layout_hotkey = false;
+        st.last_key = None;
+        crate::layout::invalidate();
     }
 
     /// Unplugged evdev devices cannot deliver releases. Cancel stale work and
     /// remove their held keys without interpreting a release as an undo tap.
     #[cfg(target_os = "linux")]
-    pub fn input_device_removed(&self, held: &HashSet<P::Key>) {
+    pub fn input_device_removed(&self, device: usize, held: &HashSet<P::Key>) {
         let mut st = self.lock();
         st.invalidate_text();
-        st.held_keys.retain(|key| !held.contains(key));
+        let held = st
+            .device_keys
+            .remove(&device)
+            .unwrap_or_else(|| held.clone());
+        for key in held {
+            if !st.device_keys.values().any(|keys| keys.contains(&key)) {
+                st.held_keys.remove(&key);
+            }
+        }
         st.completion_down = None;
         st.action_down = None;
         st.layout_hotkey = false;
@@ -966,6 +1063,32 @@ impl<P: Platform> Engine<P> {
         crate::layout::invalidate();
     }
 
+    /// Repair modifier transitions missed while native capture was unavailable.
+    #[cfg(any(target_os = "macos", target_os = "windows", test))]
+    pub fn sync_modifiers(&self, modifiers: impl IntoIterator<Item = (P::Key, bool)>) {
+        let mut st = self.lock();
+        let mut changed = false;
+        for (key, down) in modifiers {
+            if !P::is_modifier(key) || key == P::CAPS_LOCK {
+                continue;
+            }
+            changed |= if down {
+                st.held_keys.insert(key)
+            } else {
+                st.held_keys.remove(&key)
+            };
+        }
+        if changed {
+            st.invalidate_text();
+            st.action_down = None;
+            st.completion_down = None;
+            st.layout_hotkey = false;
+            st.last_key = None;
+            drop(st);
+            crate::layout::invalidate();
+        }
+    }
+
     /// Called after waits and immediately before destructive injection.
     pub fn replacement_valid(&self, generation: u64) -> bool {
         if self.lock().generation != generation || !self.control.is_enabled() || !P::input_allowed()
@@ -988,25 +1111,36 @@ impl<P: Platform> Engine<P> {
     /// A key went down.
     #[cfg(any(not(target_os = "linux"), test))]
     pub fn key_press(self: &Arc<Self>, key: P::Key) {
-        self.press(key, false, SystemTime::now());
+        self.press(key, false, SystemTime::now(), |_| {});
     }
 
     /// Preserve the kernel timestamp when queued evdev events are delivered.
     #[cfg(target_os = "linux")]
-    pub fn key_press_at(self: &Arc<Self>, key: P::Key, timestamp: SystemTime) {
-        self.press(key, false, timestamp);
+    pub fn key_press_at(self: &Arc<Self>, device: usize, key: P::Key, timestamp: SystemTime) {
+        self.press(key, false, timestamp, |st| {
+            st.device_keys.entry(device).or_default().insert(key);
+        });
     }
 
     /// Kernel repeats can be delivered together after a slow desktop reply.
     /// Their delivery spacing must not be mistaken for duplicate device reports.
     #[cfg(target_os = "linux")]
-    pub fn key_repeat_at(self: &Arc<Self>, key: P::Key, timestamp: SystemTime) {
-        self.press(key, true, timestamp);
+    pub fn key_repeat_at(self: &Arc<Self>, device: usize, key: P::Key, timestamp: SystemTime) {
+        self.press(key, true, timestamp, |st| {
+            st.device_keys.entry(device).or_default().insert(key);
+        });
     }
 
-    fn press(self: &Arc<Self>, key: P::Key, repeat: bool, timestamp: SystemTime) {
+    fn press(
+        self: &Arc<Self>,
+        key: P::Key,
+        repeat: bool,
+        timestamp: SystemTime,
+        track: impl FnOnce(&mut AppState<P>),
+    ) {
         let config = crate::config::Config::global();
         let mut st = self.lock();
+        track(&mut st);
         st.sync_shortcuts(&config);
         if !config.personal_enabled {
             st.phrase.forget_learning();
@@ -1112,6 +1246,14 @@ impl<P: Platform> Engine<P> {
             && suggestion_bare
             && (is_shift || P::QUEUE_UNDO_DURING_REPLACEMENT)
         {
+            return;
+        }
+
+        // Command modifiers can turn injected Backspace into a destructive
+        // shortcut before another physical key arrives. Preserve the safe
+        // queued gestures above, but cancel all other command-modifier presses.
+        if st.is_replacing && is_modifier_key && !is_shift {
+            st.invalidate_text();
             return;
         }
 
@@ -1318,6 +1460,10 @@ impl<P: Platform> Engine<P> {
     ) {
         if st.is_replacing {
             st.buffered_keys.push(Typed { key, shift });
+            if st.buffered_keys.is_empty() {
+                // Overflow discarded the visible suffix, so its erase count is unknown.
+                st.invalidate_text();
+            }
             return;
         }
         if st.keys.is_empty() {
@@ -1536,9 +1682,28 @@ impl<P: Platform> Engine<P> {
     ///
     /// Track held keys and configured modifier taps. Only a short, bare
     /// press/release pair counts; chords and holds retain their normal meaning.
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn key_release(self: &Arc<Self>, key: P::Key) {
+        self.release(key, |_| true);
+    }
+
+    /// A physical key stays down until every device holding it releases it.
+    #[cfg(target_os = "linux")]
+    pub fn key_release_from(self: &Arc<Self>, device: usize, key: P::Key) {
+        self.release(key, |st| {
+            if let Some(keys) = st.device_keys.get_mut(&device) {
+                keys.remove(&key);
+            }
+            !st.device_keys.values().any(|keys| keys.contains(&key))
+        });
+    }
+
+    fn release(self: &Arc<Self>, key: P::Key, track: impl FnOnce(&mut AppState<P>) -> bool) {
         let config = crate::config::Config::global();
         let mut st = self.lock();
+        if !track(&mut st) {
+            return;
+        }
         st.sync_shortcuts(&config);
         st.revision = st.revision.wrapping_add(1);
         st.held_keys.remove(&key);
@@ -2586,6 +2751,11 @@ impl<P: Platform> Engine<P> {
         }
 
         let mut st = self.lock();
+        if st.generation == generation && st.buffered_keys.len() != buffered.len() {
+            // Bookkeeping above can block while physical input keeps arriving.
+            // The replay snapshot must still describe the cursor at commit time.
+            st.invalidate_text();
+        }
         if st.generation == generation {
             if st.cycle.is_some() {
                 // An explicit successful edit establishes trusted text at the
@@ -2699,8 +2869,8 @@ impl<P: Platform> Engine<P> {
             };
             st.last_key = None;
         }
+        gate.finish(&mut st);
         drop(st);
-        drop(gate);
 
         let mut st = self.lock();
         let retry = RetryContext::capture(&st, None);
@@ -3002,7 +3172,8 @@ mod tests {
     static FOCUS_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
     static LAYOUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
     static INJECT_RETURN_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
-    struct Simulated;
+    struct SimulatedPlatform<const QUEUE_UNDO: bool>;
+    type Simulated = SimulatedPlatform<true>;
     struct Screen {
         text: Mutex<String>,
         erasures: Mutex<Vec<usize>>,
@@ -3010,13 +3181,13 @@ mod tests {
         ready: mpsc::SyncSender<()>,
         proceed: Mutex<mpsc::Receiver<()>>,
     }
-    impl Platform for Simulated {
+    impl<const QUEUE_UNDO: bool> Platform for SimulatedPlatform<QUEUE_UNDO> {
         type Key = char;
         type Retype = String;
         type Injector = Screen;
         type Focus = usize;
         const REQUIRES_FOCUS: bool = true;
-        const QUEUE_UNDO_DURING_REPLACEMENT: bool = true;
+        const QUEUE_UNDO_DURING_REPLACEMENT: bool = QUEUE_UNDO;
         // Exercise the stricter keycode-injection refusal policy as well.
         const ABORT_UNDO_IF_LAYOUT_REFUSED: bool = true;
         const SHIFT_LEFT: char = '\x01';
@@ -3210,8 +3381,8 @@ mod tests {
         }
     }
 
-    struct Session {
-        engine: Arc<Engine<Simulated>>,
+    struct SessionWithPolicy<const QUEUE_UNDO: bool> {
+        engine: Arc<Engine<SimulatedPlatform<QUEUE_UNDO>>>,
         ready: mpsc::Receiver<()>,
         proceed: mpsc::SyncSender<()>,
     }
@@ -3249,6 +3420,11 @@ mod tests {
             timestamp - Duration::from_millis(1),
         ] {
             assert!(state.duplicate_press('s', false, mirrored, window));
+            assert!(
+                state.held_keys.contains(&'s'),
+                "a delayed press still owns its physical hold"
+            );
+            state.held_keys.remove(&'s');
         }
         let next_press = timestamp + Duration::from_millis(5);
         assert!(!state.duplicate_press('s', false, next_press, window));
@@ -3269,7 +3445,486 @@ mod tests {
         assert!(!state.duplicate_press('s', false, timestamp, None));
     }
 
-    impl Session {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlapping_devices_keep_physical_keys_held_until_the_last_release() {
+        let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        for key in [Simulated::SHIFT_LEFT, Simulated::CTRL_LEFT, 'x', ' '] {
+            let s = Session::new();
+            s.engine.input_device_added(1, &HashSet::new());
+            s.engine.input_device_added(2, &HashSet::new());
+            s.engine.key_press_at(1, key, timestamp);
+            s.engine
+                .key_press_at(2, key, timestamp + Duration::from_millis(10));
+            s.engine.key_release_from(1, key);
+            assert!(s.engine.lock().held_keys.contains(&key));
+            let generation = s.engine.lock().generation;
+            assert!(s
+                .engine
+                .replay_snapshot(&[key], generation, Duration::ZERO)
+                .is_none());
+            assert!(s.engine.lock().last_action_tap.is_none());
+            s.engine.key_release_from(2, key);
+            assert!(!s.engine.lock().held_keys.contains(&key));
+        }
+        // Disconnecting one keyboard cannot release a key still held on another.
+        let s = Session::new();
+        s.engine
+            .input_device_added(1, &HashSet::from([Simulated::SHIFT_LEFT]));
+        s.engine
+            .input_device_added(2, &HashSet::from([Simulated::SHIFT_LEFT, 'x']));
+        s.engine
+            .input_device_removed(1, &HashSet::from([Simulated::SHIFT_LEFT]));
+        assert!(s.engine.lock().held_keys.contains(&Simulated::SHIFT_LEFT));
+        assert!(s.engine.lock().held_keys.contains(&'x'));
+        s.engine.key_press_at(2, 'a', timestamp);
+        assert_eq!(
+            reading::<Simulated>(&s.engine.lock().keys, Language::English),
+            "A"
+        );
+        s.engine.key_release_from(2, 'a');
+        s.engine
+            .input_device_removed(2, &HashSet::from([Simulated::SHIFT_LEFT, 'x']));
+        assert!(s.engine.lock().held_keys.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reader_unwinding_releases_its_ownership_before_reconnect() {
+        let s = Session::new();
+        s.engine
+            .input_device_added(1, &HashSet::from([Simulated::SHIFT_LEFT]));
+        s.engine.input_device_added(2, &HashSet::from(['y']));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = crate::platform::linux::InputDeviceGuard::new(&s.engine, 1);
+            s.engine.key_press_at(1, 'x', SystemTime::now());
+            panic!("simulate reader failure");
+        }));
+        assert!(result.is_err());
+        let st = s.engine.lock();
+        assert_eq!(st.held_keys, HashSet::from(['y']));
+        assert!(!st.device_keys.contains_key(&1));
+        assert!(st.device_keys.contains_key(&2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_attach_seeds_held_keys_without_typing_or_modifier_taps() {
+        let s = Session::new();
+        let held = HashSet::from([
+            Simulated::SHIFT_LEFT,
+            Simulated::CTRL_LEFT,
+            Simulated::CAPS_LOCK,
+            'y',
+        ]);
+        {
+            let mut st = s.engine.lock();
+            st.held_keys.insert('x');
+            st.action_down = Some(Instant::now());
+            st.completion_down = Some(Instant::now());
+        }
+        s.engine.input_device_added(1, &held);
+        {
+            let st = s.engine.lock();
+            assert!(held.iter().all(|key| st.held_keys.contains(key)));
+            assert!(
+                st.held_keys.contains(&'x'),
+                "other device holds must survive"
+            );
+            assert!(st.action_down.is_none());
+            assert!(st.completion_down.is_none());
+            assert!(st.keys.is_empty());
+            assert!(!st.caps_lock);
+        }
+        // An already-held Ctrl still makes the next letter a shortcut.
+        s.engine.key_press('v');
+        assert!(s.engine.lock().keys.is_empty());
+        s.engine.key_release('v');
+        s.engine.key_release(Simulated::CTRL_LEFT);
+        assert!(s.engine.lock().last_action_tap.is_none());
+        // An already-held Shift still capitalizes captured letters.
+        s.engine.key_press('a');
+        assert_eq!(
+            reading::<Simulated>(&s.engine.lock().keys, Language::English),
+            "A"
+        );
+        s.engine.key_release('a');
+        s.engine.input_device_removed(1, &held);
+        let st = s.engine.lock();
+        assert!(held.iter().all(|key| !st.held_keys.contains(key)));
+        assert!(st.held_keys.contains(&'x'));
+    }
+
+    #[test]
+    fn changing_focus_invalidates_the_previous_targets_layout_cache() {
+        const CHILD: &str = "RECAST_FOCUS_LAYOUT_CACHE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::changing_focus_invalidates_the_previous_targets_layout_cache",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use crate::layout::swap_cached_layout_for_test as swap_cache;
+
+        let s = Session::new();
+        s.engine.lock().focus = Some(1);
+        FOCUS.store(1, Ordering::SeqCst);
+        swap_cache(Some(Language::English));
+        let (st, focus) = s.engine.refresh_focus(s.engine.lock()).unwrap();
+        assert_eq!(focus, Some(1));
+        drop(st);
+        assert_eq!(swap_cache(None), Some(Language::English));
+
+        // A different foreground thread can have a different keyboard layout,
+        // even without a keyboard layout hotkey or an expired cache TTL.
+        for target in [2, 0] {
+            s.engine.lock().focus = Some(1);
+            FOCUS.store(target, Ordering::SeqCst);
+            swap_cache(Some(Language::English));
+            let (st, focus) = s.engine.refresh_focus(s.engine.lock()).unwrap();
+            assert_eq!(focus, (target != 0).then_some(target));
+            drop(st);
+            assert_eq!(swap_cache(None), None);
+        }
+    }
+
+    #[test]
+    fn mouse_chords_do_not_count_as_modifier_taps() {
+        const CHILD: &str = "RECAST_MOUSE_MODIFIER_TAPS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::mouse_chords_do_not_count_as_modifier_taps",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|cfg| {
+            cfg.action_shortcut = "left_ctrl".into();
+            cfg.undo_shortcut = "none".into();
+            cfg.completion_shortcut = "right_shift".into();
+        });
+        for native_click in [false, true] {
+            for key in [Simulated::CTRL_LEFT, Simulated::SHIFT_RIGHT] {
+                let s = Session::new();
+                s.engine.key_press(key);
+                if native_click {
+                    s.engine.mouse_click();
+                } else {
+                    s.tap('\x15'); // Mouse buttons on an evdev key stream.
+                }
+                assert!(s.engine.lock().held_keys.contains(&key));
+                assert!(s.engine.lock().action_down.is_none());
+                assert!(s.engine.lock().completion_down.is_none());
+                s.engine.key_release(key);
+                assert!(s.engine.lock().last_action_tap.is_none());
+                assert!(!s.engine.lock().is_replacing);
+                // A later genuine tap must remain the first tap of a pair.
+                s.tap(Simulated::CTRL_LEFT);
+                assert!(s.engine.lock().last_action_tap.is_some());
+                assert!(!s.engine.lock().is_replacing);
+            }
+        }
+    }
+
+    #[test]
+    fn native_capture_loss_cancels_unfinished_modifier_taps() {
+        const CHILD: &str = "RECAST_CAPTURE_MODIFIER_TAPS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::native_capture_loss_cancels_unfinished_modifier_taps",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|cfg| {
+            cfg.action_shortcut = "left_ctrl".into();
+            cfg.undo_shortcut = "none".into();
+            cfg.completion_shortcut = "right_shift".into();
+        });
+        for key in [Simulated::CTRL_LEFT, Simulated::SHIFT_RIGHT] {
+            let s = Session::new();
+            s.engine.key_press(key);
+            {
+                let st = s.engine.lock();
+                assert!(st.action_down.is_some() || st.completion_down.is_some());
+            }
+            // Secure Input, tap loss, and ambiguous synthetic flags all discard context.
+            s.engine.forget_everything();
+            {
+                let st = s.engine.lock();
+                assert!(st.held_keys.contains(&key));
+                assert!(st.action_down.is_none());
+                assert!(st.completion_down.is_none());
+            }
+            s.engine.key_release(key);
+            assert!(s.engine.lock().last_action_tap.is_none());
+            assert!(!s.engine.lock().is_replacing);
+            if key == Simulated::CTRL_LEFT {
+                s.tap(key);
+                assert!(s.engine.lock().last_action_tap.is_some());
+                assert!(!s.engine.lock().is_replacing);
+            }
+        }
+    }
+
+    #[test]
+    fn native_modifier_snapshots_recover_missed_transitions_without_rearming_taps() {
+        let snapshot = |shift, ctrl| {
+            [
+                (Simulated::SHIFT_LEFT, shift),
+                (Simulated::SHIFT_RIGHT, false),
+                (Simulated::CTRL_LEFT, ctrl),
+                (Simulated::CTRL_RIGHT, false),
+                // Caps Lock is a separate latch; ordinary held keys are not modifiers.
+                (Simulated::CAPS_LOCK, false),
+                ('x', false),
+            ]
+        };
+        for missed_release in [
+            Simulated::CTRL_LEFT,
+            Simulated::CTRL_RIGHT,
+            Simulated::SHIFT_LEFT,
+            Simulated::SHIFT_RIGHT,
+        ] {
+            let s = Session::new();
+            let generation = {
+                let mut st = s.engine.lock();
+                st.held_keys
+                    .extend([missed_release, 'x', Simulated::CAPS_LOCK]);
+                st.caps_lock = true;
+                st.keys.push(Typed {
+                    key: 'r',
+                    shift: false,
+                });
+                st.action_down = Some(Instant::now());
+                st.completion_down = Some(Instant::now());
+                st.last_action_tap = Some(Instant::now());
+                st.layout_hotkey = true;
+                st.generation
+            };
+            s.engine.forget_everything();
+            assert!(s.engine.lock().held_keys.contains(&missed_release));
+            s.engine.sync_modifiers(snapshot(false, false));
+            let st = s.engine.lock();
+            assert!(!st.held_keys.contains(&missed_release));
+            assert!(st.held_keys.contains(&'x'));
+            assert!(st.held_keys.contains(&Simulated::CAPS_LOCK));
+            assert!(st.caps_lock);
+            assert!(st.keys.is_empty());
+            assert!(st.no_fix);
+            assert!(st.generation > generation + 1);
+            assert!(st.action_down.is_none());
+            assert!(st.completion_down.is_none());
+            assert!(st.last_action_tap.is_none());
+            assert!(!st.layout_hotkey);
+        }
+
+        // Capture may resume while a modifier is already held. Do not invent a tap.
+        let s = Session::new();
+        s.engine.sync_modifiers(snapshot(true, true));
+        {
+            let st = s.engine.lock();
+            assert!(st.held_keys.contains(&Simulated::SHIFT_LEFT));
+            assert!(st.held_keys.contains(&Simulated::CTRL_LEFT));
+            assert!(st.action_down.is_none());
+            assert!(st.completion_down.is_none());
+        }
+
+        // A matching snapshot must preserve captured text and genuine gesture timing.
+        let (generation, revision, action_down, completion_down) = {
+            let mut st = s.engine.lock();
+            st.keys.push(Typed {
+                key: 'r',
+                shift: true,
+            });
+            st.no_fix = false;
+            st.action_down = Some(Instant::now());
+            st.completion_down = Some(Instant::now());
+            (
+                st.generation,
+                st.revision,
+                st.action_down,
+                st.completion_down,
+            )
+        };
+        s.engine.sync_modifiers(snapshot(true, true));
+        let st = s.engine.lock();
+        assert_eq!(st.generation, generation);
+        assert_eq!(st.revision, revision);
+        assert_eq!(st.keys.len(), 1);
+        assert!(!st.no_fix);
+        assert_eq!(st.action_down, action_down);
+        assert_eq!(st.completion_down, completion_down);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_replay_rejects_every_physical_modifier_even_outside_its_key_list() {
+        use crate::platform::linux::Linux;
+        use evdev::KeyCode;
+        let mut state = AppState::<Linux>::new();
+        for modifier in [
+            KeyCode::KEY_LEFTSHIFT,
+            KeyCode::KEY_RIGHTSHIFT,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTCTRL,
+            KeyCode::KEY_LEFTALT,
+            KeyCode::KEY_RIGHTALT,
+            KeyCode::KEY_LEFTMETA,
+            KeyCode::KEY_RIGHTMETA,
+        ] {
+            state.held_keys.insert(modifier);
+            assert!(state.replay_keys_held(&[KeyCode::KEY_E, KeyCode::KEY_SPACE]));
+            state.held_keys.remove(&modifier);
+        }
+        // Caps Lock is a latch whose state is handled by the key encoder.
+        state.held_keys.insert(KeyCode::KEY_CAPSLOCK);
+        assert!(!state.replay_keys_held(&[KeyCode::KEY_E, KeyCode::KEY_SPACE]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replay_snapshot_rejects_held_suffixes_modifiers_and_cancelled_work() {
+        let session = Session::new();
+        let engine = &session.engine;
+        let replay = ['e', ' ', Simulated::SHIFT_LEFT, Simulated::SHIFT_RIGHT];
+        let generation = {
+            let mut st = engine.lock();
+            st.is_replacing = true;
+            st.buffered_keys.push(Typed {
+                key: 'x',
+                shift: false,
+            });
+            st.held_keys.insert('x');
+            st.generation
+        };
+        // A held suffix key is absent from the corrected word, but still has
+        // to be released before the injector can reproduce it.
+        assert!(engine
+            .replay_snapshot(&replay, generation, Duration::ZERO)
+            .is_none());
+        engine.lock().held_keys.remove(&'x');
+        for key in replay {
+            engine.lock().held_keys.insert(key);
+            assert!(engine
+                .replay_snapshot(&replay, generation, Duration::ZERO)
+                .is_none());
+            engine.lock().held_keys.remove(&key);
+        }
+        for modifier in [Simulated::CTRL_LEFT, Simulated::CTRL_RIGHT] {
+            engine.lock().held_keys.insert(modifier);
+            assert!(engine
+                .replay_snapshot(&replay, generation, Duration::ZERO)
+                .is_none());
+            engine.lock().held_keys.remove(&modifier);
+        }
+        let buffered = engine
+            .replay_snapshot(&replay, generation, Duration::ZERO)
+            .unwrap();
+        assert_eq!(
+            buffered.iter().map(|typed| typed.key).collect::<String>(),
+            "x"
+        );
+        engine.lock().focus = Some(1);
+        assert!(engine.replay_valid(&replay, generation, buffered.len()));
+        engine.lock().held_keys.insert(Simulated::CTRL_LEFT);
+        assert!(!engine.replay_valid(&replay, generation, buffered.len()));
+        engine.lock().held_keys.clear();
+        engine.lock().buffered_keys.push(Typed {
+            key: 'y',
+            shift: false,
+        });
+        assert!(!engine.replay_valid(&replay, generation, buffered.len()));
+        engine.forget_everything();
+        assert!(!engine.replay_valid(&replay, generation, buffered.len()));
+        assert!(engine
+            .replay_snapshot(&replay, generation, Duration::ZERO)
+            .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replay_snapshot_waits_for_keys_added_during_release() {
+        let session = Session::new();
+        let engine = Arc::clone(&session.engine);
+        let generation = {
+            let mut st = engine.lock();
+            st.is_replacing = true;
+            st.buffered_keys.push(Typed {
+                key: 'x',
+                shift: false,
+            });
+            st.held_keys.insert('x');
+            st.generation
+        };
+        let (done, snapshot) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            done.send(engine.replay_snapshot(&['e', ' '], generation, Duration::from_secs(2)))
+                .unwrap();
+        });
+        assert!(matches!(
+            snapshot.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        {
+            let mut st = session.engine.lock();
+            st.buffered_keys.push(Typed {
+                key: 'y',
+                shift: false,
+            });
+            st.held_keys.insert('y');
+            st.held_keys.remove(&'x');
+        }
+        assert!(matches!(
+            snapshot.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        session.engine.lock().held_keys.remove(&'y');
+        let buffered = snapshot
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            buffered.iter().map(|typed| typed.key).collect::<String>(),
+            "xy"
+        );
+        worker.join().unwrap();
+    }
+
+    type Session = SessionWithPolicy<true>;
+
+    impl<const QUEUE_UNDO: bool> SessionWithPolicy<QUEUE_UNDO> {
         fn new() -> Self {
             let (ready_tx, ready) = mpsc::sync_channel(1);
             let (proceed, proceed_rx) = mpsc::sync_channel(1);
@@ -3347,6 +4002,177 @@ mod tests {
         fn text(&self) -> String {
             self.engine.injector.text.lock().unwrap().clone()
         }
+    }
+
+    #[test]
+    fn command_modifiers_cancel_pending_keycode_replacement() {
+        const CHILD: &str = "RECAST_COMMAND_MODIFIER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::command_modifiers_cancel_pending_keycode_replacement",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::config::Config::update_live(|cfg| {
+            cfg.action_shortcut = "left_ctrl".into();
+            cfg.undo_shortcut = "right_ctrl".into();
+        });
+        for modifier in [Simulated::CTRL_LEFT, Simulated::CTRL_RIGHT] {
+            let s = SessionWithPolicy::<false>::new();
+            assert!(!s.engine.control.has_app_rules());
+            s.type_text("recieve");
+            s.engine.key_press(' ');
+            s.engine.injector.text.lock().unwrap().push(' ');
+            s.pending();
+            let generation = s.engine.lock().generation;
+            s.engine.key_press(modifier);
+            assert_ne!(s.engine.lock().generation, generation);
+            assert!(!s.engine.replacement_valid(generation));
+            s.engine.key_release(' ');
+            s.engine.key_release(modifier);
+            s.finish();
+            assert_eq!(s.text(), "recieve ");
+            assert_eq!(s.engine.control.fixed_count(), 0);
+            assert!(s.engine.lock().last_action.is_none());
+        }
+
+        // Shift completion taps keep their existing queue, and the platform
+        // that injects text without physical Ctrl flags still queues undo taps.
+        fn gesture_survives<const QUEUE_UNDO: bool>(modifier: char) {
+            let s = SessionWithPolicy::<QUEUE_UNDO>::new();
+            s.type_text("recieve ");
+            s.pending();
+            let generation = s.engine.lock().generation;
+            s.tap(modifier);
+            assert_eq!(s.engine.lock().generation, generation);
+            s.finish();
+            assert_eq!(s.text(), "receive ");
+        }
+        gesture_survives::<false>(Simulated::SHIFT_RIGHT);
+        gesture_survives::<true>(Simulated::CTRL_LEFT);
+
+        #[cfg(target_os = "linux")]
+        {
+            let s = SessionWithPolicy::<false>::new();
+            s.type_text("recieve ");
+            s.pending();
+            let generation = s.engine.lock().generation;
+            let replay = ['r', ' '];
+            assert!(s.engine.replay_valid(&replay, generation, 0));
+            FOCUS.store(2, Ordering::SeqCst);
+            assert!(!s.engine.replay_valid(&replay, generation, 0));
+            FOCUS.store(1, Ordering::SeqCst);
+            assert!(s.engine.replay_valid(&replay, generation, 0));
+            s.type_text("x");
+            assert!(!s.engine.replay_valid(&replay, generation, 0));
+            s.finish();
+            assert_eq!(s.text(), "receive x");
+        }
+    }
+
+    #[test]
+    fn input_during_commit_bookkeeping_invalidates_snapshot() {
+        // Engine simulations share configuration and focus with other tests.
+        const CHILD: &str = "RECAST_COMMIT_INPUT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::input_during_commit_bookkeeping_invalidates_snapshot",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        let history = s.engine.control.lock_history_for_test();
+        s.proceed.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while s.engine.control.fixed_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "correction did not reach bookkeeping"
+            );
+            thread::yield_now();
+        }
+        // The worker accepted its replay snapshot before blocking on history.
+        s.type_text("x");
+        drop(history);
+        s.idle();
+        assert_eq!(s.text(), "receive x");
+        assert!(s.engine.lock().no_fix);
+        assert!(s.engine.lock().last_action.is_none());
+        assert_eq!(s.engine.control.fixed_count(), 1);
+        s.undo();
+        assert!(s.ready.try_recv().is_err());
+        assert_eq!(s.text(), "receive x");
+
+        s.type_text(" recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "receive x receive ");
+    }
+
+    #[test]
+    fn buffered_terminator_overflow_cancels_pending_edits() {
+        // Engine simulations share configuration and focus with other tests.
+        const CHILD: &str = "RECAST_BUFFERED_TERMINATOR_OVERFLOW_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::engine::tests::buffered_terminator_overflow_cancels_pending_edits",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let s = Session::new();
+        let spaces = " ".repeat(crate::types::MAX_WORD_KEYS + 1);
+        s.type_text("recieve ");
+        s.pending();
+        s.type_text(&spaces);
+        s.finish();
+        assert_eq!(s.text(), format!("recieve {spaces}"));
+        assert!(s.engine.lock().last_action.is_none());
+        assert!(s.engine.lock().keys.is_empty());
+        assert_eq!(s.engine.control.fixed_count(), 0);
+
+        // The next boundary recovers ordinary correction after cancellation.
+        s.type_text(" ");
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("recieve {spaces} receive "));
     }
 
     #[test]
@@ -4358,7 +5184,7 @@ mod tests {
             st.generation
         };
         s.engine
-            .input_device_removed(&HashSet::from([Simulated::CTRL_LEFT]));
+            .input_device_removed(1, &HashSet::from([Simulated::CTRL_LEFT]));
         let st = s.engine.lock();
         assert_ne!(st.generation, generation);
         assert!(st.keys.is_empty() && st.no_fix);

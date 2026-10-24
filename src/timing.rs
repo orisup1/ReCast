@@ -92,9 +92,9 @@ pub struct Injection {
     ///
     /// An ordinary keypress lasts 50–150 ms, so this has to be several times
     /// that to be a ceiling rather than a deadline. Reaching it means the user
-    /// is leaning on space, which is already producing auto-repeat the
-    /// correction cannot be reconciled with; the replacement goes out anyway,
-    /// space or no space.
+    /// is leaning on space, which may already be producing auto-repeat. The
+    /// final replay check abandons the replacement if any replay key remains
+    /// held, preserving the original text rather than losing characters.
     pub terminator_release_timeout: Duration,
 
     /// How often that wait re-checks whether the key has come up. Straight

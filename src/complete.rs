@@ -791,17 +791,15 @@ fn remove_from_ignore_file(word: &str) {
     let Some(path) = user_path("ignore.txt") else {
         return;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    remove_from_ignore_path(&path, word);
+}
+
+fn remove_from_ignore_path(path: &std::path::Path, word: &str) {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
-    // Rename over the original rather than truncating it: the user wrote this
-    // file, and a failed write should cost them nothing.
-    let tmp = path.with_extension("txt.tmp");
-    if std::fs::write(&tmp, without_word(&text, word)).is_ok()
-        && std::fs::rename(&tmp, &path).is_err()
-    {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    // Preserve managed symlinks and never follow an existing temporary file.
+    let _ = crate::settings::write_atomic(path, &without_word(&text, word));
 }
 
 /// `text` without the lines that list `word`. Everything else — comments,
@@ -916,7 +914,8 @@ pub fn learn(word: &str) {
     if !suppressed(&word) {
         return;
     }
-    *counts.entry(word).or_insert(0) += 1;
+    let count = counts.entry(word).or_insert(0);
+    *count = count.saturating_add(1);
     write_learned(&counts);
 }
 
@@ -951,15 +950,7 @@ fn write_learned(counts: &HashMap<String, u32>) {
     let Some(path) = user_path(LEARNED_FILE) else {
         return;
     };
-    if let Some(dir) = path.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
-    }
-    let tmp = path.with_extension("txt.tmp");
-    if std::fs::write(&tmp, learned_text(counts)).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::settings::write_atomic(&path, &learned_text(counts));
 }
 
 /// Words the user has taken back with the undo gesture this session.
@@ -1373,6 +1364,98 @@ fn parse_abbreviations(text: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod learned_list {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn learned_saves_preserve_unrelated_symlink_targets() {
+        const CHILD: &str = "RECAST_LEARNED_SYMLINK_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "complete::learned_list::learned_saves_preserve_unrelated_symlink_targets",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = config_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LEARNED_FILE);
+        let unrelated = dir.join("unrelated.txt");
+        std::fs::write(&unrelated, "keep this file\n").unwrap();
+        let old_temp = path.with_extension("txt.tmp");
+        std::os::unix::fs::symlink(&unrelated, &old_temp).unwrap();
+        let counts = HashMap::from([("example".into(), 2)]);
+        write_learned(&counts);
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "keep this file\n"
+        );
+        assert!(std::fs::symlink_metadata(&old_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            parse_learned(&std::fs::read_to_string(&path).unwrap()),
+            counts
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&unrelated, &path).unwrap();
+        write_learned(&counts);
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "keep this file\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn learning_preserves_a_maximum_count_from_the_user_file() {
+        const CHILD: &str = "RECAST_LEARNED_MAX_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "complete::learned_list::learning_preserves_a_maximum_count_from_the_user_file",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = config_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LEARNED_FILE);
+        std::fs::write(&path, format!("example\t{}\n", u32::MAX)).unwrap();
+        assert!(learned("example"));
+        suppress("example");
+        learn("example");
+        assert!(learned("example"));
+        assert_eq!(
+            parse_learned(&std::fs::read_to_string(&path).unwrap())["example"],
+            u32::MAX
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_count_survives_being_written_and_read_back() {
@@ -2449,6 +2532,59 @@ mod tests {
         );
         // … and a word that is not there leaves the file byte-identical.
         assert_eq!(without_word(before, "redis"), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignore_rewrite_preserves_managed_and_temporary_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "recast-ignore-symlinks-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ignore.txt");
+        let target = dir.join("managed.txt");
+        let before = "# managed words\npostgres\nhostname\n";
+        let after = "# managed words\nhostname\n";
+
+        std::fs::write(&path, before).unwrap();
+        remove_from_ignore_path(&path, "postgres");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&target, before).unwrap();
+        symlink(&target, &path).unwrap();
+        remove_from_ignore_path(&path, "postgres");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+
+        // A stale temporary link must never redirect the replacement write.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, before).unwrap();
+        let unrelated = dir.join("unrelated.txt");
+        std::fs::write(&unrelated, "keep this file\n").unwrap();
+        let old_temp = path.with_extension("txt.tmp");
+        symlink(&unrelated, &old_temp).unwrap();
+        remove_from_ignore_path(&path, "postgres");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "keep this file\n"
+        );
+        assert!(std::fs::symlink_metadata(&old_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

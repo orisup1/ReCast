@@ -12,6 +12,66 @@
 
 pub mod engine;
 
+/// Quartz carries at most 20 UTF-16 units per keyboard event.
+/// Keep surrogate pairs together and give each payload its own press/release pair.
+#[cfg(any(target_os = "macos", test))]
+fn unicode_text_events(text: &str, mut emit: impl FnMut(&[u16], bool) -> Option<()>) -> Option<()> {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut remaining = utf16.as_slice();
+    while !remaining.is_empty() {
+        let mut count = remaining.len().min(20);
+        if count < remaining.len() && (0xd800..=0xdbff).contains(&remaining[count - 1]) {
+            count -= 1;
+        }
+        let (chunk, tail) = remaining.split_at(count);
+        for down in [true, false] {
+            emit(chunk, down)?;
+        }
+        remaining = tail;
+    }
+    Some(())
+}
+
+#[cfg(test)]
+#[test]
+fn quartz_text_events_preserve_long_strings_and_surrogate_boundaries() {
+    for text in [
+        String::new(),
+        "short text".into(),
+        "x".repeat(20),
+        "x".repeat(21),
+        "an abbreviation that expands beyond one keyboard event".into(),
+        "שלום עולם ".repeat(8),
+        format!("{}🙂z", "x".repeat(19)),
+        "🙂".repeat(21),
+    ] {
+        let mut events = Vec::new();
+        unicode_text_events(&text, |units, down| {
+            events.push((units.to_vec(), down));
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(events.len() % 2, 0);
+        for pair in events.chunks_exact(2) {
+            assert!(pair[0].1);
+            assert!(!pair[1].1);
+            assert_eq!(pair[0].0, pair[1].0);
+            assert!(!pair[0].0.is_empty());
+            assert!(pair[0].0.len() <= 20);
+            String::from_utf16(&pair[0].0).expect("a payload must not split a surrogate pair");
+        }
+        // Model Quartz's bounded event payload for both press-only and release-only consumers.
+        for down in [true, false] {
+            let received: Vec<u16> = events
+                .iter()
+                .filter(|(_, pressed)| *pressed == down)
+                .flat_map(|(units, _)| units.iter().take(20).copied())
+                .collect();
+            assert_eq!(String::from_utf16(&received).unwrap(), text);
+        }
+    }
+}
+
 /// Start workers only after Linux has forked: other threads do not survive fork.
 fn start_background_tasks(control: &std::sync::Arc<crate::types::AppControl>) {
     crate::complete::spawn_watcher();

@@ -106,6 +106,99 @@ fn isolated_binary(name: &str) -> std::path::PathBuf {
 
 #[cfg(unix)]
 #[test]
+fn personal_data_cannot_be_cleared_while_another_instance_can_rewrite_it() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    struct HeldChild(std::process::Child);
+    impl Drop for HeldChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let binary = isolated_binary("clear");
+    let dir = std::env::temp_dir().join(format!("recast-clear-{}", std::process::id()));
+    let config = if cfg!(target_os = "macos") {
+        dir.join("Library/Application Support/recast")
+    } else {
+        dir.join("recast")
+    };
+    let personal = config.join("personal");
+    std::fs::create_dir_all(&personal).unwrap();
+    let frequency = personal.join("freq.txt");
+    std::fs::write(&frequency, "retainedprivateword\t7\n").unwrap();
+    // Keep a same-name peer alive without starting keyboard capture or
+    // touching a developer's running daemon. Its config read blocks on a FIFO.
+    let config_file = config.join("config.toml");
+    nix::unistd::mkfifo(
+        &config_file,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let mut held = HeldChild(
+        Command::new(&binary)
+            .arg("--status")
+            .env("HOME", &dir)
+            .env("XDG_CONFIG_HOME", &dir)
+            .env("RECAST_LAYOUT_BACKEND", "none")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let writer = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&config_file)
+        {
+            Ok(writer) => break writer,
+            Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                assert!(held.0.try_wait().unwrap().is_none());
+                assert!(Instant::now() < deadline, "fixture did not read config");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("opening config FIFO: {error}"),
+        }
+    };
+    let clear = || {
+        Command::new(&binary)
+            .arg("--clear-personal-data")
+            .env("HOME", &dir)
+            .env("XDG_CONFIG_HOME", &dir)
+            .output()
+            .unwrap()
+    };
+    let refused = clear();
+    assert!(
+        !refused.status.success(),
+        "a live peer can restore old data"
+    );
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("Stop ReCast first"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&frequency).unwrap(),
+        "retainedprivateword\t7\n"
+    );
+    assert!(held.0.try_wait().unwrap().is_none());
+    drop(held);
+    drop(writer);
+    let cleared = clear();
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    assert!(!personal.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn status_does_not_discover_another_isolated_cli_binary() {
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{Duration, Instant};

@@ -531,9 +531,10 @@ fn physical_english_to_hebrew(c: char) -> Option<char> {
 }
 
 /// Express supported Hebrew text as US characters on the same physical keys.
-/// Linux uses this before injecting under the Hebrew layout. Unsupported
-/// characters fail the whole replacement instead of producing partial text.
-#[cfg(any(target_os = "linux", test))]
+/// Linux uses this before injecting under the Hebrew layout; native text
+/// backends use it to reconstruct the physical keys of their inserted text.
+/// Unsupported characters fail the whole conversion instead of producing
+/// partial text.
 pub fn hebrew_text_to_physical_english(text: &str) -> Option<String> {
     text.chars()
         .map(|c| {
