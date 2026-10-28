@@ -794,8 +794,10 @@ and further latency opportunities.
 
 The shared correction planner is in [src/dictionary/mod.rs](src/dictionary/mod.rs), with
 spelling in [src/spell/mod.rs](src/spell/mod.rs) and completion/lists in
-[src/complete.rs](src/complete.rs). [src/platform/engine.rs](src/platform/engine.rs)
+[src/complete.rs](src/complete.rs). [src/platform/engine](src/platform/engine)
 owns typing, cancellation, completion cycling, and undo across all platforms.
+Its modules separate event handling, word state, correction planning, gestures,
+injection, and layout switching; `platform.rs` defines the native adapter contract.
 Native adapters handle capture/injection; [src/layout](src/layout) handles layout backends.
 
 Add real correction reports to [tests/data/corrections.tsv](tests/data/corrections.tsv).
@@ -810,6 +812,7 @@ screen; focus benchmarks require a desktop session.
 release CLI behavior on Linux, macOS, and Windows. The manual
 [Binaries workflow](.github/workflows/binaries.yml) publishes release assets and
 checksums, with signing/notarization when repository credentials are configured.
+See [DISTRIBUTION.md](DISTRIBUTION.md) for the release steps and signing secrets.
 `make help` and `.\deploy.ps1 -Target help` list build, install, and service targets.
 
 ## Dictionary expansion

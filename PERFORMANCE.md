@@ -12,6 +12,9 @@
   rebuilds the cache; edit costs, rank limits, and confidence gates are unchanged.
 - Short completion prefixes with exact candidates no longer generate hundreds
   of one-edit variants before immediately discarding them.
+- Engine press/release handlers reuse the configuration snapshot already taken
+  for that event when checking personalization, avoiding a second configuration
+  lock and clone at those checks.
 
 ## Reproducing measurements
 
@@ -42,6 +45,63 @@ No benchmark asserts a wall-clock threshold.
 These measurements cover search work, not the complete keyboard-to-screen path.
 Physical key release, layout confirmation, and injection delivery also affect
 visible latency. Injection timing settings remain unchanged.
+
+## Engine capture benchmark and profiling
+
+The shared state machine is split under `src/platform/engine/`. File size does
+not itself establish a runtime bottleneck. The ignored `benchmark_engine_typing`
+test exercises real press/release handlers with simulated focus and the English
+word `keyboard`. It reports letter and Space latency separately after 100 warmup
+words, with 20,000 measured words and personalization disabled. Letter samples
+are averages across the word's eight press/release pairs. Space includes automatic
+planning for an unchanged known word. Assertions check that no replacement was
+scheduled and that the word buffer was cleared. It does not measure native focus
+queries, misspelling search, layout changes, or on-screen injection.
+
+```sh
+cargo test --locked --release benchmark_engine_typing -- --ignored --nocapture --test-threads=1
+```
+
+Three consecutive local Apple Silicon macOS release runs measured letter-pair
+p50 values of 312–333 ns and Space-pair p50 values of 11.167–11.917 µs. These are
+synthetic steady-state measurements, not native keyboard-to-screen latency or a
+controlled before/after comparison. A CPU flamegraph was not captured in this
+environment: `cargo-flamegraph` and `xctrace` were unavailable.
+
+For CPU stack samples, install `cargo-flamegraph` and its platform backend:
+Linux needs `perf`; macOS needs Xcode's `xctrace`. Follow the
+[upstream setup instructions](https://github.com/flamegraph-rs/flamegraph),
+including Linux linker flags for lld/mold and local profiler permissions.
+Keep symbols for the profiling build without changing shipping settings:
+
+```sh
+cargo install flamegraph --locked
+CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false \
+  cargo flamegraph --unit-test recast -o target/engine-flamegraph.svg -- \
+  platform::engine::tests::benchmark_engine_typing --exact --ignored --nocapture --test-threads=1
+```
+
+Repeat with `benchmarks::benchmark_spelling_correction` or
+`benchmarks::benchmark_completion_candidates` to inspect slower candidate searches.
+The capture benchmark uses no subprocess, so the profiler samples the handlers
+directly. Profile actual desktop typing separately for OS-query and injection
+costs. CPU flamegraphs locate sampled CPU work; they do not count heap allocations.
+
+## Dictionary memory and correction scheduling
+
+Dictionary blobs remain embedded as static strings with build-time prefix indexes.
+They are not parsed or copied into heap dictionaries at startup. Read-only binary
+data already benefits from OS paging; a separate mmap would add external files,
+deployment/version matching, and failure handling without establishing a memory
+saving. Measure resident memory and page faults before changing this format.
+Apple describes [executable paging and virtual memory](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/ManagingMemory/Articles/AboutMemory.html).
+
+Automatic correction starts only on Space, after a word is finished. Enter clears
+context without an automatic rewrite. Continued typing during replacement is
+buffered and replayed, with cancellation for stale focus or cursor context.
+Adding an idle debounce would change when edits can safely land after the cursor
+has advanced; it requires a measured problem and coverage for replay, undo, focus,
+and layout races. No debounce or injection delay was added in the module split.
 
 ## Further opportunities
 
