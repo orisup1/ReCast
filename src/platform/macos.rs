@@ -995,6 +995,24 @@ fn request_accessibility() -> bool {
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) != 0 }
 }
 
+pub(super) fn open_setup_settings() -> Result<(), String> {
+    let action = if accessibility_granted() {
+        SetupAction::Keyboards
+    } else {
+        SetupAction::Accessibility
+    };
+    let modern = std::path::Path::new("/System/Applications/System Settings.app").exists();
+    let status = std::process::Command::new("open")
+        .arg(action.settings_url(modern).unwrap())
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Open System Settings > Privacy & Security > Accessibility or Keyboard > Input Sources.".into())
+    }
+}
+
 /// Native setup stays available while the user switches to System Settings.
 pub fn setup_guidance() -> bool {
     use crate::notify::DialogDestination;

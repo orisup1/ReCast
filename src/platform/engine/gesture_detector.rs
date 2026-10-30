@@ -73,7 +73,7 @@ impl<P: Platform> AppState<P> {
 
 impl<P: Platform> Engine<P> {
     /// A bare double tap undoes a correction or converts an unchanged word.
-    /// The optional single-tap binding undoes corrections or unlists words.
+    /// The optional single-tap binding only undoes corrections.
     /// Both gestures require unchanged cursor and focus context.
     pub(super) fn action_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, key: P::Key) {
         let Some(down) = st.action_down.take() else {
@@ -90,10 +90,7 @@ impl<P: Platform> Engine<P> {
         let single = ((shortcut == "left_ctrl" && key == P::CTRL_LEFT)
             || (shortcut == "right_ctrl" && key == P::CTRL_RIGHT))
             && ((st.is_replacing && !st.selection_replacing)
-                || matches!(
-                    st.last_action,
-                    Some(LastAction::Fixed(_) | LastAction::Skipped(_))
-                ));
+                || matches!(st.last_action, Some(LastAction::Fixed(_))));
         let double = shortcut_matches::<P>(&config.action_shortcut, key);
         if !double {
             st.last_action_tap = None;
@@ -184,7 +181,7 @@ impl<P: Platform> Engine<P> {
                     st.last_action = retry.last_action;
                 }
             }
-            Some(LastAction::Skipped(skip)) => self.unlist_and_correct(st, skip),
+            Some(action) if single => st.last_action = Some(action),
             Some(LastAction::Unchanged {
                 keys,
                 terminator,

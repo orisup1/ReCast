@@ -430,7 +430,7 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         Line::from(
             "                       conversion includes unknown words; repeat to convert back.",
         ),
-        Line::from("  Enable single-Ctrl undo in Settings to undo or unlist words."),
+        Line::from("  Enable Undo only in Settings > Shortcuts. Edit exceptions in Word rules."),
         Line::from("  Extra spaces preserve undo; other typing or cursor movement ends it."),
         Line::from("  One undo skips a word this session; two occasions remember it."),
         Line::from(""),

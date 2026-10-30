@@ -3,12 +3,12 @@
 Run these checks on macOS and Windows. Cross-target Clippy verifies compilation;
 it does not verify native drawing, privacy grants, focus, or display scaling.
 
-1. Launch from Finder/Explorer and a terminal. Confirm the menu has Status, Pause,
+1. Launch from Finder/Explorer and a terminal. Confirm the menu has Status, current-app mode, quick app pause, Pause,
    Recent corrections, Language preference, Settings, Help, and Quit. On macOS, the icon should remain
    compact in light and dark appearances, with no terminal banner in its title.
 2. Pause, resume, and disable correction. Check distinct icon shapes, matching
    status text, and the pause countdown. Re-enable correction after this check.
-3. Open each Settings section. Change spelling, sensitivity, and shortcuts; verify
+3. Use the visible navigation to open each Settings section. Change spelling, sensitivity, and shortcuts; verify
    immediate behavior and persistence after restarting. A conflicting shortcut or
    environment override should show an explanation and restore the previous value.
    Select Balanced, Prefer English, and Prefer Hebrew in both the menu and General;
@@ -27,7 +27,18 @@ it does not verify native drawing, privacy grants, focus, or display scaling.
    between monitors with different scales, resize it to its minimum, and check
    readable fonts, unclipped controls, and reachable history pagination. Include
    the log window and modal word-rule editors.
-8. Navigate with Tab, Shift+Tab, Space, and arrow keys. Check VoiceOver/Narrator
+8. Resize Settings and practice to minimum height. Scroll to every control without
+   shrinking text or hit targets. Tab to offscreen controls and confirm they become
+   visible. Switch sections after scrolling; verify navigation remains reachable.
+   Preview English `recieve` and Hebrew `תודדה` with the matching keyboard choice.
+   Preview must not type, switch the OS layout, learn, or increment correction counts.
+   Change sensitivity and preview again. Verify selection and results remain stable
+   across tray refreshes. Check original/replacement alignment separately with
+   `(שלום!)`, `(hello!)`, digits, and mixed text; timestamps must remain separate.
+9. In practice, select an undo-only key. Verify unchanged/ignored words remain
+   unchanged, exceptions survive, and corrected words restore. Existing shortcuts
+   must survive unless explicitly edited. Shared keys retain the double-tap delay.
+10. Navigate with Tab, Shift+Tab, Space, and arrow keys. Check VoiceOver/Narrator
    labels. Minimize and reopen each window from the tray. Closing a secondary
    window must leave correction running; closing the log must stop logging.
 

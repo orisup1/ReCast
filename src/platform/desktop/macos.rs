@@ -47,6 +47,7 @@ pub struct Native {
     window: id,
     content: id,
     target: id,
+    scroll: id,
     callback: Box<Callback>,
     controls: Vec<Control>,
     height: f64,
@@ -74,6 +75,7 @@ impl Native {
                 window,
                 content,
                 target,
+                scroll: nil,
                 callback,
                 controls: Vec::new(),
                 height: 0.0,
@@ -81,8 +83,46 @@ impl Native {
         }
     }
 
-    pub fn render(&mut self, elements: &[Element], height: f64, _: f64) -> Result<(), String> {
+    pub fn render(
+        &mut self,
+        elements: &[Element],
+        height: f64,
+        _: f64,
+        scrolling: bool,
+    ) -> Result<(), String> {
         unsafe {
+            if scrolling && self.scroll == nil {
+                let scroll: id = msg_send![class!(NSScrollView), new];
+                let document: id = msg_send![class!(NSView), new];
+                let _: () = msg_send![scroll, setHasVerticalScroller: YES];
+                let _: () = msg_send![scroll, setAutohidesScrollers: YES];
+                let _: () = msg_send![scroll, setDocumentView: document];
+                let _: () = msg_send![self.content, addSubview: scroll];
+                self.content = document;
+                self.scroll = scroll;
+                let _: () = msg_send![document, release];
+            }
+            let height = if scrolling {
+                let root: id = msg_send![self.window, contentView];
+                let bounds: NSRect = msg_send![root, bounds];
+                let _: () = msg_send![self.scroll, setFrame: bounds];
+                let size: NSSize = msg_send![self.scroll, contentSize];
+                let document_height = elements
+                    .iter()
+                    .map(|e| e.frame[1] + e.frame[3] + 16.0)
+                    .fold(height, f64::max);
+                let previous: NSRect = msg_send![self.content, frame];
+                let clip: id = msg_send![self.scroll, contentView];
+                let visible: NSRect = msg_send![clip, bounds];
+                let top = (previous.size.height - visible.origin.y - visible.size.height).max(0.0);
+                let _: () =
+                    msg_send![self.content, setFrameSize: NSSize::new(size.width, document_height)];
+                let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, (document_height - size.height - top).max(0.0))];
+                let _: () = msg_send![self.scroll, reflectScrolledClipView: clip];
+                document_height
+            } else {
+                height
+            };
             if self.controls.len() != elements.len()
                 || self
                     .controls
@@ -149,7 +189,7 @@ impl Native {
                     };
                     let font: id = msg_send![class!(NSFont), systemFontOfSize: if matches!(element.kind, Kind::Heading) { 19.0f64 } else { 13.0f64 }];
                     let _: () = msg_send![value, setFont: font];
-                    if matches!(element.kind, Kind::Input | Kind::Choice(..)) {
+                    if matches!(element.kind, Kind::Input | Kind::Choice(..) | Kind::Text) {
                         let label = string(&element.text);
                         let _: () = msg_send![value, setAccessibilityLabel: label];
                         let _: () = msg_send![label, release];
@@ -223,6 +263,10 @@ impl Native {
                         }
                     }
                     let _: () = msg_send![text, release];
+                }
+                if matches!(element.kind, Kind::Label | Kind::Heading) {
+                    let _: () = msg_send![control.value, setAlignment: if element.rtl { 1isize } else { 0isize }];
+                    let _: () = msg_send![control.value, setBaseWritingDirection: if element.rtl { 1isize } else { 0isize }];
                 }
                 match &element.kind {
                     Kind::Check(on) => {
@@ -323,6 +367,10 @@ impl Drop for Native {
     fn drop(&mut self) {
         unsafe {
             self.clear();
+            if self.scroll != nil {
+                let _: () = msg_send![self.scroll, removeFromSuperview];
+                let _: () = msg_send![self.scroll, release];
+            }
             let _: () = msg_send![self.target, release];
         }
     }

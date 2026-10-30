@@ -326,7 +326,7 @@ pub struct Correction {
 impl Correction {
     pub fn inspection(&self) -> String {
         format!(
-            "Original: {:?}\nReplacement: {:?}\nOperation: {}\nStatus: {}\n\n{}\n\nEvidence was captured when this replacement was applied. It stays in memory with Recent corrections.",
+            "Original: \u{2068}{:?}\u{2069}\nReplacement: \u{2068}{:?}\u{2069}\nOperation: {}\nStatus: {}\n\n{}\n\nEvidence was captured when this replacement was applied. It stays in memory with Recent corrections.",
             self.from, self.to, self.kind.tag(),
             if self.undone { "Undone" } else { "Applied" }, self.details
         )

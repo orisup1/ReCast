@@ -18,14 +18,14 @@ pub fn opened(control: &AppControl) {
     }
 }
 
-fn restore_instruction(config: &crate::config::Config) -> String {
-    if config.action_shortcut != "none" {
-        config.action_gesture()
-    } else if config.undo_shortcut != "none" {
+pub(crate) fn restore_instruction(config: &crate::config::Config) -> String {
+    if config.undo_shortcut != "none" {
         format!(
             "tap {}",
             crate::config::modifier_label(&config.undo_shortcut)
         )
+    } else if config.action_shortcut != "none" {
+        config.action_gesture()
     } else {
         "enable an undo shortcut in Settings, then use it".into()
     }
@@ -40,9 +40,9 @@ pub fn instructions() -> String {
 
 pub fn shortcut_label(value: &str) -> &'static str {
     match value {
-        "left_ctrl" => "Also single-tap Left Ctrl",
-        "right_ctrl" => "Also single-tap Right Ctrl",
-        _ => "No extra single-tap undo",
+        "left_ctrl" => "Undo only: tap Left Ctrl",
+        "right_ctrl" => "Undo only: tap Right Ctrl",
+        _ => "Undo-only shortcut disabled",
     }
 }
 

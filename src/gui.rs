@@ -18,6 +18,10 @@ struct App {
     show_practice: bool,
     practice_text: String,
     practice_offered: bool,
+    settings_page: usize,
+    example: usize,
+    preview_hebrew: bool,
+    preview: String,
 }
 
 impl eframe::App for App {
@@ -57,6 +61,7 @@ impl eframe::App for App {
                 }
                 ui.label(crate::practice::feedback(&self.control));
                 ui.label(&self.health);
+                ui.label("Set an undo-only key in Settings > Shortcuts. It never converts unchanged words.");
                 ui.label("Close to skip. Reopen Practice from the controls anytime.");
             });
         self.control
@@ -151,6 +156,17 @@ impl eframe::App for App {
                 ui.heading(state);
                 ui.label(detail);
 
+                if let Some((name, id)) = &self.last_app {
+                    ui.label(format!("Correction in {name}"));
+                    ui.horizontal_wrapped(|ui| {
+                        for mode in crate::config::AppMode::ALL {
+                            if ui.selectable_label(self.control.app_mode(Some(id)) == Some(mode), mode.label()).clicked() {
+                                self.error = crate::settings::set_app_mode(&self.control, id, mode).err();
+                            }
+                        }
+                    });
+                }
+
                 // Keep the saved switch distinct from the temporary pause.
                 let mut enabled = self.control.is_switched_on();
                 let checkbox = egui::Checkbox::new(
@@ -225,21 +241,28 @@ impl eframe::App for App {
                     }
                     for correction in history {
                         let ignored = crate::complete::ignored(&correction.from);
-                        let label = format!("{}{} → {} ({}){}",
-                            if correction.undone { "Undone: " } else { "" },
-                            correction.from, correction.to, correction.kind.tag(),
-                            if ignored { " — ignored" } else { "" });
-                        ui.collapsing(label, |ui| {
+                        let label = format!("{} · {} · {}{}", correction.at.format("%H:%M:%S"), correction.kind.tag(), if correction.undone { "Undone" } else { "Applied" }, if ignored { " · ignored" } else { "" });
+                        ui.push_id(correction.at, |ui| { ui.collapsing(label, |ui| {
+                            for (label, word) in [("Original", &correction.from), ("Replacement", &correction.to)] {
+                                ui.label(label);
+                                let rtl = word.chars().find(|c| c.is_alphabetic()).is_some_and(|c| ('א'..='ת').contains(&c));
+                                ui.with_layout(if rtl { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) }, |ui| { ui.label(word); });
+                            }
                             ui.label(correction.inspection());
                             if ui.add_enabled(!ignored, egui::Button::new(if ignored { "Already ignored" } else { "Ignore this word" })).clicked() {
                                 crate::complete::ignore_word(&correction.from);
                             }
-                        });
+                        }); });
                     }
                 });
                 ui.separator();
                 ui.heading("Settings");
-                ui.collapsing("Word rules", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (page, title) in ["General", "Shortcuts", "Applications", "Word rules"].iter().enumerate() {
+                        ui.selectable_value(&mut self.settings_page, page, *title);
+                    }
+                });
+                if self.settings_page == 3 { ui.group(|ui| {
                     for kind in crate::complete::RuleKind::ALL {
                         if ui.add_enabled(self.rule_editor.is_none(), egui::Button::new(kind.title())).clicked() {
                             match crate::complete::RuleEditor::open(kind) {
@@ -253,7 +276,9 @@ impl eframe::App for App {
                         }
                     }
                 });
+                }
                 let cfg = crate::config::Config::global();
+                if self.settings_page == 0 {
                 ui.label("Language preference");
                 let mut preference = cfg.language_preference;
                 egui::ComboBox::from_id_source("prefer").selected_text(preference.label()).show_ui(ui, |ui| {
@@ -268,14 +293,36 @@ impl eframe::App for App {
                 for (label, key, mut checked) in [
                     ("Correct English/Hebrew spelling", "spell", cfg.spell_enabled),
                     ("Word completion and abbreviations", "complete", cfg.complete_enabled),
-                    ("Conservative spelling (single-typo fixes)", "spell_dist", cfg.spell_max_dist == 1),
+
                 ] {
                     if ui.checkbox(&mut checked, label).changed() {
                         let value = if key == "spell_dist" { if checked { "1" } else { "3" } } else if checked { "true" } else { "false" };
                         self.error = crate::settings::set_live(&self.control, key, value).err();
                     }
                 }
-                ui.label("Changes are saved and applied immediately.");
+                let mut sensitivity = cfg.spell_max_dist.min(3) as usize;
+                let labels = ["No automatic spelling edits", "Conservative — common typos only", "Balanced — everyday spelling mistakes", "Flexible — more complex typos"];
+                egui::ComboBox::from_id_source("sensitivity").selected_text(labels[sensitivity]).show_ui(ui, |ui| {
+                    for (index, label) in labels.iter().enumerate() { ui.selectable_value(&mut sensitivity, index, *label); }
+                });
+                if sensitivity != cfg.spell_max_dist as usize { self.error = crate::settings::set_live(&self.control, "spell_dist", &sensitivity.to_string()).err(); }
+                ui.small("Flexible may change unfamiliar words. Short words keep stricter limits.");
+                ui.label("Preview an example with current settings");
+                egui::ComboBox::from_id_source("example").selected_text(crate::explain::EXAMPLES[self.example]).show_ui(ui, |ui| {
+                    for (index, word) in crate::explain::EXAMPLES.iter().enumerate() { ui.selectable_value(&mut self.example, index, *word); }
+                });
+                ui.checkbox(&mut self.preview_hebrew, "Hebrew keyboard (otherwise English)");
+                if ui.button("Preview").clicked() {
+                    let layout = if self.preview_hebrew { crate::types::Language::Hebrew } else { crate::types::Language::English };
+                    self.preview = match crate::explain::preview(crate::explain::EXAMPLES[self.example], layout, None) {
+                        Ok((word, reason, _)) => format!("Result: {word}\n{reason}"),
+                        Err(error) => error,
+                    };
+                }
+                ui.label(&self.preview);
+                ui.small("No typing or learning. Excludes prior words and app restrictions; preview again after changing settings.");
+                }
+                if self.settings_page == 1 {
                 for (label, key, current, choices) in [
                     ("Double-tap action (undo / convert)", "action_shortcut", &cfg.action_shortcut, crate::config::ACTION_SHORTCUTS),
                     ("Completion (single tap)", "completion_shortcut", &cfg.completion_shortcut, crate::config::MODIFIER_SHORTCUTS),
@@ -292,7 +339,7 @@ impl eframe::App for App {
                         self.error = crate::settings::set_live(&self.control, key, &selected).err();
                     }
                 }
-                ui.label("Extra undo shortcut (single tap):");
+                ui.label("Undo only (single tap):");
                 let mut shortcut = cfg.undo_shortcut.clone();
                 egui::ComboBox::from_id_source("undo_shortcut").selected_text(crate::practice::shortcut_label(&shortcut)).show_ui(ui, |ui| {
                     for value in ["none", "left_ctrl", "right_ctrl"] {
@@ -303,6 +350,9 @@ impl eframe::App for App {
                     self.error = crate::settings::set_live(&self.control, "undo_shortcut", &shortcut).err();
                 }
                 ui.separator();
+                ui.small("Undo only never converts unchanged words. For immediate undo, use a different Ctrl key from the double-tap action. Shared keys wait half a second.");
+                }
+                if self.settings_page == 2 {
                 ui.heading("Application modes");
                 let mut excluded = crate::types::lock_forgiving(&self.control.excluded_apps).clone();
                 excluded.extend(crate::types::lock_forgiving(&self.control.layout_only_apps).iter().cloned());
@@ -325,6 +375,8 @@ impl eframe::App for App {
                         self.error = crate::settings::set_app_mode(&self.control, &id, crate::config::AppMode::Full).err();
                     }
                 }
+                }
+                ui.label("Changes are saved and applied immediately.");
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, error);
                 }
@@ -388,6 +440,10 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
                 show_practice: false,
                 practice_text: String::new(),
                 practice_offered: false,
+                settings_page: 0,
+                example: 0,
+                preview_hebrew: false,
+                preview: String::new(),
             })
         }),
     )

@@ -175,6 +175,22 @@ struct Callback {
     parent: HWND,
 }
 
+unsafe fn scroll_to(parent: HWND, position: i32) {
+    let old = GetScrollPos(parent, SB_VERT as i32);
+    SetScrollPos(parent, SB_VERT as i32, position, 1);
+    let current = GetScrollPos(parent, SB_VERT as i32);
+    ScrollWindowEx(
+        parent,
+        0,
+        old - current,
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE,
+    );
+}
+
 unsafe extern "system" fn procedure(
     hwnd: HWND,
     message: UINT,
@@ -184,6 +200,56 @@ unsafe extern "system" fn procedure(
     data: usize,
 ) -> LRESULT {
     let callback = &*(data as *const Callback);
+    if message == WM_VSCROLL || message == WM_MOUSEWHEEL {
+        let mut info: SCROLLINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
+        info.fMask = SIF_ALL;
+        GetScrollInfo(callback.parent, SB_VERT as i32, &mut info);
+        if info.nMax >= info.nPage as i32 && info.nPage > 0 {
+            let line = (32 * window_dpi(callback.parent) / 96) as i32;
+            let position = if message == WM_MOUSEWHEEL {
+                info.nPos - ((w >> 16) as i16 as i32) * line / WHEEL_DELTA as i32
+            } else {
+                match (w & 0xffff) as isize {
+                    SB_LINEUP => info.nPos - line,
+                    SB_LINEDOWN => info.nPos + line,
+                    SB_PAGEUP => info.nPos - info.nPage as i32,
+                    SB_PAGEDOWN => info.nPos + info.nPage as i32,
+                    SB_THUMBTRACK | SB_THUMBPOSITION => info.nTrackPos,
+                    SB_TOP => 0,
+                    SB_BOTTOM => info.nMax,
+                    _ => info.nPos,
+                }
+            };
+            scroll_to(callback.parent, position);
+            return 0;
+        }
+    }
+    if message == WM_SETFOCUS && hwnd != callback.parent {
+        let mut rect: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut rect);
+        MapWindowPoints(
+            std::ptr::null_mut(),
+            callback.parent,
+            &mut rect as *mut _ as *mut POINT,
+            2,
+        );
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(callback.parent, &mut client);
+        let delta = if rect.top < 0 {
+            rect.top
+        } else if rect.bottom > client.bottom {
+            rect.bottom - client.bottom
+        } else {
+            0
+        };
+        if delta != 0 {
+            scroll_to(
+                callback.parent,
+                GetScrollPos(callback.parent, SB_VERT as i32) + delta,
+            );
+        }
+    }
     if message == WM_COMMAND && l != 0 {
         let notification = (w >> 16) as u16;
         if notification == BN_CLICKED || notification == CBN_SELCHANGE {
@@ -243,8 +309,45 @@ impl Native {
         }
     }
 
-    pub fn render(&mut self, elements: &[Element], _: f64, scale: f64) -> Result<(), String> {
+    pub fn render(
+        &mut self,
+        elements: &[Element],
+        viewport: f64,
+        scale: f64,
+        scrolling: bool,
+    ) -> Result<(), String> {
         unsafe {
+            let old_offset = GetScrollPos(self.parent, SB_VERT as i32);
+            let mut info: SCROLLINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
+            info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            info.nMax = if scrolling {
+                (elements
+                    .iter()
+                    .map(|e| e.frame[1] + e.frame[3] + 16.0)
+                    .fold(viewport, f64::max)
+                    * scale)
+                    .ceil() as i32
+                    - 1
+            } else {
+                0
+            };
+            info.nPage = (viewport * scale).round() as u32;
+            info.nPos = old_offset;
+            SetScrollInfo(self.parent, SB_VERT as i32, &info, 1);
+            let offset = GetScrollPos(self.parent, SB_VERT as i32);
+            if old_offset != offset {
+                ScrollWindowEx(
+                    self.parent,
+                    0,
+                    old_offset - offset,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE,
+                );
+            }
             let dpi = (96.0 * scale).round() as u32;
             let scale_changed = dpi != self.dpi;
             let new_font = if dpi != self.dpi {
@@ -371,7 +474,7 @@ impl Native {
                         *control,
                         std::ptr::null_mut(),
                         (x * scale).round() as i32,
-                        (y * scale).round() as i32,
+                        (y * scale).round() as i32 - offset,
                         (width.max(1.0) * scale).round() as i32,
                         (height.max(1.0) * scale).round() as i32,
                         SWP_NOZORDER | SWP_NOACTIVATE,
@@ -385,6 +488,23 @@ impl Native {
                         _ => element.text.replace('\n', "\r\n"),
                     };
                     SetWindowTextW(*control, wide(&text).as_ptr());
+                }
+                if matches!(element.kind, Kind::Label | Kind::Heading) {
+                    let style = GetWindowLongPtrW(*control, GWL_STYLE) as u32;
+                    let alignment = if element.rtl { SS_RIGHT } else { SS_LEFT };
+                    SetWindowLongPtrW(
+                        *control,
+                        GWL_STYLE,
+                        ((style & !SS_TYPEMASK) | alignment) as isize,
+                    );
+                    let extended = GetWindowLongPtrW(*control, GWL_EXSTYLE) as u32;
+                    SetWindowLongPtrW(
+                        *control,
+                        GWL_EXSTYLE,
+                        ((extended & !WS_EX_RTLREADING)
+                            | if element.rtl { WS_EX_RTLREADING } else { 0 })
+                            as isize,
+                    );
                 }
                 match element.kind {
                     Kind::Check(on) => {

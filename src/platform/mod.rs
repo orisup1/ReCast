@@ -200,7 +200,7 @@ fn status_for<P: engine::Platform>(
     let mode =
         control.effective_app_mode(app.as_deref(), focus.as_ref().is_some_and(P::is_own_focus));
     if !control.is_switched_on() {
-        return "Disabled until you enable it — stays disabled after restarting ReCast.".into();
+        return "Disabled until you enable it — choose Enable correction in Settings or the tray. This setting survives restarts.".into();
     }
     if control
         .word_rules_open
@@ -258,14 +258,13 @@ fn status_for<P: engine::Platform>(
     let active = app_name.map_or_else(|| state.to_string(), |name| format!("{state} in {name}"));
     match mode.unwrap() {
         crate::config::AppMode::Off => {
-            "Excluded application — choose Full correction or Layout only in Application modes."
-                .into()
+            format!("Paused in {} — choose Full correction, Layout only, or Manual only in this application's mode menu.", app_name.unwrap_or("this application"))
         }
         _ if P::current_layout().is_none() => "Keyboard layout unavailable — enable English and Hebrew keyboards and check the layout backend.".into(),
         crate::config::AppMode::LayoutOnly => {
             format!("{active} · Layout only — spelling, abbreviations, and completion are off.")
         }
-        crate::config::AppMode::ManualOnly => format!("{active} · Manual only — edits require a typing shortcut."),
+        crate::config::AppMode::ManualOnly => format!("{active} · Manual correction only — use a typing shortcut, or choose Full correction in the application mode menu."),
         crate::config::AppMode::Full => format!("{active} · Full correction — correction follows your enabled settings."),
     }
 }

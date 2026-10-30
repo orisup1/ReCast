@@ -17,6 +17,7 @@ pub struct Window {
     applications: Vec<(String, String)>,
     selected_app: usize,
     message: String,
+    preview: String,
 }
 
 fn choice(
@@ -64,6 +65,7 @@ impl Window {
             applications: Vec::new(),
             selected_app: 0,
             message: "Changes save and apply immediately.".into(),
+            preview: "Choose an example to see what your current settings would do.".into(),
         };
         window.refresh_apps(control, application);
         window.render(control)?;
@@ -109,8 +111,8 @@ impl Window {
         let mut commands = Vec::new();
         for action in self.form.actions() {
             let result = match action {
-                10 => {
-                    self.page = self.form.selection(10);
+                10..=13 => {
+                    self.page = (action - 10) as usize;
                     self.message = "Changes save and apply immediately.".into();
                     if self.page == 2 {
                         self.refresh_apps(control, application);
@@ -141,6 +143,27 @@ impl Window {
                     } else {
                         Err("Could not change Start at login. Your previous setting is still shown.".into())
                     }
+                }
+                107 => {
+                    let layout = if self.form.selection(109) == 0 {
+                        crate::types::Language::English
+                    } else {
+                        crate::types::Language::Hebrew
+                    };
+                    self.preview = match crate::explain::preview(
+                        crate::explain::EXAMPLES
+                            .get(self.form.selection(108))
+                            .copied()
+                            .unwrap_or("recieve"),
+                        layout,
+                        None,
+                    ) {
+                        Ok((word, reason, _)) => {
+                            format!("Result: \u{2068}{word}\u{2069}\n{reason}")
+                        }
+                        Err(error) => error,
+                    };
+                    break;
                 }
                 105 => {
                     commands.push(Action::OpenConfig);
@@ -206,25 +229,36 @@ impl Window {
     }
 
     fn render(&mut self, control: &AppControl) -> Result<(), String> {
-        let [width, height] = self.form.size();
+        let [width, _] = self.form.size();
+        let height = if self.page == 0 { 840.0 } else { 670.0 };
         let content = width - 48.0;
         let config = Config::global();
-        let mut scene = vec![
-            E::new(1, K::Heading, "Settings", [24.0, 20.0, content, 30.0]),
-            E::new(2, K::Label, "Settings section", [24.0, 58.0, content, 22.0]),
-            E::new(
-                10,
-                K::Choice(
-                    ["General", "Shortcuts", "Applications", "Word rules"]
-                        .iter()
-                        .map(|s| (*s).into())
-                        .collect(),
-                    self.page,
-                ),
-                "Settings section",
-                [24.0, 82.0, content, 32.0],
-            ),
-        ];
+        let mut scene = vec![E::new(
+            1,
+            K::Heading,
+            "Settings",
+            [24.0, 20.0, content, 30.0],
+        )];
+        for (index, title) in ["General", "Shortcuts", "Applications", "Word rules"]
+            .iter()
+            .enumerate()
+        {
+            scene.push(E::new(
+                10 + index as u16,
+                K::Button,
+                if self.page == index {
+                    format!("{title} (selected)")
+                } else {
+                    title.to_string()
+                },
+                [
+                    24.0 + index as f64 * content / 4.0,
+                    70.0,
+                    content / 4.0 - 8.0,
+                    34.0,
+                ],
+            ));
+        }
         match self.page {
             0 => {
                 scene.extend([
@@ -278,9 +312,9 @@ impl Window {
                         K::Choice(
                             vec![
                                 "No automatic spelling edits".into(),
-                                "Conservative — single-typo fixes".into(),
-                                "Balanced — up to two edits".into(),
-                                "Flexible — up to three edits".into(),
+                                "Conservative — common typos only".into(),
+                                "Balanced — everyday spelling mistakes".into(),
+                                "Flexible — more complex typos".into(),
                             ],
                             config.spell_max_dist.min(3) as usize,
                         ),
@@ -312,31 +346,31 @@ impl Window {
             1 => {
                 for (id, label, values, selected, y) in [
                     (
+                        204,
+                        "Undo only (single tap)",
+                        &crate::config::MODIFIER_SHORTCUTS[..3],
+                        config.undo_shortcut.as_str(),
+                        130.0,
+                    ),
+                    (
                         201,
                         "Undo or convert (double tap)",
                         crate::config::ACTION_SHORTCUTS,
                         config.action_shortcut.as_str(),
-                        130.0,
+                        215.0,
                     ),
                     (
                         202,
                         "Complete a word (single tap)",
                         crate::config::MODIFIER_SHORTCUTS,
                         config.completion_shortcut.as_str(),
-                        215.0,
+                        300.0,
                     ),
                     (
                         203,
                         "Spelling suggestions (single tap)",
                         crate::config::MODIFIER_SHORTCUTS,
                         config.correction_shortcut.as_str(),
-                        300.0,
-                    ),
-                    (
-                        204,
-                        "Extra undo (single tap)",
-                        &crate::config::MODIFIER_SHORTCUTS[..3],
-                        config.undo_shortcut.as_str(),
                         385.0,
                     ),
                 ] {
@@ -351,7 +385,7 @@ impl Window {
                     E::new(4, K::Label, app.map_or("Switch to an app, then return here.".into(), |(_, id)| format!("Identifier: {id}")), [24.0, 208.0, content, 44.0]),
                     E::new(5, K::Label, "Correction mode", [24.0, 266.0, content, 24.0]),
                     E::new(302, K::Choice(AppMode::ALL.iter().map(|m| m.label().into()).collect(), app.and_then(|(_, id)| control.app_mode(Some(id))).and_then(|mode| AppMode::ALL.iter().position(|m| *m == mode)).unwrap_or(0)), "Correction mode", [24.0, 294.0, content, 32.0]).enabled(app.is_some()),
-                    E::new(6, K::Label, "Layout only skips spelling, abbreviations, and completion. Off pauses all correction in this application.", [24.0, 342.0, content, 58.0]),
+                    E::new(6, K::Label, "Layout only skips spelling, abbreviations, and completion. Manual only waits for a shortcut. Off pauses all correction in this application.", [24.0, 342.0, content, 58.0]),
                     E::new(303, K::Button, "Use last application", [24.0, 418.0, 210.0, 32.0]),
                 ]);
             }
@@ -383,28 +417,27 @@ impl Window {
                 ));
             }
         }
-        // Keep the controls reachable on smaller high-DPI displays.
-        if height < 570.0 {
-            let scale = (height - 190.0) / 380.0;
-            for element in scene
-                .iter_mut()
-                .filter(|element| !matches!(element.id, 1 | 2 | 10))
-            {
-                element.frame[1] = 124.0 + (element.frame[1] - 124.0) * scale;
-                let minimum = if matches!(element.kind, K::Button | K::Check(_) | K::Choice(..)) {
-                    26.0
-                } else {
-                    18.0
-                };
-                element.frame[3] = (element.frame[3] * scale).max(minimum);
-            }
+        if self.page == 0 {
+            scene.extend([
+                E::new(30, K::Label, "Flexible may change unfamiliar words. Short words keep stricter limits. Turn spelling on to apply automatic spelling fixes.", [24.0, 502.0, content, 52.0]),
+                E::new(31, K::Label, "Preview an example (current settings; no typing or learning)", [24.0, 548.0, content, 24.0]),
+                E::new(110, K::Label, "Example word", [24.0, 578.0, content - 290.0, 24.0]),
+                E::new(108, K::Choice(crate::explain::EXAMPLES.iter().map(|s| s.to_string()).collect(), self.form.selection(108)), "Example word", [24.0, 602.0, content - 290.0, 34.0]),
+                E::new(111, K::Label, "Keyboard layout", [width - 300.0, 578.0, 160.0, 24.0]),
+                E::new(109, K::Choice(vec!["English keyboard".into(), "Hebrew keyboard".into()], self.form.selection(109)), "Preview keyboard layout", [width - 300.0, 602.0, 160.0, 34.0]),
+                E::new(107, K::Button, "Preview", [width - 124.0, 602.0, 100.0, 34.0]),
+                E::new(32, K::Text, &self.preview, [24.0, 650.0, content, 86.0]),
+                E::new(33, K::Label, "Preview excludes prior words and application restrictions. Choose Preview again after changing settings.", [24.0, 744.0, content, 40.0]),
+            ]);
+        } else if self.page == 1 {
+            scene.push(E::new(30, K::Label, "Undo only never converts an unchanged word. For immediate undo, choose a different Ctrl key from the double-tap action. Shared keys wait half a second. Existing bindings stay unchanged until you edit them.", [24.0, 476.0, content, 90.0]));
         }
         scene.push(E::new(
             90,
             K::Label,
             &self.message,
-            [24.0, height - 64.0, content, 52.0],
+            [24.0, height - 48.0, content, 40.0],
         ));
-        self.form.render(scene)
+        self.form.render_scrolling(scene)
     }
 }

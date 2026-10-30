@@ -41,6 +41,7 @@ pub struct Element {
     pub text: String,
     pub frame: [f64; 4],
     pub enabled: bool,
+    pub rtl: bool,
 }
 
 impl Element {
@@ -51,7 +52,17 @@ impl Element {
             text: text.into(),
             frame,
             enabled: true,
+            rtl: false,
         }
+    }
+
+    pub fn directional(mut self) -> Self {
+        self.rtl = self
+            .text
+            .chars()
+            .find(|c| c.is_alphabetic())
+            .is_some_and(|c| ('א'..='ת').contains(&c));
+        self
     }
 
     pub fn enabled(mut self, enabled: bool) -> Self {
@@ -102,7 +113,12 @@ impl Window {
 
     pub fn render(&mut self, elements: Vec<Element>) -> Result<(), String> {
         self.native
-            .render(&elements, self.size()[1], self.window.scale_factor())
+            .render(&elements, self.size()[1], self.window.scale_factor(), false)
+    }
+
+    pub fn render_scrolling(&mut self, elements: Vec<Element>) -> Result<(), String> {
+        self.native
+            .render(&elements, self.size()[1], self.window.scale_factor(), true)
     }
 
     pub fn show(&self) {
@@ -134,5 +150,28 @@ impl Window {
 
     pub fn scroll_to_end(&self, id: u16, utf16_length: usize) {
         self.native.scroll_to_end(id, utf16_length);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn words_align_independently_of_punctuation() {
+        assert!(
+            Element::new(1, Kind::Label, "(שלום!)", [0.0; 4])
+                .directional()
+                .rtl
+        );
+        assert!(
+            !Element::new(1, Kind::Label, "(hello!) שלום", [0.0; 4])
+                .directional()
+                .rtl
+        );
+        assert!(
+            !Element::new(1, Kind::Label, "123", [0.0; 4])
+                .directional()
+                .rtl
+        );
     }
 }

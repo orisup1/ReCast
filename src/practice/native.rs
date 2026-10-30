@@ -46,6 +46,12 @@ impl Window {
                     refocus = true;
                 }
                 11 => return Ok(true),
+                23 => {
+                    let values = ["none", "left_ctrl", "right_ctrl"];
+                    if let Some(value) = values.get(self.form.selection(23)) {
+                        crate::settings::set_live(control, "undo_shortcut", value)?;
+                    }
+                }
                 #[cfg(target_os = "windows")]
                 22 => unsafe {
                     use winapi::um::{shellapi::ShellExecuteW, winuser::SW_SHOWNORMAL};
@@ -68,7 +74,8 @@ impl Window {
                 _ => (),
             }
         }
-        let [width, height] = self.form.size();
+        let [width, _] = self.form.size();
+        let height = 730.0;
         let stage = control.practice_stage.load(Ordering::Relaxed);
         let (english, hebrew) = crate::layout::enabled_languages();
         let ready = english && hebrew;
@@ -128,7 +135,7 @@ impl Window {
                 6,
                 K::Label,
                 super::feedback(control).lines().next().unwrap_or_default(),
-                [24.0, 306.0, width - 48.0, (height - 426.0).max(34.0)],
+                [24.0, 306.0, width - 48.0, 100.0],
             ),
             E::new(
                 7,
@@ -159,7 +166,18 @@ impl Window {
             )
             .enabled(!ready),
         );
-        self.form.render(scene)?;
+        for element in &mut scene {
+            if matches!(element.id, 3 | 4 | 5 | 20 | 6) {
+                element.frame[1] += 100.0;
+            }
+        }
+        let config = crate::config::Config::global();
+        scene.extend([
+            E::new(24, K::Label, "Undo only (optional): never converts unchanged words", [24.0, 104.0, width - 48.0, 24.0]),
+            E::new(23, K::Choice(vec!["Disabled".into(), "Tap Left Ctrl".into(), "Tap Right Ctrl".into()], ["none", "left_ctrl", "right_ctrl"].iter().position(|v| *v == config.undo_shortcut).unwrap_or(0)), "Undo-only shortcut", [24.0, 132.0, 220.0, 34.0]),
+            E::new(25, K::Label, "For instant undo, use a different key for double-tap actions in Settings > Shortcuts. Shared keys wait half a second.", [260.0, 128.0, width - 284.0, 68.0]),
+        ]);
+        self.form.render_scrolling(scene)?;
         if refocus {
             self.focus();
         }

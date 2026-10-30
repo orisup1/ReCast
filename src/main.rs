@@ -155,7 +155,7 @@ Undo or convert (Ctrl tapped twice within half a second):
   Conversion works before or after Space; repeat to convert back without
   changing saved word exceptions. Extra spaces preserve undo. Other typing,
   Enter, or cursor movement ends the gesture. Enter never triggers a rewrite.
-  The optional single-Ctrl undo shortcut also restores corrections or unlists
+  The optional single-Ctrl undo shortcut only restores corrections; it never unlists
   skipped words. Shared bindings wait half a second so double taps take priority.
   On macOS, select text in an editable field and double-tap Ctrl to convert
   its layout. Repeat to restore the original. Requires accessibility selection

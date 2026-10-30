@@ -247,7 +247,7 @@ impl<P: Platform> Engine<P> {
             .flatten()
         {
             // Nothing happened to this word, and the only reason is that the
-            // user has it listed. Arm the gesture to change their mind about it.
+            // user has it listed. Keep it available for explicit conversion.
             st.last_action = Some(LastAction::Skipped(LastSkip {
                 keys: st.keys.to_vec(),
                 terminator: Some(key),
@@ -807,64 +807,6 @@ impl<P: Platform> Engine<P> {
                 learning_pair: fix.learning_pair,
             }),
             Some(retry),
-        );
-    }
-
-    /// Take the word off the user's lists and run the pipelines over it again —
-    /// the other half of the toggle, for a word that was passed over *because*
-    /// it was listed.
-    ///
-    /// The correction is applied exactly as it would have been a moment ago: the
-    /// terminator on screen is erased with the word and pressed again after it.
-    /// No new undo is armed, because taking this one back would put the word
-    /// straight onto the list the gesture just took it off.
-    pub(super) fn unlist_and_correct(
-        self: &Arc<Self>,
-        mut st: MutexGuard<'_, AppState<P>>,
-        skip: LastSkip<P>,
-    ) {
-        st.phrase.clear();
-        crate::complete::unlist(&skip.word);
-        // The run is read but not added to: this word was already recorded when
-        // it was first finished, and the gesture is a second opinion about it
-        // rather than a second word.
-        let outcome = self.check(&skip.keys, st.history.run(), st.mode, &st.phrase);
-        let details = format!("Reason: {}\n{}", outcome.reason, outcome.details);
-        let result = outcome.fix;
-        let note = result.as_ref().map(|fix| note_of::<P>(&skip.keys, fix));
-        let Some(mut rep) = replacement::<P>(&skip.keys, result) else {
-            return;
-        };
-        st.cycle = None;
-        let mut separators = Vec::with_capacity(skip.trailing_spaces.len() + 1);
-        if let Some(key) = skip.terminator {
-            separators.push(Typed { key, shift: false });
-        }
-        separators.extend_from_slice(&skip.trailing_spaces);
-        let erase = rep.erase + separators.len();
-        P::append_retype(
-            &mut rep.retype,
-            P::retype_original(&separators, rep.target_layout),
-        );
-        let deferred_layout = rep.previous_layout.map(|_| rep.target_layout);
-        self.start_replacement(
-            st,
-            Plan {
-                erase,
-                retype: rep.retype,
-                terminator: None,
-            },
-            Vec::new(),
-            None,
-            note.map(|(from, to, kind)| Commit::Fix {
-                from,
-                to,
-                kind,
-                rule: None,
-                details,
-                deferred_layout,
-            }),
-            None,
         );
     }
 

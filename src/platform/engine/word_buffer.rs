@@ -23,7 +23,7 @@ pub struct Typed<K> {
 
 /// Tracked text available to the conversion and optional undo gestures.
 /// Corrections carry both visible keys and undo data; skipped words can be
-/// unlisted by single-tap undo. Cursor movement invalidates every variant.
+/// converted by double-tap action. Cursor movement invalidates every variant.
 pub enum LastAction<P: Platform> {
     /// A correction landed and the cursor is still on it.
     Fixed(LastFix<P>),
@@ -81,11 +81,10 @@ pub struct LastFix<P: Platform> {
 }
 
 /// A word the pipelines passed over because the user had already told us to
-/// leave it alone, ready for single-tap unlisting or double-tap conversion.
+/// leave it alone, ready for double-tap conversion.
 ///
 /// The keys are kept rather than the decision, because there is no decision
-/// yet: the word was never put through the pipelines with the list out of the
-/// way. The gesture takes it off the list and runs them then.
+/// yet: explicit conversion preserves the saved exception.
 pub struct LastSkip<P: Platform> {
     /// The word as typed, to run the pipelines over once it is off the list.
     pub(super) keys: Vec<Typed<P::Key>>,

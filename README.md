@@ -208,7 +208,7 @@ correction until a word boundary, protecting incomplete editing fragments.
 | Rescue selected text (supported controls) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Convert an unchanged last word to the other layout | Tap **Ctrl twice within half a second**, even for unknown words |
 | Undo the latest correction or completion | Tap **Ctrl twice** immediately, or use the optional single-Ctrl undo shortcut |
-| Allow an ignored word again | Use the configured single-Ctrl undo shortcut after the word, or edit your word lists |
+| Allow an ignored word again | Edit your word lists in Settings > Word rules |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
 | Inspect or ignore a correction | Open **Recent corrections…** in the tray, then choose **Details** or **Ignore**; in the Linux window, expand a correction and choose **Ignore this word** |
 | Inspect live activity | **Help > Start live log…** in the tray/menubar, or **Live log…** in the Linux control window |
@@ -223,7 +223,7 @@ saved exceptions or training spelling replacements. Up to 32 extra spaces preser
 correction undo and explicit suggestions, and are restored with the original word. Other typing, Enter, or
 moving the cursor ends the opportunity to act on a finished word.
 
-The optional single-Ctrl shortcut handles undo/unlisting. If it shares the action
+The optional single-Ctrl shortcut only undoes corrections. It never converts unchanged words or removes saved exceptions. If it shares the action
 key, the single-tap action waits half a second so double taps take priority.
 The double-tap action can still be remapped or disabled in Settings.
 
@@ -244,7 +244,7 @@ can leave both texts rather than risk deleting the original. See the
 App exclusions, pause/disabled state, and Secure Input still apply.
 
 Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures.
-**Settings → Extra undo shortcut** can additionally enable a single tap of
+**Settings > Shortcuts > Undo only** can additionally enable a single tap of
 Left Ctrl or Right Ctrl. The configured double-tap action remains available unless disabled. Holding Ctrl or using
 it in a chord never triggers the extra shortcut; the same cursor/focus safeguards
 apply to both gestures.
@@ -266,8 +266,18 @@ spelling, completion, spelling sensitivity, and Start at login. Sensitivity rang
 spelling edits to Conservative (one edit), Balanced (two), and Flexible (three);
 shorter words still have stricter limits. The status submenu suggests Conservative
 spelling when many corrections have been undone. The Linux control window offers
-language preference and live toggles for spelling, completion, and Conservative spelling. The
+language preference and live controls for spelling, completion, and all four spelling sensitivity levels. The
 enabled/disabled switch survives restarts.
+
+Settings uses visible General, Shortcuts, Applications, and Word rules navigation.
+On smaller windows, settings scroll without shrinking controls. General includes
+example previews using the current correction settings without typing, changing
+the keyboard layout, or learning. Previews exclude prior words and application
+restrictions; choose Preview again after changing settings. The tray exposes the
+last detected application's mode and temporary pause directly below status.
+Practice offers an undo-only shortcut without changing existing bindings automatically.
+For immediate undo, assign a Ctrl key different from the double-tap action; sharing
+a key retains the half-second wait needed to distinguish taps.
 
 ### Command line
 

@@ -3823,7 +3823,7 @@ fn typing_correction_undo_and_interrupted_replacements() {
     *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()];
     assert!(
         crate::platform::status_for::<Simulated>(&s.engine.control, Some(&application))
-            .starts_with("Excluded application —")
+            .starts_with("Paused in Text Editor —")
     );
     lock_forgiving(&s.engine.control.excluded_apps).clear();
     // Knowing the frontmost app is not permission to bypass missing focus
@@ -3855,7 +3855,8 @@ fn typing_correction_undo_and_interrupted_replacements() {
     s.engine.control.resume();
     *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()];
     assert!(
-        crate::platform::status_for::<Simulated>(&s.engine.control, None).starts_with("Excluded")
+        crate::platform::status_for::<Simulated>(&s.engine.control, None)
+            .starts_with("Paused in Editor —")
     );
 
     // Layout-only still fixes the layout, but never expands abbreviations.
@@ -4074,6 +4075,31 @@ fn typing_correction_undo_and_interrupted_replacements() {
     s.finish();
     assert_eq!(s.text(), "receive גם ");
     assert_eq!(s.engine.control.undo_count(), 0);
+
+    // A dedicated undo key never converts an unchanged or ignored word.
+    crate::config::Config::update_live(|cfg| {
+        cfg.action_shortcut = "left_ctrl".into();
+        cfg.undo_shortcut = "right_ctrl".into();
+    });
+    for word in ["do", "recieve"] {
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        if word == "recieve" {
+            crate::complete::suppress(word);
+        }
+        let s = Session::new();
+        s.type_text(&format!("{word} "));
+        s.tap(Simulated::CTRL_RIGHT);
+        assert_eq!(s.text(), format!("{word} "));
+        assert!(!s.engine.lock().is_replacing);
+        if word == "recieve" {
+            assert!(crate::complete::suppressed(word));
+        }
+    }
+    crate::complete::unlist("recieve");
+    crate::config::Config::update_live(|cfg| {
+        cfg.action_shortcut = "ctrl".into();
+        cfg.undo_shortcut = "none".into();
+    });
 
     // A shared single-tap undo key must undo exactly once on a double tap.
     SIMULATED_LAYOUT.store(0, Ordering::SeqCst);

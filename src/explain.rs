@@ -6,6 +6,8 @@ use crate::types::Language;
 
 const MAX_CONTEXT_WORDS: usize = 16;
 
+pub const EXAMPLES: &[&str] = &["recieve", "xocmputer", "akuo", "תודדה"];
+
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut word = None;
     let mut layout = None;
@@ -58,13 +60,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--context accepts at most {MAX_CONTEXT_WORDS} preceding words"
         ));
     }
-    let keys: Vec<_> = word
-        .chars()
-        .map(|c| {
-            readings_for_layout(c, current)
-                .ok_or_else(|| format!("Unsupported character {c:?} for this layout"))
-        })
-        .collect::<Result<_, _>>()?;
     crate::require_readable_config();
     crate::config::Config::update_live(|cfg| *cfg = crate::config::Config::from_env());
     for complaint in crate::settings::complaints(
@@ -74,9 +69,49 @@ pub fn run(args: &[String]) -> Result<(), String> {
     ) {
         eprintln!("{complaint}");
     }
+    let (after, reason, details) = preview(word, current, context.map(String::as_str))?;
+    println!(
+        "Input: {word:?}\nLayout: {}\nReplacement: {after:?}\nReason: {}",
+        layout.unwrap(),
+        reason
+    );
+    if let Some(context) = context {
+        println!("Context: {context:?}");
+    }
+    println!("Details:\n{details}");
+    if context.is_some() {
+        println!("Preview uses this invocation's settings, saved lists, and supplied prior words, without live app checks.");
+    } else {
+        println!("Preview uses this invocation's settings and saved lists, without prior words or live app checks.");
+    }
+    println!(
+        "No text is injected or learned; supplied context stays in memory for this invocation."
+    );
+    Ok(())
+}
+
+/// Uses current settings without injecting text, switching layouts, or learning.
+pub fn preview(
+    word: &str,
+    current: Language,
+    context: Option<&str>,
+) -> Result<(String, String, String), String> {
+    if word.is_empty()
+        || word.chars().any(char::is_whitespace)
+        || word.chars().count() > crate::types::MAX_WORD_KEYS
+    {
+        return Err("Enter one word, optionally with trailing punctuation.".into());
+    }
+    let keys: Vec<_> = word
+        .chars()
+        .map(|c| {
+            readings_for_layout(c, current)
+                .ok_or_else(|| format!("Unsupported character {c:?} for this layout"))
+        })
+        .collect::<Result<_, _>>()?;
     let (phrase, run) = context.map_or_else(
         || (PhraseContext::default(), Run::default()),
-        |text| preceding_context(text),
+        preceding_context,
     );
     let result = dictionary::check_and_correct_in_context(
         &keys,
@@ -92,7 +127,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         |_| crate::layout::LayoutSwitch::Switched,
     );
     let after = match result.fix {
-        None => word.clone(),
+        None => word.to_string(),
         Some(Fix::Layout { start, text, .. }) => {
             word.chars().take(start).collect::<String>() + &text
         }
@@ -102,24 +137,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             | Fix::Suffix { text, .. },
         ) => text,
     };
-    println!(
-        "Input: {word:?}\nLayout: {}\nReplacement: {after:?}\nReason: {}",
-        layout.unwrap(),
-        result.reason
-    );
-    if let Some(context) = context {
-        println!("Context: {context:?}");
-    }
-    println!("Details:\n{}", result.details);
-    if context.is_some() {
-        println!("Preview uses this invocation's settings, saved lists, and supplied prior words, without live app checks.");
-    } else {
-        println!("Preview uses this invocation's settings and saved lists, without prior words or live app checks.");
-    }
-    println!(
-        "No text is injected or learned; supplied context stays in memory for this invocation."
-    );
-    Ok(())
+    Ok((after, result.reason.to_string(), result.details))
 }
 
 fn preceding_context(text: &str) -> (PhraseContext, Run) {
@@ -187,6 +205,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_rejects_inputs_outside_one_tracked_word() {
+        for word in ["", "hello world", "🙂"] {
+            assert!(preview(word, Language::English, None).is_err());
+        }
+        assert!(preview(
+            &"a".repeat(crate::types::MAX_WORD_KEYS + 1),
+            Language::English,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn shifted_hebrew_preview_symbols_keep_their_actual_readings() {
         for c in "~!@#$%^&*()_+{}|:\"<>?".chars() {
             let key = readings_for_layout(c, Language::Hebrew).unwrap();
@@ -218,32 +249,8 @@ mod tests {
             ("(תודדה!)", Language::Hebrew, "(תודה!)"),
             ("{רקבןקהק?}", Language::Hebrew, "{receive?}"),
         ] {
-            let keys: Vec<_> = word
-                .chars()
-                .map(|c| readings_for_layout(c, current).unwrap())
-                .collect();
-            let result = dictionary::check_and_correct_in_context(
-                &keys,
-                |key| Some(key.0),
-                |key| Some(key.1),
-                |key| key.2,
-                Run::default(),
-                dictionary::en_dict(),
-                dictionary::he_dict(),
-                Some(current),
-                false,
-                None,
-                |_| crate::layout::LayoutSwitch::Switched,
-            );
-            let after = match result.fix {
-                None => word.to_owned(),
-                Some(Fix::Layout { start, text, .. }) => {
-                    word.chars().take(start).collect::<String>() + &text
-                }
-                Some(Fix::Spelling { text, .. } | Fix::LayoutSpelling { text, .. }) => text,
-                other => panic!("{word:?}: {other:?}"),
-            };
-            assert_eq!(after, expected, "{word:?}; {}", result.details);
+            let (after, _, details) = preview(word, current, None).unwrap();
+            assert_eq!(after, expected, "{word:?}; {details}");
         }
     }
 }

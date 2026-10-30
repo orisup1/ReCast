@@ -127,13 +127,14 @@ impl Window {
             let id = 100 + slot as u16 * 10;
             let ignored = crate::complete::ignored(&correction.from);
             scene.extend([
-                E::new(id, K::Label, &correction.from, [24.0, y, column, 25.0]),
+                E::new(id, K::Label, &correction.from, [24.0, y, column, 25.0]).directional(),
                 E::new(
                     id + 1,
                     K::Label,
                     &correction.to,
                     [40.0 + column, y, column, 25.0],
-                ),
+                )
+                .directional(),
                 E::new(
                     id + 2,
                     K::Label,

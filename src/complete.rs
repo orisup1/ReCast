@@ -759,23 +759,15 @@ pub fn ignored(word: &str) -> bool {
     ignore_list().lock().is_ok_and(|list| list.contains(word))
 }
 
-/// Take `word` off both lists, `ignore.txt` included.
-///
-/// The counterpart of [`suppress`], and the reason the gesture is worth having
-/// in this direction too: a list you can only add to is one you eventually stop
-/// trusting. Editing the file is a real edit to something the user owns, so it
-/// is done conservatively — only lines that *are* this word are dropped,
-/// comments and everything else are copied through untouched, and the write
-/// goes via a temporary file so an interrupted save can't leave a half-written
-/// list behind.
+/// Clear test fixtures from suppression, learning, and ignored-word lists.
+/// Production list changes go through the word-rule editor.
+#[cfg(test)]
 pub fn unlist(word: &str) {
     let word = word.to_lowercase();
     if let Ok(mut set) = suppressed_words().lock() {
         set.remove(&word);
     }
-    // Including what earlier undos taught: the gesture is asking for this word
-    // to be corrected after all, and a count from a previous session would
-    // quietly decline.
+    // Clear learned counts as well as session suppression.
     unlearn(&word);
     let was_in_file = ignore_list()
         .lock()
@@ -787,6 +779,7 @@ pub fn unlist(word: &str) {
 }
 
 /// Drop every line of `ignore.txt` that is `word`, keeping the rest verbatim.
+#[cfg(test)]
 fn remove_from_ignore_file(word: &str) {
     let Some(path) = user_path("ignore.txt") else {
         return;
@@ -794,6 +787,7 @@ fn remove_from_ignore_file(word: &str) {
     remove_from_ignore_path(&path, word);
 }
 
+#[cfg(test)]
 fn remove_from_ignore_path(path: &std::path::Path, word: &str) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
@@ -805,6 +799,7 @@ fn remove_from_ignore_path(path: &std::path::Path, word: &str) {
 /// `text` without the lines that list `word`. Everything else — comments,
 /// blanks, spacing, the other entries — is copied through exactly as written:
 /// this is the user's file, and the gesture has a mandate for one line of it.
+#[cfg(test)]
 fn without_word(text: &str, word: &str) -> String {
     let mut kept = String::with_capacity(text.len());
     for line in text.lines() {
@@ -919,9 +914,8 @@ pub fn learn(word: &str) {
     write_learned(&counts);
 }
 
-/// Forget what the undos taught about `word` — the un-ignore gesture's half of
-/// the toggle. A user asking for a word to be corrected after all must not have
-/// it declined by a count from last month.
+/// Clear learned counts between independent test scenarios.
+#[cfg(test)]
 fn unlearn(word: &str) {
     let Ok(mut counts) = learned_words().lock() else {
         return;

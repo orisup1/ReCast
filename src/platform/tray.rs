@@ -42,14 +42,20 @@ pub fn run(control: Arc<AppControl>) {
         .append(&conservative_item)
         .expect("append sensitivity hint");
 
+    let recovery_item = MenuItem::new("Open Settings to resolve…", true, None);
+    health_menu.append(&recovery_item).expect("append recovery");
+    let app_menu = Submenu::new("Application mode (waiting for focus)", false);
+    let app_modes = crate::config::AppMode::ALL.map(|mode| {
+        let item = CheckMenuItem::new(mode.label(), true, false, None);
+        app_menu.append(&item).expect("append app mode");
+        (mode, item)
+    });
     let pause_menu = Submenu::new("Pause correction", true);
     let pause_item = MenuItem::new(pause_label(None), true, None);
     let app_pause_item = MenuItem::new("Pause in application (waiting for focus)", false, None);
     let toggle_item = MenuItem::new(toggle_label(control.is_switched_on()), true, None);
     pause_menu.append(&pause_item).expect("append timed pause");
-    pause_menu
-        .append(&app_pause_item)
-        .expect("append application pause");
+
     pause_menu
         .append(&PredefinedMenuItem::separator())
         .expect("append separator");
@@ -89,6 +95,8 @@ pub fn run(control: Arc<AppControl>) {
     }
     let quit_item = MenuItem::new("Quit ReCast", true, None);
     menu.append(&health_menu).expect("append status");
+    menu.append(&app_menu).expect("append current app");
+    menu.append(&app_pause_item).expect("append quick pause");
     menu.append(&pause_menu).expect("append pause");
     menu.append(&PredefinedMenuItem::separator())
         .expect("append separator");
@@ -169,6 +177,27 @@ pub fn run(control: Arc<AppControl>) {
                 detail
             });
             status_item.set_text(status_label(&control));
+            if let Some((name, id)) = &last_app {
+                let mode = control.app_mode(Some(id));
+                app_menu.set_text(format!("{name}: {}", mode.map_or("Unknown", |m| m.label())));
+                app_menu.set_enabled(true);
+                for (value, item) in &app_modes {
+                    item.set_checked(mode == Some(*value));
+                }
+            }
+            recovery_item.set_text(if !control.is_switched_on() {
+                "Enable correction"
+            } else if control.pause_remaining().is_some() || control.paused_app().is_some() {
+                "Resume correction"
+            } else if super::tray_icon::state(&health) == super::tray_icon::State::Attention {
+                if cfg!(target_os = "macos") {
+                    "Open system settings…"
+                } else {
+                    "Keyboard setup help…"
+                }
+            } else {
+                "Settings / application modes…"
+            });
             let preference = crate::config::Config::global().language_preference;
             for (value, item) in &preference_items {
                 item.set_checked(*value == preference);
@@ -195,7 +224,7 @@ pub fn run(control: Arc<AppControl>) {
                 app_pause_item.set_enabled(control.is_switched_on());
             }
             if let Some(tray) = &tray {
-                let _ = tray.set_tooltip(Some(format!("ReCast — {state}")));
+                let _ = tray.set_tooltip(Some(format!("ReCast — {health}")));
                 let icon = super::tray_icon::state(&health);
                 if last_icon != Some(icon) {
                     #[cfg(target_os = "macos")]
@@ -323,6 +352,14 @@ pub fn run(control: Arc<AppControl>) {
                 for (value, item) in &preference_items {
                     item.set_checked(*value == selected);
                 }
+            } else if let Some((mode, _)) =
+                app_modes.iter().find(|(_, item)| event.id == *item.id())
+            {
+                if let Some((_, id)) = &last_app {
+                    if let Err(error) = crate::settings::set_app_mode(&control, id, *mode) {
+                        crate::notify::notify("Application mode unchanged", &error);
+                    }
+                }
             } else if event.id == *conservative_item.id() {
                 if let Err(error) = crate::settings::set_live(&control, "spell_dist", "1") {
                     crate::notify::notify("Settings unchanged", &error);
@@ -341,7 +378,30 @@ pub fn run(control: Arc<AppControl>) {
                 } else {
                     control.pause_for(PAUSE_LENGTH);
                 }
-            } else if event.id == *settings_item.id() {
+            } else if event.id == *recovery_item.id() && !control.is_switched_on() {
+                control.set_enabled(true);
+            } else if event.id == *recovery_item.id()
+                && (control.pause_remaining().is_some() || control.paused_app().is_some())
+            {
+                control.resume();
+                control.resume_app();
+            } else if event.id == *recovery_item.id()
+                && super::tray_icon::state(&health) == super::tray_icon::State::Attention
+            {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(error) = super::macos::open_setup_settings() {
+                        crate::notify::notify("Could not open system settings", &error);
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    match crate::practice::native::Window::new(target, proxy.clone(), &control) {
+                        Ok(window) => practice_window = Some(window),
+                        Err(error) => crate::notify::notify("Could not open setup help", &error),
+                    }
+                }
+            } else if event.id == *settings_item.id() || event.id == *recovery_item.id() {
                 if let Some(window) = &preferences_window {
                     window.form.show();
                 } else {
