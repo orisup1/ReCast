@@ -174,7 +174,7 @@ fn assess_with_visible(
     // original. Do not let a frequent neighbor substitute for that uncertainty.
     let keep_cost = if unranked_repeat_base(word, dict, freq) {
         super::COST_DOUBLE
-    } else if best.edits == 2 {
+    } else if best.edits == 2 && word.chars().count() >= TWO_EDIT_MIN_LEN {
         TWO_EDIT_BUDGET
     } else {
         super::COST_EDIT
@@ -370,7 +370,23 @@ fn search(
         if index + 1 < letters.len() {
             let mut swapped = letters.clone();
             swapped.swap(index, index + 1);
-            consider(swapped, 60, 1);
+            consider(swapped.clone(), 60, 1);
+            // A transposition can coincide with a wrong medial form at word end.
+            if (explicit || config.spell_max_dist >= 2) && letters.len() >= 5 {
+                let last = swapped.last_mut().unwrap();
+                let final_letter = match last.0 {
+                    'כ' => 'ך',
+                    'מ' => 'ם',
+                    'נ' => 'ן',
+                    'פ' => 'ף',
+                    'צ' => 'ץ',
+                    other => other,
+                };
+                if last.0 != final_letter {
+                    last.0 = final_letter;
+                    consider(swapped, 90, 2);
+                }
+            }
         }
     }
     for index in 0..=letters.len() {
@@ -642,6 +658,42 @@ fn valid_finals(word: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversational_hebrew_never_replaces_with_a_different_word() {
+        let mut wanted = 0;
+        let mut repaired = 0;
+        let mut protected = 0;
+        for row in include_str!("../../tests/data/hebrew_conversation.tsv")
+            .lines()
+            .filter(|row| !row.starts_with('#') && !row.is_empty())
+        {
+            let fields: Vec<_> = row.split('\t').collect();
+            assert_eq!(fields.len(), 3);
+            let (typed, expected) = (fields[1], fields[2]);
+            let assessment = assess(
+                typed,
+                crate::dictionary::he_dict(),
+                crate::dictionary::he_freq(),
+                None,
+            );
+            let actual = assessment.correction.as_deref().unwrap_or(typed);
+            assert!(
+                actual == expected || actual == typed,
+                "{}: {typed} became {actual}, expected {expected}\n{}",
+                fields[0],
+                assessment.details
+            );
+            if typed == expected {
+                protected += 1;
+            } else {
+                wanted += 1;
+                repaired += usize::from(actual == expected);
+            }
+        }
+        eprintln!("Conversational Hebrew: {protected} protected, {repaired}/{wanted} repairs, zero wrong replacements");
+        assert!(repaired >= 4, "repair coverage regressed");
+    }
 
     #[test]
     fn visible_source_controls_context_for_keeping_the_literal_word() {
@@ -1099,6 +1151,34 @@ mod tests {
             assert!(suggestions(typed, dict, freq, None).is_empty(), "{typed}");
         }
         assert!(suggestions("שלומ", dict, Freq::EMPTY, None).is_empty());
+    }
+
+    #[test]
+    fn transposition_with_final_form_keeps_rank_and_distance_gates() {
+        let dict = Dict::of(&["טלפון"]);
+        let freq = Freq::of(&[("טלפון", 951)]);
+        let mut config = Config::global();
+        assert_eq!(
+            assess_with("טלופנ", dict, freq, None, &config)
+                .correction
+                .as_deref(),
+            Some("טלפון")
+        );
+        config.spell_max_dist = 1;
+        assert_eq!(
+            assess_with("טלופנ", dict, freq, None, &config).correction,
+            None
+        );
+        config.spell_max_dist = 2;
+        config.spell_max_rank = 100;
+        assert_eq!(
+            assess_with("טלופנ", dict, freq, None, &config).correction,
+            None
+        );
+        assert_eq!(
+            assess_with("טלופנ", dict, Freq::EMPTY, None, &config).correction,
+            None
+        );
     }
 
     #[test]

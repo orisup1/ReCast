@@ -306,6 +306,7 @@ impl eframe::App for App {
                 ui.heading("Application modes");
                 let mut excluded = crate::types::lock_forgiving(&self.control.excluded_apps).clone();
                 excluded.extend(crate::types::lock_forgiving(&self.control.layout_only_apps).iter().cloned());
+                excluded.extend(crate::types::lock_forgiving(&self.control.manual_only_apps).iter().cloned());
                 excluded.sort(); excluded.dedup();
                 if !crate::layout::focus_supported() {
                     ui.label("Application detection is unavailable. Saved restrictions pause correction when the app is unknown. Restore Full below to remove a restriction.");

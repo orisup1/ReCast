@@ -228,6 +228,42 @@ impl Platform for Linux {
     fn focus() -> Option<Self::Focus> {
         crate::layout::focused_target()
     }
+    fn input_allowed() -> bool {
+        crate::layout::current_layout().is_some()
+    }
+    fn replacement_allowed() -> bool {
+        crate::layout::fresh_layout().is_some()
+    }
+    fn input_block_reason() -> &'static str {
+        "Keyboard mapping unavailable or unsupported — use standard US and Hebrew layouts; GNOME Wayland also needs the ReCast Shell extension."
+    }
+    fn selection(focus: &Self::Focus) -> Option<engine::Selection> {
+        let target = crate::layout::desktop::focus()?;
+        if Self::focus().as_ref() != Some(focus) {
+            return None;
+        }
+        let value = crate::layout::desktop::request(
+            serde_json::json!({"action":"selection","focus":target.id}),
+        )?;
+        desktop_selection(value)
+    }
+    fn replace_selection(
+        engine: &Engine<Self>,
+        focus: &Self::Focus,
+        expected: &engine::Selection,
+        text: &str,
+        generation: u64,
+    ) -> Option<engine::Selection> {
+        let target = crate::layout::desktop::focus()?;
+        if !engine.replacement_valid(generation) || Self::focus().as_ref() != Some(focus) {
+            return None;
+        }
+        let value = crate::layout::desktop::request(
+            serde_json::json!({"action":"replace", "focus":target.id,
+            "expected":{"start":expected.start,"length":expected.length,"text":expected.text}, "text":text}),
+        )?;
+        desktop_selection(value)
+    }
     fn app_id(focus: &Self::Focus) -> Option<String> {
         focus.app.clone()
     }
@@ -786,6 +822,21 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     )?;
 
     Some(buffered)
+}
+
+fn desktop_selection(value: serde_json::Value) -> Option<engine::Selection> {
+    let start = isize::try_from(value["start"].as_i64()?).ok()?;
+    let length = isize::try_from(value["length"].as_i64()?).ok()?;
+    let text = value["text"].as_str()?;
+    (start >= 0
+        && length > 0
+        && text.len() <= engine::MAX_SELECTION_BYTES
+        && text.chars().count() == length as usize)
+        .then(|| engine::Selection {
+            start,
+            length,
+            text: text.into(),
+        })
 }
 
 #[cfg(test)]

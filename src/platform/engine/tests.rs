@@ -3117,6 +3117,34 @@ fn typing_correction_undo_and_interrupted_replacements() {
         );
         return;
     }
+    // Manual mode preserves commands while retaining explicit repair and undo.
+    for word in ["recieve", "akuo", "hellorecieve"] {
+        let s = Session::new();
+        *lock_forgiving(&s.engine.control.manual_only_apps) = vec!["editor".into()];
+        s.type_text(&format!("{word} "));
+        assert_eq!(s.text(), format!("{word} "));
+        assert!(!s.engine.lock().is_replacing);
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        assert!(s.engine.lock().last_action.is_some());
+    }
+    let s = Session::new();
+    *lock_forgiving(&s.engine.control.manual_only_apps) = vec!["editor".into()];
+    s.type_text("keyb");
+    s.tap(Simulated::SHIFT_RIGHT);
+    s.pending();
+    s.finish();
+    assert_ne!(s.text(), "keyb");
+    s.undo();
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "keyb");
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    *lock_forgiving(&s.engine.control.manual_only_apps) = vec!["editor".into()];
+    s.finish();
+    assert_eq!(s.text(), "recieve ");
+
     // Physical Enter may submit, move focus, or end a line. Never replay it.
     for text in ["recieve\n", "akuo\n", "old\n"] {
         let s = Session::new();

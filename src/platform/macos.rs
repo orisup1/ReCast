@@ -75,7 +75,23 @@ impl Platform for Mac {
         invalidates
     }
     fn input_allowed() -> bool {
-        !secure_input_active()
+        use objc::{class, msg_send, sel, sel_impl};
+        static SUPPORTED: AtomicBool = AtomicBool::new(false);
+        let main: bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+        if main {
+            SUPPORTED.store(mapping_supported(), Ordering::Release);
+        }
+        !secure_input_active() && SUPPORTED.load(Ordering::Acquire)
+    }
+    fn replacement_allowed() -> bool {
+        !secure_input_active() && mapping_supported()
+    }
+    fn input_block_reason() -> &'static str {
+        if secure_input_active() {
+            "Secure Input — correction resumes when secure entry ends."
+        } else {
+            "Unsupported keyboard mapping — choose a compatible US/ABC and Hebrew keyboard. Correction waits for matching physical keys."
+        }
     }
     fn is_own_focus(focus: &Focus) -> bool {
         let mut pid = 0;
@@ -314,6 +330,21 @@ extern "C" {
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRelease(cf: *const c_void);
     static kCFRunLoopCommonModes: CFRunLoopMode;
+}
+
+fn mapping_supported() -> bool {
+    crate::layout::mapping_matches(|code, shift, language| {
+        let key = key_from_code(code);
+        match language {
+            Language::English => {
+                Mac::english_char(key, shift)
+                    .map(|c| if shift { c.to_ascii_uppercase() } else { c })
+            }
+            // Shifted Hebrew letters are handled separately by capture; verify the base map.
+            Language::Hebrew if !shift => Mac::hebrew_char(key),
+            Language::Hebrew => None,
+        }
+    })
 }
 
 // macOS virtual keycodes → rdev::Key. Mirrors rdev's private mapping (we can't

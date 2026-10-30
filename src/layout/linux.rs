@@ -36,6 +36,47 @@ use std::time::{Duration, Instant};
 use super::{language_of_keymap, set_layout_cache, LayoutSwitch};
 use crate::types::Language;
 
+// Fixed physical mappings cannot safely interpret arbitrary XKB variants.
+fn compatible_keymap(name: &str) -> Option<Language> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "us" | "english (us)" => Some(Language::English),
+        "il" | "hebrew" => Some(Language::Hebrew),
+        _ => None,
+    }
+}
+fn with_variants(layouts: &str, variants: &str) -> Vec<String> {
+    let variants: Vec<_> = variants.split(',').collect();
+    layouts
+        .split(',')
+        .enumerate()
+        .map(|(index, layout)| {
+            match variants
+                .get(index)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+            {
+                Some(variant) => format!("{}({variant})", layout.trim()),
+                None => layout.trim().to_owned(),
+            }
+        })
+        .collect()
+}
+#[test]
+fn variants_never_borrow_the_base_mapping() {
+    assert_eq!(with_variants("us,il", "dvorak,"), ["us(dvorak)", "il"]);
+    for name in [
+        "us(dvorak)",
+        "us+colemak",
+        "English (US, intl., with dead keys)",
+        "il(biblical)",
+        "English (US) custom",
+    ] {
+        assert_eq!(compatible_keymap(name), None);
+    }
+    assert_eq!(compatible_keymap("us"), Some(Language::English));
+    assert_eq!(compatible_keymap("Hebrew"), Some(Language::Hebrew));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The backend, retained once its session is available
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,10 +241,18 @@ impl Backend {
             // more direct than an index — and, unlike an index, it is right
             // even when a device has its own layout list.
             Backend::Hyprland => hypr::current(),
+            Backend::Gnome if !gnome::uses_x11() => {
+                let snapshot = super::desktop::request(serde_json::json!({"action":"layout"}))?;
+                compatible_keymap(
+                    snapshot["names"]
+                        .get(snapshot["current"].as_u64()? as usize)?
+                        .as_str()?,
+                )
+            }
             _ => {
                 let names = self.names()?;
                 let index = self.current_index()?;
-                language_of_keymap(names.get(index)?)
+                compatible_keymap(names.get(index)?)
             }
         }
     }
@@ -262,7 +311,7 @@ impl Backend {
             Backend::Sway => "sway (i3 IPC socket)",
             Backend::Kde => "KDE Plasma (D-Bus)",
             Backend::Gnome if gnome::uses_x11() => "GNOME (live XKB group)",
-            Backend::Gnome => "GNOME (live layout access unavailable on native Wayland)",
+            Backend::Gnome => "GNOME (optional ReCast Shell extension required on Wayland)",
             Backend::X11 => "X11 (XKB group)",
             Backend::None => "none — layout switching unavailable",
         }
@@ -280,6 +329,21 @@ pub fn describe_backend() -> String {
                 .filter(|n| language_of_keymap(n).is_some())
                 .count();
             let mut out = format!("{} — layouts: {}", b.label(), names.join(", "));
+            if names
+                .iter()
+                .any(|name| language_of_keymap(name).is_some() && compatible_keymap(name).is_none())
+            {
+                out.push_str("  ! Unsupported keyboard variant: fixed mappings require standard US and Hebrew.");
+            }
+            if matches!(b, Backend::Gnome | Backend::Kde)
+                && std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+            {
+                out.push_str(if crate::settings::flag("RECAST_DESKTOP_HELPER", false) {
+                    "  AT-SPI helper enabled; correction requires an accessible focused control."
+                } else {
+                    "  ! Focus unavailable: install AT-SPI/PyGObject and enable RECAST_DESKTOP_HELPER=1."
+                });
+            }
             if known < 2 {
                 out.push_str(
                     "  ! ReCast needs an English and a Hebrew layout configured; \
@@ -296,13 +360,11 @@ pub fn describe_backend() -> String {
 // The two shared operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Focus identity for pending replacements. X11 and the two socket backends
-/// expose it; GNOME/KDE Wayland have no equivalent public query here.
-/// Those sessions use mouse/shortcut cancellation; add their native
-/// focus protocol when one is available, rather than querying XWayland.
+/// Native window identity plus optional AT-SPI control identity for pending edits.
+/// GNOME/KDE Wayland use the accessibility helper rather than querying XWayland.
 #[derive(PartialEq)]
 pub struct Focus {
-    id: String,
+    pub(crate) id: String,
     pub app: Option<String>,
 }
 
@@ -310,11 +372,24 @@ pub struct Focus {
 const FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
 
 pub fn focus_supported() -> bool {
-    matches!(backend(), Backend::Hyprland | Backend::Sway)
-        || std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
+    matches!(
+        backend(),
+        Backend::Hyprland | Backend::Sway | Backend::Gnome | Backend::Kde
+    ) || std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
 }
 
 pub fn focused_target() -> Option<Focus> {
+    let native = native_focused_target();
+    match (native, super::desktop::focus()) {
+        (Some(mut native), Some(accessible)) => {
+            native.id.push_str(&format!("/{}", accessible.id));
+            Some(native)
+        }
+        (native, accessible) => native.or(accessible),
+    }
+}
+
+fn native_focused_target() -> Option<Focus> {
     match backend() {
         Backend::Hyprland => {
             let reply: serde_json::Value = serde_json::from_str(&hypr::request_with_timeout(
@@ -361,7 +436,7 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     };
     let Some(index) = names
         .iter()
-        .position(|n| language_of_keymap(n) == Some(lang))
+        .position(|n| compatible_keymap(n) == Some(lang))
     else {
         // The layout simply is not installed. Nothing to do about it here, and
         // nothing to say about it every time either — the complaint belongs in
@@ -749,7 +824,7 @@ mod hypr {
         preferred_keyboard(devices_json)?
             .get("active_keymap")?
             .as_str()
-            .and_then(language_of_keymap)
+            .and_then(super::compatible_keymap)
     }
 
     /// The configured layout list, as the comma-separated xkb codes Hyprland
@@ -758,14 +833,14 @@ mod hypr {
     /// Taken from the same device as `parse_layout`, keeping the reported
     /// current layout and language-index lookup anchored to one keyboard.
     pub fn parse_names(devices_json: &str) -> Option<Vec<String>> {
-        Some(
-            preferred_keyboard(devices_json)?
-                .get("layout")?
-                .as_str()?
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect(),
-        )
+        let keyboard = preferred_keyboard(devices_json)?;
+        Some(super::with_variants(
+            keyboard.get("layout")?.as_str()?,
+            keyboard
+                .get("variant")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        ))
     }
 
     pub fn current() -> Option<Language> {
@@ -1151,28 +1226,16 @@ mod kde {
     /// The display names out of a `getLayoutsList` reply.
     ///
     /// Each entry is a `(shortName, displayName, longName)` triple —
-    /// `('us', '', 'English (US)')`. Prefer the long name when recognizable,
-    /// falling back to a supported XKB code when KDE translates the long name.
+    /// `('us', '', 'English (US)')`. Keep the long name including variants. A short code cannot distinguish
+    /// a localized standard layout from a localized Dvorak/Colemak variant.
     /// The short name is missing on some entries, and the display name is a
     /// user-defined badge rather than a language identifier. Every
     /// client's output is quoted differently, so the shared shape is what is
     /// parsed: quoted strings in order, three per layout.
     pub fn parse_names(reply: &str) -> Option<Vec<String>> {
         let quoted = quoted_strings(reply)?;
-        (quoted.len() >= 3 && quoted.len().is_multiple_of(3)).then(|| {
-            quoted
-                .chunks(3)
-                .map(|t| {
-                    if super::language_of_keymap(&t[2]).is_none()
-                        && matches!(t[0].as_str(), "us" | "il")
-                    {
-                        t[0].clone()
-                    } else {
-                        t[2].clone()
-                    }
-                })
-                .collect()
-        })
+        (quoted.len() >= 3 && quoted.len().is_multiple_of(3))
+            .then(|| quoted.chunks(3).map(|t| t[2].clone()).collect())
     }
 
     /// Every quoted string in a reply, in order, single or double quotes.
@@ -1305,7 +1368,15 @@ mod gnome {
             super::x11::names()
         } else {
             // Configuration is useful for --status, but never confirms a switch.
-            parse_names(&get("sources")?)
+            super::super::desktop::request(serde_json::json!({"action":"layout"}))
+                .and_then(|v| {
+                    v["names"]
+                        .as_array()?
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .or_else(|| parse_names(&get("sources")?))
         }
     }
 
@@ -1314,23 +1385,30 @@ mod gnome {
     }
 
     pub fn current_index() -> Option<usize> {
-        on_x11(
-            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
-            super::x11::current_index,
-        )
+        if uses_x11() {
+            super::x11::current_index()
+        } else {
+            super::super::desktop::request(serde_json::json!({"action":"layout"}))?["current"]
+                .as_u64()
+                .and_then(|v| usize::try_from(v).ok())
+        }
     }
 
     pub fn set_index(index: usize) -> bool {
-        on_x11(std::env::var("XDG_SESSION_TYPE").ok().as_deref(), || {
-            Some(super::x11::set_index(index))
-        })
-        .unwrap_or(false)
+        if uses_x11() {
+            super::x11::set_index(index)
+        } else {
+            super::super::desktop::request(serde_json::json!({"action":"switch","index":index}))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        }
     }
 
     pub(super) fn uses_x11() -> bool {
         std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("x11")
     }
 
+    #[cfg(test)]
     pub(super) fn on_x11<T>(session: Option<&str>, query: impl FnOnce() -> Option<T>) -> Option<T> {
         (session == Some("x11")).then(query).flatten()
     }
@@ -1726,11 +1804,8 @@ mod x11 {
             (c.lib.free)(data as *mut c_void);
             // rules, model, layout, …
             let layouts = fields.get(2)?;
-            let list: Vec<String> = layouts
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let list =
+                super::with_variants(layouts, fields.get(3).map(String::as_str).unwrap_or(""));
             (!list.is_empty()).then_some(list)
         }
     }
@@ -2210,10 +2285,10 @@ mod tests {
             r#"[Argument: a(sss) {[Argument: (sss) "ru", "us", "Русский"], [Argument: (sss) "us", "", "אנגלית (ארה״ב)"], [Argument: (sss) "il", "", "עברית"], [Argument: (sss) "", "", "Hebrew"]}]"#,
         ] {
             let names = kde::parse_names(reply).unwrap();
-            assert_eq!(names, ["Русский", "us", "il", "Hebrew"]);
+            assert_eq!(names, ["Русский", "אנגלית (ארה״ב)", "עברית", "Hebrew"]);
             assert_eq!(language_of_keymap(&names[0]), None);
-            assert_eq!(language_of_keymap(&names[1]), Some(Language::English));
-            assert_eq!(language_of_keymap(&names[2]), Some(Language::Hebrew));
+            assert_eq!(compatible_keymap(&names[1]), None);
+            assert_eq!(compatible_keymap(&names[2]), None);
             assert_eq!(language_of_keymap(&names[3]), Some(Language::Hebrew));
         }
     }

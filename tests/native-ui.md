@@ -30,3 +30,72 @@ it does not verify native drawing, privacy grants, focus, or display scaling.
 8. Navigate with Tab, Shift+Tab, Space, and arrow keys. Check VoiceOver/Narrator
    labels. Minimize and reopen each window from the tray. Closing a secondary
    window must leave correction running; closing the log must stop logging.
+
+## Editing and replay acceptance
+
+Use disposable documents and default US/Hebrew layouts. Record the commit/build,
+OS, compositor, application/version, mode, layouts, and result for each trial.
+Run every scenario in Full and Manual only modes; in Manual only, automatic edits
+must never occur. Explicit conversion/completion/undo must remain available.
+
+Open `tests/native-editing.html` locally for a browser fixture with a textarea,
+rich-text chat, a second focus target, password and read-only probes. It provides
+seven scenarios and exports bounded event traces locally. Type physically:
+JavaScript keyboard events do not exercise OS capture, and Windows ignores
+foreign injected keyboard events. An unchanged selection counts as unsupported,
+not a passing conversion test. Exported traces contain fixture text; use sample
+text only. Test native applications as well:
+
+| Platform | Everyday typing | Coding / terminals | Chat / mixed text |
+| --- | --- | --- | --- |
+| macOS | TextEdit plain and rich documents | VS Code, Terminal | Safari/Chrome fixture and a disposable chat draft |
+| Windows | Notepad/native Edit, WordPad or another RichEdit host | VS Code, Windows Terminal | Edge/Chrome fixture and a disposable chat draft |
+| Linux X11 | GTK text editor | VS Code, terminal | Firefox/Chromium fixture |
+| GNOME Wayland | GTK editor with AT-SPI helper and Shell extension | terminal, VS Code | browser fixture; record accessibility support |
+| KDE Wayland | Kate/Qt editor with AT-SPI bridge/helper | Konsole, VS Code | browser fixture; record accessibility support |
+
+For each supported combination:
+
+1. Type `recieve` followed by Space, three rapid Spaces, and rapidly Space/Enter.
+   The result must contain intact corrected or untouched words, every intended
+   space, and exactly one Enter. Repeat 20 times, including typing the next word
+   before correction finishes. Record corruption separately from abstention.
+2. Type a typo and immediately click another field or switch applications. The
+   destination field must remain unchanged. Repeat with cursor navigation,
+   select-all/delete, native undo, and a layout switch during pending correction.
+3. Try `const recieve = "שלום";`, `API_URL`, a URL, Hebrew with niqqud, emoji,
+   and intentional slang. Manual only must preserve exact text until a gesture.
+4. Select `akuo` within `left akuo שלום🙂 right`. Double-Ctrl must change only
+   the selection to `שלום`; repeat to restore exact original text. Change the
+   selection or focus before completion: no stale replacement may land. Test
+   readonly/password controls, an empty selection, and a selection over 64 KiB:
+   all must be declined. The clipboard must remain unchanged.
+5. Test Dvorak, Colemak, a dead-key layout, standard US and Hebrew. macOS/Linux
+   must pause on incompatible mappings and resume on supported layouts. Linux
+   custom mappings using unchanged standard names are outside name validation.
+6. Disable/re-enable the helper or GNOME extension, switch windows, and test
+   lock/unlock. Missing required layout/focus information must decline edits.
+
+An optional Windows native integration test opens its own disposable Edit control,
+takes focus, checks cancellation, replacement, stale selection, exact undo, and
+read-only rejection. Run in a logged-in Windows desktop and keep it foreground:
+
+```powershell
+cargo test native_selection_round_trip -- --ignored --nocapture
+```
+
+The existing Linux/Hyprland replay runner can exercise real evdev/uinput replay:
+
+```sh
+python3 scripts/check_linux_replay.py --binary /path/to/candidate/recast \
+  --restore /path/to/installed/recast --output /tmp/recast-replay.json --rounds 20
+```
+
+It replaces a standalone daemon for the trial and restores the specified installed
+binary afterward. Read its help and use a disposable desktop session. It is not a
+GNOME/KDE harness. macOS Carbon main-thread/worker access is checked separately by
+`cargo test --test macos_layout`; that test does not prove editing correctness.
+
+No new native Windows/Linux editing trials were executed during this implementation.
+Cross-target compilation, engine simulations, and fixture checks must not be
+reported as native acceptance or measured end-to-end typing latency.

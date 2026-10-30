@@ -82,6 +82,11 @@ impl Window {
                 .iter()
                 .cloned(),
         );
+        saved.extend(
+            crate::types::lock_forgiving(&control.manual_only_apps)
+                .iter()
+                .cloned(),
+        );
         saved.sort();
         saved.dedup();
         for id in saved {

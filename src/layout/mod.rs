@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use crate::types::Language;
 
 #[cfg(target_os = "linux")]
+pub(crate) mod desktop;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -30,6 +32,8 @@ mod windows;
 pub use linux::switch_layout_to;
 #[cfg(target_os = "macos")]
 pub use macos::enabled_languages;
+#[cfg(target_os = "macos")]
+pub use macos::mapping_matches;
 #[cfg(target_os = "macos")]
 pub use macos::switch_layout_to;
 #[cfg(target_os = "windows")]
@@ -143,7 +147,7 @@ pub fn current_layout() -> Option<Language> {
 
 /// Confirm the live layout before reporting that a requested switch succeeded.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-fn fresh_layout() -> Option<Language> {
+pub(crate) fn fresh_layout() -> Option<Language> {
     read_layout(&LAYOUT_CACHE, true, query_layout)
 }
 

@@ -1,0 +1,7 @@
+{
+  "uuid": "recast@orisupino",
+  "name": "ReCast keyboard layout access",
+  "description": "Expose live input-source queries and switching to the local ReCast desktop helper.",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "version": 1
+}

@@ -2916,6 +2916,7 @@ dependencies = [
  "tao",
  "tray-icon",
  "winapi",
+ "windows 0.61.3",
  "winresource",
 ]
 

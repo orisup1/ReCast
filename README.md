@@ -147,11 +147,19 @@ systemctl --user restart recast
 make service-uninstall
 ```
 
-Layout backends support Hyprland, Sway, KDE, GNOME on X11, and X11. GNOME uses
-the live XKB group on X11; stock GNOME Wayland exposes no supported live input-source
-API, so ReCast declines layout-dependent edits there instead of trusting obsolete
-GSettings values. Native GNOME/KDE Wayland cannot identify the focused application;
-see [Application exclusions](#application-exclusions).
+Layout backends support Hyprland, Sway, KDE, GNOME on X11, and X11.
+GNOME Wayland additionally needs the optional ReCast Shell extension for live
+layout queries and switching. GNOME/KDE Wayland focused-app detection uses the
+optional AT-SPI helper. See [Linux desktop integration](integrations/README.md)
+for dependencies, setup, supported controls, and limitations. Missing live layout
+or required focus information pauses edits; saved GSettings values never confirm a switch.
+
+macOS compares the current layout's actual key output with ReCast's physical
+mapping. Linux accepts standard US and Hebrew XKB layouts and rejects unknown
+variants, including Dvorak, Colemak, and dead-key layouts. Localized KDE layout
+names that cannot be verified are also declined. Custom remaps that keep a standard
+layout name cannot be detected by the Linux name check. Status reports unsupported
+variants; select compatible layouts to resume.
 Disconnected keyboards are detected automatically; ReCast waits for reconnection.
 
 ### Windows
@@ -197,7 +205,7 @@ correction until a word boundary, protecting incomplete editing fragments.
 | Request spelling alternatives | Tap **Left Shift** before or after Space; repeat to cycle choices and back to your original text |
 | Complete an English or Hebrew word | Tap **Right Shift** before or after Space; tap again to cycle through suggestions and back to your prefix |
 | Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space |
-| Rescue selected text (macOS) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
+| Rescue selected text (supported controls) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Convert an unchanged last word to the other layout | Tap **Ctrl twice within half a second**, even for unknown words |
 | Undo the latest correction or completion | Tap **Ctrl twice** immediately, or use the optional single-Ctrl undo shortcut |
 | Allow an ignored word again | Use the configured single-Ctrl undo shortcut after the word, or edit your word lists |
@@ -219,16 +227,20 @@ The optional single-Ctrl shortcut handles undo/unlisting. If it shares the actio
 key, the single-tap action waits half a second so double taps take priority.
 The double-tap action can still be remapped or disabled in Settings.
 
-On macOS, selected-text rescue converts physical English/Hebrew key positions,
+Selected-text rescue converts physical English/Hebrew key positions,
 without dictionary checks. The first English or Hebrew letter determines the
 source layout; select one language at a time for predictable results. Spaces,
 line breaks, digits, and unmapped characters are preserved. Converted text stays
 selected, and double-Ctrl again restores the exact original, including case.
-It uses Accessibility selection editing, leaves the clipboard and keyboard layout
-untouched, and requires an editable control that exposes writable selected-text
-and selection-range attributes. Unsupported controls are left unchanged. Selections
-are limited to 64 KiB of UTF-8 text. Windows/Linux selected-text rescue is not yet
-available; manual word conversion works through the shared engine on all platforms.
+It leaves the clipboard and keyboard layout untouched. macOS requires writable
+Accessibility selected-text and range attributes. Windows supports native Edit and
+RichEdit controls with UI Automation selection access. Linux uses the optional
+AT-SPI helper in supported editable controls. Password, read-only, and unsupported
+controls are skipped. Selections are limited to 64 KiB of UTF-8 text. Selection
+undo restores the original text; it does not promise to restore rich formatting.
+Linux AT-SPI replacement requires multiple calls: an interruption after insertion
+can leave both texts rather than risk deleting the original. See the
+[integration limits](integrations/README.md).
 App exclusions, pause/disabled state, and Secure Input still apply.
 
 Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures.
@@ -452,6 +464,7 @@ apps. On Linux, use **Application modes** in the control window:
 - **Full correction** follows the global spelling/completion settings.
 - **Layout only** keeps layout correction and undo, with spelling, abbreviations,
   completion, and personalization disabled in that app.
+- **Manual only** disables automatic rewrites and personalization while retaining explicit conversion, spelling suggestions, completion, and undo. Useful for terminals and code editors.
 - **Off** excludes the app from processing.
 
 Choose a saved application and set its mode to **Full correction** to restore it. Changes save together and apply
@@ -462,6 +475,7 @@ You can also edit these values and restart:
 # Exact IDs, comma-separated and case-insensitive; no wildcards.
 exclude_apps = "Alacritty, org.keepassxc.KeePassXC"
 layout_only_apps = "code, org.gnome.TextEditor"
+manual_only_apps = "Alacritty" # explicit gestures only
 undo_shortcut = "right_ctrl" # optional single-tap undo; none (default), left_ctrl, right_ctrl
 # Shortcut defaults; these settings are global, not per-application.
 action_shortcut = "ctrl" # ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
@@ -476,10 +490,11 @@ Diagnostics report the disabled gesture. Abbreviation expansion is unaffected.
 
 Excluded apps receive no corrections, expansions, completion, undo rewrites,
 word logging, or learning. Global events still track key releases. Off takes
-precedence if an app appears in both lists. With any application restrictions
+precedence over Manual only, then Layout only, if an app appears in multiple lists. With any application restrictions
 configured, an unknown active application also suspends processing.
-On **native GNOME/KDE Wayland**, this means correction pauses throughout the session;
-the Linux window disables adding restrictions when detection is unavailable.
+On **native GNOME/KDE Wayland**, correction requires the optional AT-SPI helper
+and an accessible focused control. Application rules use the executable basename
+there; Hyprland, Sway, and X11 retain their existing application identifiers.
 After returning to an allowed app, finish the current word with Space/Enter to resume.
 
 The compact tray menu contains Status, Pause, Recent corrections, Language preference,
@@ -859,3 +874,9 @@ are retained in [licenses/scowl.txt](licenses/scowl.txt).
 ## License
 
 Application code: Apache-2.0 — see [LICENSE](LICENSE).
+
+Native editing checks, including rapid Space/Enter, chat sends, focus interruption,
+selection undo, and mixed-language text, are documented in
+[the native test protocol](tests/native-ui.md). The disposable
+[browser fixture](tests/native-editing.html) records local traces; it does not
+simulate physical keyboard capture.

@@ -1,0 +1,24 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+let activated = [];
+const english = {index: 0, type: 'xkb', id: 'us', activate: value => activated.push(value)};
+const ime = {index: 1, type: 'ibus', id: 'mozc', activate: () => {throw Error('IME must not switch');}};
+const hebrew = {index: 2, type: 'xkb', id: 'il', activate: value => activated.push(value)};
+const manager = {inputSources: {2: hebrew, 0: english, 1: ime}, currentSource: hebrew};
+const Main = {sessionMode: {isLocked: false, isGreeter: false}};
+const context = vm.createContext({Extension: class {}, Main, Keyboard: {getInputSourceManager: () => manager}});
+const source = fs.readFileSync('integrations/gnome/recast@orisupino/extension.js', 'utf8')
+    .replace(/^import .*;\n/gm, '').replace('export default class', 'class');
+vm.runInContext(source + '\nglobalThis.extension = new ReCast();', context);
+const extension = context.extension;
+assert.deepEqual(JSON.parse(extension.Snapshot()), {names: ['us', 'ibus:mozc', 'il'], current: 2});
+assert.equal(extension.Switch(1), 'false');
+assert.equal(extension.Switch(3), 'false');
+assert.equal(extension.Switch(2), 'true');
+assert.deepEqual(activated, [true]);
+Main.sessionMode.isLocked = true;
+assert.equal(extension.Snapshot(), 'null');
+assert.equal(extension.Switch(0), 'false');
+assert.deepEqual(activated, [true]);
+console.log('GNOME protocol: ordering, IME, invalid index, and lock guards passed');

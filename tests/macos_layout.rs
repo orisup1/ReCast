@@ -35,8 +35,11 @@ fn main() {
     use std::time::{Duration, Instant};
 
     let expected = macos::enabled_languages();
+    assert!(!macos::mapping_matches(|_, _, _| Some('\0')));
+    let mapping = macos::mapping_matches(|_, _, _| None);
     let worker = std::thread::spawn(move || {
         assert_eq!(macos::enabled_languages(), expected);
+        assert_eq!(macos::mapping_matches(|_, _, _| None), mapping);
         if let Some(lang) = macos::query_layout() {
             assert_eq!(macos::switch_layout_to(lang), LayoutSwitch::AlreadyThere);
         }

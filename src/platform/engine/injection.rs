@@ -197,7 +197,10 @@ impl<P: Platform> Engine<P> {
 
     /// Called after waits and immediately before destructive injection.
     pub fn replacement_valid(&self, generation: u64) -> bool {
-        if self.lock().generation != generation || !self.control.is_enabled() || !P::input_allowed()
+        let current_generation = self.lock().generation;
+        if current_generation != generation
+            || !self.control.is_enabled()
+            || !P::replacement_allowed()
         {
             return false;
         }

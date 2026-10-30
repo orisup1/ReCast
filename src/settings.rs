@@ -50,7 +50,8 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "spell" | "complete" if parse_flag(value).is_some() => (),
         "spell_dist" if parse_number("RECAST_SPELL_DIST", value).is_ok() => (),
         "prefer" if crate::config::LanguagePreference::parse(value).is_some() => (),
-        "exclude_apps" | "layout_only_apps" if !value.contains(['\n', '\r', '"', '\\']) => (),
+        "exclude_apps" | "layout_only_apps" | "manual_only_apps"
+            if !value.contains(['\n', '\r', '"', '\\']) => {}
         "undo_shortcut" if crate::config::valid_undo_shortcut(value) => (),
         "action_shortcut" if crate::config::valid_action_shortcut(value) => (),
         "completion_shortcut" if crate::config::valid_completion_shortcut(value) => (),
@@ -79,6 +80,7 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         }
         "exclude_apps" => cfg.excluded_apps = crate::config::parse_excluded_apps(value),
         "layout_only_apps" => cfg.layout_only_apps = crate::config::parse_excluded_apps(value),
+        "manual_only_apps" => cfg.manual_only_apps = crate::config::parse_excluded_apps(value),
         "undo_shortcut" => cfg.undo_shortcut = value.into(),
         "action_shortcut" => cfg.action_shortcut = value.into(),
         "completion_shortcut" => cfg.completion_shortcut = value.into(),
@@ -91,6 +93,10 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
     }
     if key == "layout_only_apps" {
         *crate::types::lock_forgiving(&control.layout_only_apps) =
+            crate::config::parse_excluded_apps(value);
+    }
+    if key == "manual_only_apps" {
+        *crate::types::lock_forgiving(&control.manual_only_apps) =
             crate::config::parse_excluded_apps(value);
     }
     Ok(())
@@ -163,7 +169,7 @@ pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Resul
     result
 }
 
-/// Save both lists together so changing modes cannot partially discard an exclusion.
+/// Save the application lists together so changing modes cannot partially discard an exclusion.
 pub fn set_app_mode(
     control: &crate::types::AppControl,
     id: &str,
@@ -173,7 +179,11 @@ pub fn set_app_mode(
     if id.trim().is_empty() || id.contains([',', '\n', '\r', '"', '\\']) {
         return Err("This application identifier cannot be saved".into());
     }
-    for key in ["RECAST_EXCLUDE_APPS", "RECAST_LAYOUT_ONLY_APPS"] {
+    for key in [
+        "RECAST_EXCLUDE_APPS",
+        "RECAST_LAYOUT_ONLY_APPS",
+        "RECAST_MANUAL_ONLY_APPS",
+    ] {
         if std::env::var_os(key).is_some() {
             return Err(format!("{key} controls application modes. Remove the override and relaunch to change them here."));
         }
@@ -181,6 +191,7 @@ pub fn set_app_mode(
     let id = id.trim().to_lowercase();
     let mut excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
     let mut layout = crate::types::lock_forgiving(&control.layout_only_apps).clone();
+    let mut manual = crate::types::lock_forgiving(&control.manual_only_apps).clone();
     let path = file_path().ok_or("No config directory available")?;
     let saved = load_file(&path);
     if let Some(error) = saved.read_error {
@@ -196,14 +207,19 @@ pub fn set_app_mode(
             .unwrap_or_default();
         live.iter().all(|app| saved.contains(app)) && saved.iter().all(|app| live.contains(app))
     };
-    if !same_apps(&excluded, "exclude_apps") || !same_apps(&layout, "layout_only_apps") {
+    if !same_apps(&excluded, "exclude_apps")
+        || !same_apps(&layout, "layout_only_apps")
+        || !same_apps(&manual, "manual_only_apps")
+    {
         return Err("Application modes changed in config.toml. Relaunch ReCast to load those changes before saving here.".into());
     }
     excluded.retain(|app| app != &id);
     layout.retain(|app| app != &id);
+    manual.retain(|app| app != &id);
     match mode {
         AppMode::Off => excluded.push(id),
         AppMode::LayoutOnly => layout.push(id),
+        AppMode::ManualOnly => manual.push(id),
         AppMode::Full => {}
     }
     save_values(
@@ -211,17 +227,20 @@ pub fn set_app_mode(
         &[
             ("exclude_apps", &excluded.join(", ")),
             ("layout_only_apps", &layout.join(", ")),
+            ("manual_only_apps", &manual.join(", ")),
         ],
     )
     .map_err(|e| format!("Could not save application modes: {e}"))?;
     crate::config::Config::update_live(|cfg| {
         cfg.excluded_apps = excluded.clone();
         cfg.layout_only_apps = layout.clone();
+        cfg.manual_only_apps = manual.clone();
     });
     let mut live_excluded = crate::types::lock_forgiving(&control.excluded_apps);
     let mut live_layout = crate::types::lock_forgiving(&control.layout_only_apps);
     *live_excluded = excluded;
     *live_layout = layout;
+    *crate::types::lock_forgiving(&control.manual_only_apps) = manual;
     Ok(())
 }
 
@@ -516,6 +535,7 @@ pub fn sample() -> String {
 #prefer = \"balanced\"  # balanced, english, hebrew; stricter switches away from your preference
 #exclude_apps = \"\"    # exact app IDs where correction is Off
 #layout_only_apps = \"\" # exact app IDs where only layout correction is allowed
+#manual_only_apps = \"\" # exact app IDs where edits require an explicit gesture
 #undo_shortcut = \"none\" # optional single-tap undo: none, left_ctrl, right_ctrl
 #action_shortcut = \"ctrl\" # double-tap: ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
 #completion_shortcut = \"right_shift\" # single-tap: left_ctrl, right_ctrl, left_shift, right_shift, none
@@ -537,6 +557,7 @@ pub fn sample() -> String {
 # Linux only: what drives the keyboard layout. Detected from the session when
 # unset — set it if the guess is wrong. One of hyprland, sway, kde, gnome,
 # x11, none. `recast --status` prints what was chosen and the layouts it found.
+#desktop_helper = false # optional Linux AT-SPI helper; requires Python GI/Atspi
 #layout_backend = x11
 
 # Injection timings, in microseconds. Only worth touching if corrections come
@@ -814,7 +835,15 @@ mod tests {
         set_app_mode(&control, "EDITOR", crate::config::AppMode::Full).unwrap();
         assert!(crate::types::lock_forgiving(&control.excluded_apps).is_empty());
         use crate::config::AppMode;
+        set_app_mode(&control, "Editor", AppMode::ManualOnly).unwrap();
+        assert_eq!(control.app_mode(Some("EDITOR")), Some(AppMode::ManualOnly));
+        assert_eq!(control.app_mode(None), None);
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["manual_only_apps"],
+            "editor"
+        );
         set_app_mode(&control, "Editor", AppMode::LayoutOnly).unwrap();
+        assert!(crate::types::lock_forgiving(&control.manual_only_apps).is_empty());
         assert_eq!(control.app_mode(Some("EDITOR")), Some(AppMode::LayoutOnly));
         assert_eq!(
             load_file(&file_path().unwrap()).settings["layout_only_apps"],

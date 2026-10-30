@@ -95,6 +95,18 @@ impl Platform for Windows {
         }
         pid == std::process::id()
     }
+    fn selection(focus: &Focus) -> Option<engine::Selection> {
+        super::windows_selection::selection(*focus)
+    }
+    fn replace_selection(
+        engine: &Engine<Self>,
+        focus: &Focus,
+        expected: &engine::Selection,
+        text: &str,
+        generation: u64,
+    ) -> Option<engine::Selection> {
+        super::windows_selection::replace(engine, *focus, expected, text, generation)
+    }
     fn app_id(focus: &Focus) -> Option<String> {
         use winapi::um::{
             handleapi::CloseHandle, processthreadsapi::OpenProcess,

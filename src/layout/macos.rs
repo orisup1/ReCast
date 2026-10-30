@@ -45,7 +45,64 @@ extern "C" {
     // The list of language codes ("en", "he", "iw", …) an input source enters.
     static kTISPropertyInputSourceLanguages: CFStringRef;
     static kTISPropertyInputSourceIsEnabled: CFStringRef;
+    static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
+    fn UCKeyTranslate(
+        layout: *const std::ffi::c_void,
+        key: u16,
+        action: u16,
+        modifiers: u32,
+        keyboard: u32,
+        options: u32,
+        dead: *mut u32,
+        capacity: u32,
+        length: *mut u32,
+        text: *mut u16,
+    ) -> i32;
+    fn LMGetKbdType() -> u8;
     fn CFRelease(cf: CFTypeRef);
+}
+
+/// Compare the live layout's physical keys with the capture adapter's mapping.
+/// Dead keys and multi-character outputs cannot be represented by the word buffer.
+pub fn mapping_matches(expected: impl Fn(u16, bool, Language) -> Option<char> + Send) -> bool {
+    on_main(move || unsafe {
+        use core_foundation_sys::data::{CFDataGetBytePtr, CFDataGetLength, CFDataRef};
+        let source = TISCopyCurrentKeyboardInputSource();
+        if source.is_null() {
+            return false;
+        }
+        let data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) as CFDataRef;
+        let language = source_language(source);
+        let matches = !data.is_null()
+            && CFDataGetLength(data) > 0
+            && language.is_some_and(|language| {
+                (0..51).all(|key| {
+                    [false, true].into_iter().all(|shift| {
+                        let Some(character) = expected(key, shift, language) else {
+                            return true;
+                        };
+                        let (mut dead, mut length, mut text) = (0, 0, [0u16; 8]);
+                        UCKeyTranslate(
+                            CFDataGetBytePtr(data).cast(),
+                            key,
+                            0,
+                            if shift { 2 } else { 0 },
+                            LMGetKbdType() as u32,
+                            0,
+                            &mut dead,
+                            8,
+                            &mut length,
+                            text.as_mut_ptr(),
+                        ) == 0
+                            && dead == 0
+                            && length == 1
+                            && u32::from(text[0]) == character as u32
+                    })
+                })
+            });
+        CFRelease(source as CFTypeRef);
+        matches
+    })
 }
 
 pub fn enabled_languages() -> (bool, bool) {
@@ -119,13 +176,21 @@ pub fn query_layout() -> Option<Language> {
 }
 
 fn query_layout_on_main() -> Option<Language> {
+    unsafe {
+        let source = TISCopyCurrentKeyboardInputSource();
+        if source.is_null() {
+            return None;
+        }
+        let result = source_language(source);
+        CFRelease(source as CFTypeRef);
+        result
+    }
+}
+
+unsafe fn source_language(cur: TISInputSourceRef) -> Option<Language> {
     use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 
     unsafe {
-        let cur = TISCopyCurrentKeyboardInputSource();
-        if cur.is_null() {
-            return None;
-        }
         // Inspect the *current* source's own language list rather than testing
         // it for equality against the default "en"/"he" source. A user on any
         // English variant (ABC, British, Colemak, Dvorak…) has a current source
@@ -153,7 +218,6 @@ fn query_layout_on_main() -> Option<Language> {
                 }
             }
         }
-        CFRelease(cur as CFTypeRef);
         result
     }
 }

@@ -174,6 +174,7 @@ fn report(control: &AppControl, summary: &str, app: Option<&str>) -> String {
     let mode = match control.app_mode(app) {
         Some(config::AppMode::Full) => "Full correction",
         Some(config::AppMode::LayoutOnly) => "Layout only",
+        Some(config::AppMode::ManualOnly) => "Manual only",
         Some(config::AppMode::Off) => "Off",
         None => "unknown (processing suspended)",
     };
@@ -290,6 +291,16 @@ fn diagnostics(control: Option<&AppControl>) -> String {
             "none".into()
         } else {
             cfg.layout_only_apps.join(", ")
+        }
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    manual-only apps     {}",
+        if cfg.manual_only_apps.is_empty() {
+            "none".into()
+        } else {
+            cfg.manual_only_apps.join(", ")
         }
     )
     .unwrap();

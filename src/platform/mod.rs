@@ -221,7 +221,7 @@ fn status_for<P: engine::Platform>(
         return "Keyboard listener unavailable — check permissions and connected keyboards, then reopen ReCast if needed.".into();
     }
     if !P::input_allowed() {
-        return "Secure Input — correction resumes when secure entry ends.".into();
+        return P::input_block_reason().into();
     }
     if let Some(id) = control.paused_app() {
         return format!("Paused in {id} — switch to another application or choose Resume in {id}.");
@@ -265,6 +265,10 @@ fn status_for<P: engine::Platform>(
         crate::config::AppMode::LayoutOnly => {
             format!("{active} · Layout only — spelling, abbreviations, and completion are off.")
         }
+        crate::config::AppMode::ManualOnly => format!("{active} · Manual only — edits require a typing shortcut."),
         crate::config::AppMode::Full => format!("{active} · Full correction — correction follows your enabled settings."),
     }
 }
+
+#[cfg(target_os = "windows")]
+mod windows_selection;

@@ -151,6 +151,17 @@ impl<P: Platform> Engine<P> {
         let mut tail = st.keys.to_vec();
         tail.push(Typed { key, shift });
         st.deletion_tail = Some(tail);
+        if st.mode == crate::config::AppMode::ManualOnly {
+            st.last_action = Some(LastAction::Unchanged {
+                keys: st.keys.to_vec(),
+                terminator: Some(key),
+                trailing_spaces: Vec::new(),
+                layout: P::current_layout(),
+            });
+            st.keys.clear();
+            st.phrase.clear();
+            return;
+        }
         let outcome = self.check(&st.keys, st.history.run(), st.mode, &st.phrase);
         // Record what this word turned out to be before anything else happens
         // to it: the next word is decided with this one behind it. A word whose
@@ -277,7 +288,10 @@ impl<P: Platform> Engine<P> {
     /// Completion and explicit correction share cycling and undo, but search
     /// separately so an exact completion cannot hide spelling alternatives.
     fn suggestion_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, correction: bool) {
-        if st.mode != crate::config::AppMode::Full {
+        if !matches!(
+            st.mode,
+            crate::config::AppMode::Full | crate::config::AppMode::ManualOnly
+        ) {
             st.cycle = None;
             return;
         }

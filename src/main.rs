@@ -101,6 +101,7 @@ Settings:
   RECAST_EXCLUDE_APPS=  Comma-separated exact application IDs to leave alone:
                       Linux app_id/WM_CLASS, macOS bundle ID, Windows exe name.
                       Case-insensitive; unknown apps are skipped when set.
+  RECAST_MANUAL_ONLY_APPS=  Exact app IDs where edits require a typing shortcut.
   RECAST_LAYOUT_ONLY_APPS=  Exact app IDs for layout correction only; spelling,
                       abbreviations, completion, and personalization are off there.
   RECAST_UNDO_SHORTCUT=  none (default), left_ctrl, or right_ctrl to add a
@@ -111,6 +112,7 @@ Settings:
                       left_ctrl, right_ctrl, or none. Must not share another gesture.
   RECAST_CORRECTION_SHORTCUT=  Spelling suggestions: left_shift (default), right_shift,
                       left_ctrl, right_ctrl, or none. Must not share another gesture.
+  RECAST_DESKTOP_HELPER=1 Enable optional Linux AT-SPI focus/selection support.
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.

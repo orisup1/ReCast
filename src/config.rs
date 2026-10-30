@@ -3,6 +3,7 @@ pub struct Config {
     /// Exact application IDs in which capture, learning and correction stop.
     pub excluded_apps: Vec<String>,
     pub layout_only_apps: Vec<String>,
+    pub manual_only_apps: Vec<String>,
     /// An optional single Ctrl tap for undo, in addition to the action shortcut.
     pub undo_shortcut: String,
     pub action_shortcut: String,
@@ -137,6 +138,9 @@ impl Config {
             layout_only_apps: parse_excluded_apps(
                 &crate::settings::get("RECAST_LAYOUT_ONLY_APPS").unwrap_or_default(),
             ),
+            manual_only_apps: parse_excluded_apps(
+                &crate::settings::get("RECAST_MANUAL_ONLY_APPS").unwrap_or_default(),
+            ),
             undo_shortcut: crate::settings::get("RECAST_UNDO_SHORTCUT")
                 .filter(|value| valid_undo_shortcut(value))
                 .unwrap_or_else(|| "none".into()),
@@ -180,15 +184,17 @@ impl Config {
 pub enum AppMode {
     Full,
     LayoutOnly,
+    ManualOnly,
     Off,
 }
 
 impl AppMode {
-    pub const ALL: [Self; 3] = [Self::Full, Self::LayoutOnly, Self::Off];
+    pub const ALL: [Self; 4] = [Self::Full, Self::LayoutOnly, Self::ManualOnly, Self::Off];
     pub fn label(self) -> &'static str {
         match self {
             Self::Full => "Full correction",
             Self::LayoutOnly => "Layout only",
+            Self::ManualOnly => "Manual only",
             Self::Off => "Off",
         }
     }
@@ -319,6 +325,7 @@ pub const NUMERIC_KEYS: &[&str] = &[
 /// Every boolean setting, so a typo falls back with a warning instead of
 /// quietly inverting the user's intent.
 pub const BOOLEAN_KEYS: &[&str] = &[
+    "RECAST_DESKTOP_HELPER",
     "RECAST_PERSONAL",
     "RECAST_RULE_STATS",
     "RECAST_SHORT",
@@ -334,6 +341,7 @@ pub const ALL_KEYS: &[&str] = &[
     "RECAST_PREFER",
     "RECAST_EXCLUDE_APPS",
     "RECAST_LAYOUT_ONLY_APPS",
+    "RECAST_MANUAL_ONLY_APPS",
     "RECAST_UNDO_SHORTCUT",
     "RECAST_ACTION_SHORTCUT",
     "RECAST_COMPLETION_SHORTCUT",
@@ -364,6 +372,7 @@ pub const ALL_KEYS: &[&str] = &[
     "RECAST_DEBUG",
     // Linux-only setting (not in Config struct)
     "RECAST_LAYOUT_BACKEND",
+    "RECAST_DESKTOP_HELPER",
 ];
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use std::time::Duration;
 /// Keep explicit accessibility edits and their undo payload bounded.
 pub const MAX_SELECTION_BYTES: usize = 64 * 1024;
 
-/// Native selection offsets, in UTF-16 units, plus the exact selected text.
+/// Native selection offsets (UTF-16 on macOS/Windows, Unicode scalars on AT-SPI), plus exact text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selection {
     pub start: isize,
@@ -55,6 +55,13 @@ pub trait Platform: Sized + Send + Sync + 'static {
     }
     fn input_allowed() -> bool {
         true
+    }
+    /// Fresh native validation, called without the engine lock before editing.
+    fn replacement_allowed() -> bool {
+        Self::input_allowed()
+    }
+    fn input_block_reason() -> &'static str {
+        "Secure Input — correction resumes when secure entry ends."
     }
     /// Confirm an empty text field; unavailable context must remain suppressed.
     fn input_empty(_: &Self::Injector) -> bool {

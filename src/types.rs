@@ -35,6 +35,7 @@ impl Config {
             Mutex::new(Config {
                 excluded_apps: Vec::new(),
                 layout_only_apps: Vec::new(),
+                manual_only_apps: Vec::new(),
                 undo_shortcut: "none".into(),
                 action_shortcut: "ctrl".into(),
                 completion_shortcut: "right_shift".into(),
@@ -444,6 +445,7 @@ impl LiveLog {
 pub struct AppControl {
     pub excluded_apps: Mutex<Vec<String>>,
     pub layout_only_apps: Mutex<Vec<String>>,
+    pub manual_only_apps: Mutex<Vec<String>>,
     pub listener_ready: AtomicBool,
     pub practice_open: AtomicBool,
     pub word_rules_open: AtomicBool,
@@ -466,10 +468,12 @@ impl AppControl {
     pub fn new_with_config(cfg: Config) -> Self {
         let excluded_apps = Mutex::new(cfg.excluded_apps.clone());
         let layout_only_apps = Mutex::new(cfg.layout_only_apps.clone());
+        let manual_only_apps = Mutex::new(cfg.manual_only_apps.clone());
         let _ = GLOBAL_CONFIG.set(Mutex::new(cfg));
         Self {
             excluded_apps,
             layout_only_apps,
+            manual_only_apps,
             listener_ready: AtomicBool::new(false),
             practice_open: AtomicBool::new(false),
             word_rules_open: AtomicBool::new(false),
@@ -495,6 +499,7 @@ impl AppControl {
         Self::new_with_config(Config {
             excluded_apps: Vec::new(),
             layout_only_apps: Vec::new(),
+            manual_only_apps: Vec::new(),
             undo_shortcut: "none".into(),
             action_shortcut: "ctrl".into(),
             completion_shortcut: "right_shift".into(),
@@ -530,7 +535,10 @@ impl AppControl {
     pub fn has_app_rules(&self) -> bool {
         let excluded = lock_forgiving(&self.excluded_apps);
         let layout = lock_forgiving(&self.layout_only_apps);
-        !excluded.is_empty() || !layout.is_empty() || self.paused_app().is_some()
+        !excluded.is_empty()
+            || !layout.is_empty()
+            || !lock_forgiving(&self.manual_only_apps).is_empty()
+            || self.paused_app().is_some()
     }
 
     pub fn paused_app(&self) -> Option<String> {
@@ -583,6 +591,8 @@ impl AppControl {
         let layout = lock_forgiving(&self.layout_only_apps);
         Some(if !crate::config::app_allowed(&excluded, Some(&app)) {
             AppMode::Off
+        } else if lock_forgiving(&self.manual_only_apps).contains(&app) {
+            AppMode::ManualOnly
         } else if layout.contains(&app) {
             AppMode::LayoutOnly
         } else {
