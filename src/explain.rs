@@ -224,7 +224,12 @@ mod tests {
             assert_eq!(key.1, c);
             assert!(key.2, "{c:?}");
         }
-        for c in "שלום0123456789[]\\/.,;'".chars() {
+        let symbols = if cfg!(target_os = "macos") {
+            "׳ֿ"
+        } else {
+            "'\\"
+        };
+        for c in "שלום0123456789[]/.,;".chars().chain(symbols.chars()) {
             let key = readings_for_layout(c, Language::Hebrew).unwrap();
             assert_eq!(key.1, c);
             assert!(!key.2, "{c:?}");

@@ -3394,6 +3394,10 @@ mod tests {
                     ("'", "'"),
                     ("([", "])"),
                 ] {
+                    // Apple Hebrew has a geresh key, not a bare ASCII apostrophe.
+                    if cfg!(target_os = "macos") && target == Language::English && head == "'" {
+                        continue;
+                    }
                     let source_physical = |text: &str| {
                         if target.other() == Language::Hebrew {
                             crate::keymap::hebrew_text_to_physical_english(text).unwrap()

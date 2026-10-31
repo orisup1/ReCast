@@ -102,9 +102,8 @@ pub fn retype_len(text: &str) -> usize {
 /// Hebrew is mapped back to the same physical keys used by the capture buffer.
 pub fn buffer_after(text: &str) -> Vec<Typed<Key>> {
     let word = text.rsplit(char::is_whitespace).next().unwrap_or_default();
-    let physical = if word.chars().any(|c| ('א'..='ת').contains(&c)) {
-        crate::keymap::hebrew_text_to_physical_english(word)
-            .unwrap_or_else(|| crate::keymap::convert_selection(word))
+    let physical = if word.chars().any(|c| ('\u{0590}'..='\u{05ff}').contains(&c)) {
+        crate::keymap::hebrew_text_to_physical_english(word).unwrap_or_default()
     } else {
         word.to_owned()
     };
@@ -149,7 +148,11 @@ fn hebrew_inserted_symbols_reconstruct_their_actual_physical_keys() {
         "{שלום}",
         "<שלום>",
         "שלום!?",
-        "שלום,.;'/'",
+        if cfg!(target_os = "macos") {
+            "שלום,.;׳/ֿ"
+        } else {
+            "שלום,.;'/'"
+        },
     ] {
         let keys = buffer_after(text);
         let visible: String = keys
@@ -187,18 +190,12 @@ fn hebrew_inserted_symbols_reconstruct_their_actual_physical_keys() {
         assert_eq!(restored, original);
     }
 
-    // Mixed or unsupported text keeps its existing conservative fallback.
+    // Unrepresentable text must not fabricate physical keys for later edits.
     for text in ["helloשלום", "שלוםhello", "שלום🙂"] {
-        let previous = crate::keymap::convert_selection(text)
-            .chars()
-            .map(|c| english_char_to_key(c).map(|(key, shift)| Typed { key, shift }))
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_default();
-        let actual = buffer_after(text);
-        assert_eq!(actual.len(), previous.len());
-        for (actual, previous) in actual.iter().zip(previous) {
-            assert_eq!(actual.key, previous.key);
-            assert_eq!(actual.shift, previous.shift);
-        }
+        assert!(buffer_after(text).is_empty(), "{text}");
+    }
+    #[cfg(target_os = "macos")]
+    for text in ["שלום'", "שלום\\"] {
+        assert!(buffer_after(text).is_empty(), "{text}");
     }
 }

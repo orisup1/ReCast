@@ -365,6 +365,9 @@ pub fn key_to_hebrew_char(key: rdev::Key) -> Option<char> {
     use rdev::Key as K;
     match key {
         K::KeyQ => Some('/'),
+        #[cfg(target_os = "macos")]
+        K::KeyW => Some('׳'),
+        #[cfg(not(target_os = "macos"))]
         K::KeyW => Some('\''),
         K::KeyE => Some('ק'),
         K::KeyR => Some('ר'),
@@ -400,6 +403,9 @@ pub fn key_to_hebrew_char(key: rdev::Key) -> Option<char> {
         K::RightBracket => Some('['),
         K::Minus => Some('-'),
         K::Equal => Some('='),
+        #[cfg(target_os = "macos")]
+        K::BackSlash => Some('ֿ'),
+        #[cfg(not(target_os = "macos"))]
         K::BackSlash => Some('\\'),
         // Numbers
         K::Num1 => Some('1'),
@@ -556,7 +562,14 @@ pub fn hebrew_text_to_physical_english(text: &str) -> Option<String> {
                 '>' => '<',
                 ',' => '\'',
                 '.' => '/',
+                #[cfg(not(target_os = "macos"))]
                 '\'' => 'w',
+                #[cfg(target_os = "macos")]
+                '׳' => 'w',
+                #[cfg(target_os = "macos")]
+                'ֿ' => '\\',
+                #[cfg(target_os = "macos")]
+                '\\' => return None,
                 '/' => 'q',
                 ';' => '`',
                 c if c.is_ascii_digit() || " !@#$%^&*_+=\\|:\"~?-".contains(c) => c,
@@ -570,10 +583,27 @@ pub fn hebrew_text_to_physical_english(text: &str) -> Option<String> {
 mod hebrew_symbol_tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_hebrew_uses_geresh_and_rafe() {
+        assert_eq!(key_to_hebrew_char(rdev::Key::KeyW), Some('׳'));
+        assert_eq!(key_to_hebrew_char(rdev::Key::BackSlash), Some('ֿ'));
+        assert_eq!(hebrew_text_to_physical_english("׳ֿ").as_deref(), Some("w\\"));
+        for unsupported in ["'", "\\"] {
+            assert!(hebrew_text_to_physical_english(unsupported).is_none());
+        }
+    }
+
     #[test]
     fn hebrew_text_inverse_round_trips_every_supported_letter_and_symbol() {
-        for expected in
-            "אבגדהוזחטיךכלםמןנסעףפץצקרשת0123456789 ()[]{}<>,.';/\\|!@#$%^&*_-+=:\"~?".chars()
+        let symbols = if cfg!(target_os = "macos") {
+            "׳ֿ"
+        } else {
+            "'\\"
+        };
+        for expected in "אבגדהוזחטיךכלםמןנסעףפץצקרשת0123456789 ()[]{}<>,.;/|!@#$%^&*_-+=:\"~?"
+            .chars()
+            .chain(symbols.chars())
         {
             let physical = hebrew_text_to_physical_english(&expected.to_string()).unwrap();
             assert_eq!(physical.chars().count(), 1);

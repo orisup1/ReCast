@@ -3614,6 +3614,48 @@ fn typing_correction_undo_and_interrupted_replacements() {
         "completion cycle restores the exact prefix"
     );
 
+    // Adjacent offers can share more text than the original input. Preserve it
+    // while cycling, but still undo to the original input after every offer.
+    for (typed, offers, erasures) in [
+        ("keyb", ["keyboard", "keyboards", "keyboard"], [0, 0, 1]),
+        ("recie", ["receive", "receiver", "receive"], [2, 0, 1]),
+    ] {
+        for undo_at in 0..3 {
+            let cycle_session = Session::new();
+            cycle_session.type_text(typed);
+            {
+                let mut st = cycle_session.engine.lock();
+                st.cycle = Some(Cycle {
+                    typed: st.keys.to_vec(),
+                    trailing_spaces: Vec::new(),
+                    candidates: offers.iter().map(|text| (*text).into()).collect(),
+                    candidate_langs: vec![Language::English; offers.len()],
+                    correction: false,
+                    index: offers.len(),
+                    resume_index: 0,
+                    on_screen: typed.len(),
+                    lang: Language::English,
+                    original_lang: Language::English,
+                });
+            }
+            for expected in offers.iter().take(undo_at + 1) {
+                cycle_session.tap(Simulated::SHIFT_RIGHT);
+                cycle_session.pending();
+                cycle_session.finish();
+                assert_eq!(cycle_session.text(), *expected);
+            }
+            assert_eq!(
+                *cycle_session.engine.injector.erasures.lock().unwrap(),
+                erasures[..=undo_at]
+            );
+            cycle_session.undo();
+            cycle_session.pending();
+            cycle_session.finish();
+            assert_eq!(cycle_session.text(), typed);
+            crate::complete::unlist(typed);
+        }
+    }
+
     // Live settings must also stop an already cached completion cycle.
     s.tap(Simulated::SHIFT_RIGHT);
     s.pending();

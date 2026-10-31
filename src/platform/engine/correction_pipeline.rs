@@ -600,18 +600,21 @@ impl<P: Platform> Engine<P> {
         } else {
             Vec::new()
         };
-        // Keep the prefix shared by the original, current offer, and next offer.
-        // First completion usually appends only; cycling and undo touch suffixes.
+        // Cycling only changes the visible suffix; undo has its own original prefix.
         let target = if back_to_typed {
             &was
         } else {
             &candidates[index]
         };
-        let prefix = was
+        let prefix = current
             .chars()
-            .zip(current.chars())
             .zip(target.chars())
-            .take_while(|((original, current), target)| original == current && current == target)
+            .take_while(|(current, target)| current == target)
+            .count();
+        let undo_prefix = was
+            .chars()
+            .zip(target.chars())
+            .take_while(|(original, target)| original == target)
             .count();
         let Some(mut suffix) = P::retype_completion(
             &target.chars().skip(prefix).collect::<String>(),
@@ -631,8 +634,9 @@ impl<P: Platform> Engine<P> {
             visible,
             visible_layout: target_lang,
             manual_conversion: false,
-            on_screen: P::retype_len(&retype) - prefix + usize::from(!trailing_spaces.is_empty()),
-            restore: typed[prefix..].to_vec(),
+            on_screen: P::retype_len(&retype) - undo_prefix
+                + usize::from(!trailing_spaces.is_empty()),
+            restore: typed[undo_prefix..].to_vec(),
             restore_layout: original_lang,
             trailing_spaces: trailing_spaces.iter().skip(1).copied().collect(),
             terminator: trailing_spaces.first().map(|typed| typed.key),

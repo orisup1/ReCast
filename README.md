@@ -17,6 +17,8 @@ It uses the current keyboard layout, dictionary matches, and word frequency to d
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
 the terminator are preserved. Same-layout corrections keep an unchanged prefix
 on screen and rewrite only the remaining suffix, reducing visible deletion.
+Cycling suggestions also preserves all text shared by consecutive offers;
+undo still restores exactly what you typed.
 Enter accepts an already selected suggestion and clears typing context. It never
 starts an automatic rewrite or replays Enter, because that key may send a message
 or execute a command instead of inserting a line break.
