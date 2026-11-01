@@ -60,6 +60,13 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
 
+      - name: Script and integration fixtures
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          node scripts/test_gnome_extension.cjs
+          node scripts/test_native_editing.cjs
+
       - name: Test
         run: cargo test --locked
 

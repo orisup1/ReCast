@@ -40,7 +40,8 @@ published release when uploading replacement assets.
 | `recastMac` | macOS command-line or service use, both architectures |
 | `ReCast.exe` | Windows x86-64; portable tray app |
 | `recastLinux` | Linux x86-64; executable download |
-| `SHA256SUMS` | Checksums for all four downloads |
+| `LICENSES.txt` | Application and bundled English dictionary notices; also inside the macOS app |
+| `SHA256SUMS` | Checksums for the binaries, app archive, and notices |
 
 All platforms need English and Hebrew keyboards. macOS users grant Accessibility
 access through setup. Linux users need `evdev`/`uinput` access; the README describes

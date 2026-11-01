@@ -296,7 +296,7 @@ impl eframe::App for App {
 
                 ] {
                     if ui.checkbox(&mut checked, label).changed() {
-                        let value = if key == "spell_dist" { if checked { "1" } else { "3" } } else if checked { "true" } else { "false" };
+                        let value = if checked { "true" } else { "false" };
                         self.error = crate::settings::set_live(&self.control, key, value).err();
                     }
                 }

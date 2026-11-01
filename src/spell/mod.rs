@@ -1103,7 +1103,10 @@ fn budget_for(word: &str, min_len: usize, max_dist: u8) -> Option<u32> {
 
 /// Whether `word` is a token the speller may touch at all.
 fn eligible(word: &str, min_len: usize) -> bool {
-    word.len() >= min_len && word.len() <= MAX_LEN && word.bytes().all(|b| b.is_ascii_lowercase())
+    !word.is_empty()
+        && word.len() >= min_len
+        && word.len() <= MAX_LEN
+        && word.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// Worst frequency rank a suggestion of this channel cost may have. A candidate
@@ -1620,6 +1623,14 @@ impl Dp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_minimum_length_still_rejects_an_empty_word() {
+        assert_eq!(
+            correct_with("", Dict::new("hello"), Freq::new("hello\t0"), 0, 100, 3),
+            None
+        );
+    }
 
     #[test]
     fn keeping_an_unknown_token_competes_even_with_a_unique_candidate() {

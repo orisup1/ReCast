@@ -157,9 +157,9 @@ Undo or convert (Ctrl tapped twice within half a second):
   Enter, or cursor movement ends the gesture. Enter never triggers a rewrite.
   The optional single-Ctrl undo shortcut only restores corrections; it never unlists
   skipped words. Shared bindings wait half a second so double taps take priority.
-  On macOS, select text in an editable field and double-tap Ctrl to convert
+  Select text in a supported editable field and double-tap Ctrl to convert
   its layout. Repeat to restore the original. Requires accessibility selection
-  editing; the clipboard is untouched.
+  editing (Linux needs the optional desktop helper); the clipboard is untouched.
 
 Your files (<config dir>/recast/):
   config.toml `key = value` per line, everything under Settings above

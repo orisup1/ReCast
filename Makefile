@@ -79,12 +79,13 @@ BIN_DST  := $(BINDIR)/$(BIN_NAME)
 SRC := Cargo.toml Cargo.lock build.rs \
         en_dict.txt he_dict.txt en_freq.txt he_freq.txt en_tech.txt \
         src/phrases.tsv src/phrase_counts.tsv src/intent_counts.tsv \
-        assets/tray-icon.rgba assets/recast.ico \
+        assets/tray-icon.rgba assets/tray-template.rgba assets/banner-logo.rgba \
+        assets/recast.ico scripts/linux_desktop.py \
         $(shell find src -type f -name '*.rs' 2>/dev/null)
 
-assets/tray-icon.rgba: assets/recast-icon.svg  assets/recast.icns
+assets/tray-icon.rgba: assets/banner-logo.svg
 	@echo "Regenerating 32x32 transparent tray-icon.rgba..."
-	@magick "$<" -background none -flatten none -alpha remove -resize 32x32 RGBA:"$@" \
+	@magick -background none "$<" -resize 32x32 -depth 8 RGBA:"$@" \
 	  || (echo "ERROR: ImageMagick (magick) required. Install via: brew install imagemagick" && exit 1)
 
 # `make tray-icon` was listed in .PHONY and in `help` without ever existing as a
@@ -232,6 +233,7 @@ bundle: build bundle-plist
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
 	$(INSTALL) -m 755 $(BIN_SRC) $(APP_BUNDLE)/Contents/MacOS/recast
 	$(INSTALL) -m 644 assets/recast.icns $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
+	cat LICENSE licenses/scowl.txt > $(APP_BUNDLE)/Contents/Resources/LICENSES.txt
 	$(MAKE) sign
 
 sign:

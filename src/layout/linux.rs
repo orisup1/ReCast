@@ -915,6 +915,7 @@ mod sway {
     const SUBSCRIBE: u32 = 2;
     const GET_INPUTS: u32 = 100;
     const IO_TIMEOUT: Duration = Duration::from_millis(250);
+    const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
     fn socket_path() -> Option<PathBuf> {
         // Recheck availability so an initial startup race is recoverable.
@@ -951,9 +952,33 @@ mod sway {
             return None;
         }
         let len = u32::from_ne_bytes(header[6..10].try_into().ok()?) as usize;
+        if len > MAX_REPLY_BYTES {
+            return None;
+        }
         let mut body = vec![0u8; len];
         stream.read_exact(&mut body).ok()?;
         String::from_utf8(body).ok()
+    }
+
+    #[test]
+    fn oversized_replies_are_rejected_without_consuming_the_body() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let header = |len: u32| {
+            [
+                MAGIC.as_slice(),
+                &len.to_ne_bytes(),
+                &GET_INPUTS.to_ne_bytes(),
+            ]
+            .concat()
+        };
+        server
+            .write_all(&header(MAX_REPLY_BYTES as u32 + 1))
+            .unwrap();
+        server.write_all(&header(2)).unwrap();
+        server.write_all(b"[]").unwrap();
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(recv(&mut client), None);
+        assert_eq!(recv(&mut client).as_deref(), Some("[]"));
     }
 
     fn request(kind: u32, payload: &str) -> Option<String> {

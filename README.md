@@ -82,6 +82,7 @@ The release workflow produces these self-contained downloads; check
 | `ReCast.exe` | Windows x86-64, Windows 10+ |
 | `recastMac` | macOS, Intel and Apple Silicon |
 | `ReCast.app.zip` | macOS app bundle, Intel and Apple Silicon |
+| `LICENSES.txt` | Application and bundled English dictionary notices |
 | `SHA256SUMS` | Download checksums |
 
 For a source build, install Rust/Cargo, clone this repository, and run the commands

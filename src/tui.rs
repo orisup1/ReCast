@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::{
+    cursor::Show,
     event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -57,27 +58,23 @@ pub fn run_tui(control: Arc<AppControl>) -> std::io::Result<()> {
     // Setup terminal
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let res = (|| {
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(&mut stdout);
+        let mut terminal = Terminal::new(backend)?;
+        let app = App {
+            control,
+            start: Instant::now(),
+            tab: 0,
+            settings_error: None,
+        };
+        run_app(&mut terminal, app)
+    })();
 
-    let app = App {
-        control,
-        start: Instant::now(),
-        tab: 0,
-        settings_error: None,
-    };
-    let res = run_app(&mut terminal, app);
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    res
+    // Attempt every cleanup step even when setup or another cleanup step fails.
+    let raw = disable_raw_mode();
+    let screen = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+    res.and(raw).and(screen)
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Result<()> {
