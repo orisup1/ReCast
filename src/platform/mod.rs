@@ -52,7 +52,7 @@ fn quartz_text_events_preserve_long_strings_and_surrogate_boundaries() {
         })
         .unwrap();
         assert_eq!(events.len() % 2, 0);
-        for pair in events.chunks_exact(2) {
+        for pair in events.as_chunks::<2>().0 {
             assert!(pair[0].1);
             assert!(!pair[1].1);
             assert_eq!(pair[0].0, pair[1].0);

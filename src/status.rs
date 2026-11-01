@@ -9,6 +9,8 @@ use std::time::Duration;
 use crate::{complete, config, footprint, layout, personal, prefs, settings, types::AppControl};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+// A cold Windows Task Scheduler query starts PowerShell while building the report.
+const REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REPORT: u64 = 64 * 1024;
 const HEADER: &str = "ReCast live status v1";
 
@@ -107,7 +109,7 @@ fn query(path: &Path, pid: u32) -> io::Result<String> {
     let port = u16::from_be_bytes([endpoint[0], endpoint[1]]);
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_read_timeout(Some(REPORT_TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     stream.write_all(&endpoint[2..])?;
     let mut size = [0; 4];
@@ -481,9 +483,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             assert!(respond(stream, &token, || panic!("unauthenticated request")).is_err());
-            for _ in 0..2 {
+            for request in 0..2 {
                 let (stream, _) = listener.accept().unwrap();
                 respond(stream, &token, || {
+                    if request == 0 {
+                        // Report generation can outlast the connection timeout.
+                        std::thread::sleep(TIMEOUT + Duration::from_millis(100));
+                    }
                     format!("{HEADER} (pid {pid})\n  status: Paused\n")
                 })
                 .unwrap();
