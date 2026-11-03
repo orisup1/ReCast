@@ -12,11 +12,72 @@
 
 pub mod engine;
 
+/// Quartz carries at most 20 UTF-16 units per keyboard event.
+/// Keep surrogate pairs together and give each payload its own press/release pair.
+#[cfg(any(target_os = "macos", test))]
+fn unicode_text_events(text: &str, mut emit: impl FnMut(&[u16], bool) -> Option<()>) -> Option<()> {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut remaining = utf16.as_slice();
+    while !remaining.is_empty() {
+        let mut count = remaining.len().min(20);
+        if count < remaining.len() && (0xd800..=0xdbff).contains(&remaining[count - 1]) {
+            count -= 1;
+        }
+        let (chunk, tail) = remaining.split_at(count);
+        for down in [true, false] {
+            emit(chunk, down)?;
+        }
+        remaining = tail;
+    }
+    Some(())
+}
+
+#[cfg(test)]
+#[test]
+fn quartz_text_events_preserve_long_strings_and_surrogate_boundaries() {
+    for text in [
+        String::new(),
+        "short text".into(),
+        "x".repeat(20),
+        "x".repeat(21),
+        "an abbreviation that expands beyond one keyboard event".into(),
+        "שלום עולם ".repeat(8),
+        format!("{}🙂z", "x".repeat(19)),
+        "🙂".repeat(21),
+    ] {
+        let mut events = Vec::new();
+        unicode_text_events(&text, |units, down| {
+            events.push((units.to_vec(), down));
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(events.len() % 2, 0);
+        for pair in events.as_chunks::<2>().0 {
+            assert!(pair[0].1);
+            assert!(!pair[1].1);
+            assert_eq!(pair[0].0, pair[1].0);
+            assert!(!pair[0].0.is_empty());
+            assert!(pair[0].0.len() <= 20);
+            String::from_utf16(&pair[0].0).expect("a payload must not split a surrogate pair");
+        }
+        // Model Quartz's bounded event payload for both press-only and release-only consumers.
+        for down in [true, false] {
+            let received: Vec<u16> = events
+                .iter()
+                .filter(|(_, pressed)| *pressed == down)
+                .flat_map(|(units, _)| units.iter().take(20).copied())
+                .collect();
+            assert_eq!(String::from_utf16(&received).unwrap(), text);
+        }
+    }
+}
+
 /// Start workers only after Linux has forked: other threads do not survive fork.
-fn start_background_tasks() {
+fn start_background_tasks(control: &std::sync::Arc<crate::types::AppControl>) {
     crate::complete::spawn_watcher();
     crate::layout::spawn_watcher();
     crate::personal::init();
+    crate::status::start(std::sync::Arc::clone(control));
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -33,6 +94,24 @@ pub mod windows;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod tray;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod log_viewer;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod word_rules;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) mod desktop;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod preferences;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod history;
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+mod tray_icon;
 
 /// Friendly label plus the exact identifier used by the exclusion engine.
 pub fn active_application() -> Option<(String, String)> {
@@ -103,25 +182,35 @@ pub fn active_application() -> Option<(String, String)> {
 
 /// Shared status wording for live controls. It never reads the focused text.
 pub fn status(control: &crate::types::AppControl) -> String {
+    let application = active_application();
     #[cfg(target_os = "macos")]
-    return status_for::<macos::Mac>(control);
+    return status_for::<macos::Mac>(control, application.as_ref());
     #[cfg(target_os = "windows")]
-    return status_for::<windows::Windows>(control);
+    return status_for::<windows::Windows>(control, application.as_ref());
     #[cfg(target_os = "linux")]
-    return status_for::<linux::Linux>(control);
+    return status_for::<linux::Linux>(control, application.as_ref());
 }
 
-fn status_for<P: engine::Platform>(control: &crate::types::AppControl) -> String {
+fn status_for<P: engine::Platform>(
+    control: &crate::types::AppControl,
+    application: Option<&(String, String)>,
+) -> String {
     let focus = P::focus();
     let app = focus.as_ref().and_then(P::app_id);
     let mode =
         control.effective_app_mode(app.as_deref(), focus.as_ref().is_some_and(P::is_own_focus));
     if !control.is_switched_on() {
-        return "Disabled — enable correction to resume.".into();
+        return "Disabled until you enable it — choose Enable correction in Settings or the tray. This setting survives restarts.".into();
+    }
+    if control
+        .word_rules_open
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return "Paused while editing word rules — save or cancel the editor to resume.".into();
     }
     if let Some(left) = control.pause_remaining() {
         return format!(
-            "Paused — {} min left. Choose Resume to continue now.",
+            "Paused · {} min remaining — choose Resume to continue now.",
             left.as_secs() / 60 + 1
         );
     }
@@ -132,23 +221,53 @@ fn status_for<P: engine::Platform>(control: &crate::types::AppControl) -> String
         return "Keyboard listener unavailable — check permissions and connected keyboards, then reopen ReCast if needed.".into();
     }
     if !P::input_allowed() {
-        return "Secure Input — correction resumes when secure entry ends.".into();
+        return P::input_block_reason().into();
     }
     if let Some(id) = control.paused_app() {
         return format!("Paused in {id} — switch to another application or choose Resume in {id}.");
     }
-    if mode.is_none() || (P::requires_focus() && focus.is_none()) {
-        return "Cannot identify this application — switch to a text field and check focus/accessibility support. Configured app restrictions stay enforced.".into();
+    // Opening a menu can hide the text control while the frontmost app remains
+    // known. Report that app's enabled mode, not a failed focus probe. This is
+    // display-only: it neither relaxes engine focus checks nor ends an app pause.
+    let waiting_for_focus = P::requires_focus() && focus.is_none();
+    if waiting_for_focus && application.is_none() {
+        return "Text focus unavailable — click a text field. If this persists, check ReCast's Accessibility permission. Correction waits for identifiable focus.".into();
     }
+    let mode = mode.or_else(|| {
+        application
+            .filter(|_| focus.is_none())
+            .and_then(|(_, id)| control.app_mode(Some(id)))
+    });
+    if mode.is_none() {
+        return "Cannot identify this application — check application-detection support. Configured app restrictions stay enforced.".into();
+    }
+    let app_name = application
+        .filter(|(_, id)| {
+            focus.is_none()
+                || app
+                    .as_deref()
+                    .is_some_and(|app| app.eq_ignore_ascii_case(id))
+        })
+        .map(|(name, _)| name.as_str())
+        .or(app.as_deref());
+    let state = if waiting_for_focus {
+        "Enabled"
+    } else {
+        "Active"
+    };
+    let active = app_name.map_or_else(|| state.to_string(), |name| format!("{state} in {name}"));
     match mode.unwrap() {
         crate::config::AppMode::Off => {
-            "Excluded application — choose Full correction or Layout only in Application modes."
-                .into()
+            format!("Paused in {} — choose Full correction, Layout only, or Manual only in this application's mode menu.", app_name.unwrap_or("this application"))
         }
         _ if P::current_layout().is_none() => "Keyboard layout unavailable — enable English and Hebrew keyboards and check the layout backend.".into(),
         crate::config::AppMode::LayoutOnly => {
-            "Ready — layout only; spelling, abbreviations, and completion are off.".into()
+            format!("{active} · Layout only — spelling, abbreviations, and completion are off.")
         }
-        crate::config::AppMode::Full => "Ready — correction follows your enabled settings.".into(),
+        crate::config::AppMode::ManualOnly => format!("{active} · Manual correction only — use a typing shortcut, or choose Full correction in the application mode menu."),
+        crate::config::AppMode::Full => format!("{active} · Full correction — correction follows your enabled settings."),
     }
 }
+
+#[cfg(target_os = "windows")]
+mod windows_selection;

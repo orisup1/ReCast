@@ -15,6 +15,8 @@
 //   *_dict.blob   one word per line
 //   *_freq.blob   `word\trank` per line, rank = 0-based line index in the
 //                 source file (lower = more common)
+//   *.prefix      little-endian u32 start/end offsets for one- and two-letter
+//                 runs; these indexes remain read-only executable data
 //
 // ── Windows resources ───────────────────────────────────────────────────────
 // Turns the Windows binary into a "full app": the executable carries the ReCast
@@ -28,12 +30,13 @@
 // cross-compiling with the GNU (mingw-w64) toolchain we point it at the
 // prefixed windres/ar.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     prepare_dictionaries();
+    prepare_offer_phrases();
     embed_windows_resources();
 }
 
@@ -50,9 +53,14 @@ fn prepare_dictionaries() {
     for (src, dst) in [
         ("en_dict.txt", "en_dict.blob"),
         ("he_dict.txt", "he_dict.blob"),
+        ("en_tech.txt", "en_tech.blob"),
     ] {
         println!("cargo:rerun-if-changed={src}");
-        let content = read(src);
+        let mut content = read(src);
+        if src == "en_dict.txt" {
+            content.push('\n');
+            content.push_str(&read("en_tech.txt"));
+        }
         let mut words: Vec<String> = Vec::with_capacity(content.len() / 8);
         for line in content.lines() {
             let word = line.trim();
@@ -67,7 +75,7 @@ fn prepare_dictionaries() {
         }
         words.sort_unstable();
         words.dedup();
-        write(&out_dir.join(dst), &words.join("\n"));
+        write_blob(&out_dir.join(dst), &words.join("\n"), src);
     }
 
     // Frequency lists: the rank *is* the line index, so sorting by word means
@@ -108,8 +116,73 @@ fn prepare_dictionaries() {
             blob.push('\n');
         }
         blob.pop(); // no trailing newline: every line is a real entry
-        write(&out_dir.join(dst), &blob);
+        write_blob(&out_dir.join(dst), &blob, src);
     }
+}
+
+/// Derive additional explicit-offer priors from already bundled measured counts.
+/// Lexical trust matches build_phrases.py before technical additions or folding.
+fn prepare_offer_phrases() {
+    println!("cargo:rerun-if-changed=src/intent_counts.tsv");
+    let mut allowed = HashSet::new();
+    for language in ["en", "he"] {
+        let dictionary = read(&format!("{language}_dict.txt")).to_lowercase();
+        let dictionary: HashSet<_> = dictionary.lines().collect();
+        let frequency = read(&format!("{language}_freq.txt")).to_lowercase();
+        allowed.extend(
+            frequency
+                .lines()
+                .take(20_000)
+                .filter(|word| {
+                    dictionary.contains(word) && (2..=20).contains(&word.chars().count())
+                })
+                .map(str::to_owned),
+        );
+    }
+    let data = read("src/intent_counts.tsv");
+    let counts: HashMap<_, _> = data
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 3, "invalid intent count row");
+            (
+                fields[0],
+                (
+                    fields[1].parse::<u32>().expect("intent count"),
+                    fields[2].parse::<u32>().expect("intent denominator"),
+                ),
+            )
+        })
+        .collect();
+    let mut phrases = Vec::new();
+    for (&key, &(count, previous_count)) in &counts {
+        let Some((previous, next)) = key.split_once(' ') else {
+            continue;
+        };
+        if count < 5
+            || u64::from(count) * 20 < u64::from(previous_count)
+            || !allowed.contains(previous)
+            || !allowed.contains(next)
+        {
+            continue;
+        }
+        let Some(&(_, total)) = counts.get(previous) else {
+            continue;
+        };
+        let Some(&(next_count, _)) = counts.get(next) else {
+            continue;
+        };
+        let association = f64::from(count) * f64::from(total)
+            / (f64::from(previous_count) * f64::from(next_count));
+        if association >= 3.0 {
+            let weight = (1.0 + association.log2()).min(4.0);
+            phrases.push(format!("{key}\t{weight}"));
+        }
+    }
+    phrases.sort_unstable();
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    write(&out_dir.join("offer_phrases.blob"), &phrases.join("\n"));
 }
 
 /// The apostrophe/quote-free variant of `word`, or `None` when there is nothing
@@ -128,6 +201,53 @@ fn read(path: &str) -> String {
 
 fn write(path: &PathBuf, content: &str) {
     std::fs::write(path, content).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// Index the supported alphabets without changing the sorted text or folding.
+/// Each row contains the whole first-letter run, then its second-letter runs.
+fn write_blob(path: &PathBuf, content: &str, source: &str) {
+    write(path, content);
+    if source == "en_tech.txt" {
+        return;
+    }
+    let (first, letters) = if source.starts_with("en_") {
+        ('a', 26usize)
+    } else {
+        ('א', 27usize)
+    };
+    let letter_index = |letter: char| {
+        (letter as u32)
+            .checked_sub(first as u32)
+            .map(|index| index as usize)
+            .filter(|&index| index < letters)
+    };
+    let mut ranges = vec![(0u32, 0u32); letters * (letters + 1)];
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let mut chars = line.chars();
+        if let Some(row) = chars.next().and_then(letter_index) {
+            let start = u32::try_from(offset).expect("dictionary exceeds 4 GiB");
+            let end = u32::try_from(offset + line.len()).expect("dictionary exceeds 4 GiB");
+            let mut extend = |slot: usize| {
+                let range = &mut ranges[row * (letters + 1) + slot];
+                if range.1 == 0 {
+                    range.0 = start;
+                }
+                range.1 = end;
+            };
+            extend(0);
+            if let Some(column) = chars.next().and_then(letter_index) {
+                extend(column + 1);
+            }
+        }
+        offset += line.len();
+    }
+    let bytes: Vec<u8> = ranges
+        .into_iter()
+        .flat_map(|(start, end)| start.to_le_bytes().into_iter().chain(end.to_le_bytes()))
+        .collect();
+    std::fs::write(path.with_extension("prefix"), bytes)
+        .unwrap_or_else(|e| panic!("writing prefix index for {}: {e}", path.display()));
 }
 
 fn embed_windows_resources() {

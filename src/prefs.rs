@@ -91,8 +91,9 @@ fn write_user_file(name: &str, contents: &str) {
 // `make service` / `deploy.ps1 -Target service` already register ReCast at
 // login, but they are the install path — someone who was handed the binary, or
 // who ran it once to try it, has no way to say "keep doing this" without going
-// back to a shell. That is the gap the tray checkbox fills, so it writes the
-// same launchd agent / Run entry those scripts do.
+// back to a shell. The tray checkbox writes the same launchd agent or toggles
+// the Windows installer's existing task. Windows copies installed without a
+// task use the per-user Run entry instead.
 
 /// Whether ReCast is registered to start at login. `None` on platforms where
 /// this isn't wired up, which is how the tray knows to leave the item out.
@@ -133,9 +134,50 @@ pub fn set_autostart(enable: bool) -> bool {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "windows", test))]
+fn update_windows_registration<T>(
+    task_exists: bool,
+    enabled: bool,
+    previous: Option<&T>,
+    desired: Option<&T>,
+    mut write_run: impl FnMut(Option<&T>) -> bool,
+    set_task_enabled: impl FnOnce(bool) -> bool,
+) -> bool {
+    if !write_run(if task_exists { None } else { desired }) {
+        return false;
+    }
+    if !task_exists || set_task_enabled(enabled) {
+        return true;
+    }
+    // A failed task update must not discard the previous login registration.
+    let _ = write_run(previous);
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+const AUTOSTART_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn cached_autostart_enabled(
+    cached: &mut Option<(std::time::Instant, bool)>,
+    now: impl Fn() -> std::time::Instant,
+    query: impl FnOnce() -> Result<Option<bool>, ()>,
+) -> bool {
+    if let Some((updated, enabled)) = *cached {
+        if now().saturating_duration_since(updated) < AUTOSTART_CACHE_TTL {
+            return enabled;
+        }
+    }
+    let enabled = query().is_ok_and(|state| state == Some(true));
+    // Timestamp completion so a slow query does not expire its own result.
+    *cached = Some((now(), enabled));
+    enabled
+}
+
+#[cfg(any(target_os = "macos", test))]
 mod macos_autostart {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "macos")]
     use std::process::Command;
 
     /// Same label the Makefile's `service-macos` target uses, so the checkbox
@@ -143,6 +185,7 @@ mod macos_autostart {
     /// would both launch a copy.
     const LABEL: &str = "org.recast";
 
+    #[cfg(target_os = "macos")]
     fn plist_path() -> Option<PathBuf> {
         Some(
             dirs::home_dir()?
@@ -151,30 +194,97 @@ mod macos_autostart {
         )
     }
 
-    pub fn is_enabled() -> bool {
-        plist_path().is_some_and(|p| p.exists())
+    #[cfg(target_os = "macos")]
+    fn cached_state() -> &'static std::sync::Mutex<Option<(std::time::Instant, bool)>> {
+        static STATE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
+            std::sync::Mutex::new(None);
+        &STATE
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn is_enabled() -> bool {
+        if !plist_path().is_some_and(|path| path.exists()) {
+            return false;
+        }
+        let Ok(mut cached) = cached_state().lock() else {
+            return true;
+        };
+        super::cached_autostart_enabled(&mut cached, std::time::Instant::now, || {
+            let domain = format!("gui/{}", unsafe { nix::libc::getuid() });
+            let disabled = Command::new("/bin/launchctl")
+                .args(["print-disabled", &domain])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| launch_agent_disabled(&String::from_utf8_lossy(&out.stdout)));
+            // Keep the previous file-based answer if launchd cannot be queried.
+            Ok(Some(disabled != Some(true)))
+        })
+    }
+
+    fn launch_agent_disabled(listing: &str) -> Option<bool> {
+        let mut lines = listing.lines().map(str::trim);
+        if lines.next()? != "disabled services = {" {
+            return None;
+        }
+        for line in lines {
+            if line == "}" {
+                return Some(false);
+            }
+            if let Some((key, value)) = line.split_once("=>") {
+                if key.trim() == format!("\"{LABEL}\"") {
+                    return match value.trim().trim_end_matches([',', ';']) {
+                        "true" | "disabled" => Some(true),
+                        "false" | "enabled" => Some(false),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn set(enable: bool) -> bool {
         let Some(path) = plist_path() else {
             return false;
         };
-        if !enable {
-            let _ = Command::new("launchctl")
-                .arg("unload")
-                .arg("-w")
-                .arg(&path)
-                .status();
-            return std::fs::remove_file(&path).is_ok();
-        }
         let Ok(exe) = std::env::current_exe() else {
             return false;
         };
-        if let Some(dir) = path.parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                return false;
-            }
+        let changed = set_with(
+            &path,
+            &exe,
+            unsafe { nix::libc::getuid() },
+            enable,
+            |args| {
+                Command::new("/bin/launchctl")
+                    .args(args)
+                    .status()
+                    .is_ok_and(|status| status.success())
+            },
+        );
+        if let Ok(mut cached) = cached_state().lock() {
+            *cached = changed.then(|| (std::time::Instant::now(), enable));
         }
+        changed
+    }
+
+    fn set_with(
+        path: &Path,
+        exe: &Path,
+        uid: u32,
+        enable: bool,
+        mut run: impl FnMut(&[&str]) -> bool,
+    ) -> bool {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return false;
+        }
+        let previous = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return false,
+        };
         // KeepAlive matches the Makefile's agent: the point of asking for this
         // is that ReCast is running, and a tap the OS tore down should come
         // back rather than quietly stay dead until the next login.
@@ -195,26 +305,301 @@ mod macos_autostart {
 </dict>
 </plist>
 "#,
-            exe.display()
+            exe.to_string_lossy()
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
         );
-        if std::fs::write(&path, plist).is_err() {
+        let changed = if enable {
+            crate::settings::write_atomic(path, &plist)
+        } else {
+            match std::fs::remove_file(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+        };
+        if changed.is_err() {
             return false;
         }
-        // Already-loaded is the normal case when the running copy *is* the
-        // agent, so an unload failure says nothing and is ignored.
-        let _ = Command::new("launchctl").arg("unload").arg(&path).status();
-        Command::new("launchctl")
-            .arg("load")
-            .arg("-w")
-            .arg(&path)
-            .status()
-            .is_ok_and(|s| s.success())
+        // Change future login registration without stopping this process or
+        // starting another copy. Loading/unloading the agent would do both.
+        let target = format!("gui/{uid}/{LABEL}");
+        if run(&[if enable { "enable" } else { "disable" }, &target]) {
+            return true;
+        }
+        // A failed launchd update must not replace or discard the old plist.
+        if let Some(previous) = previous {
+            let _ = crate::settings::write_atomic(path, &previous);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn test_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "recast-macos-autostart-{name}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn disabled_overrides_match_only_the_recast_service() {
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => disabled\n}\n"),
+                Some(true)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => enabled\n}\n"),
+                Some(false)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => true\n}\n"),
+                Some(true)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => false\n}\n"),
+                Some(false)
+            );
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast.other\" => true\n}\n"),
+                Some(false)
+            );
+            assert_eq!(launch_agent_disabled("unrecognized response"), None);
+            assert_eq!(
+                launch_agent_disabled("disabled services = {\n \"org.recast\" => invalid\n}\n"),
+                None
+            );
+        }
+
+        #[test]
+        fn toggling_registration_preserves_the_running_launch_agent() {
+            let dir = test_dir("toggle");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/ReCast.app/Contents/MacOS/recast");
+            for enable in [true, true, false, false] {
+                let mut commands = Vec::new();
+                assert!(set_with(&path, exe, 501, enable, |args| {
+                    commands.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+                    true
+                }));
+                assert_eq!(
+                    commands,
+                    [vec![
+                        if enable { "enable" } else { "disable" }.to_string(),
+                        "gui/501/org.recast".into()
+                    ]]
+                );
+                assert_eq!(path.exists(), enable);
+                if enable {
+                    assert!(std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains("<key>KeepAlive</key><true/>"));
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn failed_registration_commands_preserve_the_previous_plist() {
+            let dir = test_dir("failure");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/new-recast");
+            for previous in [None, Some("previous registration\n")] {
+                for enable in [false, true] {
+                    match previous {
+                        Some(text) => std::fs::write(&path, text).unwrap(),
+                        None => {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                    assert!(!set_with(&path, exe, 501, enable, |_| false));
+                    assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), previous);
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn failed_file_updates_do_not_change_launchd_registration() {
+            let dir = test_dir("file-failure");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/recast");
+            std::fs::create_dir(&path).unwrap();
+            for enable in [false, true] {
+                assert!(!set_with(&path, exe, 501, enable, |_| {
+                    panic!("unreadable registration must leave launchd untouched")
+                }));
+            }
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, "previous registration\n").unwrap();
+            let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&temp, "occupied").unwrap();
+            assert!(!set_with(&path, exe, 501, true, |_| {
+                panic!("failed save must leave launchd untouched")
+            }));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "previous registration\n"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn launch_agent_paths_escape_xml_metacharacters() {
+            let dir = test_dir("xml");
+            let path = dir.join("org.recast.plist");
+            let exe = Path::new("/Applications/Work & <Play>/ReCast.app/Contents/MacOS/recast");
+            assert!(set_with(&path, exe, 501, true, |_| true));
+            let plist = std::fs::read_to_string(path).unwrap();
+            assert!(plist.contains(
+                "/Applications/Work &amp; &lt;Play&gt;/ReCast.app/Contents/MacOS/recast"
+            ));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_enabled;
+    use super::{
+        cached_autostart_enabled, parse_enabled, update_windows_registration, AUTOSTART_CACHE_TTL,
+    };
+
+    #[test]
+    fn windows_task_cache_refreshes_external_changes_and_recovers_from_errors() {
+        use std::{cell::Cell, time::Instant};
+
+        let clock = Cell::new(Instant::now());
+        let task = Cell::new(Ok(None));
+        let queries = Cell::new(0);
+        let read = |cache: &mut Option<(Instant, bool)>| {
+            cached_autostart_enabled(
+                cache,
+                || clock.get(),
+                || {
+                    queries.set(queries.get() + 1);
+                    task.get()
+                },
+            )
+        };
+        let mut cache = None;
+        assert!(!read(&mut cache));
+        assert_eq!(queries.get(), 1);
+
+        for (state, expected) in [(Ok(Some(true)), true), (Ok(Some(false)), false)] {
+            let previous = !expected;
+            task.set(state);
+            let before = queries.get();
+            clock.set(clock.get() + AUTOSTART_CACHE_TTL - std::time::Duration::from_millis(1));
+            assert_eq!(read(&mut cache), previous);
+            assert_eq!(queries.get(), before, "rendering must reuse a fresh result");
+            clock.set(clock.get() + std::time::Duration::from_millis(1));
+            assert_eq!(read(&mut cache), expected);
+            assert_eq!(queries.get(), before + 1);
+        }
+
+        task.set(Err(()));
+        clock.set(clock.get() + AUTOSTART_CACHE_TTL);
+        assert!(!read(&mut cache));
+        let before = queries.get();
+        task.set(Ok(Some(true)));
+        assert!(!read(&mut cache));
+        assert_eq!(queries.get(), before);
+        clock.set(clock.get() + AUTOSTART_CACHE_TTL);
+        assert!(read(&mut cache), "a query failure must expire too");
+        assert_eq!(queries.get(), before + 1);
+    }
+
+    #[test]
+    fn failed_task_updates_restore_the_previous_run_value() {
+        for enabled in [false, true] {
+            let previous = Some("previous executable");
+            let mut saved = previous;
+            let mut writes = Vec::new();
+            assert!(!update_windows_registration(
+                true,
+                enabled,
+                previous.as_ref(),
+                Some(&"new executable"),
+                |value| {
+                    saved = value.copied();
+                    writes.push(saved);
+                    true
+                },
+                |_| false,
+            ));
+            assert_eq!(saved, previous);
+            assert_eq!(writes, [None, previous]);
+        }
+    }
+
+    #[test]
+    fn a_failed_run_update_preserves_the_scheduled_registration() {
+        assert!(!update_windows_registration(
+            true,
+            false,
+            Some(&"previous executable"),
+            Some(&"new executable"),
+            |_| false,
+            |_| panic!("the scheduled task must survive a failed registry write"),
+        ));
+    }
+
+    #[test]
+    fn an_existing_task_keeps_its_definition_and_running_instance() {
+        for initial_enabled in [false, true] {
+            for enabled in [false, true] {
+                let definition = ("installed executable", "logon", 3, 60);
+                let mut task = (initial_enabled, definition, true);
+                let previous = Some("duplicate Run entry");
+                let mut saved = previous;
+                assert!(update_windows_registration(
+                    true,
+                    enabled,
+                    previous.as_ref(),
+                    Some(&"new executable"),
+                    |value| {
+                        saved = value.copied();
+                        true
+                    },
+                    |enabled| {
+                        task.0 = enabled;
+                        true
+                    },
+                ));
+                assert_eq!(saved, None);
+                assert_eq!(task, (enabled, definition, true));
+            }
+        }
+    }
+
+    #[test]
+    fn an_install_without_a_task_keeps_using_the_run_entry() {
+        for enabled in [false, true] {
+            let previous = Some("previous executable");
+            let desired = enabled.then_some("new executable");
+            let mut saved = previous;
+            assert!(update_windows_registration(
+                false,
+                enabled,
+                previous.as_ref(),
+                desired.as_ref(),
+                |value| {
+                    saved = value.copied();
+                    true
+                },
+                |_| panic!("the UI must not create a scheduled task"),
+            ));
+            assert_eq!(saved, desired);
+        }
+    }
 
     #[test]
     fn reads_the_switch_back() {
@@ -236,20 +621,63 @@ mod tests {
 mod windows_autostart {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::process::CommandExt;
     use std::ptr;
+    use std::sync::Mutex;
+    use std::time::Instant;
 
-    use winapi::shared::winerror::ERROR_SUCCESS;
+    use winapi::shared::winerror::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use winapi::um::winbase::CREATE_NO_WINDOW;
     use winapi::um::winnt::{KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ};
     use winapi::um::winreg::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-        HKEY_CURRENT_USER,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY_CURRENT_USER,
     };
 
-    /// The per-user Run key: entries here start at logon without needing
-    /// administrator rights or a scheduled task, which is what makes this
-    /// something a menu checkbox can do at all.
+    /// Copies installed without a Scheduled Task use the per-user Run key.
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const VALUE_NAME: &str = "ReCast";
+    static TASK_ENABLED: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+
+    // Enumerate instead of treating every failed GetTask as "not found". Access
+    // errors must fail a change rather than leave a second active registration.
+    const SCHEDULED_TASK: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    $service = New-Object -ComObject 'Schedule.Service'
+    $service.Connect()
+    $folder = $service.GetFolder('\')
+    $task = $folder.GetTasks(1) | Where-Object { $_.Name -eq 'recast' } | Select-Object -First 1
+    if ($null -eq $task) {
+        if ($env:RECAST_TASK_ACTION -ne 'query') { exit 1 }
+        Write-Output 'absent'; exit 0
+    }
+    $principal = $task.Definition.Principal.UserId
+    $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($principal -match '^S-\d-') {
+        $owner = $principal
+    } else {
+        $owner = ([System.Security.Principal.NTAccount]::new($principal)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }
+    if ($owner -ne $current) {
+        if ($env:RECAST_TASK_ACTION -ne 'query') { exit 1 }
+        Write-Output 'absent'; exit 0
+    }
+    if ($env:RECAST_TASK_ACTION -eq 'enable') { $task.Enabled = $true }
+    elseif ($env:RECAST_TASK_ACTION -eq 'disable') { $task.Enabled = $false }
+    if ($task.Enabled) {
+        Write-Output 'enabled'
+    } else {
+        Write-Output 'disabled'
+    }
+    exit 0
+} catch { exit 1 }
+"#;
+
+    struct RunValue {
+        kind: u32,
+        bytes: Vec<u8>,
+    }
 
     fn wide(s: &str) -> Vec<u16> {
         OsStr::new(s)
@@ -258,72 +686,178 @@ mod windows_autostart {
             .collect()
     }
 
-    pub fn is_enabled() -> bool {
+    fn read_run() -> Result<Option<RunValue>, ()> {
         let subkey = wide(RUN_KEY);
         let name = wide(VALUE_NAME);
         unsafe {
             let mut hkey = ptr::null_mut();
-            if RegOpenKeyExW(
+            let opened = RegOpenKeyExW(
                 HKEY_CURRENT_USER,
                 subkey.as_ptr(),
                 0,
                 KEY_QUERY_VALUE,
                 &mut hkey,
-            ) != ERROR_SUCCESS as i32
-            {
-                return false;
+            );
+            if opened == ERROR_FILE_NOT_FOUND as i32 {
+                return Ok(None);
             }
-            let mut size = 0u32;
-            let found = RegQueryValueExW(
-                hkey,
-                name.as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut size,
-            ) == ERROR_SUCCESS as i32;
+            if opened != ERROR_SUCCESS as i32 {
+                return Err(());
+            }
+            let result = (|| {
+                let mut size = 0u32;
+                let mut kind = 0u32;
+                let found = RegQueryValueExW(
+                    hkey,
+                    name.as_ptr(),
+                    ptr::null_mut(),
+                    &mut kind,
+                    ptr::null_mut(),
+                    &mut size,
+                );
+                if found == ERROR_FILE_NOT_FOUND as i32 {
+                    return Ok(None);
+                }
+                if found != ERROR_SUCCESS as i32 || size > 1024 * 1024 {
+                    return Err(());
+                }
+                let mut bytes = vec![0; size as usize];
+                if RegQueryValueExW(
+                    hkey,
+                    name.as_ptr(),
+                    ptr::null_mut(),
+                    &mut kind,
+                    bytes.as_mut_ptr(),
+                    &mut size,
+                ) != ERROR_SUCCESS as i32
+                {
+                    return Err(());
+                }
+                bytes.truncate(size as usize);
+                Ok(Some(RunValue { kind, bytes }))
+            })();
             RegCloseKey(hkey);
-            found
+            result
         }
     }
 
-    pub fn set(enable: bool) -> bool {
+    fn write_run(value: Option<&RunValue>) -> bool {
         let subkey = wide(RUN_KEY);
         let name = wide(VALUE_NAME);
         unsafe {
             let mut hkey = ptr::null_mut();
-            if RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                subkey.as_ptr(),
-                0,
-                KEY_SET_VALUE | KEY_QUERY_VALUE,
-                &mut hkey,
-            ) != ERROR_SUCCESS as i32
-            {
+            let opened = if value.is_some() {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    KEY_SET_VALUE,
+                    ptr::null_mut(),
+                    &mut hkey,
+                    ptr::null_mut(),
+                )
+            } else {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    0,
+                    KEY_SET_VALUE,
+                    &mut hkey,
+                )
+            };
+            if opened == ERROR_FILE_NOT_FOUND as i32 && value.is_none() {
+                return true;
+            }
+            if opened != ERROR_SUCCESS as i32 {
                 return false;
             }
-            let ok = if enable {
-                // Quoted: a path with spaces ("C:\Program Files\...") is one
-                // argument, and the Run key hands the value to the shell.
-                match std::env::current_exe() {
-                    Ok(exe) => {
-                        let value = wide(&format!("\"{}\"", exe.display()));
-                        RegSetValueExW(
-                            hkey,
-                            name.as_ptr(),
-                            0,
-                            REG_SZ,
-                            value.as_ptr() as *const u8,
-                            (value.len() * std::mem::size_of::<u16>()) as u32,
-                        ) == ERROR_SUCCESS as i32
-                    }
-                    Err(_) => false,
-                }
+            let ok = if let Some(value) = value {
+                RegSetValueExW(
+                    hkey,
+                    name.as_ptr(),
+                    0,
+                    value.kind,
+                    value.bytes.as_ptr(),
+                    value.bytes.len() as u32,
+                ) == ERROR_SUCCESS as i32
             } else {
-                RegDeleteValueW(hkey, name.as_ptr()) == ERROR_SUCCESS as i32
+                matches!(
+                    RegDeleteValueW(hkey, name.as_ptr()) as u32,
+                    ERROR_SUCCESS | ERROR_FILE_NOT_FOUND
+                )
             };
             RegCloseKey(hkey);
             ok
         }
+    }
+
+    fn scheduled_task(enabled: Option<bool>) -> Result<Option<bool>, ()> {
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", SCHEDULED_TASK])
+            .env(
+                "RECAST_TASK_ACTION",
+                match enabled {
+                    Some(true) => "enable",
+                    Some(false) => "disable",
+                    None => "query",
+                },
+            )
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|_| ())?;
+        if !output.status.success() {
+            return Err(());
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "enabled" if enabled != Some(false) => Ok(Some(true)),
+            "disabled" if enabled != Some(true) => Ok(Some(false)),
+            "absent" if enabled.is_none() => Ok(None),
+            _ => Err(()),
+        }
+    }
+
+    pub fn is_enabled() -> bool {
+        if read_run().is_ok_and(|value| value.is_some()) {
+            return true;
+        }
+        // Limit per-frame queries while still noticing external task changes.
+        let mut cached = crate::types::lock_forgiving(&TASK_ENABLED);
+        super::cached_autostart_enabled(&mut cached, Instant::now, || scheduled_task(None))
+    }
+
+    pub fn set(enable: bool) -> bool {
+        let Ok(task) = scheduled_task(None) else {
+            return false;
+        };
+        let Ok(previous) = read_run() else {
+            return false;
+        };
+        let desired = if enable && task.is_none() {
+            let Ok(exe) = std::env::current_exe() else {
+                return false;
+            };
+            Some(RunValue {
+                kind: REG_SZ,
+                bytes: wide(&format!("\"{}\"", exe.display()))
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        let saved = super::update_windows_registration(
+            task.is_some(),
+            enable,
+            previous.as_ref(),
+            desired.as_ref(),
+            write_run,
+            |enabled| scheduled_task(Some(enabled)).is_ok(),
+        );
+        *crate::types::lock_forgiving(&TASK_ENABLED) =
+            saved.then(|| (Instant::now(), task.is_some() && enable));
+        saved
     }
 }

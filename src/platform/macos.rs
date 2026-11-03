@@ -3,9 +3,10 @@ use super::textkeys;
 use crate::dictionary::Dict;
 use crate::types::{AppControl, Language};
 use rdev::Key;
+use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 type Typed = engine::Typed<Key>;
 
 pub struct Mac;
@@ -14,6 +15,13 @@ impl Platform for Mac {
     type Retype = String;
     type Injector = AtomicBool;
     type Focus = Focus;
+    const PREVIEW_ALTERNATIVES: bool = true;
+    fn show_preview(engine: Arc<Engine<Self>>, generation: u64, choices: Vec<String>) {
+        candidate_strip::show(engine, generation, choices);
+    }
+    fn hide_preview() {
+        candidate_strip::hide();
+    }
     const REQUIRES_FOCUS: bool = true;
     const QUEUE_UNDO_DURING_REPLACEMENT: bool = true;
     const SHIFT_LEFT: Key = textkeys::SHIFT_LEFT;
@@ -24,6 +32,9 @@ impl Platform for Mac {
     const BACKSPACE: Key = textkeys::BACKSPACE;
     fn is_terminator(key: Key) -> bool {
         textkeys::is_terminator(key)
+    }
+    fn is_line_break(key: Key) -> bool {
+        key == Key::Return
     }
     fn is_reset(key: Key) -> bool {
         textkeys::is_reset(key)
@@ -52,14 +63,42 @@ impl Platform for Mac {
     fn retype_len(text: &String) -> usize {
         textkeys::retype_len(text)
     }
+    fn append_retype(text: &mut String, tail: String) {
+        text.push_str(&tail);
+    }
     fn buffer_after(text: &String) -> Vec<Typed> {
         textkeys::buffer_after(text)
     }
     fn injecting_flag(injector: &AtomicBool) -> Option<&AtomicBool> {
         Some(injector)
     }
+    fn injection_finished() -> bool {
+        // Reserved before deletion starts, so releasing input cannot fail to allocate.
+        let input = crate::types::lock_forgiving(deferred_input());
+        let invalidates = unsafe { !deferred_gestures_only(&input.input.events) };
+        if let Some(marker) = &input.finish {
+            unsafe { CGEventPost(KCG_HID_EVENT_TAP, marker.event) };
+        }
+        invalidates
+    }
     fn input_allowed() -> bool {
-        !secure_input_active()
+        use objc::{class, msg_send, sel, sel_impl};
+        static SUPPORTED: AtomicBool = AtomicBool::new(false);
+        let main: bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+        if main {
+            SUPPORTED.store(mapping_supported(), Ordering::Release);
+        }
+        !secure_input_active() && SUPPORTED.load(Ordering::Acquire)
+    }
+    fn replacement_allowed() -> bool {
+        !secure_input_active() && mapping_supported()
+    }
+    fn input_block_reason() -> &'static str {
+        if secure_input_active() {
+            "Secure Input — correction resumes when secure entry ends."
+        } else {
+            "Unsupported keyboard mapping — choose a compatible US/ABC and Hebrew keyboard. Correction waits for matching physical keys."
+        }
     }
     fn is_own_focus(focus: &Focus) -> bool {
         let mut pid = 0;
@@ -163,11 +202,18 @@ type CGEventSourceRef = *mut c_void;
 type CFIndex = isize;
 
 const KCG_HID_EVENT_TAP: u32 = 0;
+const KCG_SESSION_EVENT_TAP: u32 = 1;
 const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
-const KCG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+// Active taps use Accessibility authorization. Listen-only taps use Input
+// Monitoring. Physical events are deferred briefly while a replacement lands.
+const KCG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 
 const KCG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+const KCG_EVENT_LEFT_MOUSE_UP: u32 = 2;
 const KCG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
+const KCG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
+const KCG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
+const KCG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
 const KCG_EVENT_KEY_DOWN: u32 = 10;
 const KCG_EVENT_KEY_UP: u32 = 11;
 /// Modifier keys — Shift, Ctrl, Caps Lock — are *not* delivered as key-down and
@@ -177,6 +223,8 @@ const KCG_EVENT_KEY_UP: u32 = 11;
 /// to undo) can fire at all.
 const KCG_EVENT_FLAGS_CHANGED: u32 = 12;
 const KCG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+const KCG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+const KCG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
 
 /// Caps Lock's flag. Unlike the others it is a latch: the bit *is* the state,
 /// rather than saying whether a key is being held.
@@ -190,19 +238,26 @@ const KCG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const KCG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 
 const EVENT_MASK: u64 = (1u64 << KCG_EVENT_LEFT_MOUSE_DOWN)
+    | (1u64 << KCG_EVENT_LEFT_MOUSE_UP)
     | (1u64 << KCG_EVENT_RIGHT_MOUSE_DOWN)
+    | (1u64 << KCG_EVENT_RIGHT_MOUSE_UP)
+    | (1u64 << KCG_EVENT_LEFT_MOUSE_DRAGGED)
+    | (1u64 << KCG_EVENT_RIGHT_MOUSE_DRAGGED)
     | (1u64 << KCG_EVENT_KEY_DOWN)
     | (1u64 << KCG_EVENT_KEY_UP)
     | (1u64 << KCG_EVENT_FLAGS_CHANGED)
-    | (1u64 << KCG_EVENT_OTHER_MOUSE_DOWN);
+    | (1u64 << KCG_EVENT_OTHER_MOUSE_DOWN)
+    | (1u64 << KCG_EVENT_OTHER_MOUSE_UP)
+    | (1u64 << KCG_EVENT_OTHER_MOUSE_DRAGGED);
 
 const KCG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
 const EVENT_USER_DATA: u32 = 42;
 const RECAST_EVENT: i64 = 0x5245_4341_5354;
+const FINISH_EVENT: i64 = 0x5245_0000_0000_0000;
+const FINISH_MASK: i64 = !0xffff_ffff;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn CGRequestListenEventAccess() -> bool;
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -213,6 +268,11 @@ extern "C" {
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventGetTimestamp(event: CGEventRef) -> u64;
+    #[cfg(test)]
+    fn CGEventGetType(event: CGEventRef) -> u32;
+    fn CGEventCreateCopy(event: CGEventRef) -> CGEventRef;
+    fn CGEventTapPostEvent(proxy: CGEventTapProxy, event: CGEventRef);
     /// Which modifiers are down *after* the event. A `flagsChanged` event says
     /// which key changed but not in which direction, so this is what turns it
     /// back into a press or a release.
@@ -249,9 +309,9 @@ extern "C" {
 /// focus right now.
 ///
 /// While it does, ReCast stops looking at the keyboard entirely: the buffer is
-/// dropped, nothing is checked, nothing is corrected. The tap is listen-only
-/// and macOS already withholds the characters, but "we couldn't have read it
-/// anyway" is a weaker promise than not being in the loop at all — and the
+/// dropped, nothing is checked, nothing is corrected. macOS already withholds
+/// the characters, but "we couldn't have read it anyway" is a weaker promise
+/// than not being in the loop at all — and the
 /// visible half matters too, since a correction firing inside a password field
 /// would rewrite a password on the strength of a dictionary lookup.
 ///
@@ -259,6 +319,11 @@ extern "C" {
 /// server keeps, with no round trip.
 fn secure_input_active() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
+/// Read-only permission check for the explicitly started live log.
+pub fn accessibility_granted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -272,6 +337,21 @@ extern "C" {
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRelease(cf: *const c_void);
     static kCFRunLoopCommonModes: CFRunLoopMode;
+}
+
+fn mapping_supported() -> bool {
+    crate::layout::mapping_matches(|code, shift, language| {
+        let key = key_from_code(code);
+        match language {
+            Language::English => {
+                Mac::english_char(key, shift)
+                    .map(|c| if shift { c.to_ascii_uppercase() } else { c })
+            }
+            // Shifted Hebrew letters are handled separately by capture; verify the base map.
+            Language::Hebrew if !shift => Mac::hebrew_char(key),
+            Language::Hebrew => None,
+        }
+    })
 }
 
 // macOS virtual keycodes → rdev::Key. Mirrors rdev's private mapping (we can't
@@ -338,6 +418,7 @@ fn key_from_code(code: u16) -> Key {
         58 => Key::Alt,
         59 => Key::ControlLeft,
         60 => Key::ShiftRight,
+        61 => Key::AltGr,
         62 => Key::ControlRight,
         63 => Key::Function,
         96 => Key::F5,
@@ -375,6 +456,24 @@ fn navigation_keycodes_reset_text() {
     }
 }
 
+#[test]
+fn modifier_keycodes_preserve_sides_and_native_flags() {
+    for (code, key, flag) in [
+        (56, Key::ShiftLeft, 0x0000_0002),
+        (60, Key::ShiftRight, 0x0000_0004),
+        (59, Key::ControlLeft, 0x0000_0001),
+        (62, Key::ControlRight, 0x0000_2000),
+        (58, Key::Alt, 0x0000_0020),
+        (61, Key::AltGr, 0x0000_0040),
+        (55, Key::MetaLeft, 0x0000_0008),
+        (54, Key::MetaRight, 0x0000_0010),
+    ] {
+        assert_eq!(key_from_code(code), key, "keycode {code}");
+        assert!(Mac::is_modifier(key), "keycode {code}");
+        assert_eq!(device_flag(key), Some(flag), "keycode {code}");
+    }
+}
+
 /// Raw handle to our tap, stored so the callback can re-enable it if the OS
 /// disables it. `CFMachPortRef` is a thread-safe Core Foundation type.
 struct TapPort(CFMachPortRef);
@@ -382,8 +481,206 @@ unsafe impl Send for TapPort {}
 unsafe impl Sync for TapPort {}
 static TAP_PORT: OnceLock<TapPort> = OnceLock::new();
 
+struct DeferredEvent {
+    kind: u32,
+    event: CGEventRef,
+}
+// Copies are owned here and read only on the main thread; workers only post markers.
+unsafe impl Send for DeferredEvent {}
+impl Drop for DeferredEvent {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.event.cast()) };
+    }
+}
+
+struct DeferredInput<T> {
+    ticket: u32,
+    active: bool,
+    events: Vec<T>,
+}
+impl<T> Default for DeferredInput<T> {
+    fn default() -> Self {
+        Self {
+            ticket: 0,
+            active: false,
+            events: Vec::new(),
+        }
+    }
+}
+impl<T> DeferredInput<T> {
+    fn next_ticket(&self) -> u32 {
+        self.ticket.wrapping_add(1).max(1)
+    }
+    fn begin(&mut self) -> u32 {
+        self.ticket = self.next_ticket();
+        self.active = true;
+        self.ticket
+    }
+    fn finish(&mut self, ticket: u32) -> Option<Vec<T>> {
+        if !self.active || ticket != self.ticket {
+            return None;
+        }
+        self.active = false;
+        Some(std::mem::take(&mut self.events))
+    }
+}
+#[derive(Default)]
+struct NativeDeferredInput {
+    input: DeferredInput<DeferredEvent>,
+    finish: Option<DeferredEvent>,
+}
+fn deferred_input() -> &'static Mutex<NativeDeferredInput> {
+    static INPUT: OnceLock<Mutex<NativeDeferredInput>> = OnceLock::new();
+    INPUT.get_or_init(|| Mutex::new(NativeDeferredInput::default()))
+}
+
+fn begin_injection(engine: &Engine<Mac>, generation: u64) -> Option<()> {
+    // Serialize validation and gating with capture; never dispatch with the state locked.
+    dispatch::Queue::main().exec_sync(|| arm_deferred_input(engine, generation))
+}
+
+/// Main thread only. Retain any acceptance event queued before the worker starts.
+fn arm_deferred_input(engine: &Engine<Mac>, generation: u64) -> Option<()> {
+    if !engine.replacement_valid(generation) {
+        return None;
+    }
+    let mut input = crate::types::lock_forgiving(deferred_input());
+    let tag = FINISH_EVENT | i64::from(input.input.next_ticket());
+    let event = keyboard_event_with_tag(0, false, false, tag)?;
+    input.input.begin();
+    input.finish = Some(DeferredEvent { kind: 0, event });
+    engine.injector.store(true, Ordering::Relaxed);
+    Some(())
+}
+
+fn gesture_input(kind: u32, key: Key, flags: u64) -> bool {
+    match kind {
+        KCG_EVENT_FLAGS_CHANGED => Mac::is_modifier(key),
+        KCG_EVENT_KEY_UP => true,
+        KCG_EVENT_KEY_DOWN => key == Key::Space && flags & 0x001d_0000 == 0,
+        _ => false,
+    }
+}
+
+unsafe fn deferred_gestures_only(events: &[DeferredEvent]) -> bool {
+    queued_gestures(events.iter().map(|event| {
+        let key = key_from_code(
+            CGEventGetIntegerValueField(event.event, KCG_KEYBOARD_EVENT_KEYCODE) as u16,
+        );
+        (event.kind, key, CGEventGetFlags(event.event))
+    }))
+}
+
+fn queued_gestures(events: impl Iterator<Item = (u32, Key, u64)>) -> bool {
+    let mut held = HashMap::new();
+    for (kind, key, flags) in events {
+        if !gesture_input(kind, key, flags) {
+            return false;
+        }
+        if kind == KCG_EVENT_FLAGS_CHANGED {
+            if let Some(bit) = device_flag(key) {
+                if flags & bit != 0 {
+                    held.insert(key, ());
+                } else {
+                    held.remove(&key);
+                }
+            }
+        }
+    }
+    // An unfinished hold must not acquire a fresh tap timestamp at replay time.
+    held.is_empty()
+}
+
+fn within_gesture_window(pressed: u64, released: u64, ceiling: std::time::Duration) -> bool {
+    released >= pressed && u128::from(released - pressed) <= ceiling.as_nanos()
+}
+
+unsafe fn replay_deferred(
+    ctx: &Arc<Engine<Mac>>,
+    proxy: CGEventTapProxy,
+    events: Vec<DeferredEvent>,
+) {
+    let gestures_only = deferred_gestures_only(&events);
+    let mut modifier_down = HashMap::new();
+    let mut action_released = None;
+    if !gestures_only {
+        ctx.forget_everything();
+    }
+    for event in events {
+        if gestures_only {
+            if event.kind == KCG_EVENT_FLAGS_CHANGED {
+                let key = key_from_code(CGEventGetIntegerValueField(
+                    event.event,
+                    KCG_KEYBOARD_EVENT_KEYCODE,
+                ) as u16);
+                let timestamp = CGEventGetTimestamp(event.event);
+                if let Some(bit) = device_flag(key) {
+                    if CGEventGetFlags(event.event) & bit != 0 {
+                        modifier_down.insert(key, timestamp);
+                    } else {
+                        let mut state = crate::types::lock_forgiving(&ctx.state);
+                        let action = state.action_down.is_some();
+                        if modifier_down.remove(&key).is_some_and(|pressed| {
+                            !within_gesture_window(pressed, timestamp, engine::TAP_MAX)
+                        }) {
+                            state.action_down = None;
+                            state.completion_down = None;
+                        }
+                        if action {
+                            if action_released.is_some_and(|previous| {
+                                !within_gesture_window(
+                                    previous,
+                                    timestamp,
+                                    engine::DOUBLE_TAP_WINDOW,
+                                )
+                            }) {
+                                state.last_action_tap = None;
+                            }
+                            action_released = Some(timestamp);
+                        }
+                    }
+                }
+            }
+            capture_event(ctx, event.kind, event.event);
+        } else {
+            let key = key_from_code(CGEventGetIntegerValueField(
+                event.event,
+                KCG_KEYBOARD_EVENT_KEYCODE,
+            ) as u16);
+            let mut state = crate::types::lock_forgiving(&ctx.state);
+            match event.kind {
+                KCG_EVENT_KEY_DOWN => {
+                    state.held_keys.insert(key);
+                }
+                KCG_EVENT_KEY_UP => {
+                    state.held_keys.remove(&key);
+                }
+                KCG_EVENT_FLAGS_CHANGED if key == Key::CapsLock => {
+                    state.caps_lock = CGEventGetFlags(event.event) & FLAG_ALPHA_SHIFT != 0;
+                    crate::layout::invalidate();
+                }
+                KCG_EVENT_FLAGS_CHANGED => {
+                    if let Some(bit) = device_flag(key) {
+                        if CGEventGetFlags(event.event) & bit != 0 {
+                            state.held_keys.insert(key);
+                        } else {
+                            state.held_keys.remove(&key);
+                        }
+                        crate::layout::invalidate();
+                    }
+                }
+                _ => {}
+            }
+            state.completion_down = None;
+            state.action_down = None;
+        }
+        // Posts downstream before the next physical event; copies keep flags and releases.
+        CGEventTapPostEvent(proxy, event.event);
+    }
+}
+
 unsafe extern "C" fn tap_callback(
-    _proxy: CGEventTapProxy,
+    proxy: CGEventTapProxy,
     event_type: u32,
     cg_event: CGEventRef,
     _user_info: *mut c_void,
@@ -398,6 +695,13 @@ unsafe extern "C" fn tap_callback(
         if let Some(port) = TAP_PORT.get() {
             CGEventTapEnable(port.0, true);
         }
+        if let Some(ctx) = CTX.get() {
+            ctx.forget_everything();
+            if !ctx.injector.load(Ordering::Relaxed) {
+                // A finish posted while the tap was disabled may have been missed.
+                Mac::injection_finished();
+            }
+        }
         return cg_event;
     }
 
@@ -406,26 +710,105 @@ unsafe extern "C" fn tap_callback(
         None => return cg_event,
     };
 
-    // Only our marked events are ignored. Real arrows, clicks, and shortcut
-    // keys must still cancel a rewrite while its paced events are going out.
-    if CGEventGetIntegerValueField(cg_event, EVENT_USER_DATA) == RECAST_EVENT {
+    let marker = CGEventGetIntegerValueField(cg_event, EVENT_USER_DATA);
+    if marker & FINISH_MASK == FINISH_EVENT {
+        let events = {
+            let mut input = crate::types::lock_forgiving(deferred_input());
+            let events = input.input.finish(marker as u32);
+            if events.is_some() {
+                input.finish.take();
+            }
+            events
+        };
+        if let Some(events) = events {
+            replay_deferred(ctx, proxy, events);
+        }
+        // Even stale markers must never reach the application as keyboard input.
+        return std::ptr::null_mut();
+    }
+    if marker == RECAST_EVENT {
         return cg_event;
     }
 
-    // A password field has focus: drop whatever is buffered and look away until
-    // it doesn't. Clearing rather than merely skipping matters — the buffer may
-    // hold the start of a word typed a moment before the field took focus, and
-    // that half-word must not be joined to what is typed into it, nor still be
-    // sitting there to be corrected when focus comes back.
+    // Secure input must never be copied into the deferred queue.
     if secure_input_active() {
         ctx.forget_everything();
         return cg_event;
     }
 
+    {
+        let mut input = crate::types::lock_forgiving(deferred_input());
+        if input.input.active {
+            let mut event = CGEventCreateCopy(cg_event);
+            if event.is_null() {
+                // Suppressed originals have no downstream writer; retaining is a lossless fallback.
+                event = core_foundation_sys::base::CFRetain(cg_event.cast()).cast_mut();
+            }
+            input.input.events.push(DeferredEvent {
+                kind: event_type,
+                event,
+            });
+            return std::ptr::null_mut();
+        }
+    }
+
+    if event_type == KCG_EVENT_KEY_DOWN && ctx.has_ready_preview() {
+        let key =
+            key_from_code(CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16);
+        let flags = CGEventGetFlags(cg_event);
+        let accepts = preview_acceptance_key(key, flags);
+        if accepts
+            && focused_target().as_ref().and_then(Mac::app_id).as_deref()
+                == Some("com.apple.Spotlight")
+        {
+            if let Some(generation) = ctx.commit_preview() {
+                if arm_deferred_input(ctx, generation).is_some() {
+                    // Spotlight must not commit its own inline autocomplete first.
+                    let event = core_foundation_sys::base::CFRetain(cg_event.cast()).cast_mut();
+                    crate::types::lock_forgiving(deferred_input())
+                        .input
+                        .events
+                        .push(DeferredEvent {
+                            kind: event_type,
+                            event,
+                        });
+                    return std::ptr::null_mut();
+                }
+                ctx.forget_everything();
+            }
+        }
+    }
+    capture_event(ctx, event_type, cg_event);
+    cg_event
+}
+
+fn preview_acceptance_key(key: Key, flags: u64) -> bool {
+    key != Key::Return
+        && flags & 0x001c_0000 == 0
+        && (Mac::is_terminator(key)
+            || Mac::english_char_plain(key).is_some()
+            || Mac::hebrew_char(key).is_some())
+}
+
+unsafe fn capture_event(ctx: &Arc<Engine<Mac>>, event_type: u32, cg_event: CGEventRef) {
     match event_type {
         KCG_EVENT_KEY_DOWN => {
+            let flags = CGEventGetFlags(cg_event);
+            ctx.caps_lock_changed(flags & FLAG_ALPHA_SHIFT != 0);
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
-            ctx.key_press(key_from_code(code));
+            let key = key_from_code(code);
+            if !Mac::is_modifier(key) {
+                match modifier_snapshot(flags) {
+                    Some(modifiers) => ctx.sync_modifiers(modifiers),
+                    // Other software can post aggregate flags without identifying a side.
+                    // Keep tracked holds but discard text that cannot be interpreted safely.
+                    None => {
+                        ctx.forget_everything();
+                        return;
+                    }
+                }
+            }
+            ctx.key_press(key);
         }
         KCG_EVENT_KEY_UP => {
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
@@ -435,13 +818,16 @@ unsafe extern "C" fn tap_callback(
             let code = CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16;
             handle_flags_changed(ctx, key_from_code(code), CGEventGetFlags(cg_event));
         }
-        KCG_EVENT_LEFT_MOUSE_DOWN | KCG_EVENT_RIGHT_MOUSE_DOWN | KCG_EVENT_OTHER_MOUSE_DOWN => {
+        KCG_EVENT_LEFT_MOUSE_DOWN
+        | KCG_EVENT_RIGHT_MOUSE_DOWN
+        | KCG_EVENT_OTHER_MOUSE_DOWN
+        | KCG_EVENT_LEFT_MOUSE_DRAGGED
+        | KCG_EVENT_RIGHT_MOUSE_DRAGGED
+        | KCG_EVENT_OTHER_MOUSE_DRAGGED => {
             ctx.mouse_click();
         }
         _ => {}
     }
-
-    cg_event
 }
 
 /// A modifier changed state. macOS never delivers these as key-down / key-up
@@ -456,6 +842,7 @@ fn handle_flags_changed(ctx: &Arc<Engine<Mac>>, key: Key, flags: u64) {
     if key == Key::CapsLock {
         // A latch rather than a held key: the flag is the state itself.
         ctx.caps_lock_changed(flags & FLAG_ALPHA_SHIFT != 0);
+        crate::layout::invalidate();
         return;
     }
     let Some(bit) = device_flag(key) else {
@@ -482,6 +869,28 @@ fn device_flag(key: Key) -> Option<u64> {
         Key::MetaRight => 0x0000_0010,
         _ => return None,
     })
+}
+
+/// Ordinary key events carry modifier state even after capture missed a release.
+/// Aggregate-only synthetic flags cannot identify which physical side is held.
+fn modifier_snapshot(flags: u64) -> Option<[(Key, bool); 8]> {
+    let pairs = [
+        (Key::ShiftLeft, Key::ShiftRight, 0x0002_0000),
+        (Key::ControlLeft, Key::ControlRight, 0x0004_0000),
+        (Key::Alt, Key::AltGr, 0x0008_0000),
+        (Key::MetaLeft, Key::MetaRight, 0x0010_0000),
+    ];
+    let mut snapshot = [(Key::ShiftLeft, false); 8];
+    for (index, (left, right, aggregate)) in pairs.into_iter().enumerate() {
+        let left_down = flags & device_flag(left)? != 0;
+        let right_down = flags & device_flag(right)? != 0;
+        if flags & aggregate != 0 && !left_down && !right_down {
+            return None;
+        }
+        snapshot[index * 2] = (left, left_down);
+        snapshot[index * 2 + 1] = (right, right_down);
+    }
+    Some(snapshot)
 }
 
 pub struct EventTapHandle {
@@ -512,7 +921,7 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
     if !setup_guidance() {
         return;
     }
-    super::start_background_tasks();
+    super::start_background_tasks(&control);
     // The event tap must live on the main run loop (see `setup_event_tap`), so
     // a main-thread TUI can't coexist with it — the tray is the UI here.
     if with_gui {
@@ -528,10 +937,12 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
         std::process::exit(1);
     };
     crate::platform::tray::run(control);
+    candidate_strip::shutdown();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SetupAction {
+    Start,
     Check,
     Accessibility,
     Keyboards,
@@ -539,15 +950,18 @@ enum SetupAction {
     Quit,
 }
 
-const SETUP_ACTIONS: &[(SetupAction, &str)] = &[
-    (SetupAction::Check, "Check again"),
-    (SetupAction::Accessibility, "Open Accessibility"),
-    (SetupAction::Keyboards, "Keyboard Settings"),
-    (SetupAction::Reveal, "Show ReCast in Finder"),
-    (SetupAction::Quit, "Quit"),
-];
-
 impl SetupAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start ReCast",
+            Self::Check => "Check again",
+            Self::Accessibility => "Open Accessibility",
+            Self::Keyboards => "Open Keyboard Settings",
+            Self::Reveal => "Show ReCast in Finder",
+            Self::Quit => "Quit",
+        }
+    }
+
     fn settings_url(self, modern: bool) -> Option<&'static str> {
         match (self, modern) {
             (Self::Accessibility, true) => Some("x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"),
@@ -555,6 +969,52 @@ impl SetupAction {
             (Self::Keyboards, true) => Some("x-apple.systempreferences:com.apple.Keyboard-Settings.extension?inputSources"),
             (Self::Keyboards, false) => Some("x-apple.systempreferences:com.apple.preference.keyboard?InputSources"),
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SetupStep {
+    Accessibility,
+    Keyboards,
+    Ready,
+}
+
+impl SetupStep {
+    fn current(accessibility: bool, english: bool, hebrew: bool) -> Self {
+        if !accessibility {
+            Self::Accessibility
+        } else if !english || !hebrew {
+            Self::Keyboards
+        } else {
+            Self::Ready
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Accessibility => "Set up ReCast: Accessibility",
+            Self::Keyboards => "Set up ReCast: Keyboards",
+            Self::Ready => "ReCast is ready",
+        }
+    }
+
+    fn actions(self, can_reveal: bool) -> Vec<SetupAction> {
+        match self {
+            Self::Accessibility => {
+                let mut actions = vec![SetupAction::Accessibility, SetupAction::Check];
+                if can_reveal {
+                    actions.push(SetupAction::Reveal);
+                }
+                actions.push(SetupAction::Quit);
+                actions
+            }
+            Self::Keyboards => vec![
+                SetupAction::Keyboards,
+                SetupAction::Check,
+                SetupAction::Quit,
+            ],
+            Self::Ready => vec![SetupAction::Start, SetupAction::Quit],
         }
     }
 }
@@ -580,6 +1040,24 @@ fn request_accessibility() -> bool {
     unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) != 0 }
 }
 
+pub(super) fn open_setup_settings() -> Result<(), String> {
+    let action = if accessibility_granted() {
+        SetupAction::Keyboards
+    } else {
+        SetupAction::Accessibility
+    };
+    let modern = std::path::Path::new("/System/Applications/System Settings.app").exists();
+    let status = std::process::Command::new("open")
+        .arg(action.settings_url(modern).unwrap())
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Open System Settings > Privacy & Security > Accessibility or Keyboard > Input Sources.".into())
+    }
+}
+
 /// Native setup stays available while the user switches to System Settings.
 pub fn setup_guidance() -> bool {
     use crate::notify::DialogDestination;
@@ -593,50 +1071,55 @@ pub fn setup_guidance() -> bool {
     loop {
         let accessibility = unsafe { AXIsProcessTrusted() != 0 };
         let (english, hebrew) = crate::layout::enabled_languages();
-        // Accessibility grants both event posting and listening. Requiring an
-        // additional Input Monitoring entry can strand an already-authorized app.
-        let ready = accessibility && english && hebrew;
-        if ready && !first {
+        // The active session tap and event posting both use Accessibility.
+        let step = SetupStep::current(accessibility, english, hebrew);
+        if step == SetupStep::Ready && !first {
             return true;
         }
-        let state = |ok| if ok { "Ready" } else { "Needs setup" };
-        let mut body = format!("ReCast fixes English/Hebrew layout mistakes and English spelling as you type. Processing stays on this Mac.\n\nAccessibility: {}\nEnglish keyboard: {}\nHebrew keyboard: {}\n\n{}", state(accessibility), state(english), state(hebrew), if ready { "You're ready. Optional practice opens after setup so you can try correction, undo, and completion in a local field. Close it to skip; reopen Practice from the menu anytime." } else { "In System Settings → Privacy & Security → Accessibility, enable ReCast. Accessibility covers both reading keys and typing corrections; a separate Input Monitoring entry is not required.\n\nFor keyboards, open Keyboard → Text Input → Edit and add English and Hebrew. Return here and choose Check again. After granting permission, macOS may require you to quit and reopen ReCast." });
-        if !accessibility {
+        let instruction = match step {
+            SetupStep::Accessibility => "Step 1 of 2: Enable ReCast in Privacy & Security → Accessibility. Return here and choose Check again. If macOS asks, quit and reopen ReCast.",
+            SetupStep::Keyboards => match (english, hebrew) {
+                (false, false) => "Step 2 of 2: Open Keyboard → Text Input → Edit and add English and Hebrew. Return here and choose Check again.",
+                (false, true) => "Step 2 of 2: Open Keyboard → Text Input → Edit and add English. Return here and choose Check again.",
+                _ => "Step 2 of 2: Open Keyboard → Text Input → Edit and add Hebrew. Return here and choose Check again.",
+            },
+            SetupStep::Ready => "Start ReCast to try correction, undo, and completion in a local practice field. Close practice to skip; reopen it from Help anytime.",
+        };
+        let state = |ok| if ok { "Ready" } else { "Needed" };
+        let mut body = format!(
+            "ReCast corrects typing locally on this Mac.\n\nAccessibility: {}\nEnglish keyboard: {}\nHebrew keyboard: {}\n\n{}",
+            state(accessibility), state(english), state(hebrew), instruction
+        );
+        if step == SetupStep::Accessibility {
             if let Some(path) = permission_target {
-                body.push_str(&format!("\n\nIf ReCast is missing, click + in Accessibility, press Cmd+Shift+G, and enter:\n{}\n\nShow ReCast in Finder reveals this exact copy.", path.display()));
+                body.push_str(&format!(
+                    "\n\nIf it is missing, click +, press Cmd+Shift+G, and add this copy:\n{}",
+                    path.display()
+                ));
             }
             if bundle.is_none() {
-                body.push_str("\n\nThis is a standalone executable. A terminal launch may appear under the terminal's name. For permissions attached to ReCast.app, install the app bundle and open it from Finder.");
+                body.push_str("\n\nA terminal launch may appear under the terminal's name. To grant access to ReCast.app, install the app bundle and open it from Finder.");
             }
         }
-        let buttons: Vec<&str> = if ready {
-            vec!["Start ReCast", "Quit"]
-        } else {
-            SETUP_ACTIONS.iter().map(|(_, label)| *label).collect()
-        };
+        let actions = step.actions(permission_target.is_some());
+        let buttons: Vec<&str> = actions.iter().map(|action| action.label()).collect();
         let choice = crate::notify::dialog_with_destination(
-            "Set up ReCast",
+            step.title(),
             &body,
             &buttons,
             destination.take(),
         );
-        if ready {
-            if choice != 0 {
-                return false;
-            }
-            if let Some(path) = &marker {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                    let _ = std::fs::write(path, "Setup completed\n");
-                }
-            }
-            return true;
-        }
-        let action = SETUP_ACTIONS
-            .get(choice)
-            .map(|(action, _)| *action)
-            .unwrap_or(SetupAction::Quit);
+        let action = actions.get(choice).copied().unwrap_or(SetupAction::Quit);
         match action {
+            SetupAction::Start => {
+                if let Some(path) = &marker {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        let _ = std::fs::write(path, "Setup completed\n");
+                    }
+                }
+                return true;
+            }
             SetupAction::Check => {
                 first = true;
             }
@@ -673,8 +1156,7 @@ pub fn setup_event_tap(
     he_dict: Dict,
     control: Arc<AppControl>,
 ) -> Option<EventTapHandle> {
-    // A listen-only tap can succeed without Accessibility, but focus checks
-    // then fail and every correction is discarded. Ask before starting capture.
+    // Capture, focus checks, and injection all require Accessibility.
     if !request_accessibility() {
         eprintln!(
             "ReCast needs Accessibility access to correct words. Enable ReCast in \
@@ -695,18 +1177,18 @@ pub fn setup_event_tap(
 
     unsafe {
         let tap = CGEventTapCreate(
-            KCG_HID_EVENT_TAP,
+            KCG_SESSION_EVENT_TAP,
             KCG_HEAD_INSERT_EVENT_TAP,
-            KCG_EVENT_TAP_OPTION_LISTEN_ONLY,
+            KCG_EVENT_TAP_OPTION_DEFAULT,
             EVENT_MASK,
             tap_callback,
             std::ptr::null_mut(),
         );
         if tap.is_null() {
-            CGRequestListenEventAccess();
             eprintln!(
-                "Could not create event tap. Grant 'Input Monitoring' permission \
-                 in System Settings > Privacy & Security, then relaunch."
+                "Could not create event tap. Quit and reopen ReCast after granting \
+                 Accessibility access. If an older entry is enabled, remove it and \
+                 add this copy again in System Settings > Privacy & Security > Accessibility."
             );
             return None;
         }
@@ -733,12 +1215,17 @@ pub fn setup_event_tap(
 }
 
 fn keyboard_event(code: u16, down: bool, shift: bool) -> Option<CGEventRef> {
+    keyboard_event_with_tag(code, down, shift, RECAST_EVENT)
+}
+
+fn keyboard_event_with_tag(code: u16, down: bool, shift: bool, tag: i64) -> Option<CGEventRef> {
     unsafe {
         let event = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, down);
         if event.is_null() {
             return None;
         }
-        CGEventSetIntegerValueField(event, EVENT_USER_DATA, RECAST_EVENT);
+        // Quartz ignores retagging an event; assign its final tag at construction.
+        CGEventSetIntegerValueField(event, EVENT_USER_DATA, tag);
         // Do not inherit a physical Ctrl/Shift pressed during the correction.
         // Inherited flags can turn a backspace into a shortcut or select text.
         CGEventSetFlags(event, if shift { 0x0002_0000 } else { 0 });
@@ -757,41 +1244,68 @@ fn post_key(key: Key, down: bool, shift: bool) -> Option<()> {
 }
 
 fn paste_text(text: &str) -> Option<()> {
-    if text.is_empty() {
-        return Some(());
-    }
-    let utf16: Vec<u16> = text.encode_utf16().collect();
-    unsafe {
+    super::unicode_text_events(text, |utf16, down| unsafe {
         // A press/release pair: some applications only act on one of the two,
         // and the string is attached to both so either order works.
-        for down in [true, false] {
-            let event = keyboard_event(0, down, false)?;
-            CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
-            CGEventPost(KCG_HID_EVENT_TAP, event);
-            CFRelease(event as *const c_void);
-        }
-    }
-    Some(())
+        let event = keyboard_event(0, down, false)?;
+        CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
+        CGEventPost(KCG_HID_EVENT_TAP, event);
+        CFRelease(event as *const c_void);
+        Some(())
+    })
 }
 
 fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<Typed>> {
     let Plan {
+        expected,
         erase,
         retype: text,
         terminator,
+        verify,
     } = plan;
     let gaps = crate::timing::injection();
     if terminator == Some(Key::Return) {
-        engine.wait_for_release(&[Key::Return], gaps.held_release_timeout);
+        return None;
     }
     if !engine.replacement_valid(generation) {
         return None;
     }
-    engine.injector.store(true, Ordering::Relaxed);
+    begin_injection(engine, generation)?;
     let buf = engine.buffered();
+    if let Some(check) = &verify {
+        // A verified replacement must land atomically or not at all; input
+        // that arrived while the worker was queued moves the caret.
+        if !buf.is_empty() {
+            return None;
+        }
+        let focus = focused_target()?;
+        replace_expected_suffix(engine, &focus, check, &text, generation)?;
+        return Some(Vec::new());
+    }
+    let focus = focused_target()?;
+    if Mac::app_id(&focus).as_deref() == Some("com.apple.Spotlight") {
+        let replacement = format!("{text}{}", if terminator.is_some() { " " } else { "" });
+        replace_spotlight_query(engine, &focus, &expected, &replacement, &buf, generation)?;
+        return Some(buf);
+    }
+    // Prefer a single native text edit when the control exposes a writable range.
+    if buf.is_empty() {
+        let replacement = format!("{text}{}", if terminator.is_some() { " " } else { "" });
+        if replace_expected_suffix(engine, &focus, &expected, &replacement, generation).is_some() {
+            return Some(buf);
+        }
+        if !engine.replacement_valid(generation) {
+            return None;
+        }
+    }
+    // A host selection is not a counted run of characters: its first Backspace
+    // would delete the selection rather than one character of our tracked word.
+    if selected_range(&focus).is_some_and(|range| range.length != 0) {
+        return None;
+    }
     // Press + release a single key with pacing that macOS won't drop. Only the
-    // backspaces and the odd replayed key go through this now; the word itself
-    // is one event.
+    // backspaces and the odd replayed key go through this; the replacement
+    // text uses bounded Unicode event payloads.
     let tap_key = |k: Key, shift: bool| {
         post_key(k, true, shift)?;
         crate::timing::pause(gaps.press_gap);
@@ -811,19 +1325,12 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         return None;
     }
     match terminator {
-        Some(Key::Return) => {
-            paste_text(&text)?;
-            if !engine.replacement_valid(generation) {
-                return None;
-            }
-            tap_key(Key::Return, false)?;
-        }
         // The trailing space is part of the same paste, so nothing has to be
         // pressed at all.
         Some(_) => {
             paste_text(&format!("{text} "))?;
         }
-        // A completion ends mid-word: no terminator, no trailing space.
+        // Explicit offers already include any tracked trailing spaces.
         None => {
             paste_text(&text)?;
         }
@@ -1051,6 +1558,147 @@ mod setup_tests {
     use std::path::Path;
 
     #[test]
+    fn preview_acceptance_defers_space_and_letters_but_never_enter_or_shortcuts() {
+        for key in [Key::Space, Key::KeyA, Key::Dot] {
+            assert!(preview_acceptance_key(key, 0));
+            assert!(preview_acceptance_key(key, 0x0002_0000));
+            for flags in [0x0004_0000, 0x0008_0000, 0x0010_0000] {
+                assert!(!preview_acceptance_key(key, flags));
+            }
+        }
+        for key in [Key::Return, Key::Escape, Key::Backspace, Key::ShiftLeft] {
+            assert!(!preview_acceptance_key(key, 0));
+        }
+    }
+
+    #[test]
+    fn modifier_snapshots_preserve_sides_and_reject_aggregate_only_flags() {
+        let empty = modifier_snapshot(FLAG_ALPHA_SHIFT).unwrap();
+        assert_eq!(modifier_snapshot(0), Some(empty));
+        assert!(empty.iter().all(|(_, down)| !down));
+        assert!(empty.iter().all(|(key, _)| *key != Key::CapsLock));
+        for (left, right, aggregate) in [
+            (Key::ShiftLeft, Key::ShiftRight, 0x0002_0000),
+            (Key::ControlLeft, Key::ControlRight, 0x0004_0000),
+            (Key::Alt, Key::AltGr, 0x0008_0000),
+            (Key::MetaLeft, Key::MetaRight, 0x0010_0000),
+        ] {
+            assert!(modifier_snapshot(aggregate).is_none());
+            for held in [left, right] {
+                let snapshot = modifier_snapshot(aggregate | device_flag(held).unwrap()).unwrap();
+                assert!(snapshot.contains(&(held, true)));
+                assert_eq!(snapshot.iter().filter(|(_, down)| *down).count(), 1);
+            }
+            let snapshot = modifier_snapshot(
+                aggregate | device_flag(left).unwrap() | device_flag(right).unwrap(),
+            )
+            .unwrap();
+            assert!(snapshot.contains(&(left, true)));
+            assert!(snapshot.contains(&(right, true)));
+        }
+    }
+
+    #[test]
+    fn deferred_input_waits_for_the_latest_replacement_and_keeps_event_order() {
+        let mut input = DeferredInput::<&str>::default();
+        let first = input.begin();
+        input.events.extend(["shift down", "key down", "key up"]);
+        let second = input.begin();
+        input.events.extend(["shift up", "mouse down", "mouse up"]);
+        assert!(input.finish(first).is_none());
+        assert!(input.active);
+        assert_eq!(
+            input.finish(second).unwrap(),
+            [
+                "shift down",
+                "key down",
+                "key up",
+                "shift up",
+                "mouse down",
+                "mouse up"
+            ]
+        );
+        assert!(!input.active);
+        assert!(input.finish(second).is_none());
+    }
+
+    #[test]
+    fn typing_during_each_erasure_waits_until_the_corrected_word_is_complete() {
+        for arrival in 0..=8 {
+            let mut input = DeferredInput::<char>::default();
+            let ticket = input.begin();
+            let mut screen = String::from("recieve ");
+            for erased in 0..=8 {
+                if erased == arrival {
+                    input.events.extend("next".chars());
+                }
+                if erased < 8 {
+                    screen.pop();
+                }
+            }
+            screen.push_str("receive ");
+            screen.extend(input.finish(ticket).unwrap());
+            assert_eq!(screen, "receive next", "typing after {arrival} erasures");
+        }
+    }
+
+    #[test]
+    fn canceled_injection_releases_every_deferred_press_and_release() {
+        let mut input = DeferredInput::<&str>::default();
+        let ticket = input.begin();
+        input
+            .events
+            .extend(["ctrl down", "v down", "v up", "ctrl up"]);
+        assert_eq!(
+            input.finish(ticket).unwrap(),
+            ["ctrl down", "v down", "v up", "ctrl up"]
+        );
+        assert!(!input.active);
+    }
+
+    #[test]
+    fn only_modifier_taps_and_plain_spaces_keep_correction_gestures() {
+        for key in [Key::ControlLeft, Key::ShiftRight, Key::CapsLock] {
+            assert!(gesture_input(KCG_EVENT_FLAGS_CHANGED, key, 0));
+        }
+        assert!(gesture_input(KCG_EVENT_KEY_DOWN, Key::Space, 0));
+        assert!(gesture_input(KCG_EVENT_KEY_UP, Key::Space, 0x0002_0000));
+        assert!(gesture_input(KCG_EVENT_KEY_UP, Key::KeyA, 0));
+        assert!(!gesture_input(KCG_EVENT_KEY_DOWN, Key::KeyA, 0));
+        for flags in [0x0001_0000, 0x0004_0000, 0x0008_0000, 0x0010_0000] {
+            assert!(!gesture_input(KCG_EVENT_KEY_DOWN, Key::Space, flags));
+        }
+        for key in [Key::KeyA, Key::Return, Key::Backspace, Key::LeftArrow] {
+            assert!(!gesture_input(KCG_EVENT_KEY_DOWN, key, 0));
+        }
+        assert!(!gesture_input(KCG_EVENT_LEFT_MOUSE_DOWN, Key::KeyA, 0));
+        assert!(!gesture_input(KCG_EVENT_LEFT_MOUSE_UP, Key::KeyA, 0));
+        assert!(!gesture_input(KCG_EVENT_LEFT_MOUSE_DRAGGED, Key::KeyA, 0));
+    }
+
+    #[test]
+    fn replay_preserves_physical_hold_and_double_tap_limits() {
+        assert!(within_gesture_window(10, 300_000_010, engine::TAP_MAX));
+        assert!(!within_gesture_window(10, 300_000_011, engine::TAP_MAX));
+        assert!(within_gesture_window(
+            10,
+            500_000_010,
+            engine::DOUBLE_TAP_WINDOW
+        ));
+        assert!(!within_gesture_window(
+            10,
+            500_000_011,
+            engine::DOUBLE_TAP_WINDOW
+        ));
+        assert!(!within_gesture_window(10, 9, engine::TAP_MAX));
+        let down = (KCG_EVENT_FLAGS_CHANGED, Key::ControlLeft, 0x0000_0001);
+        let up = (KCG_EVENT_FLAGS_CHANGED, Key::ControlLeft, 0);
+        assert!(queued_gestures([down, up].into_iter()));
+        assert!(queued_gestures([up].into_iter()));
+        assert!(!queued_gestures([down].into_iter()));
+    }
+
+    #[test]
     #[ignore = "requires an unsandboxed macOS WindowServer; constructs events without posting"]
     fn injected_events_have_only_the_requested_modifiers() {
         // Construct events without posting them or capturing any real typing.
@@ -1069,6 +1717,51 @@ mod setup_tests {
                 }
             }
         }
+        for ticket in [1, u32::MAX] {
+            let value = FINISH_EVENT | i64::from(ticket);
+            let marker = keyboard_event_with_tag(0, false, false, value).unwrap();
+            unsafe {
+                assert_eq!(CGEventGetIntegerValueField(marker, EVENT_USER_DATA), value);
+                assert_eq!(value & FINISH_MASK, FINISH_EVENT);
+                assert_ne!(RECAST_EVENT & FINISH_MASK, FINISH_EVENT);
+                assert_eq!(CGEventGetType(marker), KCG_EVENT_KEY_UP);
+                CFRelease(marker.cast());
+            }
+        }
+    }
+
+    #[test]
+    fn setup_guides_the_next_requirement_only() {
+        for accessibility in [false, true] {
+            for english in [false, true] {
+                for hebrew in [false, true] {
+                    let step = SetupStep::current(accessibility, english, hebrew);
+                    let actions = step.actions(true);
+                    if !accessibility {
+                        assert_eq!(step, SetupStep::Accessibility);
+                        assert_eq!(actions[0], SetupAction::Accessibility);
+                        assert!(actions.contains(&SetupAction::Reveal));
+                        assert!(!actions.contains(&SetupAction::Keyboards));
+                    } else if !english || !hebrew {
+                        assert_eq!(step, SetupStep::Keyboards);
+                        assert_eq!(actions[0], SetupAction::Keyboards);
+                        assert!(!actions.contains(&SetupAction::Accessibility));
+                        assert!(!actions.contains(&SetupAction::Reveal));
+                    } else {
+                        assert_eq!(step, SetupStep::Ready);
+                        assert_eq!(actions, [SetupAction::Start, SetupAction::Quit]);
+                    }
+                    assert_eq!(actions.last(), Some(&SetupAction::Quit));
+                    assert_eq!(
+                        actions.contains(&SetupAction::Start),
+                        accessibility && english && hebrew
+                    );
+                }
+            }
+        }
+        assert!(!SetupStep::Accessibility
+            .actions(false)
+            .contains(&SetupAction::Reveal));
     }
 
     #[test]
@@ -1088,7 +1781,27 @@ mod setup_tests {
         let keyboards = SetupAction::Keyboards.settings_url(true).unwrap();
         assert!(accessibility.ends_with("PrivacySecurity.extension?Privacy_Accessibility"));
         assert!(keyboards.ends_with("Keyboard-Settings.extension?inputSources"));
+        assert!(SetupAction::Accessibility
+            .settings_url(false)
+            .unwrap()
+            .ends_with("security?Privacy_Accessibility"));
+        assert!(SetupAction::Keyboards
+            .settings_url(false)
+            .unwrap()
+            .ends_with("keyboard?InputSources"));
+        assert!(SetupAction::Start.settings_url(true).is_none());
         assert!(SetupAction::Reveal.settings_url(true).is_none());
         assert!(SetupAction::Quit.settings_url(true).is_none());
     }
+}
+
+mod candidate_strip;
+mod spotlight;
+use spotlight::{replace_expected_suffix, replace_spotlight_query, selected_range};
+
+pub(crate) fn dismiss_candidates() {
+    if let Some(engine) = CTX.get() {
+        engine.forget_everything();
+    }
+    candidate_strip::hide();
 }

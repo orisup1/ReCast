@@ -46,7 +46,8 @@
 //! word. So the posterior only ranks candidates that have already cleared a set
 //! of hard gates:
 //!
-//! * the typed word is not itself an English word (the caller guarantees this),
+//! * dictionary words seen in the frequency corpus are protected; unobserved
+//!   entries require a cheap edit into a very common word,
 //! * it is not a token the corpus sees often enough to be deliberate — a name
 //!   or a handle rather than a typo (see [`correct_with`]),
 //! * it is long enough to be a real typo rather than an initialism (`min_len`),
@@ -60,17 +61,18 @@
 //!
 //! Rather than generating the ring of all strings one edit away (which explodes
 //! past distance 1 — 26² insertions of insertions), we scan the frequency list
-//! itself and score each entry. The list is sorted, so each possible opening
-//! letter is one contiguous run of it, and the scan is limited to the few
-//! openings a correction could plausibly have: the typed word's own first
-//! letter, its second (a transposed opening, `hte` → `the`), and whatever a
-//! word-initial rule could produce (`fone` → **ph**`one`). A length filter and
-//! a letter-bag lower bound then throw out most of what is left before the
-//! matrix is touched.
+//! itself and score each entry. The sorted list gives narrow runs for unchanged
+//! openings, transpositions (`hte` → `the`) and spelling rules (`fone` →
+//! **ph**`one`). Other changed openings use the same channel to bound two- and
+//! three-letter prefixes before scanning their runs, so a second nearby typo
+//! does not have to leave an intact opening anchor. Length, letter-bag, rank
+//! and posterior bounds reject candidates before expensive alignments.
 //!
 //! Everything here is pure and dictionary-driven, so it is unit testable and
 //! never touches the OS.
 
+pub(crate) mod hebrew;
+mod lexicon;
 mod rules;
 
 use std::sync::OnceLock;
@@ -85,7 +87,7 @@ use crate::dictionary::{Dict, Freq};
 /// Longest word we try to correct. Beyond this a "word" is almost certainly a
 /// URL fragment, a path or an identifier, and scanning for a correction gets
 /// pointlessly wide.
-const MAX_LEN: usize = 20;
+const MAX_LEN: usize = 24;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Channel costs, in negative-log-probability units where one ordinary edit — a
@@ -119,6 +121,8 @@ const COST_ADJACENT_DIAG: u32 = 72;
 const COST_STRAY_KEY: u32 = 70;
 /// Two letters typed in the wrong order.
 const COST_TRANSPOSE: u32 = 60;
+/// Moving a letter across two neighbours is two overlapping transpositions.
+const COST_ROTATE: u32 = 2 * COST_TRANSPOSE;
 /// Half of a double letter dropped (`hello` → `helo`) or a single letter typed
 /// twice (`help` → `hellp`). The most frequent real-world typo there is.
 const COST_DOUBLE: u32 = 55;
@@ -140,10 +144,10 @@ const COST_SECOND: u32 = 25;
 /// much of the word that the "correction" is usually a different word — and
 /// short unknown tokens are overwhelmingly names, which is exactly what must
 /// not be rewritten.
-const DIST2_MIN_LEN: usize = 7;
+const DIST2_MIN_LEN: usize = 6;
 /// Shortest word allowed a three-edit correction. A word this long that is
 /// three edits from a very common word is almost always that word, badly typed.
-const DIST3_MIN_LEN: usize = 10;
+const DIST3_MIN_LEN: usize = 8;
 
 /// A two-edit suggestion has to be this many times more common than a one-edit
 /// one would need to be: two edits is a much weaker signal, so only genuinely
@@ -170,6 +174,26 @@ const PRIOR_WEIGHT: f32 = 8.0;
 /// Added to a rank before taking its log, so rank 0 is finite and the very top
 /// of the list isn't spread out absurdly far from the rest of it.
 const PRIOR_SMOOTHING: f32 = 10.0;
+const MAX_PERSONAL_DISCOUNT: f32 = 50.0;
+/// Abstain when two distinct words have almost the same posterior score.
+// ponytail: fixed score margin; recalibrate from ambiguity reports if recall suffers.
+const MIN_SCORE_GAP: f32 = 4.0;
+/// Joint ranking retains margins up to four acceptance thresholds. Search
+/// runners-up throughout that range rather than treating unsearched words as
+/// evidence of strong confidence.
+const CONFIDENCE_WINDOW: f32 = 4.0 * MIN_SCORE_GAP;
+/// Bound contextual influence without widening the edit or frequency gates.
+const MAX_AUTOMATIC_CONTEXT_DISCOUNT: f32 = 8.0;
+/// A wider candidate pool must not make the literal token less plausible solely
+/// because more target words are admitted to the search.
+const KEEP_ORIGINAL_MAX_RANK: u32 = 50_000;
+
+/// Only reviewed three-letter transpositions bypass the default length guard.
+pub(crate) fn is_reviewed_short_transposition(word: &str) -> bool {
+    word.len() == 3
+        && lexicon::reviewed_misspelling(word)
+            .is_some_and(|target| typo_class(word, target) == Some(0))
+}
 
 /// Posterior score of a candidate: the channel cost of the slip plus the
 /// improbability of the word, both as negative log probabilities, so lower is
@@ -180,26 +204,228 @@ const PRIOR_SMOOTHING: f32 = 10.0;
 fn score(cost: u32, rank: u32, word: &str) -> f32 {
     let base = cost as f32 + PRIOR_WEIGHT * (rank as f32 + PRIOR_SMOOTHING).ln();
     let boost = crate::personal::personal_boost(word);
-    base - (boost - 1.0) * 50.0 // Personal boost reduces score by up to 50 points
+    base - (boost - 1.0) * MAX_PERSONAL_DISCOUNT
 }
 
-/// Best English correction for `word`, or `None` to leave it alone.
-///
-/// Thresholds come from the global config (`RECAST_SPELL*`); the actual work is
-/// in [`correct_with`], which takes them explicitly so tests don't depend on
-/// the environment.
-pub fn correct(word: &str, en_dict: Dict, en_freq: Freq) -> Option<String> {
-    let cfg = Config::global();
-    if !cfg.spell_enabled {
+/// Classify only unambiguous single slips: transposition, adjacent substitution,
+/// or a missing letter. Multi-edit and non-English pairs never train these costs.
+pub(crate) fn typo_class(typed: &str, corrected: &str) -> Option<usize> {
+    if typed.is_empty()
+        || corrected.is_empty()
+        || !typed.bytes().all(|c| c.is_ascii_lowercase())
+        || !corrected.bytes().all(|c| c.is_ascii_lowercase())
+    {
         return None;
     }
-    correct_with(
+    let (a, b) = (typed.as_bytes(), corrected.as_bytes());
+    let prefix = a.iter().zip(b).take_while(|(a, b)| a == b).count();
+    let (a, b) = (&a[prefix..], &b[prefix..]);
+    if a.len() == b.len() {
+        if a.len() >= 2 && a[0] == b[1] && a[1] == b[0] && a[2..] == b[2..] {
+            return Some(0);
+        }
+        if !a.is_empty() && adjacent_cost(a[0], b[0]).is_some() && a[1..] == b[1..] {
+            return Some(1);
+        }
+    } else if b.len() == a.len() + 1 && a == &b[1..] {
+        return Some(2);
+    }
+    None
+}
+
+const MAX_TYPO_DISCOUNT: f32 = 15.0;
+
+fn typo_discount(typed: &str, corrected: &str, counts: [u64; 3]) -> f32 {
+    class_discount(typo_class(typed, corrected), counts)
+}
+
+fn class_discount(class: Option<usize>, counts: [u64; 3]) -> f32 {
+    class.map_or(0.0, |class| {
+        if counts[class] < 2 {
+            0.0
+        } else {
+            (counts[class] as f32 * 2.0).min(MAX_TYPO_DISCOUNT)
+        }
+    })
+}
+
+/// Conservative spelling fallbacks for completion share automatic edit/rank
+/// gates, but expose close alternatives without deciding an ambiguous case.
+/// Phrase evidence orders the list without the automatic near-tie restriction.
+pub(crate) fn suggestions(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Vec<String> {
+    let cfg = Config::global();
+    if !cfg.spell_enabled || word.len() > MAX_LEN || dict.contains(word) {
+        return Vec::new();
+    }
+    if let Some((stem, suffix)) = crate::dictionary::english_form(word) {
+        return suggestions(stem, dict, freq, context)
+            .into_iter()
+            .map(|stem| format!("{stem}{suffix}"))
+            .filter(|form| crate::dictionary::english_form_rank(form, dict, freq).is_some())
+            .collect();
+    }
+    let Some(budget) = budget_for(word, cfg.spell_min_len, cfg.spell_max_dist) else {
+        return Vec::new();
+    };
+    let mut search = Search::new(word, budget, cfg.spell_max_rank.min(20_000));
+    search.offers = Some(Vec::new());
+    search.context = context;
+    search.run(word, dict, freq);
+    search
+        .offers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, _, word)| word)
+        .collect()
+}
+
+/// An explicit correction request may reconsider dictionary words and short
+/// inputs. Keep malformed tokens protected and bound the search independently
+/// of the settings that govern unsolicited spelling changes.
+pub(crate) fn correction_suggestions(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Vec<String> {
+    if word.len() > MAX_LEN {
+        return Vec::new();
+    }
+    if let Some((stem, suffix)) = crate::dictionary::english_form(word) {
+        return correction_suggestions(stem, dict, freq, context)
+            .into_iter()
+            .map(|stem| format!("{stem}{suffix}"))
+            .filter(|form| crate::dictionary::english_form_rank(form, dict, freq).is_some())
+            .collect();
+    }
+    if !eligible(word, 2) {
+        return Vec::new();
+    }
+    let budget = if word.len() < DIST2_MIN_LEN { 2 } else { 3 } * COST_EDIT;
+    let mut search = Search::new(word, budget, 50_000);
+    search.offers = Some(Vec::new());
+    search.manual = true;
+    search.context = context;
+    freq.for_each_with_prefix("", |candidate, rank| search.consider(candidate, rank, dict));
+    search.consider_derivatives(word, dict, freq);
+    search
+        .offers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, _, word)| word)
+        .collect()
+}
+
+/// Result and evidence from one spelling search. No diagnostic replay is needed.
+#[derive(Clone, Debug)]
+pub(crate) struct Candidate {
+    pub text: String,
+    pub score: f32,
+    pub cost: u32,
+    pub rank: u32,
+}
+
+pub(crate) struct Assessment {
+    pub correction: Option<String>,
+    pub details: String,
+    /// Preserve the best rejected candidate for bilingual ambiguity checks.
+    pub best: Option<Candidate>,
+    /// Minimum lead over keeping the original and the next candidate, in
+    /// shared policy units: four means this language's acceptance threshold.
+    pub lead: f32,
+}
+
+impl Assessment {
+    pub(crate) fn unchanged(reason: &str) -> Self {
+        Self {
+            correction: None,
+            details: reason.into(),
+            best: None,
+            lead: 0.0,
+        }
+    }
+}
+
+/// Keeping the original is an action with its own evidence, not the absence of
+/// a second dictionary candidate. These are cost scores, not probabilities.
+fn keep_original(
+    word: &str,
+    dict: Dict,
+    freq: Freq,
+    budget: u32,
+    max_rank: u32,
+    phrase_evidence: bool,
+) -> (f32, &'static str) {
+    if let Some(rank) = freq.rank(word) {
+        (
+            score(COST_DOUBLE, rank, word),
+            "the original is frequency-attested",
+        )
+    } else if let Some(rank) = lexicon::compound_rank(word, dict, freq) {
+        (
+            score(2 * COST_EDIT, rank, word),
+            "both compound components are trusted",
+        )
+    } else if word.len() <= 4
+        && word.bytes().any(is_vowel)
+        && !dict.contains(word)
+        && !phrase_evidence
+    {
+        // Short unknown words are also names and handles. A common, cheap slip
+        // can beat this score; a merely unique rare suggestion cannot.
+        (
+            score(COST_DOUBLE, 5_000, word),
+            "short unknown token protection",
+        )
+    } else {
+        (
+            score(budget, max_rank.min(KEEP_ORIGINAL_MAX_RANK), word),
+            "the configured edit and rank budget",
+        )
+    }
+}
+
+#[cfg(test)]
+pub fn correct(word: &str, en_dict: Dict, en_freq: Freq) -> Option<String> {
+    assess(word, en_dict, en_freq, None).correction
+}
+
+pub(crate) fn assess(
+    word: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Assessment {
+    assess_for_visible(word, word, en_dict, en_freq, context)
+}
+
+/// The layout reading supplies edit evidence; the visible source supplies the
+/// contextual evidence for leaving the user's literal text unchanged.
+pub(crate) fn assess_for_visible(
+    word: &str,
+    visible: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Assessment {
+    let cfg = Config::global();
+    if !cfg.spell_enabled {
+        return Assessment::unchanged("English spelling is disabled.");
+    }
+    assess_with_visible_context(
         word,
+        visible,
         en_dict,
         en_freq,
         cfg.spell_min_len,
         cfg.spell_max_rank,
         cfg.spell_max_dist,
+        context,
     )
 }
 
@@ -207,6 +433,7 @@ pub fn correct(word: &str, en_dict: Dict, en_freq: Freq) -> Option<String> {
 ///
 /// `max_dist` is an upper bound in whole edits (0 disables correction entirely);
 /// the word's own length can lower it further — see [`budget_for`].
+#[cfg(test)]
 pub fn correct_with(
     word: &str,
     en_dict: Dict,
@@ -215,21 +442,155 @@ pub fn correct_with(
     max_rank: u32,
     max_dist: u8,
 ) -> Option<String> {
-    // A curated transposition, not permission to guess at other three-letter tokens.
-    if word == "teh"
-        && !en_dict.contains(word)
-        && min_len <= crate::config::DEFAULT_SPELL_MIN_LEN
-        && max_dist > 0
-        && en_dict.contains("the")
-        && en_freq.rank("the").is_some_and(|rank| rank <= max_rank)
+    assess_with(word, en_dict, en_freq, min_len, max_rank, max_dist).correction
+}
+
+#[cfg(test)]
+fn assess_with(
+    word: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    max_dist: u8,
+) -> Assessment {
+    assess_with_context(word, en_dict, en_freq, min_len, max_rank, max_dist, None)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn assess_with_context(
+    word: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    max_dist: u8,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Assessment {
+    assess_with_visible_context(
+        word, word, en_dict, en_freq, min_len, max_rank, max_dist, context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assess_with_visible_context(
+    word: &str,
+    visible: &str,
+    en_dict: Dict,
+    en_freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    max_dist: u8,
+    context: Option<&crate::complete::PhraseContext>,
+) -> Assessment {
+    if let Some((stem, suffix)) =
+        crate::dictionary::english_form(word).filter(|_| word.len() <= MAX_LEN)
     {
-        return Some("the".into());
+        if stem.len() < min_len {
+            return Assessment::unchanged(
+                "The apostrophe stem is shorter than the configured spelling minimum.",
+            );
+        }
+        let folded = word.replace('\'', "");
+        if (lexicon::reviewed_misspelling(stem).is_none()
+            && (en_dict.contains(stem)
+                || en_dict.contains(&folded)
+                || en_freq
+                    .rank(&folded)
+                    .is_some_and(|rank| rank <= max_rank.min(20_000))))
+            || crate::complete::ignored(stem)
+            || crate::complete::learned(stem)
+            || crate::complete::suppressed(stem)
+        {
+            return Assessment::unchanged(
+                "Protected apostrophe form: recognized stem, folded word, or saved word rule.",
+            );
+        }
+        let mut assessment = assess_with_visible_context(
+            stem, visible, en_dict, en_freq, min_len, max_rank, max_dist, context,
+        );
+        assessment.correction = assessment.correction.and_then(|corrected| {
+            let form = format!("{corrected}{suffix}");
+            crate::dictionary::english_form_rank(&form, en_dict, en_freq)
+                .filter(|rank| *rank <= max_rank)
+                .map(|_| form)
+        });
+        assessment.best = assessment.best.and_then(|mut best| {
+            let form = format!("{}{suffix}", best.text);
+            crate::dictionary::english_form_rank(&form, en_dict, en_freq)
+                .filter(|rank| *rank <= max_rank)
+                .map(|_| {
+                    best.text = form;
+                    best
+                })
+        });
+        assessment.details.push_str("\nPreserved the apostrophe suffix and required dictionary and frequency evidence for the resulting form.");
+        return assessment;
     }
-    let budget = budget_for(word, min_len, max_dist)?;
-    // A word we already know is never a typo. The caller normally checks this
-    // too, but it is cheap and this must never "correct" a valid word.
-    if en_dict.contains(word) {
-        return None;
+    let min_len = if min_len <= crate::config::DEFAULT_SPELL_MIN_LEN
+        && is_reviewed_short_transposition(word)
+    {
+        min_len.min(3)
+    } else {
+        min_len
+    };
+    let Some(mut budget) = budget_for(word, min_len, max_dist) else {
+        return Assessment::unchanged(if max_dist == 0 {
+            "English spelling is disabled by the edit-distance limit."
+        } else if word.len() < min_len {
+            "The word is shorter than the configured spelling minimum."
+        } else if word.len() > MAX_LEN {
+            "The word exceeds the spelling length limit."
+        } else {
+            "Spelling requires lowercase English letters; digits and internal punctuation are protected."
+        });
+    };
+    let mut max_rank = max_rank;
+    // Layout dictionaries are intentionally permissive. Reviewed nonwords do
+    // not become trusted spellings merely because an imported list contains them.
+    match lexicon::trust(word, en_dict, en_freq) {
+        lexicon::Trust::Technical | lexicon::Trust::Attested => {
+            return Assessment::unchanged(
+                "Protected dictionary word: attested frequency or curated technical term.",
+            );
+        }
+        lexicon::Trust::ReviewedMisspelling(target) => {
+            // A missing letter may put the typed form below a length boundary.
+            // Reviewed targets can supply that boundary, but never exceed the
+            // user's configured edit ceiling or relax the typed minimum length.
+            let budget = budget.max(budget_for(&target, min_len, max_dist).unwrap_or(budget));
+            let candidate = en_freq
+                .rank(&target)
+                .filter(|_| en_dict.contains(&target))
+                .and_then(|rank| {
+                    let cost =
+                        Dp::default().distance(word.as_bytes(), target.as_bytes(), budget)?;
+                    (rank <= rank_budget(cost, max_rank, word.len())).then(|| Candidate {
+                        text: target.clone(),
+                        score: score(cost, rank, &target),
+                        cost,
+                        rank,
+                    })
+                });
+            return match candidate {
+                Some(candidate) => Assessment {
+                    correction: Some(candidate.text.clone()),
+                    details: format!("Reviewed misspelling: {word} / {target}; dictionary membership does not confer spelling trust.\n  {target}: score {:.2}, edit cost {}, frequency rank {}.\nThe reviewed repair passed the configured length, edit, dictionary, and rank gates.", candidate.score, candidate.cost, candidate.rank),
+                    best: Some(candidate),
+                    lead: 16.0,
+                },
+                None => Assessment::unchanged("The reviewed spelling repair failed the configured edit, dictionary, or frequency-rank gate."),
+            };
+        }
+        lexicon::Trust::Unattested => {
+            budget = budget.min(COST_VOWEL);
+            max_rank = max_rank.min(1_000);
+        }
+        lexicon::Trust::Unknown => {}
+    }
+    if word.len() < DIST3_MIN_LEN {
+        max_rank = max_rank.min(20_000);
     }
     // Not in the dictionary, but common enough in the corpus that people
     // clearly type it on purpose: names and internet spellings ("sami", "ori",
@@ -237,37 +598,97 @@ pub fn correct_with(
     // token we would have been willing to *suggest* is not one to overwrite.
     // (The bound matters: the tail of the corpus is itself full of misspellings
     // — "adress", "goverment" — which are exactly what we are here to fix.)
-    if en_freq.rank(word).is_some_and(|rank| rank <= max_rank) {
-        return None;
+    // Keep protection calibrated independently of the broader suggestion list.
+    if en_freq
+        .rank(word)
+        .is_some_and(|rank| rank <= max_rank.min(20_000))
+    {
+        return Assessment::unchanged(
+            "Protected frequent word or name, even though it is absent from the dictionary.",
+        );
     }
 
-    let typed = word.as_bytes();
-    let mut search = Search {
-        typed,
-        typed_letters: letter_counts(typed),
-        budget,
-        max_rank,
-        dp: Dp::default(),
-        best: None,
+    let mut search = Search::new(word, budget, max_rank);
+    search.context = context;
+    search.run(word, en_dict, en_freq);
+
+    // Apply the same bounded evidence before selecting any winner, including
+    // a previously confident guess. Protection and search eligibility stay hard.
+    let mut context_details = String::new();
+    if let (Some(context), Some((_, _, _, winner))) = (
+        context.filter(|context| context.previous_word().is_some()),
+        search.best.as_ref(),
+    ) {
+        context_details = format!(
+            "\nPhrase context reconsidered all eligible candidates before deciding; maximum cost adjustment +/-{MAX_AUTOMATIC_CONTEXT_DISCOUNT:.2}.\nPrevious word: {:?}; context weight for {winner}: {:.2}; score discount: {:.2}.",
+            context.previous_word().unwrap_or_default(), context.boost(winner), search.context_discount(winner)
+        );
+    }
+
+    let Some((best_score, cost, rank, fixed)) = search.best else {
+        return Assessment::unchanged(&format!(
+            "No candidate passed the spelling gates (weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits)."
+        ));
     };
-
-    for opening in openings(word) {
-        let prefix = [opening.letter];
-        let Ok(prefix) = std::str::from_utf8(&prefix) else {
-            continue;
-        };
-        en_freq.for_each_with_prefix(prefix, |cand, rank| {
-            // The one gate that belongs to the scan rather than to the
-            // candidate: this run was opened for a particular kind of word, and
-            // everything else in it is passed over without being scored.
-            if opening.admits(typed, cand.as_bytes()) {
-                search.consider(cand, rank, en_dict);
-            }
-        });
+    let clear_gap = search
+        .runner_up
+        .as_ref()
+        .is_none_or(|(second, ..)| second - best_score >= MIN_SCORE_GAP);
+    let phrase_evidence = search
+        .context
+        .is_some_and(|context| context.boost(&fixed) >= 2.0);
+    let (keep_score, keep_reason) =
+        keep_original(word, en_dict, en_freq, budget, max_rank, phrase_evidence);
+    let keep_score =
+        keep_score - context.map_or(0.0, |context| context.automatic_discount(visible));
+    let mut scores = vec![keep_score, best_score];
+    if let Some((second, ..)) = &search.runner_up {
+        scores.push(*second);
     }
-    search.consider_neighbouring_openings(en_dict, en_freq);
-
-    search.best.map(|(_, _, _, fixed)| fixed)
+    let confident = crate::intent::select(&scores, MIN_SCORE_GAP) == Some(1);
+    let lead = crate::intent::normalized_lead(&scores, 1, MIN_SCORE_GAP);
+    let rank_evidence = if en_freq.rank(&fixed).is_some() {
+        "frequency rank"
+    } else {
+        "inferred rank from a dictionary stem"
+    };
+    let mut details = format!(
+        "Spelling candidates (lower score is better; scores are not confidence percentages):\n  {fixed}: score {best_score:.2}, edit cost {cost}, {rank_evidence} {rank}\nLimits: weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits."
+    );
+    if let Some((second, second_cost, second_rank, word)) = search.runner_up {
+        let rank_evidence = if en_freq.rank(&word).is_some() {
+            "frequency rank"
+        } else {
+            "inferred rank from a dictionary stem"
+        };
+        details.push_str(&format!(
+            "\nOther evaluated candidate: {word}: score {second:.2}, edit cost {second_cost}, {rank_evidence} {second_rank}\nScore gap: {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", second - best_score
+        ));
+    } else {
+        details.push_str("\nNo competing candidate was found within the confidence window.");
+    }
+    details.push_str(&context_details);
+    details.push_str(&format!(
+        "\nKeep original: score {keep_score:.2} ({keep_reason}); replacement lead {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", keep_score - best_score
+    ));
+    details.push_str(if confident {
+        "\nAccepted the best spelling candidate."
+    } else if !clear_gap {
+        "\nLeft unchanged: the leading candidates are too close in score."
+    } else {
+        "\nLeft unchanged: the spelling candidate did not overcome keeping the original token."
+    });
+    Assessment {
+        correction: confident.then(|| fixed.clone()),
+        details,
+        best: Some(Candidate {
+            text: fixed,
+            score: best_score,
+            cost,
+            rank,
+        }),
+        lead,
+    }
 }
 
 /// The best correction found so far, and everything needed to judge the next
@@ -276,7 +697,7 @@ pub fn correct_with(
 /// A struct rather than a pile of locals because candidates arrive from two
 /// places now — the scan of the frequency list, and the handful of words a
 /// mistyped opening could have been (see
-/// [`consider_neighbouring_openings`](Self::consider_neighbouring_openings)) —
+/// [`consider_edited_openings`](Self::consider_edited_openings)) —
 /// and both have to be scored and compared the same way.
 struct Search<'a> {
     typed: &'a [u8],
@@ -289,79 +710,264 @@ struct Search<'a> {
     /// (score, cost, rank, word) — the score decides, the rest only makes ties
     /// deterministic.
     best: Option<(f32, u32, u32, String)>,
+    runner_up: Option<(f32, u32, u32, String)>,
+    offers: Option<Vec<(f32, u32, String)>>,
+    /// Only the dedicated correction gesture bypasses automatic rank gates.
+    manual: bool,
+    context: Option<&'a crate::complete::PhraseContext>,
+    typo_counts: [u64; 3],
 }
 
-impl Search<'_> {
+impl<'a> Search<'a> {
+    fn new(word: &'a str, budget: u32, max_rank: u32) -> Self {
+        Self {
+            typed: word.as_bytes(),
+            typed_letters: letter_counts(word.as_bytes()),
+            budget,
+            max_rank,
+            dp: Dp::default(),
+            best: None,
+            runner_up: None,
+            offers: None,
+            manual: false,
+            context: None,
+            typo_counts: crate::personal::typo_counts(),
+        }
+    }
+
+    fn run(&mut self, word: &str, dict: Dict, freq: Freq) {
+        for opening in openings(word) {
+            let prefix = [opening.letter];
+            let Ok(prefix) = std::str::from_utf8(&prefix) else {
+                continue;
+            };
+            freq.for_each_with_prefix(prefix, |cand, rank| {
+                if opening.admits(self.typed, cand.as_bytes()) {
+                    self.consider(cand, rank, dict);
+                }
+            });
+        }
+        self.consider_derivatives(word, dict, freq);
+        self.consider_edited_openings(dict, freq);
+    }
+
+    /// Cheap exact dictionary derivatives can be absent from the frequency
+    /// sample. Search only doubled letters and transpositions, using ranked
+    /// stems as weaker evidence, before accepting a distant unrelated word.
+    fn consider_derivatives(&mut self, word: &str, dict: Dict, freq: Freq) {
+        if word.len() < 8 {
+            return;
+        }
+        let mut consider = |bytes: &[u8]| {
+            let candidate = std::str::from_utf8(bytes).expect("ASCII spelling candidate");
+            if let Some(rank) = lexicon::derived_rank(candidate, dict, freq) {
+                self.consider(candidate, rank, dict);
+            }
+        };
+        let mut candidate = word.as_bytes().to_vec();
+        for index in 0..word.len() {
+            candidate.insert(index, word.as_bytes()[index]);
+            consider(&candidate);
+            candidate.remove(index);
+            if index + 1 < word.len() {
+                candidate.swap(index, index + 1);
+                consider(&candidate);
+                candidate.swap(index, index + 1);
+            }
+            if index > 0 && candidate[index] == candidate[index - 1] {
+                let letter = candidate.remove(index);
+                consider(&candidate);
+                candidate.insert(index, letter);
+            }
+        }
+    }
+
+    fn discount(&self, cand: &str) -> f32 {
+        typo_discount(
+            std::str::from_utf8(self.typed).unwrap_or_default(),
+            cand,
+            self.typo_counts,
+        ) + self.context_discount(cand)
+    }
+
+    fn context_discount(&self, cand: &str) -> f32 {
+        if self.offers.is_some() {
+            20.0 * self
+                .context
+                .map_or(1.0, |context| context.offer_boost(cand))
+                .ln() as f32
+        } else {
+            self.context
+                .map_or(0.0, |context| context.automatic_discount(cand))
+        }
+    }
+
     /// Score one candidate and keep it if it beats what is already held.
     fn consider(&mut self, cand: &str, rank: u32, en_dict: Dict) {
         // Cheap gates first: the whole point of scanning the list is that almost
         // every entry is thrown out before the matrix is touched.
         let cb = cand.as_bytes();
-        if rank > self.max_rank {
+        if self
+            .offers
+            .as_ref()
+            .is_some_and(|offers| offers.iter().any(|(_, _, word)| word == cand))
+        {
             return;
         }
-        let len_gap = cb.len().abs_diff(self.typed.len()) as u32 * COST_EDIT;
-        if len_gap > self.budget || bag_bound(&self.typed_letters, cb) > self.budget {
+        if self
+            .best
+            .as_ref()
+            .is_some_and(|(_, _, _, word)| word == cand)
+        {
             return;
         }
-        let Some(cost) = self.dp.distance(self.typed, cb, self.budget) else {
+        if rank > self.max_rank || lexicon::reviewed_misspelling(cand).is_some() {
+            return;
+        }
+        if self.manual && (!eligible(cand, 1) || !en_dict.contains(cand)) {
+            return;
+        }
+        // Keep candidates close enough to the winner to establish ambiguity,
+        // even when they cannot win themselves.
+        let budget = if self.offers.is_some() {
+            self.budget
+        } else {
+            self.best.as_ref().map_or(self.budget, |(best, ..)| {
+                self.budget.min(
+                    (best + CONFIDENCE_WINDOW - score(0, rank, cand) + self.discount(cand)).ceil()
+                        as u32,
+                )
+            })
+        };
+        let len_gap = cb.len().abs_diff(self.typed.len()) as u32 * COST_DOUBLE;
+        if len_gap > budget || bag_bound(&self.typed_letters, cb) > budget {
+            return;
+        }
+        let Some(cost) = self.dp.distance(self.typed, cb, budget) else {
             return;
         };
-        if cost == 0 || rank > rank_budget(cost, self.max_rank, self.typed.len()) {
+        if cost == 0 || (!self.manual && rank > rank_budget(cost, self.max_rank, self.typed.len()))
+        {
             return;
         }
-        let candidate = score(cost, rank, cand);
+        let candidate = score(cost, rank, cand) - self.discount(cand);
+        if lexicon::reviewed_repair(cand, en_dict).is_some() {
+            return;
+        }
+        if let Some(offers) = &mut self.offers {
+            if en_dict.contains(cand) {
+                offers.push((candidate, rank, cand.to_owned()));
+                offers.sort_by(|a, b| {
+                    a.0.total_cmp(&b.0)
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                });
+                offers.truncate(crate::complete::MAX_CANDIDATES);
+            }
+            return;
+        }
         let better = self
             .best
             .as_ref()
             .is_none_or(|(cur, cur_cost, cur_rank, _)| {
                 (candidate, cost, rank) < (*cur, *cur_cost, *cur_rank)
             });
-        // Checked last: it is the only expensive test, and a candidate that
-        // isn't going to win doesn't need it.
-        if better && en_dict.contains(cand) {
-            self.best = Some((candidate, cost, rank, cand.to_string()));
+        // Only dictionary words may win or provide evidence of ambiguity.
+        if en_dict.contains(cand) {
+            if better {
+                if let Some(previous) = self.best.take() {
+                    self.consider_runner_up(previous);
+                }
+                self.best = Some((candidate, cost, rank, cand.to_string()));
+            } else {
+                self.consider_runner_up((candidate, cost, rank, cand.to_string()));
+            }
         }
     }
 
-    /// The words a *fat-fingered opening* could have been: the typed word with
-    /// its first letter replaced by one of the keys beside it.
-    ///
-    /// Looked up rather than scanned for, which is the whole reason this is
-    /// affordable. The other openings are guesses about a *class* of candidate
-    /// and have to be searched for; here the candidate is known exactly, so a
-    /// dozen binary searches do what a dozen more passes over the frequency
-    /// list would otherwise have cost — measured at 1.6 ms against 2.3 ms per
-    /// correction, on a path that runs at the end of every word.
-    ///
-    /// Only an otherwise-perfect word is reachable this way, and that is not a
-    /// restriction so much as an observation: a first-letter slip costs
-    /// [`COST_ADJACENT_DIAG`] + [`COST_INITIAL`] = 162, and the cheapest further
-    /// edit (55) does not fit under the 200 such a word's budget allows.
-    fn consider_neighbouring_openings(&mut self, en_dict: Dict, en_freq: Freq) {
-        // Two edits' worth of budget is the floor for this, so a short word —
-        // which is overwhelmingly a name — cannot reach it at all.
+    fn consider_runner_up(&mut self, candidate: (f32, u32, u32, String)) {
+        if self.runner_up.as_ref().is_none_or(|current| {
+            (candidate.0, candidate.1, candidate.2, &candidate.3)
+                < (current.0, current.1, current.2, &current.3)
+        }) {
+            self.runner_up = Some(candidate);
+        }
+    }
+
+    /// Search changed openings without requiring the next letters to be intact.
+    /// The same edit channel bounds two- and three-letter prefixes before their narrow
+    /// frequency runs are scanned; complete candidates still pass every gate.
+    fn consider_edited_openings(&mut self, en_dict: Dict, en_freq: Freq) {
         if self.budget < 2 * COST_EDIT {
             return;
         }
-        let Some((&first, rest)) = self.typed.split_first() else {
-            return;
+        let discount = if Config::global().personal_enabled {
+            MAX_PERSONAL_DISCOUNT + MAX_TYPO_DISCOUNT
+        } else {
+            0.0
+        } + if self.context.is_some() {
+            MAX_AUTOMATIC_CONTEXT_DISCOUNT
+        } else {
+            0.0
         };
-        let mut candidate = Vec::with_capacity(self.typed.len());
-        for letter in b'a'..=b'z' {
-            if letter == first || !adjacent(first, letter) {
-                continue;
+        let budget = self.best.as_ref().map_or(self.budget, |(best, ..)| {
+            self.budget.min(
+                (best + CONFIDENCE_WINDOW + discount - PRIOR_WEIGHT * PRIOR_SMOOTHING.ln()).ceil()
+                    as u32,
+            )
+        });
+        if budget < COST_ADJACENT_ROW + COST_INITIAL {
+            return;
+        }
+        // Other rules and transpositions were already scanned. Every remaining
+        // changed opening pays at least a neighbouring-key edit plus the
+        // initial surcharge, so its rank gate can run before the full matrix.
+        let covered: Vec<_> = RULES
+            .iter()
+            .filter(|rule| self.typed.starts_with(rule.from.as_bytes()))
+            .map(|rule| rule.to.as_bytes())
+            .collect();
+        let max_rank =
+            (self.max_rank.min(30_000) / DIST2_RANK_FACTOR).max(self.max_rank / DIST3_RANK_FACTOR);
+        for first in b'a'..=b'z' {
+            if first == self.typed[0] {
+                continue; // the ordinary opening scan already covers this run
             }
-            candidate.clear();
-            candidate.push(letter);
-            candidate.extend_from_slice(rest);
-            let Ok(cand) = std::str::from_utf8(&candidate) else {
-                continue;
-            };
-            let Some(rank) = en_freq.rank(cand) else {
-                continue;
-            };
-            self.consider(cand, rank, en_dict);
+            for second in b'a'..=b'z' {
+                let prefix = [first, second];
+                if self.dp.align(self.typed, &prefix, budget, true).is_none() {
+                    continue;
+                }
+                let prefix_text = std::str::from_utf8(&prefix).expect("ASCII opening");
+                let mut thirds = 0u32;
+                en_freq.for_each_with_prefix(prefix_text, |cand, rank| {
+                    if rank <= max_rank {
+                        if let Some(&third) =
+                            cand.as_bytes().get(2).filter(|b| b.is_ascii_lowercase())
+                        {
+                            thirds |= 1 << (third - b'a');
+                        }
+                    }
+                });
+                for third in b'a'..=b'z' {
+                    if thirds & (1 << (third - b'a')) == 0 {
+                        continue;
+                    }
+                    let prefix = [first, second, third];
+                    if self.dp.align(self.typed, &prefix, budget, true).is_none() {
+                        continue;
+                    }
+                    let prefix = std::str::from_utf8(&prefix).expect("ASCII opening");
+                    en_freq.for_each_with_prefix(prefix, |cand, rank| {
+                        if rank <= max_rank
+                            && !cand.as_bytes().starts_with(&[self.typed[1], self.typed[0]])
+                            && !covered.iter().any(|to| cand.as_bytes().starts_with(to))
+                        {
+                            self.consider(cand, rank, en_dict);
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -384,6 +990,8 @@ enum Why {
     /// opening, so nothing else is scored — which is what stops a second full
     /// run of the list from costing anything.
     Transposed,
+    /// A letter moved across the next two letters.
+    Rotated([u8; 3]),
     /// A word-initial rule, e.g. `f` → `ph`: the candidate has to actually
     /// begin with what the rule intended.
     Rule(&'static str),
@@ -397,6 +1005,7 @@ impl Opening {
             Why::Transposed => {
                 cand.len() >= 2 && typed.len() >= 2 && cand[0] == typed[1] && cand[1] == typed[0]
             }
+            Why::Rotated(opening) => cand.starts_with(&opening),
             Why::Rule(to) => cand.starts_with(to.as_bytes()),
         }
     }
@@ -411,12 +1020,10 @@ impl Opening {
 /// `the`), and the first letter of any rule matching at the start of the word,
 /// which is what makes `fone` → `phone` reachable.
 ///
-/// A first letter from the other side of the keyboard stays out of reach by
-/// construction, and that is the case worth keeping out: an arbitrary wrong
-/// opening is what turns a name into an unrelated word. The *neighbouring* key
-/// is a different event — the hand was in the right place and landed one key
-/// over — and it is reached without a scan at all, in
-/// [`Search::consider_neighbouring_openings`].
+/// Edited openings use bounded prefix scans. Their full channel cost and rank
+/// gates decide whether changing the opening is affordable, including additional
+/// errors beside it. See
+/// [`Search::consider_edited_openings`].
 fn openings(word: &str) -> Vec<Opening> {
     let typed = word.as_bytes();
     let mut openings = vec![Opening {
@@ -428,6 +1035,16 @@ fn openings(word: &str) -> Vec<Opening> {
             letter: typed[1],
             why: Why::Transposed,
         });
+    }
+    if typed.len() >= DIST2_MIN_LEN {
+        for rotated in rotations(&typed[..3]) {
+            if rotated[0] != typed[0] {
+                openings.push(Opening {
+                    letter: rotated[0],
+                    why: Why::Rotated(rotated),
+                });
+            }
+        }
     }
     for rule in RULES {
         if !word.starts_with(rule.from) {
@@ -445,6 +1062,13 @@ fn openings(word: &str) -> Vec<Opening> {
         });
     }
     openings
+}
+
+fn rotations(letters: &[u8]) -> [[u8; 3]; 2] {
+    [
+        [letters[1], letters[2], letters[0]],
+        [letters[2], letters[0], letters[1]],
+    ]
 }
 
 /// The channel-cost budget for `word`, or `None` if the word is not the kind of
@@ -467,12 +1091,22 @@ fn budget_for(word: &str, min_len: usize, max_dist: u8) -> Option<u32> {
         1
     };
     let edits = by_length.min(max_dist as u32);
-    (edits > 0).then(|| edits * COST_EDIT)
+    (edits > 0).then(|| {
+        let budget = edits * COST_EDIT;
+        if word.len() == DIST2_MIN_LEN {
+            budget.min(CHEAPLY_EXPLAINED)
+        } else {
+            budget
+        }
+    })
 }
 
 /// Whether `word` is a token the speller may touch at all.
 fn eligible(word: &str, min_len: usize) -> bool {
-    word.len() >= min_len && word.len() <= MAX_LEN && word.bytes().all(|b| b.is_ascii_lowercase())
+    !word.is_empty()
+        && word.len() >= min_len
+        && word.len() <= MAX_LEN
+        && word.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 /// Worst frequency rank a suggestion of this channel cost may have. A candidate
@@ -500,8 +1134,8 @@ fn eligible(word: &str, min_len: usize) -> bool {
 /// already measures exactly that, so it is what the loosening is conditioned on
 /// — see [`CHEAPLY_EXPLAINED`].
 ///
-/// Three edits are left alone. The same argument would apply, but nothing in the
-/// corpus needs it and the only thing it could add is a wrong answer.
+/// Speculative two-edit targets retain the calibrated rank ceiling. The wider
+/// suggestion list is available for one-edit and cheaply explained long words.
 fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
     if cost <= COST_EDIT {
         max_rank
@@ -509,7 +1143,7 @@ fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
         if len >= LONG_ENOUGH_FOR_TWO && cost <= CHEAPLY_EXPLAINED {
             max_rank
         } else {
-            max_rank / DIST2_RANK_FACTOR
+            max_rank.min(30_000) / DIST2_RANK_FACTOR
         }
     } else {
         max_rank / DIST3_RANK_FACTOR
@@ -521,7 +1155,7 @@ fn rank_budget(cost: u32, max_rank: u32, len: usize) -> u32 {
 /// Two more than [`DIST2_MIN_LEN`], which is the shortest word allowed two edits
 /// at all: right at that floor two edits are still a third of the word, and the
 /// tighter rank budget is what stands between a name and a rewrite.
-const LONG_ENOUGH_FOR_TWO: usize = 9;
+const LONG_ENOUGH_FOR_TWO: usize = 8;
 
 /// Total channel cost past which two edits stop counting as cheaply explained.
 ///
@@ -628,7 +1262,7 @@ fn is_vowel(c: u8) -> bool {
 /// Position of `c` on a QWERTY keyboard as `(row, 2×column)`. The doubled
 /// column lets the half-key stagger between rows be expressed in integers.
 fn qwerty_pos(c: u8) -> Option<(i32, i32)> {
-    const ROWS: [&[u8]; 3] = [b"qwertyuiop", b"asdfghjkl", b"zxcvbnm"];
+    const ROWS: [&[u8]; 3] = [b"qwertyuiop", b"asdfghjkl;'", b"zxcvbnm,./"];
     for (row, keys) in ROWS.iter().enumerate() {
         if let Some(col) = keys.iter().position(|&k| k == c) {
             // Each row sits half a key to the right of the one above it.
@@ -779,14 +1413,46 @@ fn extra_cost(w: &[u8], i: usize) -> u32 {
 struct Dp {
     cells: Vec<u32>,
     /// `extra_cost` for each position of the typed word, computed once per
-    /// candidate instead of once per cell. It depends only on the typed word,
+    /// search instead of once per candidate. It depends only on the typed word,
     /// which is the same for every one of the thousands of candidates in a
     /// scan — and the deletion cell is on the hot path, where two adjacency
     /// lookups per cell were costing ~10% of the whole correction.
     extra: Vec<u32>,
+    typed: Vec<u8>,
+    /// Rules whose typed side actually matches at each row, cached with `extra`.
+    row_rules: Vec<&'static rules::Rule>,
+    rule_ends: Vec<usize>,
 }
 
 impl Dp {
+    fn prepare(&mut self, typed: &[u8]) {
+        if self.typed == typed {
+            return;
+        }
+        self.typed.clear();
+        self.typed.extend_from_slice(typed);
+        self.extra.clear();
+        self.extra.push(0); // unused: positions are 1-based here
+        self.extra
+            .extend((1..=typed.len()).map(|i| extra_cost(typed, i)));
+        self.row_rules.clear();
+        self.rule_ends.clear();
+        self.rule_ends.push(0);
+        let index = rules_by_last_byte();
+        for i in 1..=typed.len() {
+            self.row_rules.extend(
+                index[(typed[i - 1] - b'a') as usize]
+                    .iter()
+                    .copied()
+                    .filter(|rule| {
+                        i >= rule.from.len()
+                            && &typed[i - rule.from.len()..i] == rule.from.as_bytes()
+                    }),
+            );
+            self.rule_ends.push(self.row_rules.len());
+        }
+    }
+
     /// Channel cost of the typed word `a` having come out of the intended word
     /// `b` — a weighted Damerau-Levenshtein alignment extended with the
     /// [`RULES`] block edits and [`position_penalty`] — or `None` once every
@@ -796,6 +1462,28 @@ impl Dp {
     /// entries the whole row goes over budget within a couple of letters and the
     /// rest of the matrix is never computed.
     fn distance(&mut self, a: &[u8], b: &[u8], budget: u32) -> Option<u32> {
+        let cost = self.align(a, b, budget, false);
+        // A single stray final key after an otherwise exact word is a timing
+        // slip. Discount only that complete alignment: extending the discount
+        // to multiple deletions can turn names such as "yarden" into "yard".
+        // Short bases remain protected from shortening unknown initialisms.
+        if b.len() >= crate::config::DEFAULT_SPELL_MIN_LEN
+            && a.len() == b.len() + 1
+            && a.starts_with(b)
+        {
+            let extra = extra_cost(a, a.len()).min(COST_STRAY_KEY);
+            if extra <= budget {
+                return Some(cost.map_or(extra, |cost| cost.min(extra)));
+            }
+        }
+        cost
+    }
+
+    /// Prefix searches may stop before consuming all typed letters. Rules and
+    /// transpositions may also cross the candidate prefix boundary, so their
+    /// partial output is admitted at its full cost rather than priced as a
+    /// different edit. This is optimistic; the complete alignment decides.
+    fn align(&mut self, a: &[u8], b: &[u8], budget: u32, prefix: bool) -> Option<u32> {
         let (n, m) = (a.len(), b.len());
         let width = m + 1;
         // Rules look back up to MAX_RULE_LEN rows and columns, so the whole
@@ -807,20 +1495,25 @@ impl Dp {
         }
         let at = |i: usize, j: usize| i * width + j;
 
-        self.extra.clear();
-        self.extra.push(0); // unused: positions are 1-based here
-        self.extra.extend((1..=n).map(|i| extra_cost(a, i)));
+        self.prepare(a);
 
         self.cells[0] = 0;
         for j in 1..=m {
             // Turning the empty prefix of `a` into `b[..j]` is all insertions,
             // every one of them at the start of the typed word.
             self.cells[j] = self.cells[j - 1]
-                .saturating_add(missing_cost(b, j))
+                .saturating_add(if prefix && j == m {
+                    COST_DOUBLE
+                } else {
+                    missing_cost(b, j)
+                })
                 .saturating_add(position_penalty(0));
         }
 
-        let index = rules_by_last_byte();
+        if prefix && self.cells[m] <= budget {
+            return Some(self.cells[m]);
+        }
+
         // Minima of the last few rows. Bailing on a single over-budget row
         // would be wrong: a transposition reaches back two rows and a rule up
         // to `MAX_RULE_LEN`, so a row that looks hopeless can still be jumped
@@ -844,7 +1537,11 @@ impl Dp {
                     // was dropped, one only in `a` was added — and only the
                     // second can be explained by where the keys are.
                     let insertion = self.cells[at(i, j - 1)]
-                        .saturating_add(missing_cost(b, j))
+                        .saturating_add(if prefix && j == m {
+                            COST_DOUBLE
+                        } else {
+                            missing_cost(b, j)
+                        })
                         .saturating_add(position_penalty(i));
                     let deletion = self.cells[at(i - 1, j)]
                         .saturating_add(self.extra[i])
@@ -864,24 +1561,52 @@ impl Dp {
                         best =
                             best.min(self.cells[at(i - 2, j - 2)].saturating_add(COST_TRANSPOSE));
                     }
+                    if prefix && j == m && i >= 2 && a[i - 1] == b[j - 1] {
+                        best =
+                            best.min(self.cells[at(i - 2, j - 1)].saturating_add(COST_TRANSPOSE));
+                    }
+                    if i >= 3 {
+                        for rotated in rotations(&a[i - 3..i]) {
+                            let lengths = if prefix && j == m {
+                                1..=3.min(j)
+                            } else {
+                                3..=3
+                            };
+                            for length in lengths {
+                                if j >= length && b[j - length..j] == rotated[..length] {
+                                    best = best.min(
+                                        self.cells[at(i - 3, j - length)]
+                                            .saturating_add(COST_ROTATE),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     best
                 };
 
                 // Brill–Moore block edits: one event covering several letters
-                // on each side. Indexed by the typed letter this cell ends on,
-                // so only a couple of rules are ever tested here.
-                for rule in &index[(a[i - 1] - b'a') as usize] {
+                // on each side. The matching typed sides were prepared once
+                // for this word; only the candidate side varies between cells.
+                for rule in &self.row_rules[self.rule_ends[i - 1]..self.rule_ends[i]] {
                     let (fl, tl) = (rule.from.len(), rule.to.len());
-                    if i < fl || j < tl {
-                        continue;
-                    }
-                    if &a[i - fl..i] == rule.from.as_bytes() && &b[j - tl..j] == rule.to.as_bytes()
-                    {
-                        best = best.min(self.cells[at(i - fl, j - tl)].saturating_add(rule.cost));
+                    let lengths = if prefix && j == m {
+                        1..=tl.min(j)
+                    } else {
+                        tl..=tl
+                    };
+                    for tl in lengths {
+                        if j >= tl && b[j - tl..j] == rule.to.as_bytes()[..tl] {
+                            best =
+                                best.min(self.cells[at(i - fl, j - tl)].saturating_add(rule.cost));
+                        }
                     }
                 }
 
                 self.cells[at(i, j)] = best;
+                if prefix && j == m && best <= budget {
+                    return Some(best);
+                }
                 row_min = row_min.min(best);
             }
             recent[i % LOOKBACK] = row_min;
@@ -898,6 +1623,167 @@ impl Dp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_minimum_length_still_rejects_an_empty_word() {
+        assert_eq!(
+            correct_with("", Dict::new("hello"), Freq::new("hello\t0"), 0, 100, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn keeping_an_unknown_token_competes_even_with_a_unique_candidate() {
+        let d = Dict::of(&["aunt"]);
+        let f = Freq::of(&[("aunt", 100)]);
+        let guarded = assess_with("auno", d, f, 4, 50_000, 3);
+        assert_eq!(guarded.correction, None);
+        assert_eq!(guarded.best.unwrap().text, "aunt");
+        assert!(guarded.details.contains("Keep original:"));
+        assert_eq!(correction_suggestions("auno", d, f, None), ["aunt"]);
+
+        let guarded = assess_with(
+            "selin",
+            Dict::of(&["selina"]),
+            Freq::of(&[("selin", 30_000), ("selina", 15_000)]),
+            4,
+            50_000,
+            3,
+        );
+        assert_eq!(guarded.correction, None);
+        assert_eq!(guarded.best.unwrap().text, "selina");
+        assert!(guarded.details.contains("original is frequency-attested"));
+
+        let guarded = assess_with(
+            "cloudforge",
+            Dict::of(&["cloud", "forge", "cloudfront"]),
+            Freq::of(&[("cloud", 500), ("forge", 2_000), ("cloudfront", 100)]),
+            4,
+            50_000,
+            3,
+        );
+        assert_eq!(guarded.correction, None);
+        assert_eq!(guarded.best.unwrap().text, "cloudfront");
+        assert!(guarded.details.contains("compound components are trusted"));
+    }
+
+    #[test]
+    fn reviewed_nonwords_do_not_inherit_dictionary_or_frequency_protection() {
+        for (typed, corrected) in [
+            ("enviroment", "environment"),
+            ("priviledge", "privilege"),
+            ("succesful", "successful"),
+        ] {
+            let d = Dict::of(&[typed, corrected]);
+            let f = Freq::of(&[(typed, 100), (corrected, 12_000)]);
+            let assessment = assess_with(typed, d, f, 4, 50_000, 1);
+            assert_eq!(
+                assessment.correction.as_deref(),
+                Some(corrected),
+                "{}",
+                assessment.details
+            );
+            assert!(assessment.details.contains("Reviewed misspelling"));
+            assert_eq!(correct_with(typed, d, f, typed.len() + 1, 50_000, 1), None);
+            assert_eq!(correct_with(typed, d, f, 4, 11_999, 1), None);
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 0), None);
+            assert_eq!(
+                correct_with(typed, Dict::of(&[typed]), f, 4, 50_000, 1),
+                None
+            );
+        }
+        let d = Dict::of(&["enviroment", "environment", "calender", "calendar"]);
+        let f = Freq::of(&[("environment", 3_000), ("calendar", 6_000)]);
+        assert_eq!(
+            correct_with("enviroment's", d, f, 4, 50_000, 1).as_deref(),
+            Some("environment's")
+        );
+        assert_eq!(
+            correct_with("calender", d, f, 4, 50_000, 3),
+            None,
+            "a rare valid word is not a reviewed nonword"
+        );
+    }
+
+    #[test]
+    fn reviewed_short_transpositions_keep_settings_and_dictionary_gates() {
+        let d = Dict::of(&["the"]);
+        let f = Freq::of(&[("the", 2)]);
+        for typed in ["teh", "hte"] {
+            assert_eq!(
+                correct_with(typed, d, f, 4, 50_000, 1).as_deref(),
+                Some("the")
+            );
+            assert_eq!(correct_with(typed, d, f, 5, 50_000, 3), None);
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 0), None);
+            assert_eq!(correct_with(typed, d, f, 4, 1, 3), None);
+            assert_eq!(correct_with(typed, Dict::of(&[]), f, 4, 50_000, 3), None);
+        }
+        for word in ["nad", "adn", "yeh", "idk", "brb"] {
+            assert_eq!(correct_with(word, d, f, 4, 50_000, 3), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn reviewed_inflections_require_dictionary_rank_and_edit_evidence() {
+        for (typed, corrected) in [
+            ("seperated", "separated"),
+            ("accomodating", "accommodating"),
+            ("committments", "commitments"),
+            ("langauges", "languages"),
+        ] {
+            let d = Dict::of(&[typed, corrected]);
+            let f = Freq::of(&[(typed, 100), (corrected, 500)]);
+            assert_eq!(
+                correct_with(typed, d, f, 4, 50_000, 3).as_deref(),
+                Some(corrected),
+                "{typed}"
+            );
+            assert_eq!(correct_with(typed, d, f, 4, 499, 3), None);
+            assert_eq!(
+                correct_with(typed, Dict::of(&[typed]), f, 4, 50_000, 3),
+                None
+            );
+            assert_eq!(correct_with(typed, d, Freq::EMPTY, 4, 50_000, 3), None);
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 0), None);
+        }
+    }
+
+    #[test]
+    fn unranked_derivatives_need_a_cheap_edit_and_an_attested_dictionary_stem() {
+        let d = Dict::of(&["spelling", "misspelling", "missing"]);
+        let f = Freq::of(&[("spelling", 9_938), ("missing", 728)]);
+        let result = assess_with("mispelling", d, f, 4, 50_000, 3);
+        assert_eq!(
+            result.correction.as_deref(),
+            Some("misspelling"),
+            "{}",
+            result.details
+        );
+        assert!(result.details.contains("inferred rank"));
+        assert_eq!(
+            correction_suggestions("mispelling", d, f, None)[0],
+            "misspelling"
+        );
+        assert_eq!(correct_with("mispelling", d, f, 4, 20_000, 1), None);
+        assert_eq!(
+            correct_with("mispelling", d, Freq::EMPTY, 4, 50_000, 3),
+            None
+        );
+        assert_eq!(
+            correct_with("mispelling", Dict::of(&["misspelling"]), f, 4, 50_000, 3),
+            None
+        );
+        assert_eq!(
+            correct_with("mispelling", d, f, 4, 50_000, 1).as_deref(),
+            Some("misspelling")
+        );
+
+        // Two equally supported derivatives remain ambiguous.
+        let d = Dict::of(&["abcdde", "abdced", "unabcdde", "unabdced"]);
+        let f = Freq::of(&[("abcdde", 100), ("abdced", 100)]);
+        assert_eq!(correct_with("unabdcde", d, f, 4, 50_000, 3), None);
+    }
 
     fn dict(words: &[&str]) -> Dict {
         Dict::of(words)
@@ -921,6 +1807,463 @@ mod tests {
     }
 
     #[test]
+    fn manual_phrase_ranking_resolves_an_automatic_abstention() {
+        let d = Dict::of(&["cafe", "cake"]);
+        let f = Freq::of(&[("cafe", 100), ("cake", 100)]);
+        assert_eq!(correct_with("caxe", d, f, 4, 20_000, 1), None);
+        assert_eq!(suggestions("caxe", d, f, None)[0], "cafe");
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        assert_eq!(suggestions("caxe", d, f, Some(&context))[0], "cake");
+        assert!(suggestions("cake", d, f, Some(&context)).is_empty());
+        assert!(suggestions("c4xe", d, f, Some(&context)).is_empty());
+        assert_eq!(correct_with("caxe", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn explicit_correction_reconsiders_valid_short_and_less_common_words() {
+        let d = dict(&["form", "from", "the", "work", "hello"]);
+        let f = freq(&[
+            ("form", 900),
+            ("from", 10),
+            ("the", 0),
+            ("work", 100),
+            ("hello", 30_000),
+        ]);
+        for (typed, expected) in [
+            ("form", "from"),
+            ("hte", "the"),
+            ("wrk", "work"),
+            ("hellx", "hello"),
+        ] {
+            let offers = correction_suggestions(typed, d, f, None);
+            assert!(
+                offers.iter().any(|word| word == expected),
+                "{typed}: {offers:?}"
+            );
+            assert!(!offers.iter().any(|word| word == typed));
+            assert!(offers.len() <= crate::complete::MAX_CANDIDATES);
+            assert_eq!(offers, correction_suggestions(typed, d, f, None));
+            if typed == "hte" {
+                assert_eq!(fix(typed, d, f).as_deref(), Some("the"));
+            } else {
+                assert_eq!(fix(typed, d, f), None, "automatic protections for {typed}");
+            }
+        }
+        assert!(suggestions("form", d, f, None).is_empty());
+        assert!(suggestions("hte", d, f, None).is_empty());
+    }
+
+    #[test]
+    fn explicit_correction_keeps_phrase_ranking_and_rejects_malformed_tokens() {
+        let d = dict(&["cafe", "cake"]);
+        let f = freq(&[("cafe", 100), ("cake", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        assert_eq!(correction_suggestions("caxe", d, f, None)[0], "cafe");
+        assert_eq!(
+            correction_suggestions("caxe", d, f, Some(&context))[0],
+            "cake"
+        );
+        for word in [
+            "c4xe",
+            "cax_e",
+            "https://cake",
+            "ca'xe",
+            "cake''s",
+            "שלום",
+            "c",
+        ] {
+            assert!(
+                correction_suggestions(word, d, f, None).is_empty(),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn spelling_preserves_supported_apostrophe_suffixes_and_protected_stems() {
+        let d = dict(&["receive", "class", "the", "do", "does", "doesnt"]);
+        let f = freq(&[
+            ("receive", 100),
+            ("class", 100),
+            ("the", 0),
+            ("doesnt", 100),
+        ]);
+        assert_eq!(fix("recieve's", d, f).as_deref(), Some("receive's"));
+        assert_eq!(
+            correction_suggestions("recieve's", d, f, None),
+            ["receive's"]
+        );
+        for word in [
+            "receive's",
+            "clas's",
+            "hte's",
+            "recieve'll",
+            "recieve''s",
+            "recieve_1's",
+            "https://recieve's",
+            "rec'ieve",
+            "recieve'ss",
+        ] {
+            assert_eq!(fix(word, d, f), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn visible_source_controls_keep_context_including_apostrophe_repairs() {
+        let d = dict(&["catee"]);
+        let f = freq(&[("catee", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        for _ in 0..2 {
+            context.retain("zzsource");
+            context.retain("held");
+        }
+        context.retain("zzsource");
+        let keep_score = |assessment: &Assessment| {
+            assessment
+                .details
+                .split("Keep original: score ")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<f32>()
+                .unwrap()
+        };
+        for word in ["caxee", "caxee's"] {
+            let literal =
+                assess_with_visible_context(word, "held", d, f, 4, 20_000, 1, Some(&context));
+            let unrelated =
+                assess_with_visible_context(word, "unrelated", d, f, 4, 20_000, 1, Some(&context));
+            let literal_best = literal.best.as_ref().expect("eligible spelling candidate");
+            let unrelated_best = unrelated.best.as_ref().unwrap();
+            assert_eq!(literal_best.text, unrelated_best.text);
+            assert_eq!(literal_best.score, unrelated_best.score);
+            assert!(
+                (keep_score(&unrelated) - keep_score(&literal) - 8.0).abs() < 0.01,
+                "{word}: {}\n{}",
+                literal.details,
+                unrelated.details,
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_phrase_context_respects_bounded_evidence_and_original() {
+        let d = dict(&["cafe", "cake", "cane"]);
+        let f = freq(&[("cafe", 100), ("cake", 100), ("cane", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        let assess = |d: Dict, f: Freq, context: Option<&crate::complete::PhraseContext>| {
+            assess_with_context("caxe", d, f, 4, 20_000, 1, context)
+        };
+        assert_eq!(assess(d, f, None).correction, None);
+        let resolved = assess(d, f, Some(&context));
+        assert_eq!(resolved.correction.as_deref(), Some("cake"));
+        assert!(resolved.details.contains("Phrase context reconsidered"));
+        assert!(resolved.details.contains("score discount: 8.00"));
+        context.clear();
+        assert_eq!(assess(d, f, Some(&context)).correction, None);
+
+        // Bounded context cannot overcome a large likelihood difference or
+        // remove the independent keep-original and candidate-margin checks.
+        context.observe("birthday", false);
+        let f = freq(&[("cafe", 100), ("cake", 200), ("cane", 100)]);
+        assert_eq!(assess(d, f, Some(&context)).correction, None);
+        let f = freq(&[("cafe", 100), ("cake", 110), ("cane", 100)]);
+        assert_eq!(
+            assess(d, f, Some(&context)).correction.as_deref(),
+            Some("cake")
+        );
+        let f = freq(&[("cafe", 100), ("cake", 110)]);
+        let d = dict(&["cafe", "cake"]);
+        assert_eq!(
+            assess(d, f, Some(&context)).correction.as_deref(),
+            Some("cake")
+        );
+        let f = freq(&[("cafe", 100), ("cake", 1_000)]);
+        let guarded = assess(d, f, Some(&context));
+        assert_eq!(
+            guarded.correction, None,
+            "keeping the unknown token still competes"
+        );
+        assert_eq!(
+            guarded.best.unwrap().text,
+            "cafe",
+            "context cannot rescue a distant candidate"
+        );
+    }
+
+    #[test]
+    fn sentence_context_can_overturn_a_previously_confident_wrong_guess() {
+        let d = dict(&["canee", "catee"]);
+        let f = freq(&[("canee", 200), ("catee", 100)]);
+        let without = assess_with_context("caxee", d, f, 4, 20_000, 1, None);
+        assert_eq!(without.correction.as_deref(), Some("catee"));
+        let model = "at\t100\t10000\nat the\t100\t100\nat the canee\t12\t100\ncanee\t200\t10000\ncatee\t100\t10000\nthe\t100\t10000\nthe canee\t12\t100\nthe catee\t12\t100\n";
+        let mut context = crate::complete::PhraseContext::with_model(model);
+        context.observe("at", false);
+        context.observe("the", false);
+        let with = assess_with_context("caxee", d, f, 4, 20_000, 1, Some(&context));
+        assert_eq!(
+            with.correction.as_deref(),
+            Some("canee"),
+            "{}",
+            with.details
+        );
+        context.clear();
+        assert_eq!(
+            assess_with_context("caxee", d, f, 4, 20_000, 1, Some(&context)).correction,
+            without.correction,
+        );
+    }
+
+    #[test]
+    fn joint_confidence_keeps_runners_up_beyond_the_acceptance_margin() {
+        let d = dict(&["canee", "catee"]);
+        let f = freq(&[("canee", 100), ("catee", 300)]);
+        // The winner is visited first. A later competitor beyond the local
+        // four-point acceptance margin must still limit joint confidence.
+        let assessment = assess_with_context("caxee", d, f, 4, 20_000, 1, None);
+        assert_eq!(assessment.correction.as_deref(), Some("canee"));
+        assert!(
+            assessment.lead > 4.0 && assessment.lead < 12.0,
+            "{}",
+            assessment.details
+        );
+    }
+
+    #[test]
+    fn automatic_context_keeps_spelling_protections_and_limits() {
+        let d = dict(&["cafe", "cake"]);
+        let f = freq(&[("cafe", 100), ("cake", 100)]);
+        let mut context = crate::complete::PhraseContext::default();
+        context.observe("birthday", false);
+        for (word, min_len, max_rank, max_dist) in [
+            ("cake", 4, 20_000, 1),
+            ("ca4e", 4, 20_000, 1),
+            ("caxe", 4, 20_000, 0),
+            ("caxe", 5, 20_000, 1),
+            ("caxe", 4, 99, 1),
+            ("caxx", 4, 20_000, 1),
+        ] {
+            assert_eq!(
+                assess_with_context(word, d, f, min_len, max_rank, max_dist, Some(&context))
+                    .correction,
+                None,
+                "{word}"
+            );
+        }
+        let f = freq(&[("caxe", 50), ("cafe", 100), ("cake", 100)]);
+        assert_eq!(
+            assess_with_context("caxe", d, f, 4, 20_000, 1, Some(&context)).correction,
+            None
+        );
+
+        // Two equally supported alternatives must still abstain.
+        for _ in 0..2 {
+            context.retain("birthday");
+            context.retain("cafe");
+        }
+        context.retain("birthday");
+        let f = freq(&[("cafe", 100), ("cake", 100)]);
+        assert_eq!(
+            assess_with_context("caxe", d, f, 4, 20_000, 1, Some(&context)).correction,
+            None
+        );
+    }
+
+    #[test]
+    fn spelling_evidence_explains_ambiguity_protection_and_limits() {
+        let d = Dict::of(&["cafe", "cake"]);
+        let f = Freq::of(&[("cafe", 100), ("cake", 100)]);
+        let ambiguous = assess_with("caxe", d, f, 4, 20_000, 1);
+        assert!(ambiguous.correction.is_none());
+        assert!(ambiguous.details.contains("cafe: score"));
+        assert!(ambiguous.details.contains("cake: score"));
+        assert!(ambiguous.details.contains("candidates are too close"));
+        assert!(ambiguous.details.contains("required minimum: 4.00"));
+        assert!(assess_with("cake", d, f, 4, 20_000, 1)
+            .details
+            .contains("Protected dictionary word"));
+        assert!(assess_with("cat", d, f, 4, 20_000, 1)
+            .details
+            .contains("shorter than"));
+        assert!(assess_with("caxe", d, f, 4, 20_000, 0)
+            .details
+            .contains("disabled"));
+        assert!(assess_with("ca4e", d, f, 4, 20_000, 1)
+            .details
+            .contains("internal punctuation"));
+        assert!(assess_with("zzzz", d, f, 4, 20_000, 1)
+            .details
+            .contains("No candidate passed"));
+    }
+
+    #[test]
+    fn adaptive_typo_classes_require_repetition_and_have_a_small_cap() {
+        assert_eq!(typo_class("watre", "water"), Some(0));
+        assert_eq!(typo_class("gello", "hello"), Some(1));
+        assert_eq!(typo_class("helo", "hello"), Some(2));
+        for (typed, fixed) in [("hello", "hello"), ("xxllo", "hello"), ("שלום", "hello")] {
+            assert_eq!(typo_class(typed, fixed), None);
+        }
+        assert_eq!(typo_discount("watre", "water", [1, 0, 0]), 0.0);
+        assert_eq!(typo_discount("watre", "water", [2, 0, 0]), 4.0);
+        assert_eq!(
+            typo_discount("watre", "water", [u64::MAX, 0, 0]),
+            MAX_TYPO_DISCOUNT
+        );
+        assert_eq!(typo_discount("gello", "hello", [100, 0, 0]), 0.0);
+    }
+
+    #[test]
+    fn missing_and_extra_openings_keep_the_existing_confidence_gates() {
+        let d = dict(&["computer", "keyboard", "hello"]);
+        let f = freq(&[("computer", 100), ("keyboard", 500), ("hello", 50)]);
+        for (typed, expected) in [
+            ("omputer", "computer"),
+            ("xcomputer", "computer"),
+            ("eyboard", "keyboard"),
+            ("xkeyboard", "keyboard"),
+        ] {
+            assert_eq!(fix(typed, d, f).as_deref(), Some(expected));
+            assert_eq!(correct_with(typed, d, f, 4, 20_000, 1), None);
+        }
+        assert_eq!(fix("ello", d, f), None);
+        assert_eq!(fix("xhello", d, f), None);
+        assert_eq!(
+            fix(
+                "omputer",
+                dict(&["omputer", "computer"]),
+                freq(&[("omputer", 500), ("computer", 100)])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn edited_openings_allow_later_typos_within_the_existing_budget() {
+        let d = dict(&["communication"]);
+        let f = freq(&[("communication", 100)]);
+        for typed in ["ommunicaton", "xcommuncation", "vommuncation"] {
+            assert_eq!(
+                fix(typed, d, f).as_deref(),
+                Some("communication"),
+                "{typed}"
+            );
+            assert_eq!(correct_with(typed, d, f, 4, 20_000, 1), None);
+            assert_eq!(fix(typed, d, freq(&[("communication", 20_001)])), None);
+        }
+        assert_eq!(fix("pommuncation", d, f).as_deref(), Some("communication"));
+        assert_eq!(
+            fix(
+                "ommunicaton",
+                dict(&["ommunicaton", "communication"]),
+                freq(&[("ommunicaton", 50), ("communication", 100)])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn long_typos_can_use_three_edits_but_conservative_cannot() {
+        let d = dict(&["wonderful"]);
+        let f = freq(&[("wonderful", 100)]);
+        assert_eq!(fix("wonqerqxl", d, f).as_deref(), Some("wonderful"));
+        assert_eq!(correct_with("wonqerqxl", d, f, 4, 20_000, 2), None);
+        assert_eq!(correct_with("wonqerqxl", d, f, 4, 20_000, 1), None);
+    }
+
+    #[test]
+    fn broader_spelling_recovers_less_common_long_words_with_multiple_slips() {
+        for (typed, intended, rank) in [
+            ("baloonsz", "balloons", 65_000),
+            ("keybozrp", "keyboard", 12_000),
+        ] {
+            let d = dict(&[intended]);
+            let f = freq(&[(intended, rank)]);
+            let result = assess_with(
+                typed,
+                d,
+                f,
+                crate::config::DEFAULT_SPELL_MIN_LEN,
+                crate::config::DEFAULT_SPELL_MAX_RANK,
+                crate::config::DEFAULT_SPELL_MAX_DIST,
+            );
+            assert_eq!(
+                result.correction.as_deref(),
+                Some(intended),
+                "{}",
+                result.details
+            );
+            assert_eq!(correct_with(typed, d, f, 4, 75_000, 1), None);
+            assert_eq!(correct_with(typed, d, f, 4, 1_000, 3), None);
+            assert_eq!(correct_with(typed, d, f, typed.len() + 1, 75_000, 3), None);
+        }
+    }
+
+    #[test]
+    fn aggressive_reach_keeps_short_names_and_configured_limits() {
+        for (typed, intended) in [
+            ("helooo", "hello"),
+            ("comqztxr", "computer"),
+            ("pomputer", "computer"),
+        ] {
+            let d = dict(&[intended]);
+            let f = freq(&[(intended, 100)]);
+            assert_eq!(fix(typed, d, f).as_deref(), Some(intended), "{typed}");
+            assert_eq!(correct_with(typed, d, f, 4, 50_000, 1), None);
+        }
+        let d = dict(&["keyboard"]);
+        let f = freq(&[("keyboard", 40_000)]);
+        assert_eq!(fix("keyboarx", d, f).as_deref(), Some("keyboard"));
+        assert_eq!(correct_with("keyboarx", d, f, 4, 20_000, 3), None);
+        assert_eq!(
+            fix("supino", dict(&["suing"]), freq(&[("suing", 9_986)])),
+            None
+        );
+    }
+
+    #[test]
+    fn rare_dictionary_entries_need_strong_frequency_and_edit_evidence() {
+        let d = dict(&["thos", "this", "helo", "hello", "form", "from"]);
+        let f = freq(&[("this", 16), ("hello", 500), ("from", 20), ("form", 40_000)]);
+        assert_eq!(fix("thos", d, f).as_deref(), Some("this"));
+        assert_eq!(fix("helo", d, f).as_deref(), Some("hello"));
+        assert_eq!(fix("form", d, f), None, "attested rare words stay intact");
+        assert_eq!(fix("helo", d, freq(&[("hello", 1_001)])), None);
+        assert_eq!(correct_with("thos", d, f, 4, 10, 2), None);
+        assert_eq!(correct_with("thos", d, f, 5, 20_000, 2), None);
+        assert_eq!(correct_with("thos", d, f, 4, 20_000, 0), None);
+    }
+
+    #[test]
+    fn length_pruning_keeps_discounted_insertions_and_deletions() {
+        for (typed, intended) in [
+            ("baloons", "balloons"),
+            ("commmittee", "committee"),
+            ("comittee", "committee"),
+            ("comitte", "committee"),
+            ("committteee", "committee"),
+        ] {
+            let d = dict(&[intended]);
+            let f = freq(&[(intended, 100)]);
+            assert_eq!(fix(typed, d, f).as_deref(), Some(intended), "{typed}");
+        }
+        // Three discounted deletions fit a long word's budget; three full
+        // edits (the former length filter) did not fit the configured limit.
+        let d = dict(&["committee"]);
+        let f = freq(&[("committee", 100)]);
+        assert_eq!(
+            correct_with("commmittteee", d, f, 4, 20_000, 2).as_deref(),
+            Some("committee")
+        );
+    }
+
+    #[test]
     fn corrects_a_one_letter_typo() {
         let d = dict(&["hello", "hell"]);
         let f = freq(&[("hello", 500), ("hell", 4000)]);
@@ -928,6 +2271,31 @@ mod tests {
         // from "hell"; restoring the dropped half of the "ll" is the cheaper
         // edit, and the more common word too.
         assert_eq!(fix("helo", d, f).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn close_distinct_candidates_are_not_silently_chosen() {
+        let d = dict(&["baker", "barer"]);
+        for entries in [
+            [("baker", 100), ("barer", 101)],
+            [("baker", 101), ("barer", 100)],
+        ] {
+            assert_eq!(fix("baxer", d, freq(&entries)), None);
+        }
+        assert_eq!(
+            fix("baxer", d, freq(&[("baker", 100), ("barer", 10_000)])).as_deref(),
+            Some("baker")
+        );
+        // A corpus token outside the dictionary must not become a runner-up.
+        assert_eq!(
+            fix(
+                "baxer",
+                dict(&["baker"]),
+                freq(&[("baker", 100), ("barer", 101)])
+            )
+            .as_deref(),
+            Some("baker")
+        );
     }
 
     #[test]
@@ -962,9 +2330,9 @@ mod tests {
     fn a_neighbouring_key_beats_a_distant_one() {
         // "s" and "d" are neighbours; "s" and "t" are not. Both candidates are
         // one substitution away and the distant one is the more common word.
-        let d = dict(&["wand", "want"]);
-        let f = freq(&[("want", 100), ("wand", 900)]);
-        assert_eq!(fix("wans", d, f).as_deref(), Some("wand"));
+        let d = dict(&["wands", "wants"]);
+        let f = freq(&[("wants", 100), ("wands", 900)]);
+        assert_eq!(fix("wanss", d, f).as_deref(), Some("wands"));
     }
 
     #[test]
@@ -975,9 +2343,9 @@ mod tests {
         let d = dict(&["same"]);
         let f = freq(&[("same", 240), ("sami", 18_299)]);
         assert_eq!(fix("sami", d, f), None);
-        // The same word, unseen by the corpus, is treated as a typo.
+        // An unseen short name now competes through the keep-original action.
         let f_unseen = freq(&[("same", 240)]);
-        assert_eq!(fix("sami", d, f_unseen).as_deref(), Some("same"));
+        assert_eq!(fix("sami", d, f_unseen), None);
     }
 
     #[test]
@@ -1014,14 +2382,19 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_first_letter_is_out_of_reach() {
+    fn short_words_keep_their_first_letter() {
         // "sork" is one substitution from both "work" and "sort". Only the one
         // that keeps the first letter is even scanned for, and that is
         // deliberate: rewriting the opening of a word is what turns a name into
         // an unrelated word.
         let d = dict(&["work", "sort"]);
         let f = freq(&[("work", 100), ("sort", 900)]);
-        assert_eq!(fix("sork", d, f).as_deref(), Some("sort"));
+        let assessment = assess_with("sork", d, f, 4, 20_000, 3);
+        assert_eq!(assessment.best.unwrap().text, "sort");
+        assert_eq!(
+            assessment.correction, None,
+            "a sole candidate need not beat keeping a short unknown token"
+        );
     }
 
     #[test]
@@ -1070,9 +2443,8 @@ mod tests {
 
     #[test]
     fn a_short_word_never_gets_a_two_edit_correction() {
-        // "cloud" is two edits from "claude" — a name, and short enough that the
-        // length gate refuses the second edit no matter how common the
-        // candidate is.
+        // Six-letter words only receive the cheap-edit budget. Rewriting this
+        // name requires more cost than that budget permits.
         let d = dict(&["cloud"]);
         let f = freq(&[("cloud", 900)]);
         assert_eq!(fix("claude", d, f), None);
@@ -1127,6 +2499,56 @@ mod tests {
         let d = dict(&["hello"]);
         let f = freq(&[("hello", 500)]);
         assert_eq!(correct_with("helo", d, f, 4, 20_000, 0), None);
+    }
+
+    #[test]
+    fn prefix_search_admits_complete_alignments_at_their_known_cost() {
+        let mut dp = Dp::default();
+        let mut pairs = vec![
+            ("xxcomputer".into(), "computer".into()),
+            ("xocmputer".into(), "computer".into()),
+            ("xmoputer".into(), "computer".into()),
+            ("omputer".into(), "computer".into()),
+            ("computerx".into(), "computer".into()),
+            ("comittee".into(), "committee".into()),
+            ("tounge".into(), "tongue".into()),
+            ("ropblem".into(), "problem".into()),
+        ];
+        pairs.extend(RULES.iter().map(|rule| {
+            (
+                format!("{}testing", rule.from),
+                format!("{}testing", rule.to),
+            )
+        }));
+        for (typed, intended) in pairs {
+            let cost = dp
+                .distance(typed.as_bytes(), intended.as_bytes(), 1_000)
+                .unwrap();
+            for end in 1..=intended.len() {
+                assert!(
+                    dp.align(typed.as_bytes(), &intended.as_bytes()[..end], cost, true)
+                        .is_some(),
+                    "{typed} -> {intended}: prefix {} rejected at complete cost {cost}",
+                    &intended[..end]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_stray_final_key_does_not_discount_multiple_deletions() {
+        let mut dp = Dp::default();
+        assert_eq!(
+            dp.distance(b"computerx", b"computer", COST_STRAY_KEY),
+            Some(COST_STRAY_KEY)
+        );
+        assert_eq!(
+            dp.distance(b"somewh", b"somew", 1_000),
+            Some(COST_HOMOPHONE)
+        );
+        assert_eq!(dp.distance(b"yarden", b"yard", CHEAPLY_EXPLAINED), None);
+        assert_eq!(dp.distance(b"toml", b"tom", COST_VOWEL), None);
+        assert_eq!(fix("yarden", dict(&["yard"]), freq(&[("yard", 500)])), None);
     }
 
     #[test]
@@ -1231,6 +2653,7 @@ mod tests {
         // distance would have accepted, so check it against the matrix itself.
         let mut dp = Dp::default();
         for (a, b) in [
+            ("thos", "this"),
             ("helo", "hello"),
             ("hellp", "help"),
             ("theri", "their"),
@@ -1380,12 +2803,16 @@ mod tests {
     }
 
     #[test]
-    fn a_neighbouring_opening_is_looked_up_rather_than_scanned_for() {
-        // The candidate a fat-fingered opening could have been is known exactly
-        // — the typed word with its first letter replaced — so it never joins
-        // the scan, and `openings` stays the three kinds it always was. That is
-        // the whole reason this is affordable at the end of every word.
-        let letters = |w: &str| openings(w).iter().map(|o| o.letter).collect::<Vec<_>>();
+    fn base_opening_runs_stay_narrow_for_mistyped_first_keys() {
+        // The broader changed-opening search is separate, so the original
+        // unchanged, transposed and phonetic runs retain their narrow scope.
+        let letters = |w: &str| {
+            openings(w)
+                .iter()
+                .filter(|o| !matches!(o.why, Why::Rotated(_)))
+                .map(|o| o.letter)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(letters("beed"), vec![b'b', b'e']);
         assert_eq!(letters("vusiness"), vec![b'v', b'u']);
     }
@@ -1408,12 +2835,9 @@ mod tests {
         let d = dict(&["computer"]);
         let f = freq(&[("computer", 900)]);
         assert_eq!(fix("xomputer", d, f).as_deref(), Some("computer"));
-        // But not from a key nowhere near the one typed, however long the word
-        // and however affordable the arithmetic: that candidate is never asked
-        // about at all.
-        assert_eq!(fix("pomputer", d, f), None, "p is not beside c");
-        // And the rest of the word still has to be right — this reaches exactly
-        // one candidate, not a neighbourhood of them.
+        // Eight-letter words can afford a distant opening when the rest matches.
+        assert_eq!(fix("pomputer", d, f).as_deref(), Some("computer"));
+        // Candidates still compete using their full edit cost and frequency.
         let d = dict(&["computer", "computed"]);
         let f = freq(&[("computer", 900), ("computed", 200)]);
         assert_eq!(fix("xomputed", d, f).as_deref(), Some("computed"));
@@ -1429,6 +2853,50 @@ mod real_data {
     use crate::dictionary::{en_dict, en_freq};
     use crate::spell::correct_with;
 
+    #[test]
+    fn repairs_reviewed_misses_inflections_and_unranked_derivatives() {
+        for (typed, intended) in [
+            ("hte", "the"),
+            ("cemetary", "cemetery"),
+            ("committment", "commitment"),
+            ("happend", "happened"),
+            ("immediatly", "immediately"),
+            ("indispensible", "indispensable"),
+            ("irresistable", "irresistible"),
+            ("langauge", "language"),
+            ("millenium", "millennium"),
+            ("noticable", "noticeable"),
+            ("prefered", "preferred"),
+            ("refered", "referred"),
+            ("relevent", "relevant"),
+            ("rythm", "rhythm"),
+            ("seige", "siege"),
+            ("tounge", "tongue"),
+            ("twelth", "twelfth"),
+            ("withdrawl", "withdrawal"),
+            ("seperated", "separated"),
+            ("accomodating", "accommodating"),
+            ("committments", "commitments"),
+            ("langauges", "languages"),
+            ("mispelling", "misspelling"),
+            ("mispelled", "misspelled"),
+            ("unhelpfull", "unhelpful"),
+            ("probeml", "problem"),
+            ("ropblem", "problem"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+        }
+        for word in [
+            "publically",
+            "miniscule",
+            "calender",
+            "dependant",
+            "misspelling",
+        ] {
+            assert_eq!(fix(word), None, "valid word: {word}");
+        }
+    }
+
     /// The shipped defaults (`Config::from_env`).
     fn fix(word: &str) -> Option<String> {
         correct_with(
@@ -1442,8 +2910,89 @@ mod real_data {
     }
 
     #[test]
+    fn corrects_each_typo_class_at_the_start_middle_and_end() {
+        for (typed, intended) in [
+            ("xcomputer", "computer"),
+            ("compxuter", "computer"),
+            ("computerx", "computer"),
+            ("ccomputer", "computer"),
+            ("compuuter", "computer"),
+            ("computerr", "computer"),
+            ("ommunication", "communication"),
+            ("commnication", "communication"),
+            ("communicatio", "communication"),
+            ("xomputer", "computer"),
+            ("compiter", "computer"),
+            ("computee", "computer"),
+            ("ocmputer", "computer"),
+            ("comptuer", "computer"),
+            ("computre", "computer"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+            assert_eq!(
+                correct_with(typed, en_dict(), en_freq(), 4, 50_000, 0),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn changed_openings_allow_immediate_extra_missing_and_transposed_letters() {
+        for (typed, intended) in [
+            ("xxcomputer", "computer"),
+            ("xcxomputer", "computer"),
+            ("xcoxmputer", "computer"),
+            ("xocmputer", "computer"),
+            ("xmoputer", "computer"),
+            ("xcmputer", "computer"),
+            ("xcoputer", "computer"),
+            ("zoxmputer", "computer"),
+            ("zeceive", "receive"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+            assert_eq!(
+                correct_with(typed, en_dict(), en_freq(), 4, 50_000, 1),
+                None
+            );
+            assert_eq!(correct_with(typed, en_dict(), en_freq(), 4, 50, 3), None);
+        }
+    }
+
+    #[test]
+    fn single_final_extras_keep_the_base_word_without_rewriting_names() {
+        for (typed, intended) in [
+            ("computerx", "computer"),
+            ("communicationx", "communication"),
+            ("governmentx", "government"),
+            ("languagex", "language"),
+            ("workx", "work"),
+            ("makex", "make"),
+            ("helpx", "help"),
+        ] {
+            assert_eq!(fix(typed).as_deref(), Some(intended), "{typed}");
+            assert_eq!(
+                correct_with(typed, en_dict(), en_freq(), 4, 50_000, 1).as_deref(),
+                Some(intended),
+                "one-edit spelling: {typed}"
+            );
+        }
+        for word in [
+            "yarden",
+            "toml",
+            "works",
+            "makes",
+            "helps",
+            "computers",
+            "government",
+        ] {
+            assert_eq!(fix(word), None, "{word}");
+        }
+    }
+
+    #[test]
     fn fixes_everyday_typos() {
         for (typo, want) in [
+            ("thos", "this"),
             ("helo", "hello"),
             ("hellp", "help"),
             ("recieve", "receive"),
@@ -1572,6 +3121,24 @@ mod real_data {
             ("rhought", "thought"),
         ] {
             assert_eq!(fix(typo).as_deref(), Some(want), "{typo}");
+        }
+    }
+
+    #[test]
+    fn fixes_missing_and_extra_first_letters() {
+        for (typo, want) in [
+            ("omputer", "computer"),
+            ("overnment", "government"),
+            ("nformation", "information"),
+            ("xkeyboard", "keyboard"),
+            ("zcomputer", "computer"),
+        ] {
+            assert_eq!(fix(typo).as_deref(), Some(want), "{typo}");
+            assert_eq!(
+                correct_with(typo, en_dict(), en_freq(), 4, 20_000, 1),
+                None,
+                "conservative spelling: {typo}"
+            );
         }
     }
 

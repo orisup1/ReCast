@@ -54,6 +54,12 @@ jobs:
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libgl1-mesa-dev
       - run: cargo fmt --check
+      - name: Script and integration fixtures
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          node scripts/test_gnome_extension.cjs
+          node scripts/test_native_editing.cjs
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -271,6 +277,7 @@ jobs:
           install -m 755 incoming/recastMac/recastMac    dist/recastMac
           install -m 755 incoming/ReCast.exe/recast.exe  dist/ReCast.exe
           cp incoming/recastMac/ReCast.app.zip           dist/ReCast.app.zip
+          cat LICENSE licenses/scowl.txt > dist/LICENSES.txt
           file dist/recastLinux dist/recastMac dist/ReCast.exe
           ls -lh dist
           version=$(make version)
@@ -278,7 +285,7 @@ jobs:
             echo "Requested tag $REQUESTED_TAG does not match Cargo.toml version v${version}." >&2
             exit 1
           fi
-          (cd dist && sha256sum recastLinux recastMac ReCast.exe ReCast.app.zip > SHA256SUMS)
+          (cd dist && sha256sum recastLinux recastMac ReCast.exe ReCast.app.zip LICENSES.txt > SHA256SUMS)
           echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
           echo "default_tag=v${version}" >> "$GITHUB_OUTPUT"
 

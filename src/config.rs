@@ -3,12 +3,21 @@ pub struct Config {
     /// Exact application IDs in which capture, learning and correction stop.
     pub excluded_apps: Vec<String>,
     pub layout_only_apps: Vec<String>,
-    /// An optional single modifier tap; double-tap Ctrl remains available.
+    pub manual_only_apps: Vec<String>,
+    /// An optional single Ctrl tap for undo, in addition to the action shortcut.
     pub undo_shortcut: String,
+    pub action_shortcut: String,
+    pub completion_shortcut: String,
+    pub correction_shortcut: String,
     /// Persist local word-frequency, correction-pair, and typing-timing data.
     /// Off by default because the word files may contain sensitive text.
     pub personal_enabled: bool,
-    /// Allow short (≤3 char) switches up to frequency rank 20,000.
+    /// Persist only aggregate counts of automatic corrections and undos by rule.
+    pub rule_stats_enabled: bool,
+    /// Require stronger evidence before switching away from the preferred language.
+    pub language_preference: LanguagePreference,
+    /// Allow short (≤3 char) switches up to frequency rank 30,000, or 50,000
+    /// with an established run in the target language.
     /// Turning this off restricts them to very common words (rank ≤500).
     pub short_enabled: bool,
     /// Enable missing‑space split fallback.
@@ -17,9 +26,8 @@ pub struct Config {
     /// real word in *both* layouts, switch to the reading that is decisively more
     /// common instead of always keeping the current layout.
     pub freq_enabled: bool,
-    /// Enable the English in-language spelling autocorrect: when a word is not
-    /// a wrong-layout mistype but *is* a near-miss of a common English word,
-    /// retype it as that word.
+    /// Enable English and Hebrew spelling autocorrect for confident near-misses
+    /// of common words after the layout correction pipeline.
     pub spell_enabled: bool,
     /// Shortest word the spelling autocorrect will touch. Below this, unknown
     /// tokens are overwhelmingly initialisms and names ("btw", "ori"), and a
@@ -31,67 +39,127 @@ pub struct Config {
     pub spell_max_rank: u32,
     /// Maximum edit distance for a spelling suggestion (0 disables, 1 = only
     /// single-typo fixes, 2–3 = also badly mangled words). The word's own
-    /// length caps this further: two edits need 7 characters and three need 10,
-    /// so raising it only ever affects words long enough to survive it.
+    /// length caps this further: two cheap edits need 6 characters, full two-edit
+    /// repairs need 7, and three edits need 8.
     pub spell_max_dist: u8,
     /// Enable auto-complete: the completion key finishes the word being typed,
     /// and abbreviations from `<config>/recast/abbrev.txt` expand when a word
     /// is finished.
     pub complete_enabled: bool,
-    /// Shortest partial word the completer will finish. One or two letters
-    /// match too many words for the most common one to be a good guess.
+    /// Shortest partial word the completer will finish. Two-letter prefixes
+    /// use exact matches; edited-prefix recovery requires more letters.
     pub complete_min_len: usize,
     /// Worst frequency rank a completion may have — the same idea as
     /// `spell_max_rank`, but looser, because a completion is asked for.
     pub complete_max_rank: u32,
 }
 
-/// Shipped defaults for the spelling autocorrect. Deliberately conservative:
-/// a missed correction is invisible, a wrong one rewrites the user's text.
+/// Shipped spelling defaults balance broader recall with word-length and cost gates.
 pub const DEFAULT_SPELL_MIN_LEN: usize = 4;
-pub const DEFAULT_SPELL_MAX_RANK: u32 = 20_000;
+pub const DEFAULT_SPELL_MAX_RANK: u32 = 75_000;
 pub const DEFAULT_SPELL_MAX_DIST: u8 = 3;
 
-/// Shipped defaults for auto-complete. Looser than the speller's, because a
-/// completion only ever happens when the user presses the key for it.
-pub const DEFAULT_COMPLETE_MIN_LEN: usize = 3;
-pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 30_000;
+/// Shipped defaults for completion, which requires an explicit user gesture.
+pub const DEFAULT_COMPLETE_MIN_LEN: usize = 2;
+pub const DEFAULT_COMPLETE_MAX_RANK: u32 = 100_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LanguagePreference {
+    #[default]
+    Balanced,
+    English,
+    Hebrew,
+}
+
+impl LanguagePreference {
+    pub const ALL: [Self; 3] = [Self::Balanced, Self::English, Self::Hebrew];
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "balanced" => Some(Self::Balanced),
+            "english" => Some(Self::English),
+            "hebrew" => Some(Self::Hebrew),
+            _ => None,
+        }
+    }
+
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::English => "english",
+            Self::Hebrew => "hebrew",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Balanced => "Balanced",
+            Self::English => "Prefer English",
+            Self::Hebrew => "Prefer Hebrew",
+        }
+    }
+
+    pub fn disfavours(self, target: crate::types::Language) -> bool {
+        matches!(
+            (self, target),
+            (Self::English, crate::types::Language::Hebrew)
+                | (Self::Hebrew, crate::types::Language::English)
+        )
+    }
+}
 
 impl Config {
     /// Load configuration from environment variables.
     /// RECAST_SHORT – set to `0` to restrict short (≤3 char) switches to very
     ///                common words (default: enabled).
-    /// RECAST_SPLIT – set (to anything but `0`) to enable the missing-space
-    ///                split fallback (default: disabled).
+    /// RECAST_SPLIT – set to `0` to disable merged-token last-word correction
+    ///                (default: enabled).
     /// RECAST_FREQ  – set to `0` to disable the homograph frequency tie-break
     ///                (default: enabled).
-    /// RECAST_SPELL – set to `0` to disable the English spelling autocorrect
+    /// RECAST_SPELL – set to `0` to disable English and Hebrew spelling autocorrect
     ///                (default: enabled).
     /// RECAST_SPELL_MIN  – shortest correctable word (default: 4).
     /// RECAST_SPELL_RANK – worst frequency rank a suggestion may have
-    ///                     (default: 20000).
+    ///                     (default: 75000).
     /// RECAST_SPELL_DIST – maximum edit distance, 0 to 3 (default: 3; 0 disables).
     /// RECAST_COMPLETE   – set to `0` to disable auto-complete (default:
     ///                     enabled).
-    /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 3).
+    /// RECAST_COMPLETE_MIN  – shortest completable prefix (default: 2).
     /// RECAST_COMPLETE_RANK – worst frequency rank a completion may have
-    ///                        (default: 30000).
+    ///                        (default: 100000).
     /// RECAST_PERSONAL – set to `1` to persist local personalization data
     ///                   (default: disabled).
+    /// RECAST_PREFER – balanced (default), english, or hebrew.
     pub fn from_env() -> Self {
-        Self {
+        let mut config = Self {
             excluded_apps: parse_excluded_apps(
                 &crate::settings::get("RECAST_EXCLUDE_APPS").unwrap_or_default(),
             ),
             layout_only_apps: parse_excluded_apps(
                 &crate::settings::get("RECAST_LAYOUT_ONLY_APPS").unwrap_or_default(),
             ),
+            manual_only_apps: parse_excluded_apps(
+                &crate::settings::get("RECAST_MANUAL_ONLY_APPS").unwrap_or_default(),
+            ),
             undo_shortcut: crate::settings::get("RECAST_UNDO_SHORTCUT")
                 .filter(|value| valid_undo_shortcut(value))
                 .unwrap_or_else(|| "none".into()),
+            action_shortcut: crate::settings::get("RECAST_ACTION_SHORTCUT")
+                .filter(|value| valid_action_shortcut(value))
+                .unwrap_or_else(|| "ctrl".into()),
+            completion_shortcut: crate::settings::get("RECAST_COMPLETION_SHORTCUT")
+                .filter(|value| valid_completion_shortcut(value))
+                .unwrap_or_else(|| "right_shift".into()),
+            correction_shortcut: crate::settings::get("RECAST_CORRECTION_SHORTCUT")
+                .filter(|value| valid_completion_shortcut(value))
+                .unwrap_or_else(|| "left_shift".into()),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
+            rule_stats_enabled: crate::settings::flag("RECAST_RULE_STATS", false),
+            language_preference: crate::settings::get("RECAST_PREFER")
+                .and_then(|value| LanguagePreference::parse(&value))
+                .unwrap_or_default(),
             short_enabled: crate::settings::flag("RECAST_SHORT", true),
-            split_enabled: crate::settings::flag("RECAST_SPLIT", false),
+            split_enabled: crate::settings::flag("RECAST_SPLIT", true),
             freq_enabled: crate::settings::flag("RECAST_FREQ", true),
             spell_enabled: crate::settings::flag("RECAST_SPELL", true),
             spell_min_len: env_num("RECAST_SPELL_MIN", DEFAULT_SPELL_MIN_LEN),
@@ -100,7 +168,15 @@ impl Config {
             complete_enabled: crate::settings::flag("RECAST_COMPLETE", true),
             complete_min_len: env_num("RECAST_COMPLETE_MIN", DEFAULT_COMPLETE_MIN_LEN),
             complete_max_rank: env_num("RECAST_COMPLETE_RANK", DEFAULT_COMPLETE_MAX_RANK),
+        };
+        // Keep the explicit action/undo bindings; disable ambiguous completion.
+        if config.completion_conflict() {
+            config.completion_shortcut = "none".into();
         }
+        if config.correction_conflict() {
+            config.correction_shortcut = "none".into();
+        }
+        config
     }
 }
 
@@ -108,15 +184,17 @@ impl Config {
 pub enum AppMode {
     Full,
     LayoutOnly,
+    ManualOnly,
     Off,
 }
 
 impl AppMode {
-    pub const ALL: [Self; 3] = [Self::Full, Self::LayoutOnly, Self::Off];
+    pub const ALL: [Self; 4] = [Self::Full, Self::LayoutOnly, Self::ManualOnly, Self::Off];
     pub fn label(self) -> &'static str {
         match self {
             Self::Full => "Full correction",
             Self::LayoutOnly => "Layout only",
+            Self::ManualOnly => "Manual only",
             Self::Off => "Off",
         }
     }
@@ -124,6 +202,117 @@ impl AppMode {
 
 pub fn valid_undo_shortcut(value: &str) -> bool {
     matches!(value, "none" | "left_ctrl" | "right_ctrl")
+}
+
+/// Bare modifier taps avoid typing characters or swallowing application shortcuts.
+pub const MODIFIER_SHORTCUTS: &[(&str, &str)] = &[
+    ("none", "Disabled"),
+    ("left_ctrl", "Left Ctrl"),
+    ("right_ctrl", "Right Ctrl"),
+    ("left_shift", "Left Shift"),
+    ("right_shift", "Right Shift"),
+];
+pub const ACTION_SHORTCUTS: &[(&str, &str)] = &[
+    ("none", "Disabled"),
+    ("ctrl", "Either Ctrl"),
+    ("left_ctrl", "Left Ctrl"),
+    ("right_ctrl", "Right Ctrl"),
+    ("left_shift", "Left Shift"),
+    ("right_shift", "Right Shift"),
+];
+
+pub fn valid_completion_shortcut(value: &str) -> bool {
+    MODIFIER_SHORTCUTS.iter().any(|(key, _)| *key == value)
+}
+pub fn valid_action_shortcut(value: &str) -> bool {
+    ACTION_SHORTCUTS.iter().any(|(key, _)| *key == value)
+}
+pub fn modifier_label(value: &str) -> &'static str {
+    ACTION_SHORTCUTS
+        .iter()
+        .find(|(key, _)| *key == value)
+        .map_or("Disabled", |(_, label)| *label)
+}
+
+impl Config {
+    /// Recommend only an unused Ctrl; never silently change existing bindings.
+    pub fn recommended_undo(&self) -> Option<&'static str> {
+        ["right_ctrl", "left_ctrl"].into_iter().find(|key| {
+            self.action_shortcut != "ctrl"
+                && self.action_shortcut != *key
+                && self.completion_shortcut != *key
+                && self.correction_shortcut != *key
+        })
+    }
+
+    pub fn undo_setup_hint(&self) -> String {
+        if self.undo_shortcut != "none" {
+            if self.action_shortcut == "ctrl" || self.action_shortcut == self.undo_shortcut {
+                return "Your undo key shares the double-tap action: it waits 500 ms. Choose separate Ctrl keys in Settings > Shortcuts for immediate undo.".into();
+            }
+            return "Your undo-only key acts immediately. It never converts unchanged text.".into();
+        }
+        match self.recommended_undo() {
+            Some(key) => format!("Recommended: tap {} for immediate undo. Enable it below; existing bindings stay unchanged.", modifier_label(key)),
+            None => "No separate Ctrl is free. In Settings > Shortcuts, assign the double-tap action to one Ctrl and undo only to the other; move any conflicting completion or spelling binding first. Shared keys wait 500 ms.".into(),
+        }
+    }
+
+    pub fn shortcut_conflict(&self) -> bool {
+        self.completion_conflict() || self.correction_conflict()
+    }
+    fn tap_conflicts_action(&self, tap: &str) -> bool {
+        tap != "none"
+            && (tap == self.action_shortcut
+                || tap == self.undo_shortcut
+                || (self.action_shortcut == "ctrl" && matches!(tap, "left_ctrl" | "right_ctrl")))
+    }
+    pub fn completion_conflict(&self) -> bool {
+        self.tap_conflicts_action(&self.completion_shortcut)
+    }
+    pub fn correction_conflict(&self) -> bool {
+        self.tap_conflicts_action(&self.correction_shortcut)
+            || (self.correction_shortcut != "none"
+                && self.correction_shortcut == self.completion_shortcut)
+    }
+    pub fn action_gesture(&self) -> String {
+        if self.action_shortcut == "none" {
+            "double-tap action disabled".into()
+        } else {
+            format!("double-tap {}", modifier_label(&self.action_shortcut))
+        }
+    }
+    pub fn undo_gesture(&self) -> String {
+        if self.undo_shortcut != "none" {
+            if self.action_shortcut == "ctrl" || self.action_shortcut == self.undo_shortcut {
+                format!(
+                    "tap {} (wait 500 ms), or {}",
+                    modifier_label(&self.undo_shortcut),
+                    self.action_gesture()
+                )
+            } else {
+                format!("tap {}", modifier_label(&self.undo_shortcut))
+            }
+        } else if self.action_shortcut != "none" {
+            self.action_gesture()
+        } else {
+            "enable an undo shortcut in Settings > Shortcuts".into()
+        }
+    }
+    pub fn completion_gesture(&self) -> String {
+        if self.completion_shortcut == "none" {
+            "completion shortcut disabled".into()
+        } else {
+            format!("tap {}", modifier_label(&self.completion_shortcut))
+        }
+    }
+    pub fn correction_gesture(&self) -> String {
+        if self.correction_shortcut == "none" {
+            "correction shortcut disabled".into()
+        } else {
+            format!("tap {}", modifier_label(&self.correction_shortcut))
+        }
+    }
 }
 
 pub fn parse_excluded_apps(value: &str) -> Vec<String> {
@@ -176,7 +365,9 @@ pub const NUMERIC_KEYS: &[&str] = &[
 /// Every boolean setting, so a typo falls back with a warning instead of
 /// quietly inverting the user's intent.
 pub const BOOLEAN_KEYS: &[&str] = &[
+    "RECAST_DESKTOP_HELPER",
     "RECAST_PERSONAL",
+    "RECAST_RULE_STATS",
     "RECAST_SHORT",
     "RECAST_SPLIT",
     "RECAST_FREQ",
@@ -187,10 +378,16 @@ pub const BOOLEAN_KEYS: &[&str] = &[
 
 /// All known settings, for validating the config file.
 pub const ALL_KEYS: &[&str] = &[
+    "RECAST_PREFER",
     "RECAST_EXCLUDE_APPS",
     "RECAST_LAYOUT_ONLY_APPS",
+    "RECAST_MANUAL_ONLY_APPS",
     "RECAST_UNDO_SHORTCUT",
+    "RECAST_ACTION_SHORTCUT",
+    "RECAST_COMPLETION_SHORTCUT",
+    "RECAST_CORRECTION_SHORTCUT",
     "RECAST_PERSONAL",
+    "RECAST_RULE_STATS",
     "RECAST_SHORT",
     "RECAST_SPLIT",
     "RECAST_FREQ",
@@ -215,11 +412,32 @@ pub const ALL_KEYS: &[&str] = &[
     "RECAST_DEBUG",
     // Linux-only setting (not in Config struct)
     "RECAST_LAYOUT_BACKEND",
+    "RECAST_DESKTOP_HELPER",
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_correction_requires_its_own_tap_key() {
+        let mut config = Config::global();
+        config.action_shortcut = "ctrl".into();
+        config.undo_shortcut = "none".into();
+        config.completion_shortcut = "right_shift".into();
+        config.correction_shortcut = "left_shift".into();
+        assert!(!config.shortcut_conflict());
+        for key in ["right_shift", "left_ctrl", "right_ctrl"] {
+            config.correction_shortcut = key.into();
+            assert!(config.correction_conflict(), "{key}");
+            assert!(!config.completion_conflict());
+        }
+        config.correction_shortcut = "none".into();
+        assert!(!config.shortcut_conflict());
+        config.action_shortcut = "left_shift".into();
+        config.correction_shortcut = "left_shift".into();
+        assert!(config.correction_conflict());
+    }
 
     #[test]
     fn exclusions_match_whole_app_ids_and_decline_unknown_apps() {
@@ -301,5 +519,50 @@ mod tests {
                 "{key} is a real setting but not in --help"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod undo_recommendation_tests {
+    use super::*;
+    #[test]
+    fn undo_hint_tracks_enabled_binding_and_shared_key_delay() {
+        let mut config = Config::global().clone();
+        config.action_shortcut = "none".into();
+        config.undo_shortcut = "right_ctrl".into();
+        assert_eq!(config.undo_gesture(), "tap Right Ctrl");
+        config.undo_shortcut = "none".into();
+        assert!(config.undo_gesture().contains("enable an undo shortcut"));
+        config.action_shortcut = "left_ctrl".into();
+        assert_eq!(config.undo_gesture(), "double-tap Left Ctrl");
+        config.undo_shortcut = "left_ctrl".into();
+        assert!(config.undo_gesture().contains("500 ms"));
+        assert!(config.undo_gesture().contains("double-tap Left Ctrl"));
+        config.action_shortcut = "ctrl".into();
+        assert!(config.undo_gesture().contains("500 ms"));
+        config.undo_shortcut = "right_ctrl".into();
+        config.action_shortcut = "left_ctrl".into();
+        assert_eq!(config.undo_gesture(), "tap Right Ctrl");
+    }
+    #[test]
+    fn recommends_only_an_available_separate_ctrl_without_remapping() {
+        let mut config = Config::global().clone();
+        config.action_shortcut = "ctrl".into();
+        config.undo_shortcut = "none".into();
+        config.completion_shortcut = "right_shift".into();
+        config.correction_shortcut = "left_shift".into();
+        assert_eq!(config.recommended_undo(), None);
+        config.action_shortcut = "left_ctrl".into();
+        assert_eq!(config.recommended_undo(), Some("right_ctrl"));
+        assert_eq!(config.undo_shortcut, "none");
+        config.correction_shortcut = "right_ctrl".into();
+        assert_eq!(config.recommended_undo(), None);
+        config.undo_shortcut = "right_ctrl".into();
+        assert!(config.shortcut_conflict());
+        config.correction_shortcut = "left_shift".into();
+        assert!(!config.shortcut_conflict());
+        assert!(config.undo_setup_hint().contains("immediately"));
+        config.action_shortcut = "ctrl".into();
+        assert!(config.undo_setup_hint().contains("500 ms"));
     }
 }

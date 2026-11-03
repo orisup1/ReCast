@@ -21,6 +21,7 @@ mod footprint;
 #[cfg(target_os = "linux")]
 mod gui;
 mod instance;
+mod intent;
 mod keymap;
 mod layout;
 mod notify;
@@ -30,6 +31,7 @@ mod practice;
 mod prefs;
 mod settings;
 mod spell;
+mod status;
 mod timing;
 mod types;
 // The terminal dashboard is Linux/Windows only: on macOS the event tap owns the
@@ -58,13 +60,13 @@ Options:
                     new ReCast replaces the old one — two at once correct every
                     word twice)
       --status      Print what is running and what is configured, then exit
-      --explain WORD --layout en|he
+      --explain WORD --layout en|he [--context 'prior visible words']
                     Preview one visible word using an explicit layout, then exit
                     (no keyboard capture, layout changes, or typing)
       --write-config  Write a commented config.toml with every setting in it
                     (never overwrites an existing one), then exit
-      --clear-personal-data  Delete locally learned word, correction, and
-                    typing-timing files, then exit (stop ReCast first)
+      --clear-personal-data  Delete local personalization and rule statistics
+                    files, then exit (stop ReCast first)
   -v, --version     Print the version and exit
   -h, --help        Show this help
 
@@ -80,25 +82,37 @@ Settings:
   ReCast is started the way it is meant to be.
 
   RECAST_DEBUG=1      Print every word check and switch decision
-  RECAST_SPLIT=1      Enable the opt-in missing-space split fallback
+  RECAST_SPLIT=0      Disable merged-token last-word correction
   RECAST_SHORT=0      Restrict short (≤3 char) switches to very common words
   RECAST_FREQ=0       Disable the homograph frequency tie-break
-  RECAST_SPELL=0      Disable the English spelling autocorrect
+  RECAST_PREFER=      balanced (default), english, or hebrew. Require stronger
+                      evidence before switching to the less-preferred language.
+  RECAST_SPELL=0      Disable English and Hebrew spelling autocorrect
   RECAST_SPELL_MIN=n  Shortest word the autocorrect may fix (default 4)
-  RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 20000)
+  RECAST_SPELL_RANK=n Worst frequency rank a suggestion may have (default 75000)
   RECAST_SPELL_DIST=n Maximum edit distance, 0 to 3 (0 disables; default 3)
-  RECAST_COMPLETE=0   Disable auto-complete (word completion + abbreviations)
-  RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 3)
-  RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 30000)
+  RECAST_COMPLETE=0   Disable completion and abbreviations
+  RECAST_COMPLETE_MIN=n  Shortest prefix that will be completed (default 2)
+  RECAST_COMPLETE_RANK=n Worst frequency rank a completion may have (default 100000)
   RECAST_PERSONAL=1   Opt in to local word/correction/timing personalization;
                       off by default because its files can contain typed words
+  RECAST_RULE_STATS=1 Save aggregate correction, undo, and completion-use counts;
+                      off by default; no typed words or app names stored
   RECAST_EXCLUDE_APPS=  Comma-separated exact application IDs to leave alone:
                       Linux app_id/WM_CLASS, macOS bundle ID, Windows exe name.
                       Case-insensitive; unknown apps are skipped when set.
+  RECAST_MANUAL_ONLY_APPS=  Exact app IDs where edits require a typing shortcut.
   RECAST_LAYOUT_ONLY_APPS=  Exact app IDs for layout correction only; spelling,
                       abbreviations, completion, and personalization are off there.
   RECAST_UNDO_SHORTCUT=  none (default), left_ctrl, or right_ctrl to add a
-                      single Ctrl tap for undo. Double-tap Ctrl stays available.
+                      single Ctrl tap for undo in addition to the action shortcut.
+  RECAST_ACTION_SHORTCUT=  Double-tap key: ctrl (default), left_ctrl, right_ctrl,
+                      left_shift, right_shift, or none.
+  RECAST_COMPLETION_SHORTCUT=  Single-tap key: right_shift (default), left_shift,
+                      left_ctrl, right_ctrl, or none. Must not share another gesture.
+  RECAST_CORRECTION_SHORTCUT=  Spelling suggestions: left_shift (default), right_shift,
+                      left_ctrl, right_ctrl, or none. Must not share another gesture.
+  RECAST_DESKTOP_HELPER=1 Enable optional Linux AT-SPI focus/selection support.
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.
@@ -122,30 +136,42 @@ scrambled, or if you want them faster and are willing to measure):
                                 the end of long words
 
 Auto-complete:
-  Tap Right Shift mid-word to finish it; tap again to cycle through the
-  next guesses, and once more to get back exactly what you typed.
+  Default shortcuts (change in Settings or config.toml):
+  Tap Right Shift before or after Space to complete the tracked word.
+  macOS previews choices first: type or Space to accept; Enter cancels.
+  Four choices, then your original text; keep tapping for the next page.
+  Tracked trailing spaces survive every choice and undo.
   Abbreviations expand when a word is finished, and are offered by the
   first tap too; define them one per line as `abbr = expansion` in
   <config dir>/recast/abbrev.txt.
 
-Undo and manual correction (Ctrl tapped twice, quickly):
-  After a correction, it puts back what you typed — the layout too, if the
-  correction changed it — and leaves that word alone from then on.
-  After a word that was left alone *because* you had listed it, the same
-  gesture takes it off the list (ignore.txt included) and corrects it.
-  For an unchanged word, a valid reading in the other layout takes priority,
-  even when both readings are words. This works before or after Space/Enter.
-  Undoing a manual conversion does not teach an exception.
-  Typing anything else or moving the cursor ends the word gesture.
-  On macOS, select text in an editable field and double-tap Ctrl to convert
+Spelling suggestions:
+  Tap Left Shift before or after Space; tap again to cycle alternatives and
+  return to your original text. Includes short and already valid words.
+  macOS previews in a passive caret strip: typing or Space accepts; Enter cancels.
+  Original is a no-op. The strip anchors to the caret or a single-line search field.
+  Windows/Linux retain direct replacement cycling.
+  This explicit gesture works when automatic spelling or completion is off.
+
+Undo or convert (Ctrl tapped twice within half a second):
+  Undo the latest correction, abbreviation expansion, or completion. If the last
+  word was unchanged, convert it to the other layout, even for unknown words.
+  Conversion works before or after Space; repeat to convert back without
+  changing saved word exceptions. Extra spaces preserve undo. Other typing,
+  Enter, or cursor movement ends the gesture. Enter never triggers a rewrite.
+  The optional single-Ctrl undo shortcut only restores corrections; it never unlists
+  skipped words. Practice recommends an available separate Ctrl for immediate undo.
+  Existing bindings are preserved. Shared bindings wait half a second so double taps take priority.
+  Select text in a supported editable field and double-tap Ctrl to convert
   its layout. Repeat to restore the original. Requires accessibility selection
-  editing; the clipboard is untouched.
+  editing (Linux needs the optional desktop helper); the clipboard is untouched.
 
 Your files (<config dir>/recast/):
   config.toml `key = value` per line, everything under Settings above
   abbrev.txt  `abbr = expansion` per line
   ignore.txt  one word per line, never corrected
-  personal/   created only with RECAST_PERSONAL=1; may contain typed words
+  personal/   created with RECAST_PERSONAL=1 or RECAST_RULE_STATS=1;
+              word files exist only with RECAST_PERSONAL=1
   The two lists are re-read within a couple of seconds of being edited;
   config.toml is read once, so a change to it takes a restart.";
 
@@ -159,7 +185,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args
         .iter()
-        .any(|arg| matches!(arg.as_str(), "--explain" | "--layout"))
+        .any(|arg| matches!(arg.as_str(), "--explain" | "--layout" | "--context"))
     {
         if let Err(error) = explain::run(&args) {
             eprintln!("{error}");
@@ -180,8 +206,7 @@ fn main() {
             "-f" | "--foreground" => with_foreground = true,
             "--keep-others" => keep_others = true,
             "--status" => {
-                require_readable_config();
-                print_status();
+                status::print();
                 return;
             }
             "--write-config" => {
@@ -351,128 +376,5 @@ fn require_readable_config() {
     if let Err(error) = settings::check_readable() {
         eprintln!("{error}; refusing to discard configured settings.");
         process::exit(1);
-    }
-}
-
-/// Report running state and this invocation's settings, without needing a daemon.
-fn print_status() {
-    println!("recast {}", env!("CARGO_PKG_VERSION"));
-    println!("Settings, layout backend, and memory below describe this status process, not the running daemon.");
-
-    // Linux and macOS write a pidfile, so both can answer this from disk
-    // without attaching to anything. Windows does not: its instance is found
-    // through the process table instead, which `--status` does not walk.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    match daemon::running_pid() {
-        Some(pid) => println!("  running:        yes (pid {pid})"),
-        None => println!("  running:        no"),
-    }
-
-    println!(
-        "  correction:     {}",
-        if prefs::load_enabled() {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    // The layout pipeline is the headline feature and the one that can be
-    // silently unavailable: on a Linux session ReCast cannot drive, mistyped
-    // words go through untouched and nothing else says why.
-    println!("  layout switch:  {}", layout::describe_backend());
-    match prefs::autostart_enabled() {
-        Some(true) => println!("  start at login: yes"),
-        Some(false) => println!("  start at login: no"),
-        None => {}
-    }
-    match complete::config_dir() {
-        Some(dir) => println!("  config dir:     {}", dir.display()),
-        None => println!("  config dir:     (none — no OS config directory)"),
-    }
-    // Whether the file exists is the first thing to check when a setting in it
-    // did nothing, and the most likely answer is that it is somewhere else.
-    match settings::file_path() {
-        Some(path) if path.exists() => println!("  config.toml:    {}", path.display()),
-        Some(path) => println!(
-            "  config.toml:    none ({} — --write-config makes one)",
-            path.display()
-        ),
-        None => println!("  config.toml:    (none — no OS config directory)"),
-    }
-    let (abbrevs, ignored, learned) = complete::list_counts();
-    println!("  abbrev.txt:     {abbrevs} abbreviation(s)");
-    println!("  ignore.txt:     {ignored} word(s)");
-    println!("  learned.txt:    {learned} word(s) retired by undo");
-    // This process, not the daemon's — `--status` is a separate invocation and
-    // cannot see the running one's figure. Still worth showing: it is the same
-    // binary doing the same page-faulting, so it answers "roughly what does
-    // this cost" without attaching to anything.
-    if let Some(rss) = footprint::rss_human() {
-        println!("  memory (this):  {rss}");
-    }
-
-    // The other half of "is it configured the way I think it is". Every one of
-    // these can be overridden from the environment and none of them used to be
-    // reported, so someone who set RECAST_SPELL_DIST had no way to confirm it
-    // had been read — least of all when the value was a typo and had silently
-    // fallen back to the default.
-    let cfg = config::Config::from_env();
-    println!("\n  settings (this process; config.toml and RECAST_* applied):");
-    println!(
-        "    excluded apps        {}",
-        if cfg.excluded_apps.is_empty() {
-            "none".to_string()
-        } else {
-            cfg.excluded_apps.join(", ")
-        }
-    );
-    println!(
-        "    layout-only apps     {}",
-        if cfg.layout_only_apps.is_empty() {
-            "none".into()
-        } else {
-            cfg.layout_only_apps.join(", ")
-        }
-    );
-    println!(
-        "    extra undo shortcut  {}",
-        crate::practice::shortcut_label(&cfg.undo_shortcut)
-    );
-    println!("    short words          {}", on_off(cfg.short_enabled));
-    println!("    missing-space split  {}", on_off(cfg.split_enabled));
-    println!("    frequency tie-break  {}", on_off(cfg.freq_enabled));
-    println!(
-        "    spelling             {}  (min length {}, max rank {}, max distance {})",
-        on_off(cfg.spell_enabled),
-        cfg.spell_min_len,
-        cfg.spell_max_rank,
-        cfg.spell_max_dist,
-    );
-    println!(
-        "    auto-complete        {}  (min prefix {}, max rank {})",
-        on_off(cfg.complete_enabled),
-        cfg.complete_min_len,
-        cfg.complete_max_rank,
-    );
-    println!(
-        "    personalization      {}{}",
-        on_off(cfg.personal_enabled),
-        personal::data_dir()
-            .map(|path| format!("  ({})", path.display()))
-            .unwrap_or_default(),
-    );
-
-    for complaint in
-        settings::complaints(config::NUMERIC_KEYS, config::BOOLEAN_KEYS, config::ALL_KEYS)
-    {
-        eprintln!("\n  ! {complaint}");
-    }
-}
-
-fn on_off(value: bool) -> &'static str {
-    if value {
-        "on"
-    } else {
-        "off"
     }
 }

@@ -28,17 +28,23 @@ static GLOBAL_CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
 
 impl Config {
     /// Access the global config, falling back to defaults if not yet set
-    /// (matches the `from_env` defaults: short-word switching on, split off,
+    /// (matches the `from_env` defaults: short-word switching on, split on,
     /// spelling autocorrect on).
     pub fn global() -> Config {
         lock_forgiving(GLOBAL_CONFIG.get_or_init(|| {
             Mutex::new(Config {
                 excluded_apps: Vec::new(),
                 layout_only_apps: Vec::new(),
+                manual_only_apps: Vec::new(),
                 undo_shortcut: "none".into(),
+                action_shortcut: "ctrl".into(),
+                completion_shortcut: "right_shift".into(),
+                correction_shortcut: "left_shift".into(),
                 personal_enabled: false,
+                rule_stats_enabled: false,
+                language_preference: crate::config::LanguagePreference::Balanced,
                 short_enabled: true,
-                split_enabled: false,
+                split_enabled: true,
                 freq_enabled: true,
                 spell_enabled: true,
                 spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
@@ -113,37 +119,56 @@ pub trait Replaceable {
 pub struct ReplaceGuard<'a, S: Replaceable> {
     state: &'a Mutex<S>,
     injecting: Option<&'a AtomicBool>,
+    armed: bool,
 }
 
 impl<'a, S: Replaceable> ReplaceGuard<'a, S> {
     /// Arm the guard for a replacement that is about to start. `injecting` is
     /// `None` on Linux, which gates on `is_replacing` alone.
     pub fn new(state: &'a Mutex<S>, injecting: Option<&'a AtomicBool>) -> Self {
-        Self { state, injecting }
+        Self {
+            state,
+            injecting,
+            armed: true,
+        }
+    }
+
+    /// Reopen capture under the same lock that commits the final text state.
+    /// Consuming the guard prevents its destructor from clearing a later rewrite.
+    pub fn finish(mut self, state: &mut S) {
+        self.armed = false;
+        self.clear(state);
+    }
+
+    fn clear(&self, state: &mut S) {
+        if let Some(flag) = self.injecting {
+            flag.store(false, Ordering::Relaxed);
+        }
+        state.set_replacing(false);
+        state.clear_buffered();
     }
 }
 
 impl<S: Replaceable> Drop for ReplaceGuard<'_, S> {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         // `lock_forgiving`, not `lock().unwrap()`: unwinding through a second
         // panic would abort the process, and this runs precisely when the first
         // one may already have poisoned this lock.
         {
             let mut st = lock_forgiving(self.state);
-            if let Some(flag) = self.injecting {
-                flag.store(false, Ordering::Relaxed);
-            }
-            st.set_replacing(false);
-            st.clear_buffered();
+            self.clear(&mut st);
         }
     }
 }
 
 /// Longest run of keys that can still be treated as one word.
 ///
-/// Both pipelines already refuse anything much shorter than this — the speller
-/// stops at 20 characters (`spell::MAX_LEN`) and the completer at 20
-/// (`complete::MAX_PREFIX_LEN`) — so past this point the buffer is being filled
+/// Most speculative searches stop much earlier — spelling and edited-prefix
+/// completion stop at 20 characters, while exact completion can use this full
+/// tracked range. Past this point the buffer is being filled
 /// with something that is provably never going to be corrected: a base64 blob,
 /// a URL, a path, a key held down. Held at 64 rather than 20 because the buffer
 /// also has to hold the punctuation a word ends with and, once the split
@@ -288,6 +313,8 @@ pub struct Correction {
     /// What replaced it.
     pub to: String,
     pub kind: FixKind,
+    /// Decision evidence retained only with the bounded in-memory history.
+    pub details: String,
     /// Wall-clock time, for the log line. Read by the TUI, which macOS does
     /// not build (the event tap owns the main run loop there).
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -296,17 +323,132 @@ pub struct Correction {
     pub undone: bool,
 }
 
+impl Correction {
+    pub fn inspection(&self) -> String {
+        format!(
+            "Original: \u{2068}{:?}\u{2069}\nReplacement: \u{2068}{:?}\u{2069}\nOperation: {}\nStatus: {}\n\n{}\n\nEvidence was captured when this replacement was applied. It stays in memory with Recent corrections.",
+            self.from, self.to, self.kind.tag(),
+            if self.undone { "Undone" } else { "Applied" }, self.details
+        )
+    }
+}
+
 /// How many corrections are kept. Long enough to answer "what did it just
 /// change?" after a few more words, short enough to stay a glance rather than a
 /// log to read.
 const HISTORY_LEN: usize = 20;
+const LIVE_LOG_LEN: usize = 500;
+
+/// Explicitly started, memory-only log for the live viewer.
+pub struct LiveLog {
+    active: AtomicBool,
+    lines: Mutex<VecDeque<String>>,
+    last_issue: Mutex<Option<String>>,
+}
+
+impl LiveLog {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            lines: Mutex::new(VecDeque::new()),
+            last_issue: Mutex::new(None),
+        }
+    }
+
+    pub fn start(&self) {
+        *lock_forgiving(&self.last_issue) = None;
+        lock_forgiving(&self.lines).clear();
+        self.active.store(true, Ordering::Release);
+    }
+
+    pub fn stop(&self) {
+        let _lines = lock_forgiving(&self.lines);
+        self.active.store(false, Ordering::Release);
+    }
+
+    pub fn close(&self) {
+        self.stop();
+        lock_forgiving(&self.lines).clear();
+        *lock_forgiving(&self.last_issue) = None;
+    }
+
+    pub fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn push(&self, message: String) {
+        if !self.active() {
+            return;
+        }
+        let mut lines = lock_forgiving(&self.lines);
+        if !self.active() {
+            return;
+        }
+        if lines.len() == LIVE_LOG_LEN {
+            lines.pop_front();
+        }
+        lines.push_back(format!(
+            "[{}] {message}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ));
+    }
+
+    pub fn correction(&self, from: &str, to: &str, kind: FixKind) {
+        if self.active() {
+            self.push(format!("{}: {from:?} -> {to:?}", kind.tag()));
+        }
+    }
+
+    pub fn undo(&self, from: &str, to: &str) {
+        if self.active() {
+            self.push(format!("undo: {to:?} -> {from:?}"));
+        }
+    }
+
+    /// Record actionable health changes once, without logging normal focus changes.
+    pub fn observe_health(&self, health: &str) {
+        if !self.active() {
+            return;
+        }
+        let issue = [
+            "Accessibility permission unavailable",
+            "Keyboard listener unavailable",
+            "Keyboard layout unavailable",
+            "Cannot identify this application",
+        ]
+        .into_iter()
+        .find(|prefix| health.starts_with(prefix));
+        let mut last = lock_forgiving(&self.last_issue);
+        if issue.map(str::to_string) == *last {
+            return;
+        }
+        if let Some(issue) = issue {
+            self.push(format!("Issue: {health}"));
+            *last = Some(issue.to_string());
+        } else if (health.starts_with("Active") || health.starts_with("Enabled"))
+            && last.take().is_some()
+        {
+            self.push("Issue cleared".into());
+        }
+    }
+
+    pub fn text(&self) -> String {
+        lock_forgiving(&self.lines)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 /// Shared runtime state between the keyboard listener and the optional GUI.
 pub struct AppControl {
     pub excluded_apps: Mutex<Vec<String>>,
     pub layout_only_apps: Mutex<Vec<String>>,
+    pub manual_only_apps: Mutex<Vec<String>>,
     pub listener_ready: AtomicBool,
     pub practice_open: AtomicBool,
+    pub word_rules_open: AtomicBool,
     pub practice_stage: std::sync::atomic::AtomicU8,
     enabled: AtomicBool,
     fixed_count: AtomicU64,
@@ -318,6 +460,7 @@ pub struct AppControl {
     paused_until: Mutex<Option<Instant>>,
     paused_app: Mutex<Option<String>>,
     history: Mutex<VecDeque<Correction>>,
+    pub live_log: LiveLog,
 }
 
 impl AppControl {
@@ -325,12 +468,15 @@ impl AppControl {
     pub fn new_with_config(cfg: Config) -> Self {
         let excluded_apps = Mutex::new(cfg.excluded_apps.clone());
         let layout_only_apps = Mutex::new(cfg.layout_only_apps.clone());
+        let manual_only_apps = Mutex::new(cfg.manual_only_apps.clone());
         let _ = GLOBAL_CONFIG.set(Mutex::new(cfg));
         Self {
             excluded_apps,
             layout_only_apps,
+            manual_only_apps,
             listener_ready: AtomicBool::new(false),
             practice_open: AtomicBool::new(false),
+            word_rules_open: AtomicBool::new(false),
             practice_stage: std::sync::atomic::AtomicU8::new(0),
             enabled: AtomicBool::new(true),
             fixed_count: AtomicU64::new(0),
@@ -338,6 +484,7 @@ impl AppControl {
             paused_until: Mutex::new(None),
             paused_app: Mutex::new(None),
             history: Mutex::new(VecDeque::with_capacity(HISTORY_LEN)),
+            live_log: LiveLog::new(),
         }
     }
 
@@ -352,10 +499,16 @@ impl AppControl {
         Self::new_with_config(Config {
             excluded_apps: Vec::new(),
             layout_only_apps: Vec::new(),
+            manual_only_apps: Vec::new(),
             undo_shortcut: "none".into(),
+            action_shortcut: "ctrl".into(),
+            completion_shortcut: "right_shift".into(),
+            correction_shortcut: "left_shift".into(),
             personal_enabled: false,
+            rule_stats_enabled: false,
+            language_preference: crate::config::LanguagePreference::Balanced,
             short_enabled: true,
-            split_enabled: false,
+            split_enabled: true,
             freq_enabled: true,
             spell_enabled: true,
             spell_min_len: crate::config::DEFAULT_SPELL_MIN_LEN,
@@ -382,7 +535,10 @@ impl AppControl {
     pub fn has_app_rules(&self) -> bool {
         let excluded = lock_forgiving(&self.excluded_apps);
         let layout = lock_forgiving(&self.layout_only_apps);
-        !excluded.is_empty() || !layout.is_empty() || self.paused_app().is_some()
+        !excluded.is_empty()
+            || !layout.is_empty()
+            || !lock_forgiving(&self.manual_only_apps).is_empty()
+            || self.paused_app().is_some()
     }
 
     pub fn paused_app(&self) -> Option<String> {
@@ -390,6 +546,8 @@ impl AppControl {
     }
 
     pub fn pause_in_app(&self, app: &str) {
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::dismiss_candidates();
         if !app.trim().is_empty() {
             *lock_forgiving(&self.paused_app) = Some(app.to_lowercase());
         }
@@ -406,6 +564,9 @@ impl AppControl {
         app: Option<&str>,
         own_focus: bool,
     ) -> Option<crate::config::AppMode> {
+        if self.word_rules_open.load(Ordering::Relaxed) {
+            return None;
+        }
         {
             let mut paused = lock_forgiving(&self.paused_app);
             if let Some(id) = paused.as_ref() {
@@ -432,6 +593,8 @@ impl AppControl {
         let layout = lock_forgiving(&self.layout_only_apps);
         Some(if !crate::config::app_allowed(&excluded, Some(&app)) {
             AppMode::Off
+        } else if lock_forgiving(&self.manual_only_apps).contains(&app) {
+            AppMode::ManualOnly
         } else if layout.contains(&app) {
             AppMode::LayoutOnly
         } else {
@@ -448,6 +611,8 @@ impl AppControl {
     /// Flip the switch, and remember it: an app that forgets it was turned off
     /// every time the machine reboots is one the user has to turn off twice.
     pub fn set_enabled(&self, value: bool) {
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::dismiss_candidates();
         self.enabled.store(value, Ordering::Relaxed);
         self.resume();
         crate::prefs::save_enabled(value);
@@ -455,6 +620,8 @@ impl AppControl {
 
     /// Stop correcting for `how_long`, then carry on by itself.
     pub fn pause_for(&self, how_long: Duration) {
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::dismiss_candidates();
         if let Ok(mut until) = self.paused_until.lock() {
             *until = Some(Instant::now() + how_long);
         }
@@ -495,8 +662,14 @@ impl AppControl {
         self.undo_count.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn record_fix(&self, from: &str, to: &str, kind: FixKind) {
+        self.record_fix_with_details(from, to, kind, String::new());
+    }
+
+    pub fn record_fix_with_details(&self, from: &str, to: &str, kind: FixKind, details: String) {
         self.fixed_count.fetch_add(1, Ordering::Relaxed);
+        self.live_log.correction(from, to, kind);
         if let Ok(mut log) = self.history.lock() {
             if log.len() == HISTORY_LEN {
                 log.pop_back();
@@ -505,6 +678,7 @@ impl AppControl {
                 from: from.to_string(),
                 to: to.to_string(),
                 kind,
+                details,
                 at: chrono::Local::now(),
                 undone: false,
             });
@@ -518,15 +692,23 @@ impl AppControl {
     /// when they go looking. Saturates at zero rather than wrapping: the
     /// counter is a tally the user reads, not an audit trail.
     pub fn record_undo(&self) {
-        let _ = self
-            .fixed_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
+        let mut count = self.fixed_count.load(Ordering::Relaxed);
+        while count != 0 {
+            match self.fixed_count.compare_exchange_weak(
+                count,
+                count - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => count = actual,
+            }
+        }
         self.undo_count.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut log) = self.history.lock() {
             if let Some(last) = log.iter_mut().find(|c| !c.undone) {
                 last.undone = true;
+                self.live_log.undo(&last.from, &last.to);
             }
         }
     }
@@ -537,6 +719,11 @@ impl AppControl {
             .lock()
             .map(|log| log.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_history_for_test(&self) -> std::sync::MutexGuard<'_, VecDeque<Correction>> {
+        self.history.lock().unwrap()
     }
 
     /// A nudge to tighten the speller, once enough of its work has been thrown
@@ -622,6 +809,29 @@ mod tests {
     }
 
     #[test]
+    fn finishing_under_the_state_lock_cannot_clear_the_next_replacement() {
+        let state = Mutex::new(FakeState {
+            replacing: true,
+            buffered: 2,
+        });
+        let injecting = AtomicBool::new(true);
+        let gate = ReplaceGuard::new(&state, Some(&injecting));
+        {
+            let mut st = lock_forgiving(&state);
+            gate.finish(&mut st);
+            assert!(!st.replacing);
+            assert_eq!(st.buffered, 0);
+            assert!(!injecting.load(Ordering::Relaxed));
+            st.replacing = true;
+            st.buffered = 1;
+            injecting.store(true, Ordering::Relaxed);
+        }
+        assert!(lock_forgiving(&state).replacing);
+        assert_eq!(lock_forgiving(&state).buffered, 1);
+        assert!(injecting.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn a_poisoned_lock_is_still_usable() {
         let state = Mutex::new(FakeState::default());
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -655,6 +865,46 @@ mod tests {
         let log = c.history();
         assert_eq!(log[0].from, "b");
         assert_eq!(log[1].from, "a");
+    }
+
+    #[test]
+    fn live_log_only_collects_during_explicit_session() {
+        let log = LiveLog::new();
+        log.correction("akuo", "שלום", FixKind::Layout);
+        assert!(log.text().is_empty());
+
+        log.start();
+        log.correction("akuo", "שלום", FixKind::Layout);
+        let issue = "Keyboard listener unavailable — check permissions and connected keyboards";
+        log.observe_health(issue);
+        log.observe_health(issue);
+        log.observe_health("Text focus unavailable — click a text field");
+        let lines = log.text();
+        assert!(lines.contains("layout: \"akuo\" -> \"שלום\""));
+        assert_eq!(lines.matches("Keyboard listener unavailable").count(), 1);
+        assert!(!lines.contains("Issue cleared"));
+        log.observe_health("Active · Full correction");
+        assert!(log.text().contains("Issue cleared"));
+        log.observe_health("Accessibility permission unavailable — relaunch ReCast");
+        assert!(log.text().contains("Accessibility permission unavailable"));
+
+        log.stop();
+        log.correction("after", "stopped", FixKind::Spelling);
+        assert!(!log.text().contains("after"));
+        log.start();
+        assert!(log.text().is_empty());
+        log.correction("new", "session", FixKind::Spelling);
+        log.close();
+        assert!(log.text().is_empty());
+        assert!(!log.active());
+
+        let control = control();
+        control.live_log.start();
+        control.record_fix("recieve", "receive", FixKind::Spelling);
+        control.record_undo();
+        let lines = control.live_log.text();
+        assert!(lines.contains("spell: \"recieve\" -> \"receive\""));
+        assert!(lines.contains("undo: \"receive\" -> \"recieve\""));
     }
 
     #[test]

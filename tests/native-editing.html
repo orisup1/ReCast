@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>ReCast disposable editing checks</title>
+<style>
+body{font:16px system-ui;max-width:880px;margin:32px auto;padding:0 20px;line-height:1.5}textarea,[contenteditable]{box-sizing:border-box;width:100%;min-height:110px;padding:12px;border:1px solid #777;border-radius:4px;font:18px monospace}button,select,input{font:inherit;padding:8px;margin:5px 0}label{display:block;margin-top:16px}pre{white-space:pre-wrap}#result{font-weight:bold} .hint{color:#555}
+</style>
+<h1>ReCast editing checks</h1>
+<p>Run ReCast separately. Type physically into these disposable fields. This page does not inject keys or emulate correction. Nothing leaves this page; exported traces contain only text entered here. Use sample text, never private content.</p>
+<label for="scenario">Scenario</label><select id="scenario"></select>
+<button id="reset">Prepare scenario</button><p id="steps"></p>
+<label for="plain">Everyday typing / code</label><textarea id="plain" spellcheck="false" autocapitalize="off"></textarea>
+<label for="rich">Rich text / chat (Enter sends locally; Shift+Enter inserts a line)</label>
+<div id="rich" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Rich text chat" spellcheck="false"></div>
+<label for="other">Second focus target</label><textarea id="other" spellcheck="false"></textarea>
+<p>Messages sent locally: <output id="sent"></output></p>
+<label for="password">Password exclusion probe (sample text only; never traced)</label><input id="password" type="password" autocomplete="off">
+<label for="readonly">Read-only selection probe</label><input id="readonly" readonly value="left akuo right">
+<label for="notes">Build, OS, desktop, app mode, layouts, observed behavior</label><input id="notes" style="width:100%">
+<button id="check">Check text</button><button id="export">Export local JSON</button>
+<p id="result" role="status">Not checked.</p><p class="hint">A text check cannot prove capture timing, formatting preservation, or accessibility support. Record skipped features and native application trials separately.</p>
+<script src="native-editing.js"></script>
+</html>

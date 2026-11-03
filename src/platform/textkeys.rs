@@ -99,14 +99,19 @@ pub fn retype_len(text: &str) -> usize {
 
 /// The word buffer that matches `text` now being on screen. Only the last word
 /// of it is still in progress — an abbreviation expansion may carry spaces —
-/// and anything the English layout can't type is dropped rather than guessed at.
+/// Hebrew is mapped back to the same physical keys used by the capture buffer.
 pub fn buffer_after(text: &str) -> Vec<Typed<Key>> {
-    text.rsplit(' ')
-        .next()
-        .unwrap_or_default()
+    let word = text.rsplit(char::is_whitespace).next().unwrap_or_default();
+    let physical = if word.chars().any(|c| ('\u{0590}'..='\u{05ff}').contains(&c)) {
+        crate::keymap::hebrew_text_to_physical_english(word).unwrap_or_default()
+    } else {
+        word.to_owned()
+    };
+    physical
         .chars()
-        .filter_map(|c| english_char_to_key(c).map(|(key, shift)| Typed { key, shift }))
-        .collect()
+        .map(|c| english_char_to_key(c).map(|(key, shift)| Typed { key, shift }))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// The keys the state machine names, in rdev's spelling.
@@ -116,3 +121,81 @@ pub const CTRL_LEFT: Key = Key::ControlLeft;
 pub const CTRL_RIGHT: Key = Key::ControlRight;
 pub const CAPS_LOCK: Key = Key::CapsLock;
 pub const BACKSPACE: Key = Key::Backspace;
+
+#[cfg(test)]
+#[test]
+fn hebrew_completion_buffer_preserves_physical_keys() {
+    let keys = buffer_after("שלום");
+    assert_eq!(keys.len(), 4);
+    let hebrew: String = keys.iter().filter_map(|t| hebrew_char(t.key)).collect();
+    assert_eq!(hebrew, "שלום");
+    assert!(keys.iter().all(|t| !t.shift));
+    let english: String = buffer_after("by the way")
+        .iter()
+        .filter_map(|t| english_char(t.key, t.shift))
+        .collect();
+    assert_eq!(english, "way");
+    assert_eq!(buffer_after("hello\nworld").len(), 5);
+    assert!(buffer_after("hello🙂").is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn hebrew_inserted_symbols_reconstruct_their_actual_physical_keys() {
+    for text in [
+        "(שלום)",
+        "[שלום]",
+        "{שלום}",
+        "<שלום>",
+        "שלום!?",
+        if cfg!(target_os = "macos") {
+            "שלום,.;׳/ֿ"
+        } else {
+            "שלום,.;'/'"
+        },
+    ] {
+        let keys = buffer_after(text);
+        let visible: String = keys
+            .iter()
+            .map(|typed| {
+                crate::keymap::hebrew_char_shifted(
+                    english_char(typed.key, typed.shift),
+                    hebrew_char(typed.key),
+                    typed.shift,
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(visible, text);
+    }
+
+    // A second manual conversion must restore the exact English wrappers.
+    for original in ["(hello)", "[hello]", "{hello}", "<hello>"] {
+        let converted: String = original
+            .chars()
+            .map(|c| {
+                let (key, shift) = english_char_to_key(c).unwrap();
+                crate::keymap::hebrew_char_shifted(
+                    english_char(key, shift),
+                    hebrew_char(key),
+                    shift,
+                )
+                .unwrap()
+            })
+            .collect();
+        let restored: String = buffer_after(&converted)
+            .iter()
+            .filter_map(|typed| english_char(typed.key, typed.shift))
+            .collect();
+        assert_eq!(restored, original);
+    }
+
+    // Unrepresentable text must not fabricate physical keys for later edits.
+    for text in ["helloשלום", "שלוםhello", "שלום🙂"] {
+        assert!(buffer_after(text).is_empty(), "{text}");
+    }
+    #[cfg(target_os = "macos")]
+    for text in ["שלום'", "שלום\\"] {
+        assert!(buffer_after(text).is_empty(), "{text}");
+    }
+}

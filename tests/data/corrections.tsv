@@ -3,6 +3,9 @@
 # Unchanged expectations protect text; changed expectations measure useful fixes.
 # Optional fifth column: exact existing failure, not the desired result. It still
 # counts as an accuracy error; remove this column when the defect is fixed.
+# Seven-column rows add sequence and mode (full/layout-only) after the baseline.
+# Empty baseline means expected. Consecutive rows in a sequence share language
+# history; a different sequence or app mode resets it, matching the engine.
 en	hello	יקךךם	hello
 en	github	עןאיונ	github
 en	async	שדטמב	async
@@ -209,3 +212,775 @@ en	accomodate	שבבםצםגשאק	accommodate
 he	accomodate	שבבםצםגשאק	accommodate
 en	untill	ומאןךך	until
 he	untill	ומאןךך	until
+
+# Technical vocabulary: lowercase words must survive automatic correction.
+en	ansible	שמדןנךק	ansible
+en	argparse	שרעפשרדק	argparse
+en	asyncio	שדטמבןם	asyncio
+en	async	שדטמב	async
+en	await	ש'שןא	await
+en	backend	נשבלקמג	backend
+en	backends	נשבלקמגד	backends
+en	bitbucket	נןאנובלקא	bitbucket
+en	bootstrap	נםםאדארשפ	bootstrap
+en	bytecode	נטאקבםגק	bytecode
+en	callback	בשךךנשבל	callback
+en	callbacks	בשךךנשבלד	callbacks
+en	chmod	ביצםג	chmod
+en	chown	בים'מ	chown
+en	codebase	בםגקנשדק	codebase
+en	coroutine	בםרםואןמק	coroutine
+en	coroutines	בםרםואןמקד	coroutines
+en	dataclass	גשאשבךשדד	dataclass
+en	dataframe	גשאשכרשצק	dataframe
+en	deadlock	גקשגךםבל	deadlock
+en	debounce	גקנםומבק	debounce
+en	deserialize	גקדקרןשךןזק	deserialize
+en	deserialization	גקדקרןשךןזשאןםמ	deserialization
+en	devops	גקהםפד	devops
+en	docker	גםבלקר	docker
+en	dotenv	גםאקמה	dotenv
+en	elasticsearch	קךשדאןבדקשרבי	elasticsearch
+en	enum	קמוצ	enum
+en	enums	קמוצד	enums
+en	fastapi	כשדאשפן	fastapi
+en	frontend	כרםמאקמג	frontend
+en	frontends	כרםמאקמגד	frontends
+en	github	עןאיונ	github
+en	gitlab	עןאךשנ	gitlab
+en	golang	עםךשמע	golang
+en	grafana	ערשכשמש	grafana
+en	graphql	ערשפי/ך	graphql
+en	grpc	ערפב	grpc
+en	hashcode	ישדיבםגק	hashcode
+en	hashmap	ישדיצשפ	hashmap
+en	hashmaps	ישדיצשפד	hashmaps
+en	hashset	ישדידקא	hashset
+en	hostname	יםדאמשצק	hostname
+en	http	יאאפ	http
+en	https	יאאפד	https
+en	idempotent	ןגקצפםאקמא	idempotent
+en	instanceof	ןמדאשמבקםכ	instanceof
+en	javascript	חשהשדברןפא	javascript
+en	json	חדםמ	json
+en	junit	חומןא	junit
+en	keymap	לקטצשפ	keymap
+en	keymaps	לקטצשפד	keymaps
+en	kotlin	לםאךןמ	kotlin
+en	kubectl	לונקבאך	kubectl
+en	kubernetes	לונקרמקאקד	kubernetes
+en	localhost	ךםבשךיםדא	localhost
+en	lockfile	ךםבלכןךק	lockfile
+en	mariadb	צשרןשגנ	mariadb
+en	middleware	צןגגךק'שרק	middleware
+en	mongodb	צםמעםגנ	mongodb
+en	mutex	צואקס	mutex
+en	mysql	צטד/ך	mysql
+en	namespace	משצקדפשבק	namespace
+en	namespaces	משצקדפשבקד	namespaces
+en	nginx	מעןמס	nginx
+en	nodejs	מםגקחד	nodejs
+en	noexcept	מםקסבקפא	noexcept
+en	nosql	מםד/ך	nosql
+en	numpy	מוצפט	numpy
+en	oauth	םשואי	oauth
+en	observability	םנדקרהשנןךןאט	observability
+en	openapi	םפקמשפן	openapi
+en	openid	םפקמןג	openid
+en	opensearch	םפקמדקשרבי	opensearch
+en	pathlib	פשאיךןנ	pathlib
+en	pipenv	פןפקמה	pipenv
+en	podman	פםגצשמ	podman
+en	postgres	פםדאערקד	postgres
+en	postgresql	פםדאערקד/ך	postgresql
+en	protobuf	פרםאםנוכ	protobuf
+en	pydantic	פטגשמאןב	pydantic
+en	pyproject	פטפרםחקבא	pyproject
+en	pytest	פטאקדא	pytest
+en	pythonic	פטאיםמןב	pythonic
+en	reactjs	רקשבאחד	reactjs
+en	readonly	רקשגםמךט	readonly
+en	redis	רקגןד	redis
+en	refactor	רקכשבאםר	refactor
+en	refactoring	רקכשבאםרןמע	refactoring
+en	regex	רקעקס	regex
+en	regexp	רקעקספ	regexp
+en	restapi	רקדאשפן	restapi
+en	restful	רקדאכוך	restful
+en	rustacean	רודאשבקשמ	rustacean
+en	rustfmt	רודאכצא	rustfmt
+en	serde	דקרגק	serde
+en	serverless	דקרהקרךקדד	serverless
+en	sqlalchemy	ד/ךשךביקצט	sqlalchemy
+en	sqlite	ד/ךןאק	sqlite
+en	stacktrace	דאשבלארשבק	stacktrace
+en	stdlib	דאגךןנ	stdlib
+en	subprocess	דונפרםבקדד	subprocess
+en	sudo	דוגם	sudo
+en	syscalls	דטדבשךךד	syscalls
+en	tailwind	אשןך'ןמג	tailwind
+en	terraform	אקררשכםרצ	terraform
+en	tokio	אםלןם	tokio
+en	toml	אםצך	toml
+en	toolchain	אםםךבישןמ	toolchain
+en	traceback	ארשבקנשבל	traceback
+en	transpiler	ארשמדפןךקר	transpiler
+en	typescript	אטפקדברןפא	typescript
+en	uint	וןמא	uint
+en	unicode	ומןבםגק	unicode
+en	unittest	ומןאאקדא	unittest
+en	urlpatterns	ורךפשאאקרמד	urlpatterns
+en	urllib	ורךךןנ	urllib
+en	vite	הןאק	vite
+en	vscode	הדבםגק	vscode
+en	webpack	'קנפשבל	webpack
+en	webhook	'קניםםל	webhook
+en	webhooks	'קניםםלד	webhooks
+en	websocket	'קנדםבלקא	websocket
+en	websockets	'קנדםבלקאד	websockets
+en	yaml	טשצך	yaml
+
+# Language transitions, one-word ambiguity, focus resets, and application modes.
+he	akuo	שלום	שלום		he-run	full
+he	,usv	תודה	תודה		he-run	full
+en	go	עם	עם		he-run	full
+en	hello	יקךךם	hello		he-run	full
+en	keyboard	לקטנםשרג	keyboard		he-run	full
+he	to	אם	to		he-run	full
+he	akuo	שלום	שלום		one-he-word	full
+en	go	עם	go		one-he-word	full
+en	hello	יקךךם	hello		en-run	full
+en	keyboard	לקטנםשרג	keyboard		en-run	full
+he	to	אם	to		en-run	full
+he	akuo	שלום	שלום		en-run	full
+he	,usv	תודה	תודה		en-run	full
+en	go	עם	עם		en-run	full
+en	go	עם	go		new-field	full
+he	to	אם	אם		new-field	full
+en	recieve	רקבןקהק	recieve		layout-mode	layout-only
+en	akuo	שלום	שלום		layout-mode	layout-only
+he	hello	יקךךם	hello		layout-mode	layout-only
+he	recieve	רקבןקהק	רקבןקהק		layout-mode	layout-only
+en	teh	אקי	teh		layout-mode	layout-only
+en	Recieve	רקבןקהק	Recieve		layout-mode	layout-only
+he	akuo	שלום	שלום		mode-change	full
+he	,usv	תודה	תודה		mode-change	full
+en	go	עם	go		mode-change	layout-only
+en	recieve	רקבןקהק	receive		mode-change	full
+he	akuo	שלום	שלום		jargon-in-he-run	full
+he	,usv	תודה	תודה		jargon-in-he-run	full
+en	backend	נשבלקמג	backend		jargon-in-he-run	full
+en	mutex	צואקס	mutex		jargon-in-he-run	full
+en	serde	דקרגק	serde		jargon-in-he-run	full
+en	sudo	דוגם	sudo		jargon-in-he-run	full
+en	hello	יקךךם	hello		names	full
+en	keyboard	לקטנםשרג	keyboard		names	full
+en	supino	דופןמם	supino		names	full
+en	sami	דשצן	sami		names	full
+he	akuo	שלום	שלום		names	full
+he	akuo	שלום	שלום		he-layout-only	layout-only
+he	,usv	תודה	תודה		he-layout-only	layout-only
+en	go	עם	עם		he-layout-only	layout-only
+
+# Technical additions also restore wrong-layout text and preserve case.
+he	backend	נשבלקמג	backend
+he	mutex	צואקס	mutex
+he	serde	דקרגק	serde
+he	postgres	פםדאערקד	postgres
+he	typescript	אטפקדברןפא	typescript
+he	webhook	'קניםםל	webhook
+he	kubernetes	לונקרמקאקד	kubernetes
+he	devops	גקהםפד	devops
+he	graphql	ערשפי/ך	graphql
+he	json	חדםמ	json
+he	yaml	טשצך	yaml
+he	tokio	אםלןם	tokio
+he	refactor	רקכשבאםר	refactor
+he	hostname	יםדאמשצק	hostname
+he	redis	רקגןד	redis
+he	toml	אםצך	toml
+he	sudo	דוגם	דוגם
+en	Backend	נשבלקמג	Backend
+en	Mutex	צואקס	Mutex
+en	Serde	דקרגק	Serde
+en	TypeScript	אטפקדברןפא	TypeScript
+en	GraphQL	ערשפי/ך	GraphQL
+en	PostgreSQL	פםדאערקד/ך	PostgreSQL
+en	JSON	חדםמ	JSON
+en	YAML	טשצך	YAML
+en	SUDO	דוגם	SUDO
+en	Redis!	רקגןד!	Redis!
+
+# Rare dictionary typos and discounted multi-letter edits compose with layout repair.
+en	thos	איםד	this
+he	thos	איםד	this
+en	Thos!	איםד!	This!
+he	Thos!	איםד!	This!
+en	commmittteee	בםצצצןאאאקקק	committee
+he	commmittteee	בםצצצןאאאקקק	committee
+
+# Expanded first-letter coverage and technical vocabulary.
+en	omputer	םצפואקר	computer
+he	omputer	םצפואקר	computer
+en	xcomputer	סבםצפואקר	computer
+he	xcomputer	סבםצפואקר	computer
+en	eyboard	קטנםשרג	keyboard
+he	eyboard	קטנםשרג	keyboard
+en	xkeyboard	סלקטנםשרג	keyboard
+he	xkeyboard	סלקטנםשרג	keyboard
+en	nformation	מכםרצשאןםמ	information
+he	nformation	מכםרצשאןםמ	information
+en	ximportant	סןצפםראשמא	important
+he	ximportant	סןצפםראשמא	important
+en	alloc	שךךםב	alloc
+en	applet	שפפךקא	applet
+en	applets	שפפךקאד	applets
+en	autocompletion	שואםבםצפךקאןםמ	autocompletion
+en	autoscale	שואםדבשךק	autoscale
+en	autoscaling	שואםדבשךןמע	autoscaling
+en	backpressure	נשבלפרקדדורק	backpressure
+en	backtraces	נשבלארשבקד	backtraces
+en	bigint	נןעןמא	bigint
+en	bitmask	נןאצשדל	bitmask
+en	bitmasks	נןאצשדלד	bitmasks
+en	bloomfilter	נךםםצכןךאקר	bloomfilter
+en	bootloaders	נםםאךםשגקרד	bootloaders
+en	callsite	בשךךדןאק	callsite
+en	callsites	בשךךדןאקד	callsites
+en	camelcase	בשצקךבשדק	camelcase
+en	changelog	בישמעקךםע	changelog
+en	classpath	בךשדדפשאי	classpath
+en	cloudflare	בךםוגכךשרק	cloudflare
+en	codegen	בםגקעקמ	codegen
+en	codepoint	בםגקפםןמא	codepoint
+en	codepoints	בםגקפםןמאד	codepoints
+en	composability	בםצפםדשנןךןאט	composability
+en	concat	בםמבשא	concat
+en	connectionpool	בםממקבאןםמפםםך	connectionpool
+en	constexpr	בםמדאקספר	constexpr
+en	cron	ברםמ	cron
+en	crontab	ברםמאשנ	crontab
+en	csrf	בדרכ	csrf
+en	cybersecurity	בטנקרדקבורןאט	cybersecurity
+en	dedup	גקגופ	dedup
+en	deduplicate	גקגופךןבשאק	deduplicate
+en	deserializer	גקדקרןשךןזקר	deserializer
+en	deserializers	גקדקרןשךןזקרד	deserializers
+en	devcontainer	גקהבםמאשןמקר	devcontainer
+en	dns	גמד	dns
+en	duckdb	גובלגנ	duckdb
+en	endianness	קמגןשממקדד	endianness
+en	entrypoint	קמארטפםןמא	entrypoint
+en	entrypoints	קמארטפםןמאד	entrypoints
+en	epoll	קפםךך	epoll
+en	eslint	קדךןמא	eslint
+en	eventloop	קהקמאךםםפ	eventloop
+en	fastify	כשדאןכט	fastify
+en	filesystem	כןךקדטדאקצ	filesystem
+en	filesystems	כןךקדטדאקצד	filesystems
+en	finalizer	כןמשךןזקר	finalizer
+en	finalizers	כןמשךןזקרד	finalizers
+en	flatpak	כךשאפשל	flatpak
+en	fsync	כדטמב	fsync
+en	fullstack	כוךךדאשבל	fullstack
+en	gcloud	עבךםוג	gcloud
+en	gevent	עקהקמא	gevent
+en	gitignore	עןאןעמםרק	gitignore
+en	gitops	עןאםפד	gitops
+en	goroutine	עםרםואןמק	goroutine
+en	goroutines	עםרםואןמקד	goroutines
+en	gzip	עזןפ	gzip
+en	hardcoded	ישרגבםגקג	hardcoded
+en	hotfix	יםאכןס	hotfix
+en	hotfixes	יםאכןסקד	hotfixes
+en	html	יאצך	html
+en	httpx	יאאפס	httpx
+en	hypervisor	יטפקרהןדםר	hypervisor
+en	hypervisors	יטפקרהןדםרד	hypervisors
+en	iframe	ןכרשצק	iframe
+en	intellisense	ןמאקךךןדקמדק	intellisense
+en	interop	ןמאקרםפ	interop
+en	iostream	ןםדארקשצ	iostream
+en	iptables	ןפאשנךקד	iptables
+en	iterables	ןאקרשנךקד	iterables
+en	jit	חןא	jit
+en	jsonl	חדםמך	jsonl
+en	jsx	חדס	jsx
+en	keybinding	לקטנןמגןמע	keybinding
+en	keybindings	לקטנןמגןמעד	keybindings
+en	keycloak	לקטבךםשל	keycloak
+en	linting	ךןמאןמע	linting
+en	llvm	ךךהצ	llvm
+en	logrotate	ךםערםאשאק	logrotate
+en	longpolling	ךםמעפםךךןמע	longpolling
+en	lru	ךרו	lru
+en	malloc	צשךךםב	malloc
+en	memoization	צקצםןזשאןםמ	memoization
+en	memoize	צקצםןזק	memoize
+en	metaclass	צקאשבךשדד	metaclass
+en	microservice	צןברםדקרהןבק	microservice
+en	microservices	צןברםדקרהןבקד	microservices
+en	mixin	צןסןמ	mixin
+en	mixins	צןסןמד	mixins
+en	monorepo	צםמםרקפם	monorepo
+en	monorepos	צםמםרקפםד	monorepos
+en	msgpack	צדעפשבל	msgpack
+en	multithreading	צוךאןאירקשגןמע	multithreading
+en	mypy	צטפט	mypy
+en	netlify	מקאךןכט	netlify
+en	nixos	מןסםד	nixos
+en	nullability	מוךךשנןךןאט	nullability
+en	nullish	מוךךןדי	nullish
+en	nvarchar	מהשרבישר	nvarchar
+en	openbsd	םפקמנדג	openbsd
+en	openssl	םפקמדדך	openssl
+en	opentelemetry	םפקמאקךקצקארט	opentelemetry
+en	parseable	פשרדקשנךק	parseable
+en	passthrough	פשדדאירםועי	passthrough
+en	pem	פקצ	pem
+en	pipx	פןפס	pipx
+en	pnpm	פמפצ	pnpm
+en	polyfill	פםךטכןךך	polyfill
+en	polyfills	פםךטכןךךד	polyfills
+en	postcss	פםדאבדד	postcss
+en	prefetch	פרקכקאבי	prefetch
+en	prefetching	פרקכקאביןמע	prefetching
+en	prisma	פרןדצש	prisma
+en	pubsub	פונדונ	pubsub
+en	pypi	פטפן	pypi
+en	pyright	פטרןעיא	pyright
+en	pytorch	פטאםרבי	pytorch
+en	qemu	/קצו	qemu
+en	rabbitmq	רשננןאצ/	rabbitmq
+en	readme	רקשגצק	readme
+en	realloc	רקשךךםב	realloc
+en	rebased	רקנשדקג	rebased
+en	rebasing	רקנשדןמע	rebasing
+en	renderless	רקמגקרךקדד	renderless
+en	retryable	רקארטשנךק	retryable
+en	runtimes	רומאןצקד	runtimes
+en	rustup	רודאופ	rustup
+en	sanitizers	דשמןאןזקרד	sanitizers
+en	screenshot	דברקקמדיםא	screenshot
+en	screenshots	דברקקמדיםאד	screenshots
+en	sdk	דגל	sdk
+en	serializer	דקרןשךןזקר	serializer
+en	serializers	דקרןשךןזקרד	serializers
+en	shellcheck	דיקךךביקבל	shellcheck
+en	singleflight	דןמעךקכךןעיא	singleflight
+en	smtp	דצאפ	smtp
+en	solidjs	דםךןגחד	solidjs
+en	sourcemap	דםורבקצשפ	sourcemap
+en	sourcemaps	דםורבקצשפד	sourcemaps
+en	sql	ד/ך	sql
+en	ssh	דדי	ssh
+en	ssl	דדך	ssl
+en	stylesheet	דאטךקדיקקא	stylesheet
+en	stylesheets	דאטךקדיקקאד	stylesheets
+en	supabase	דופשנשדק	supabase
+en	symlink	דטצךןמל	symlink
+en	symlinks	דטצךןמלד	symlinks
+en	syscall	דטדבשךך	syscall
+en	systemd	דטדאקצג	systemd
+en	tailcall	אשןךבשךך	tailcall
+en	tcp	אבפ	tcp
+en	templating	אקצפךשאןמע	templating
+en	tensorflow	אקמדםרכךם'	tensorflow
+en	timeseries	אןצקדקרןקד	timeseries
+en	tls	אךד	tls
+en	tokenization	אםלקמןזשאןםמ	tokenization
+en	tokenizer	אםלקמןזקר	tokenizer
+en	tokenizers	אםלקמןזקרד	tokenizers
+en	toolchains	אםםךבישןמד	toolchains
+en	treeview	ארקקהןק'	treeview
+en	turborepo	אורנםרקפם	turborepo
+en	typecheck	אטפקביקבל	typecheck
+en	typechecking	אטפקביקבלןמע	typechecking
+en	typedef	אטפקגקכ	typedef
+en	typehint	אטפקיןמא	typehint
+en	typesafe	אטפקדשכק	typesafe
+en	typesafety	אטפקדשכקאט	typesafety
+en	typeshed	אטפקדיקג	typeshed
+en	typespec	אטפקדפקב	typespec
+en	unmarshal	ומצשרדישך	unmarshal
+en	unmarshalling	ומצשרדישךךןמע	unmarshalling
+en	upsert	ופדקרא	upsert
+en	upserts	ופדקראד	upserts
+en	utf	ואכ	utf
+en	uuid	ווןג	uuid
+en	uuids	ווןגד	uuids
+en	venv	הקמה	venv
+en	vercel	הקרבקך	vercel
+en	virtualenv	הןראושךקמה	virtualenv
+en	virtualization	הןראושךןזשאןםמ	virtualization
+en	vuejs	הוקחד	vuejs
+en	wasm	'שדצ	wasm
+en	webassembly	'קנשדדקצנךט	webassembly
+en	webauthn	'קנשואימ	webauthn
+en	webgpu	'קנעפו	webgpu
+en	webrtc	'קנראב	webrtc
+en	werkzeug	'קרלזקוע	werkzeug
+en	wireguard	'ןרקעושרג	wireguard
+en	worktree	'םרלארקק	worktree
+en	worktrees	'םרלארקקד	worktrees
+en	wsgi	'דען	wsgi
+en	xorg	סםרע	xorg
+en	xss	סדד	xss
+en	zsh	זדי	zsh
+en	zstd	זדאג	zstd
+he	autocompletion	שואםבםצפךקאןםמ	autocompletion
+he	autoscaling	שואםדבשךןמע	autoscaling
+he	backpressure	נשבלפרקדדורק	backpressure
+he	codegen	בםגקעקמ	codegen
+he	devcontainer	גקהבםמאשןמקר	devcontainer
+he	goroutine	עםרםואןמק	goroutine
+he	monorepo	צםמםרקפם	monorepo
+he	tokenizer	אםלקמןזקר	tokenizer
+he	worktree	'םרלארקק	worktree
+he	webgpu	'קנעפו	webgpu
+he	opentelemetry	םפקמאקךקצקארט	opentelemetry
+
+# Productive Hebrew prefixes absent from the embedded dictionary.
+en	fngrf,	כמערכת	כמערכת
+he	fngrf,	כמערכת	כמערכת
+en	u,ufbh,	ותוכנית	ותוכנית
+he	u,ufbh,	ותוכנית	ותוכנית
+en	f,ufbh,	כתוכנית	כתוכנית
+he	f,ufbh,	כתוכנית	כתוכנית
+en	a,ufbh,	שתוכנית	שתוכנית
+he	a,ufbh,	שתוכנית	שתוכנית
+en	fjacui	כחשבון	כחשבון
+he	fjacui	כחשבון	כחשבון
+en	ajacui	שחשבון	שחשבון
+he	ajacui	שחשבון	שחשבון
+en	fscrho	כדברים	כדברים
+he	fscrho	כדברים	כדברים
+en	fgcusv	כעבודה	כעבודה
+he	fgcusv	כעבודה	כעבודה
+
+# Broader opening-typo and prefixed-Hebrew coverage.
+en	overnment	םהקרמצקמא	government
+he	overnment	םהקרמצקמא	government
+en	zcomputer	זבםצפואקר	computer
+he	zcomputer	זבםצפואקר	computer
+en	cneks,	במקלדת	במקלדת
+he	cneks,	במקלדת	במקלדת
+en	cneks,	במקלדת	במקלדת			layout-only
+en	ucneks,	ובמקלדת	ובמקלדת
+he	ucneks,	ובמקלדת	ובמקלדת
+en	ucneks,	ובמקלדת	ובמקלדת			layout-only
+en	unjac	ומחשב	ומחשב
+he	unjac	ומחשב	ומחשב
+en	unjac	ומחשב	ומחשב			layout-only
+en	nv,ufbv	מהתוכנה	מהתוכנה
+he	nv,ufbv	מהתוכנה	מהתוכנה
+en	nv,ufbv	מהתוכנה	מהתוכנה			layout-only
+en	c,hehhv	בתיקייה	בתיקייה
+he	c,hehhv	בתיקייה	בתיקייה
+en	c,hehhv	בתיקייה	בתיקייה			layout-only
+
+# Synthetic chat regressions: names, mixed scripts, language switches, and layout-only mode.
+en	hello	יקךךם	hello		chat-names	full
+en	Ori	םרן	Ori		chat-names	full
+en	recieve	רקבןקהק	receive		chat-names	full
+en	github	עןאיונ	github		chat-names	full
+he	akuo	שלום	שלום		chat-names	full
+he	,usv	תודה	תודה		chat-names	full
+en	Supino	דופןמם	Supino		chat-names	full
+en	user_id	ודקר_ןג	user_id		chat-names	full
+en	hello	יקךךם	hello		chat-layout-only	layout-only
+en	recieve	רקבןקהק	recieve		chat-layout-only	layout-only
+en	akuo	שלום	שלום		chat-layout-only	layout-only
+he	keyboard	לקטנםשרג	keyboard		chat-layout-only	layout-only
+en	config.toml	בםמכןעץאםצך	config.toml		chat-layout-only	layout-only
+he	akuo	שלום	שלום		chat-switches	full
+en	hello	יקךךם	hello		chat-switches	full
+he	,usv	תודה	תודה		chat-switches	full
+en	NASA	משדש	NASA		chat-switches	full
+en	recieve	רקבןקהק	receive		chat-switches	full
+en	Ori,	םרןת	Ori,
+en	Supino!	דופןמם!	Supino!
+en	Sami.	דשצןץ	Sami.
+en	Claude?	בךשוגק?	Claude?
+en	user_id2	ודקר_ןג2	user_id2
+en	release_v2	רקךקשדק_ה2	release_v2
+en	helloשלום	helloשלום	helloשלום
+en	שלוםworld	שלוםworld	שלוםworld
+
+# Phrase disambiguation requires the preceding word in the same field.
+en	data	גשאש	data		phrase-base	full
+en	baye	נשטק	base		phrase-base	full
+en	baye	נשטק	baye
+en	data	גשאש	data		phrase-layout-only	layout-only
+en	baye	נשטק	baye		phrase-layout-only	layout-only
+en	data	גשאש	data		phrase-wrong-layout	full
+he	baye	נשטק	base		phrase-wrong-layout	full
+
+# Multiple typos including an edited opening; shared spelling/layout recovery.
+en	ommunicaton	םצצומןבשאםמ	communication
+he	ommunicaton	םצצומןבשאםמ	communication
+en	xcommuncation	סבםצצומבשאןםמ	communication
+he	xcommuncation	סבםצצומבשאןםמ	communication
+en	vommuncation	הםצצומבשאןםמ	communication
+he	vommuncation	הםצצומבשאןםמ	communication
+en	wonqerqxl	'םמ/קר/סך	wonderful
+he	wonqerqxl	'םמ/קר/סך	wonderful
+# Supported three-letter Hebrew prefix stacks: recover and preserve.
+en	uakneks,	ושלמקלדת	ושלמקלדת
+he	uakneks,	ושלמקלדת	ושלמקלדת
+en	ufanjac	וכשמחשב	וכשמחשב
+he	ufanjac	וכשמחשב	וכשמחשב
+en	favneks,	כשהמקלדת	כשהמקלדת
+he	favneks,	כשהמקלדת	כשהמקלדת
+
+# Broader reach: six-letter cheap slips, eight-letter multi-typos, distant openings, rarer targets.
+en	helooo	יקךםםם	hello
+he	helooo	יקךםםם	hello
+en	comqztxr	בםצ/זאסר	computer
+he	comqztxr	בםצ/זאסר	computer
+en	pomputer	פםצפואקר	computer
+he	pomputer	פםצפואקר	computer
+en	authentcation	שואיקמאבשאןםמ	authentication
+he	authentcation	שואיקמאבשאןםמ	authentication
+en	configuraton	בםמכןעורשאםמ	configuration
+he	configuraton	בםמכןעורשאםמ	configuration
+en	compatibilty	בםצפשאןנןךאט	compatibility
+he	compatibilty	בםצפשאןנןךאט	compatibility
+en	ufavneks,	וכשהמקלדת	וכשהמקלדת
+he	ufavneks,	וכשהמקלדת	וכשהמקלדת
+en	ufaknjac	וכשלמחשב	וכשלמחשב
+he	ufaknjac	וכשלמחשב	וכשלמחשב
+en	kfavneks,	לכשהמקלדת	לכשהמקלדת
+he	kfavneks,	לכשהמקלדת	לכשהמקלדת
+
+# Typo classes at word boundaries and inside words; contractions and possessives.
+en	kkeyboard	ללקטנםשרג	keyboard
+he	kkeyboard	ללקטנםשרג	keyboard
+en	jeyboard	חקטנםשרג	keyboard
+he	jeyboard	חקטנםשרג	keyboard
+en	ekyboard	קלטנםשרג	keyboard
+he	ekyboard	קלטנםשרג	keyboard
+en	keybard	לקטנשרג	keyboard
+he	keybard	לקטנשרג	keyboard
+en	keybxoard	לקטנסםשרג	keyboard
+he	keybxoard	לקטנסםשרג	keyboard
+en	keybooard	לקטנםםשרג	keyboard
+he	keybooard	לקטנםםשרג	keyboard
+en	keybiard	לקטנןשרג	keyboard
+he	keybiard	לקטנןשרג	keyboard
+en	keybaord	לקטנשםרג	keyboard
+he	keybaord	לקטנשםרג	keyboard
+en	keyboar	לקטנםשר	keyboard
+he	keyboar	לקטנםשר	keyboard
+en	keyboardx	לקטנםשרגס	keyboard
+he	keyboardx	לקטנםשרגס	keyboard
+en	keyboardd	לקטנםשרגג	keyboard
+he	keyboardd	לקטנםשרגג	keyboard
+en	keyboars	לקטנםשרד	keyboard
+he	keyboars	לקטנםשרד	keyboard
+en	keyboadr	לקטנםשגר	keyboard
+he	keyboadr	לקטנםשגר	keyboard
+en	keyboarrdx	לקטנםשררגס	keyboard
+he	keyboarrdx	לקטנםשררגס	keyboard
+en	xxcomputer	ססבםצפואקר	computer
+he	xxcomputer	ססבםצפואקר	computer
+en	xocmputer	סםבצפואקר	computer
+he	xocmputer	סםבצפואקר	computer
+en	xcxomputer	סבסםצפואקר	computer
+he	xcxomputer	סבסםצפואקר	computer
+en	xcmputer	סבצפואקר	computer
+he	xcmputer	סבצפואקר	computer
+en	xcmoputer	סבצםפואקר	computer
+he	xcmoputer	סבצםפואקר	computer
+en	xcoxmputer	סבםסצפואקר	computer
+he	xcoxmputer	סבםסצפואקר	computer
+en	xcoputer	סבםפואקר	computer
+he	xcoputer	סבםפואקר	computer
+en	zxomputer	זסםצפואקר	computer
+he	zxomputer	זסםצפואקר	computer
+en	zmoputer	זצםפואקר	computer
+he	zmoputer	זצםפואקר	computer
+en	zoxmputer	זםסצפואקר	computer
+he	zoxmputer	זםסצפואקר	computer
+en	oevrnment	םקהרמצקמא	government
+he	oevrnment	םקהרמצקמא	government
+en	odnerful	םגמקרכוך	wonderful
+he	odnerful	םגמקרכוך	wonderful
+en	xxkeyboard	ססלקטנםשרג	keyboard
+he	xxkeyboard	ססלקטנםשרג	keyboard
+en	xekyboard	סקלטנםשרג	keyboard
+he	xekyboard	סקלטנםשרג	keyboard
+en	xkexyboard	סלקסטנםשרג	keyboard
+he	xkexyboard	סלקסטנםשרג	keyboard
+en	xkeboard	סלקנםשרג	keyboard
+he	xkeboard	סלקנםשרג	keyboard
+en	zyeboard	זטקנםשרג	keyboard
+he	zyeboard	זטקנםשרג	keyboard
+en	zebyoard	זקנטםשרג	keyboard
+he	zebyoard	זקנטםשרג	keyboard
+en	zeceive	זקבקןהק	receive
+he	zeceive	זקבקןהק	receive
+en	xxtomorrow	ססאםצםררם'	tomorrow
+he	xxtomorrow	ססאםצםררם'	tomorrow
+en	computerx	בםצפואקרס	computer
+he	computerx	בםצפואקרס	computer
+en	communicationx	בםצצומןבשאןםמס	communication
+he	communicationx	בםצצומןבשאןםמס	communication
+en	governmentx	עםהקרמצקמאס	government
+he	governmentx	עםהקרמצקמאס	government
+en	languagex	ךשמעושעקס	language
+he	languagex	ךשמעושעקס	language
+en	don't	גםמ,א	don't
+he	don't	גםמ,א	don't
+en	couldn't	בםוךגמ,א	couldn't
+he	couldn't	בםוךגמ,א	couldn't
+en	can't	בשמ,א	can't
+he	can't	בשמ,א	can't
+en	won't	'םמ,א	won't
+he	won't	'םמ,א	won't
+en	shan't	דישמ,א	shan't
+he	shan't	דישמ,א	shan't
+en	we're	'ק,רק	we're
+he	we're	'ק,רק	we're
+en	you'll	טםו,ךך	you'll
+he	you'll	טםו,ךך	you'll
+en	keyboard's	לקטנםשרג,ד	keyboard's
+he	keyboard's	לקטנםשרג,ד	keyboard's
+en	organisation's	םרעשמןדשאןםמ,ד	organisation's
+he	organisation's	םרעשמןדשאןםמ,ד	organisation's
+en	i'm	ן,צ	i'm
+he	i'm	ן,צ	i'm
+en	i'd	ן,ג	i'd
+he	i'd	ן,ג	i'd
+en	i'll	ן,ךך	i'll
+he	i'll	ן,ךך	i'll
+en	i've	ן,הק	i've
+he	i've	ן,הק	i've
+en	I'm	ן,צ	I'm
+he	I'm	ן,צ	I'm
+en	I'd	ן,ג	I'd
+he	I'd	ן,ג	I'd
+en	I'll	ן,ךך	I'll
+he	I'll	ן,ךך	I'll
+en	I've	ן,הק	I've
+he	I've	ן,הק	I've
+en	yarden	טשרגקמ	yarden
+en	compute	בםצפואק	compute
+en	hell	יקךך	hell
+en	clas's	בךשד,ד	clas's
+en	keyboard''s	לקטנםשרג,,ד	keyboard''s
+en	keyboard_1's	לקטנםשרג_1,ד	keyboard_1's
+en	don't	גםמ,א	don't			layout-only
+he	don't	גםמ,א	don't			layout-only
+en	keyboard's	לקטנםשרג,ד	keyboard's			layout-only
+he	keyboard's	לקטנםשרג,ד	keyboard's			layout-only
+en	I'm	ן,צ	I'm			layout-only
+he	I'm	ן,צ	I'm			layout-only
+
+# Automatic Hebrew spelling: clear repairs and protected real words.
+he	,ussv	תודדה	תודה
+he	gcussv	עבודדה	עבודה
+he	tbaaho	אנששים	אנשים
+he	njacho	מחשבים	מחשבים
+he	xpur	ספור	ספור
+
+# Apostrophe-aware spelling preserves suffixes, case, punctuation, and protections.
+en	recieve's	רקבןקהק,ד	receive's
+he	recieve's	רקבןקהק,ד	receive's
+en	Recieve's!	רקבןקהק,ד!	Receive's!
+he	Recieve's!	רקבןקהק,ד!	Receive's!
+en	adress's,	שגרקדד,דת	address's,
+he	adress's,	שגרקדד,דת	address's,
+en	RECIEVE'S	רקבןקהק,ד	RECIEVE'S
+en	recieve've	רקבןקהק,הק	recieve've
+en	recieve''s	רקבןקהק,,ד	recieve''s
+en	recieve_1's	רקבןקהק_1,ד	recieve_1's
+en	https://recieve's	יאאפד:..רקבןקהק,ד	https://recieve's
+en	recieve's	רקבןקהק,ד	recieve's			layout-only
+he	recieve's	רקבןקהק,ד	רקבןקהק,ד			layout-only
+
+# Reviewed spelling families, unranked derivatives, and three-letter ordering slips.
+en	cemetary	בקצקאשרט	cemetery
+he	cemetary	בקצקאשרט	cemetery
+en	committment	בםצצןאאצקמא	commitment
+he	committment	בםצצןאאצקמא	commitment
+en	happend	ישפפקמג	happened
+he	happend	ישפפקמג	happened
+en	immediatly	ןצצקגןשאךט	immediately
+he	immediatly	ןצצקגןשאךט	immediately
+en	indispensible	ןמגןדפקמדןנךק	indispensable
+he	indispensible	ןמגןדפקמדןנךק	indispensable
+en	irresistable	ןררקדןדאשנךק	irresistible
+he	irresistable	ןררקדןדאשנךק	irresistible
+en	langauge	ךשמעשועק	language
+he	langauge	ךשמעשועק	language
+en	millenium	צןךךקמןוצ	millennium
+he	millenium	צןךךקמןוצ	millennium
+en	noticable	מםאןבשנךק	noticeable
+he	noticable	מםאןבשנךק	noticeable
+en	prefered	פרקכקרקג	preferred
+he	prefered	פרקכקרקג	preferred
+en	refered	רקכקרקג	referred
+he	refered	רקכקרקג	referred
+en	relevent	רקךקהקמא	relevant
+he	relevent	רקךקהקמא	relevant
+en	rythm	רטאיצ	rhythm
+he	rythm	רטאיצ	rhythm
+en	seige	דקןעק	siege
+he	seige	דקןעק	siege
+en	tounge	אםומעק	tongue
+he	tounge	אםומעק	tongue
+en	twelth	א'קךאי	twelfth
+he	twelth	א'קךאי	twelfth
+en	withdrawl	'ןאיגרש'ך	withdrawal
+he	withdrawl	'ןאיגרש'ך	withdrawal
+en	seperated	דקפקרשאקג	separated
+he	seperated	דקפקרשאקג	separated
+en	accomodating	שבבםצםגשאןמע	accommodating
+he	accomodating	שבבםצםגשאןמע	accommodating
+en	committments	בםצצןאאצקמאד	commitments
+he	committments	בםצצןאאצקמאד	commitments
+en	langauges	ךשמעשועקד	languages
+he	langauges	ךשמעשועקד	languages
+en	mispelling	צןדפקךךןמע	misspelling
+he	mispelling	צןדפקךךןמע	misspelling
+en	mispelled	צןדפקךךקג	misspelled
+he	mispelled	צןדפקךךקג	misspelled
+en	unhelpfull	ומיקךפכוךך	unhelpful
+he	unhelpfull	ומיקךפכוךך	unhelpful
+en	probeml	פרםנקצך	problem
+he	probeml	פרםנקצך	problem
+en	ropblem	רםפנךקצ	problem
+he	ropblem	רםפנךקצ	problem
+en	Mispelling!	צןדפקךךןמע!	Misspelling!
+he	Mispelling!	צןדפקךךןמע!	Misspelling!
+en	Langauges,	ךשמעשועקדת	Languages,
+he	Langauges,	ךשמעשועקדת	Languages,
+
+# Reviewed short transpositions apply only in the English layout.
+en	hte	יאק	the
+en	Hte!	יאק!	The!
+he	hte	יאק	יאק
+en	hte	יאק	hte			layout-only
+
+# Valid variants, names, identifiers, and capitalized initialisms stay protected.
+en	publically	פונךןבשךךט	publically
+en	miniscule	צןמןדבוךק	miniscule
+en	calender	בשךקמגקר	calender
+en	dependant	גקפקמגשמא	dependant
+en	nad	משג	nad
+en	adn	שגמ	adn
+en	hte_id	יאק_ןג	hte_id
+en	MISPELLING	צןדפקךךןמע	MISPELLING
+en	LANGAUGE	ךשמעשועק	LANGAUGE
+en	misspelling	צןדדפקךךןמע	misspelling
+
+# Long Hebrew stems recover two cheap slips, including prefixed forms.
+he	thbyrrbyy	אינטררנטט	אינטרנט
+en	thbyrrbyy	אינטררנטט	אינטרנט
+he	ngfru,,	מעכרותת	מערכות
+en	ngfru,,	מעכרותת	ngfru,,
+he	ufanjaaccho	וכשמחששבבים	וכשמחשבים
+en	ufanjaaccho	וכשמחששבבים	וכשמחשבים
+he	njaaccho	מחששבבים	מחששבבים
+he	thbyrrbbyy	אינטררננטט	אינטררננטט

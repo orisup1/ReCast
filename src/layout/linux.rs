@@ -4,9 +4,9 @@
 //! There is no such thing as "the Linux way" to do this. X11 has one (the XKB
 //! group, settable by anyone who can open the display) and Wayland deliberately
 //! has none — the compositor owns the keymap, and each one exposes its own
-//! private way to ask. So this module holds five [`Backend`]s, probed once at
-//! startup in order of specificity, and every one of them answers the same
-//! three questions:
+//! private way to ask. So this module holds five [`Backend`]s, probed in order
+//! of specificity, with unavailable sessions retried after startup. Every one
+//! of them answers the same three questions:
 //!
 //! * [`Backend::names`] — the layouts configured, in order
 //! * [`Backend::current`] — which of them is live
@@ -27,18 +27,58 @@
 //! **6.3 ms** against **0.11 ms** for the same question over Hyprland's socket,
 //! and a correction that changes layout asks twice. Hyprland, sway and X11
 //! therefore talk to the session directly — two socket protocols and a bit of
-//! Xlib. GNOME and KDE do shell out, because their answer lives behind D-Bus
-//! and a D-Bus client is a great deal more code than these two calls are worth;
-//! the cache is what makes that survivable.
+//! Xlib. GNOME on X11 also uses live XKB; its configured-source diagnostics and
+//! KDE's D-Bus backend use subprocesses. The cache bounds those query costs.
 
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::{language_of_keymap, set_layout_cache, LayoutSwitch};
 use crate::types::Language;
 
+// Fixed physical mappings cannot safely interpret arbitrary XKB variants.
+fn compatible_keymap(name: &str) -> Option<Language> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "us" | "english (us)" => Some(Language::English),
+        "il" | "hebrew" => Some(Language::Hebrew),
+        _ => None,
+    }
+}
+fn with_variants(layouts: &str, variants: &str) -> Vec<String> {
+    let variants: Vec<_> = variants.split(',').collect();
+    layouts
+        .split(',')
+        .enumerate()
+        .map(|(index, layout)| {
+            match variants
+                .get(index)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+            {
+                Some(variant) => format!("{}({variant})", layout.trim()),
+                None => layout.trim().to_owned(),
+            }
+        })
+        .collect()
+}
+#[test]
+fn variants_never_borrow_the_base_mapping() {
+    assert_eq!(with_variants("us,il", "dvorak,"), ["us(dvorak)", "il"]);
+    for name in [
+        "us(dvorak)",
+        "us+colemak",
+        "English (US, intl., with dead keys)",
+        "il(biblical)",
+        "English (US) custom",
+    ] {
+        assert_eq!(compatible_keymap(name), None);
+    }
+    assert_eq!(compatible_keymap("us"), Some(Language::English));
+    assert_eq!(compatible_keymap("Hebrew"), Some(Language::Hebrew));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// The backend, chosen once
+// The backend, retained once its session is available
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,7 +89,7 @@ enum Backend {
     Sway,
     /// KDE Plasma's `org.kde.KeyboardLayouts` D-Bus interface, via a helper.
     Kde,
-    /// GNOME's `org.gnome.desktop.input-sources` GSettings keys.
+    /// GNOME's live XKB group on X11, with source diagnostics on Wayland.
     Gnome,
     /// The XKB group, for any X11 session — including GNOME and KDE on X11,
     /// and every window manager that has no opinion of its own.
@@ -59,17 +99,84 @@ enum Backend {
     None,
 }
 
-/// Which backend this session gets, decided once.
+const BACKEND_RETRY: Duration = Duration::from_secs(1);
+
+struct BackendProbe {
+    chosen: Option<Backend>,
+    attempted: Option<Instant>,
+}
+
+impl BackendProbe {
+    fn resolve(&mut self, now: Instant, probe: impl FnOnce() -> Option<Backend>) -> Backend {
+        if let Some(chosen) = self.chosen {
+            return chosen;
+        }
+        if self
+            .attempted
+            .is_some_and(|attempted| now.duration_since(attempted) < BACKEND_RETRY)
+        {
+            return Backend::None;
+        }
+        self.attempted = Some(now);
+        self.chosen = probe();
+        self.chosen.unwrap_or(Backend::None)
+    }
+
+    fn explicitly_disabled(&self) -> bool {
+        self.chosen == Some(Backend::None)
+    }
+}
+
+/// Session hints remain authoritative while the compositor creates its socket;
+/// an already-running XWayland server cannot manage its Wayland layout state.
+/// Unknown Wayland sessions must not fall back to XWayland's unrelated XKB state.
+fn auto_backend(
+    desktop: &str,
+    session: Option<&str>,
+    hyprland: bool,
+    sway: bool,
+    kde: bool,
+    x11: impl FnOnce() -> bool,
+) -> Option<Backend> {
+    let desktop = desktop.to_uppercase();
+    if hyprland || desktop.contains("HYPRLAND") {
+        Some(Backend::Hyprland)
+    } else if sway || desktop.contains("SWAY") {
+        Some(Backend::Sway)
+    } else if kde || desktop.contains("KDE") {
+        Some(Backend::Kde)
+    } else if desktop.contains("GNOME") || desktop.contains("UNITY") {
+        Some(Backend::Gnome)
+    } else if session != Some("wayland") && x11() {
+        Some(Backend::X11)
+    } else {
+        None
+    }
+}
+
+/// Which backend this session gets. Retry an unavailable session rather than
+/// making a compositor startup race disable layout correction until restart.
 ///
 /// Order is specificity, not preference: a compositor that owns the keymap has
 /// to be asked in its own language, and X11 is the catch-all underneath because
 /// XKB works under any X server whatever is drawing the windows. GNOME and KDE
-/// come before it even on X11, because they manage input sources *above* XKB —
-/// setting the group under GNOME works for exactly as long as it takes
-/// gnome-shell to set it back.
+/// retain their own backend identities even on X11. GNOME uses the live XKB
+/// group there, while KDE exposes its layout policy over D-Bus.
 fn backend() -> Backend {
-    static BACKEND: OnceLock<Backend> = OnceLock::new();
-    *BACKEND.get_or_init(|| {
+    backend_state().0
+}
+
+/// The second value distinguishes an explicit off setting from an unavailable
+/// session, whose watcher and discovery must remain eligible to recover.
+fn backend_state() -> (Backend, bool) {
+    static BACKEND: Mutex<BackendProbe> = Mutex::new(BackendProbe {
+        chosen: None,
+        attempted: None,
+    });
+    let Ok(mut state) = BACKEND.lock() else {
+        return (Backend::None, false);
+    };
+    let chosen = state.resolve(Instant::now(), || {
         // An escape hatch for a session the probe reads wrongly — a compositor
         // that sets XDG_CURRENT_DESKTOP to something unexpected, or an X11
         // session under a desktop that also answers on D-Bus. Named rather than
@@ -85,7 +192,7 @@ fn backend() -> Backend {
                 _ => None,
             };
             match chosen {
-                Some(b) => return b,
+                Some(b) => return Some(b),
                 None => eprintln!(
                     "Unknown layout backend {forced:?} — expected one of \
                      hyprland, sway, kde, gnome, x11, none. Detecting instead."
@@ -93,23 +200,23 @@ fn backend() -> Backend {
             }
         }
 
-        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
-            .unwrap_or_default()
-            .to_uppercase();
-        if hypr::available() {
-            Backend::Hyprland
-        } else if sway::available() {
-            Backend::Sway
-        } else if desktop.contains("KDE") || std::env::var_os("KDE_FULL_SESSION").is_some() {
-            Backend::Kde
-        } else if desktop.contains("GNOME") || desktop.contains("UNITY") {
-            Backend::Gnome
-        } else if x11::available() {
-            Backend::X11
-        } else {
-            Backend::None
-        }
-    })
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        let session = std::env::var("XDG_SESSION_TYPE").ok();
+        let configured = |key| std::env::var_os(key).is_some_and(|value| !value.is_empty());
+        let hyprland = hypr::available() || configured("HYPRLAND_INSTANCE_SIGNATURE");
+        let sway = sway::available()
+            || configured("SWAYSOCK")
+            || (configured("I3SOCK") && session.as_deref() == Some("wayland"));
+        auto_backend(
+            &desktop,
+            session.as_deref(),
+            hyprland,
+            sway,
+            std::env::var_os("KDE_FULL_SESSION").is_some(),
+            x11::available,
+        )
+    });
+    (chosen, state.explicitly_disabled())
 }
 
 impl Backend {
@@ -134,10 +241,18 @@ impl Backend {
             // more direct than an index — and, unlike an index, it is right
             // even when a device has its own layout list.
             Backend::Hyprland => hypr::current(),
+            Backend::Gnome if !gnome::uses_x11() => {
+                let snapshot = super::desktop::request(serde_json::json!({"action":"layout"}))?;
+                compatible_keymap(
+                    snapshot["names"]
+                        .get(snapshot["current"].as_u64()? as usize)?
+                        .as_str()?,
+                )
+            }
             _ => {
                 let names = self.names()?;
                 let index = self.current_index()?;
-                language_of_keymap(names.get(index)?)
+                compatible_keymap(names.get(index)?)
             }
         }
     }
@@ -195,7 +310,8 @@ impl Backend {
             Backend::Hyprland => "Hyprland (control socket)",
             Backend::Sway => "sway (i3 IPC socket)",
             Backend::Kde => "KDE Plasma (D-Bus)",
-            Backend::Gnome => "GNOME (GSettings input-sources)",
+            Backend::Gnome if gnome::uses_x11() => "GNOME (live XKB group)",
+            Backend::Gnome => "GNOME (optional ReCast Shell extension required on Wayland)",
             Backend::X11 => "X11 (XKB group)",
             Backend::None => "none — layout switching unavailable",
         }
@@ -213,6 +329,21 @@ pub fn describe_backend() -> String {
                 .filter(|n| language_of_keymap(n).is_some())
                 .count();
             let mut out = format!("{} — layouts: {}", b.label(), names.join(", "));
+            if names
+                .iter()
+                .any(|name| language_of_keymap(name).is_some() && compatible_keymap(name).is_none())
+            {
+                out.push_str("  ! Unsupported keyboard variant: fixed mappings require standard US and Hebrew.");
+            }
+            if matches!(b, Backend::Gnome | Backend::Kde)
+                && std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+            {
+                out.push_str(if crate::settings::flag("RECAST_DESKTOP_HELPER", false) {
+                    "  AT-SPI helper enabled; correction requires an accessible focused control."
+                } else {
+                    "  ! Focus unavailable: install AT-SPI/PyGObject and enable RECAST_DESKTOP_HELPER=1."
+                });
+            }
             if known < 2 {
                 out.push_str(
                     "  ! ReCast needs an English and a Hebrew layout configured; \
@@ -229,13 +360,11 @@ pub fn describe_backend() -> String {
 // The two shared operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Focus identity for pending replacements. X11 and the two socket backends
-/// expose it; GNOME/KDE Wayland have no equivalent public query here.
-/// Those sessions use mouse/shortcut cancellation; add their native
-/// focus protocol when one is available, rather than querying XWayland.
+/// Native window identity plus optional AT-SPI control identity for pending edits.
+/// GNOME/KDE Wayland use the accessibility helper rather than querying XWayland.
 #[derive(PartialEq)]
 pub struct Focus {
-    id: String,
+    pub(crate) id: String,
     pub app: Option<String>,
 }
 
@@ -243,11 +372,24 @@ pub struct Focus {
 const FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
 
 pub fn focus_supported() -> bool {
-    matches!(backend(), Backend::Hyprland | Backend::Sway)
-        || std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
+    matches!(
+        backend(),
+        Backend::Hyprland | Backend::Sway | Backend::Gnome | Backend::Kde
+    ) || std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
 }
 
 pub fn focused_target() -> Option<Focus> {
+    let native = native_focused_target();
+    match (native, super::desktop::focus()) {
+        (Some(mut native), Some(accessible)) => {
+            native.id.push_str(&format!("/{}", accessible.id));
+            Some(native)
+        }
+        (native, accessible) => native.or(accessible),
+    }
+}
+
+fn native_focused_target() -> Option<Focus> {
     match backend() {
         Backend::Hyprland => {
             let reply: serde_json::Value = serde_json::from_str(&hypr::request_with_timeout(
@@ -281,7 +423,7 @@ pub fn query_layout() -> Option<Language> {
 pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     // Already on the requested layout. Nothing to send — and, unlike before,
     // this is reported as the success it is.
-    if super::current_layout() == Some(lang) {
+    if super::fresh_layout() == Some(lang) {
         return LayoutSwitch::AlreadyThere;
     }
 
@@ -294,7 +436,7 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     };
     let Some(index) = names
         .iter()
-        .position(|n| language_of_keymap(n) == Some(lang))
+        .position(|n| compatible_keymap(n) == Some(lang))
     else {
         // The layout simply is not installed. Nothing to do about it here, and
         // nothing to say about it every time either — the complaint belongs in
@@ -348,10 +490,9 @@ type Signals = Box<dyn Iterator<Item = ()> + Send>;
 /// here, on a thread nobody is waiting on, and only when something has actually
 /// changed.
 ///
-/// Failure is quiet and safe by construction. A backend with no subscription, a
-/// compositor that restarts and closes the socket, a `gsettings` that is not
-/// there — all of them end this thread, and what is left is the 300 ms cache
-/// that was the whole story before. Nothing here is load-bearing.
+/// Disconnected notification sources are reopened with a capped backoff. A
+/// failed refresh also clears the old answer, including when the user selects
+/// a third language. The ordinary cache remains the fallback between retries.
 pub fn spawn_watcher() {
     let spawned = std::thread::Builder::new()
         .name("recast-layout".into())
@@ -362,16 +503,23 @@ pub fn spawn_watcher() {
 }
 
 fn watch_forever() {
-    let Some(signals) = backend().subscribe() else {
-        return;
-    };
-    for () in signals {
-        // Ask in the ordinary way. The cache is not consulted on this path —
-        // `query_layout` goes straight to the backend — so this is the fresh
-        // answer, taken at the one moment it is known to have changed.
-        if let Some(lang) = query_layout() {
-            set_layout_cache(lang);
+    let mut retry = Duration::from_secs(1);
+    loop {
+        let (backend, disabled) = backend_state();
+        if matches!(backend, Backend::X11 | Backend::Gnome) || disabled {
+            return;
         }
+        if let Some(signals) = backend.subscribe() {
+            // Reconnecting can miss the change that closed the old stream.
+            let _ = super::fresh_layout();
+            for () in signals {
+                retry = Duration::from_secs(1);
+                let _ = super::fresh_layout();
+            }
+        }
+        super::invalidate();
+        std::thread::sleep(retry);
+        retry = (retry * 2).min(Duration::from_secs(5));
     }
 }
 
@@ -401,6 +549,15 @@ impl<R: std::io::BufRead> Iterator for Lines<R> {
             if (self.interesting)(&line) {
                 return Some(());
             }
+        }
+    }
+}
+
+impl<R> Drop for Lines<R> {
+    fn drop(&mut self) {
+        if let Some(child) = self._child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -515,58 +672,6 @@ fn command_output(command: &mut std::process::Command) -> Option<String> {
 const INJECTOR: &str = "recast-injector";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Minimal JSON field access, shared by the Hyprland and sway backends.
-//
-// Both speak JSON and neither reply needs more than a flat field out of an
-// object: pulling in a JSON crate to read three keys would be the largest
-// dependency in the program.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The value of a flat `"key": "value"` string field inside one JSON object.
-fn json_str<'a>(block: &'a str, key: &str) -> Option<&'a str> {
-    let at = block.find(&format!("\"{key}\""))?;
-    let rest = &block[at + key.len() + 2..];
-    let open = rest.find('"')?;
-    let rest = &rest[open + 1..];
-    let close = rest.find('"')?;
-    Some(&rest[..close])
-}
-
-/// The value of a flat `"key": 3` numeric field inside one JSON object.
-fn json_num(block: &str, key: &str) -> Option<usize> {
-    let at = block.find(&format!("\"{key}\""))?;
-    let rest = &block[at + key.len() + 2..];
-    let digits: String = rest
-        .trim_start_matches([':', ' '])
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
-}
-
-/// The elements of a flat `"key": ["a", "b"]` string-array field.
-fn json_str_array(block: &str, key: &str) -> Option<Vec<String>> {
-    let at = block.find(&format!("\"{key}\""))?;
-    let rest = &block[at..];
-    let open = rest.find('[')?;
-    let close = rest.find(']')?;
-    if close < open {
-        return None;
-    }
-    Some(
-        rest[open + 1..close]
-            .split(',')
-            .filter_map(|item| {
-                let item = item.trim();
-                item.strip_prefix('"')?
-                    .strip_suffix('"')
-                    .map(str::to_string)
-            })
-            .collect(),
-    )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Hyprland — the control socket
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -585,31 +690,26 @@ mod hypr {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
-    use super::{json_str, language_of_keymap, Language, INJECTOR};
+    use super::{language_of_keymap, Language, INJECTOR};
 
     /// A wedged compositor must not wedge the injection thread with it: this
     /// runs on the thread a correction is waiting on.
     const IO_TIMEOUT: Duration = Duration::from_millis(250);
 
-    fn socket_path() -> Option<&'static PathBuf> {
-        static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-        PATH.get_or_init(|| {
-            let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-            // Hyprland moved this under XDG_RUNTIME_DIR in 0.40; older builds
-            // kept it in /tmp. Both are checked so the daemon works either way.
-            let runtime = std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from);
-            [
-                runtime.map(|r| r.join("hypr").join(&sig).join(".socket.sock")),
-                Some(PathBuf::from("/tmp/hypr").join(&sig).join(".socket.sock")),
-            ]
-            .into_iter()
-            .flatten()
-            .find(|p| p.exists())
-        })
-        .as_ref()
+    fn socket_path() -> Option<PathBuf> {
+        let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+        // Do not cache a missing socket: the daemon can start before Hyprland
+        // creates it. Recheck both supported locations on each connection.
+        let runtime = std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from);
+        [
+            runtime.map(|r| r.join("hypr").join(&sig).join(".socket.sock")),
+            Some(PathBuf::from("/tmp/hypr").join(&sig).join(".socket.sock")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| p.exists())
     }
 
     /// Send one command and return the reply, or `None` if this is not a
@@ -667,63 +767,80 @@ mod hypr {
     /// Each keyboard block of a `j/devices` reply, in order, with our own
     /// injector left out.
     ///
-    /// Splitting on `{` rather than parsing is enough because the blocks are
-    /// flat, and stopping at the end of the keyboards array is what keeps the
-    /// mice and tablets below it out of the answer.
-    fn keyboards(devices_json: &str) -> impl Iterator<Item = &str> {
-        let keyboards = devices_json
-            .find("\"keyboards\"")
-            .map(|at| &devices_json[at..])
-            .unwrap_or("");
-        keyboards
-            .split('{')
-            .skip(1)
-            .take_while(|block| !block.starts_with(']'))
-            .filter(|block| json_str(block, "name") != Some(INJECTOR))
+    /// Decode the array before selecting devices: braces and escaped quotes
+    /// inside names are text, and other device arrays are not keyboards.
+    fn keyboards(devices_json: &str) -> Option<impl Iterator<Item = serde_json::Value>> {
+        let mut reply: serde_json::Value = serde_json::from_str(devices_json).ok()?;
+        let keyboards = reply.get_mut("keyboards")?.as_array_mut()?;
+        Some(
+            std::mem::take(keyboards)
+                .into_iter()
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+        )
     }
 
-    /// The active layout, read out of a `j/devices` reply.
-    ///
-    /// Deliberately not "whatever keyboard is flagged `main`". On a session with
-    /// an input method running, `main` is the *input method's own virtual
-    /// keyboard* — on the machine this was written on,
-    /// `hl-virtual-keyboard-fcitx5`. Reading it means reporting the layout of a
-    /// device nobody types on.
-    ///
-    /// So: our injector never counts, `main` is preferred among the rest, and
-    /// anything else recognizable is the fallback.
+    /// Choose one keyboard for both the live layout and its configured list.
+    /// Input methods can mark their virtual keyboard as `main` while retaining
+    /// a different layout. Prefer physical keyboards, then those configured for
+    /// both supported languages; keep virtual-only sessions usable as a fallback.
+    fn preferred_keyboard(devices_json: &str) -> Option<serde_json::Value> {
+        keyboards(devices_json)?
+            .filter(|block| {
+                ["layout", "active_keymap"].iter().any(|field| {
+                    block
+                        .get(*field)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+            })
+            .max_by_key(|block| {
+                let name = block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let virtual_keyboard =
+                    name.contains("virtual") || name.contains("fcitx") || name.contains("ibus");
+                let layout = block.get("layout").and_then(|v| v.as_str()).unwrap_or("");
+                let english = layout
+                    .split(',')
+                    .any(|name| language_of_keymap(name) == Some(Language::English));
+                let hebrew = layout
+                    .split(',')
+                    .any(|name| language_of_keymap(name) == Some(Language::Hebrew));
+                let main = block.get("main").and_then(|v| v.as_bool()) == Some(true);
+                (
+                    !virtual_keyboard,
+                    english && hebrew,
+                    main,
+                    layout.split(',').count(),
+                )
+            })
+    }
+
+    /// The selected keyboard's actual layout, including `None` for a third
+    /// language rather than another device's unrelated supported layout.
     pub fn parse_layout(devices_json: &str) -> Option<Language> {
-        let mut fallback = None;
-        for block in keyboards(devices_json) {
-            let Some(lang) = json_str(block, "active_keymap").and_then(language_of_keymap) else {
-                continue;
-            };
-            let is_main = block.contains("\"main\": true") || block.contains("\"main\":true");
-            if is_main {
-                return Some(lang);
-            }
-            fallback.get_or_insert(lang);
-        }
-        fallback
+        preferred_keyboard(devices_json)?
+            .get("active_keymap")?
+            .as_str()
+            .and_then(super::compatible_keymap)
     }
 
     /// The configured layout list, as the comma-separated xkb codes Hyprland
     /// reports per device (`"layout": "us,il"`).
     ///
-    /// Taken from the device with the *longest* list rather than from `main`,
-    /// for the same reason `parse_layout` distrusts `main`: a virtual keyboard
-    /// often carries a single-layout list of its own, and reading `us` off it
-    /// would make Hebrew unreachable.
+    /// Taken from the same device as `parse_layout`, keeping the reported
+    /// current layout and language-index lookup anchored to one keyboard.
     pub fn parse_names(devices_json: &str) -> Option<Vec<String>> {
-        keyboards(devices_json)
-            .filter_map(|block| json_str(block, "layout"))
-            .map(|layout| {
-                layout
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .max_by_key(Vec::len)
+        let keyboard = preferred_keyboard(devices_json)?;
+        Some(super::with_variants(
+            keyboard.get("layout")?.as_str()?,
+            keyboard
+                .get("variant")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        ))
     }
 
     pub fn current() -> Option<Language> {
@@ -789,30 +906,24 @@ mod sway {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
-    use super::{json_num, json_str, json_str_array, INJECTOR};
+    use super::INJECTOR;
 
     const MAGIC: &[u8; 6] = b"i3-ipc";
     const RUN_COMMAND: u32 = 0;
     const SUBSCRIBE: u32 = 2;
     const GET_INPUTS: u32 = 100;
     const IO_TIMEOUT: Duration = Duration::from_millis(250);
+    const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
 
-    fn socket_path() -> Option<&'static PathBuf> {
-        static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-        PATH.get_or_init(|| {
-            // SWAYSOCK is what sway exports; I3SOCK is the same protocol under
-            // i3, which has no xkb layout switching of its own but does answer
-            // the input query.
-            let sock = std::env::var("SWAYSOCK")
-                .or_else(|_| std::env::var("I3SOCK"))
-                .ok()?;
-            let path = PathBuf::from(sock);
-            path.exists().then_some(path)
-        })
-        .as_ref()
+    fn socket_path() -> Option<PathBuf> {
+        // Recheck availability so an initial startup race is recoverable.
+        let sock = std::env::var("SWAYSOCK")
+            .or_else(|_| std::env::var("I3SOCK"))
+            .ok()?;
+        let path = PathBuf::from(sock);
+        path.exists().then_some(path)
     }
 
     pub fn available() -> bool {
@@ -841,9 +952,33 @@ mod sway {
             return None;
         }
         let len = u32::from_ne_bytes(header[6..10].try_into().ok()?) as usize;
+        if len > MAX_REPLY_BYTES {
+            return None;
+        }
         let mut body = vec![0u8; len];
         stream.read_exact(&mut body).ok()?;
         String::from_utf8(body).ok()
+    }
+
+    #[test]
+    fn oversized_replies_are_rejected_without_consuming_the_body() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let header = |len: u32| {
+            [
+                MAGIC.as_slice(),
+                &len.to_ne_bytes(),
+                &GET_INPUTS.to_ne_bytes(),
+            ]
+            .concat()
+        };
+        server
+            .write_all(&header(MAX_REPLY_BYTES as u32 + 1))
+            .unwrap();
+        server.write_all(&header(2)).unwrap();
+        server.write_all(b"[]").unwrap();
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(recv(&mut client), None);
+        assert_eq!(recv(&mut client).as_deref(), Some("[]"));
     }
 
     fn request(kind: u32, payload: &str) -> Option<String> {
@@ -922,22 +1057,36 @@ mod sway {
     }
 
     /// The keyboard entries of a `GET_INPUTS` reply, our own injector left out.
-    fn keyboards(inputs_json: &str) -> impl Iterator<Item = &str> {
-        inputs_json
-            .split('{')
-            .skip(1)
-            .filter(|block| json_str(block, "type") == Some("keyboard"))
-            .filter(|block| json_str(block, "identifier") != Some(INJECTOR))
-            .filter(|block| json_str(block, "name") != Some(INJECTOR))
+    fn keyboards(inputs_json: &str) -> Option<impl Iterator<Item = serde_json::Value>> {
+        let inputs: Vec<serde_json::Value> = serde_json::from_str(inputs_json).ok()?;
+        Some(
+            inputs
+                .into_iter()
+                .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("keyboard"))
+                .filter(|block| block.get("identifier").and_then(|v| v.as_str()) != Some(INJECTOR))
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+        )
+    }
+
+    fn preferred_keyboard(inputs_json: &str) -> Option<(Vec<String>, serde_json::Value)> {
+        keyboards(inputs_json)?
+            .filter_map(|block| {
+                let names: Option<Vec<String>> = block
+                    .get("xkb_layout_names")?
+                    .as_array()?
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_owned))
+                    .collect();
+                Some((names?, block))
+            })
+            .max_by_key(|(names, _)| names.len())
     }
 
     /// The configured layouts, from the keyboard that lists the most of them —
     /// a virtual device with a single-layout list must not be what decides
     /// Hebrew is unavailable.
     pub fn parse_names(inputs_json: &str) -> Option<Vec<String>> {
-        keyboards(inputs_json)
-            .filter_map(|block| json_str_array(block, "xkb_layout_names"))
-            .max_by_key(Vec::len)
+        preferred_keyboard(inputs_json).map(|(names, _)| names)
     }
 
     /// Which layout is live, as an index into [`parse_names`].
@@ -945,14 +1094,13 @@ mod sway {
     /// Read off the same keyboard the names came from: a device with its own
     /// shorter list indexes into that list, not into this one.
     pub fn parse_index(inputs_json: &str) -> Option<usize> {
-        keyboards(inputs_json)
-            .filter_map(|block| {
-                let names = json_str_array(block, "xkb_layout_names")?;
-                let index = json_num(block, "xkb_active_layout_index")?;
-                Some((names.len(), index))
-            })
-            .max_by_key(|(len, _)| *len)
-            .map(|(_, index)| index)
+        let (names, block) = preferred_keyboard(inputs_json)?;
+        let index = block
+            .get("xkb_active_layout_index")?
+            .as_u64()?
+            .try_into()
+            .ok()?;
+        (index < names.len()).then_some(index)
     }
 
     fn inputs() -> Option<String> {
@@ -1009,7 +1157,7 @@ mod kde {
                     ("qdbus6", Style::Qdbus),
                     ("qdbus", Style::Qdbus),
                 ] {
-                    if super::command_output(Command::new(bin).arg("--version")).is_some() {
+                    if client_available(bin, style) {
                         return Some((bin, style));
                     }
                 }
@@ -1025,11 +1173,28 @@ mod kde {
         Qdbus,
     }
 
+    pub(super) fn client_available(bin: &str, style: Style) -> bool {
+        let argument = match style {
+            Style::Gdbus => "help",
+            Style::Busctl | Style::Qdbus => "--version",
+        };
+        super::command_output(Command::new(bin).arg(argument)).is_some()
+    }
+
     /// Call one method on `/Layouts` and return stdout, whatever client is
     /// available. Arguments are only ever a single unsigned integer here, which
     /// is why this takes one rather than a general argument list.
     fn call(method: &str, arg: Option<usize>) -> Option<String> {
         let (bin, style) = *client()?;
+        call_with_client(bin, style, method, arg)
+    }
+
+    pub(super) fn call_with_client(
+        bin: &str,
+        style: Style,
+        method: &str,
+        arg: Option<usize>,
+    ) -> Option<String> {
         let mut cmd = Command::new(bin);
         match style {
             Style::Gdbus => {
@@ -1066,6 +1231,10 @@ mod kde {
                 }
             }
             Style::Qdbus => {
+                // Qt cannot print the a(sss) reply in its default scalar mode.
+                if method == "getLayoutsList" {
+                    cmd.arg("--literal");
+                }
                 cmd.args([
                     "org.kde.keyboard",
                     "/Layouts",
@@ -1082,19 +1251,20 @@ mod kde {
     /// The display names out of a `getLayoutsList` reply.
     ///
     /// Each entry is a `(shortName, displayName, longName)` triple —
-    /// `('us', '', 'English (US)')` — and the long name is the one worth
-    /// matching, because the short name is missing on some entries and the
-    /// display name is the two-letter badge KDE draws in the tray. Every
+    /// `('us', '', 'English (US)')`. Keep the long name including variants. A short code cannot distinguish
+    /// a localized standard layout from a localized Dvorak/Colemak variant.
+    /// The short name is missing on some entries, and the display name is a
+    /// user-defined badge rather than a language identifier. Every
     /// client's output is quoted differently, so the shared shape is what is
     /// parsed: quoted strings in order, three per layout.
     pub fn parse_names(reply: &str) -> Option<Vec<String>> {
-        let quoted = quoted_strings(reply);
+        let quoted = quoted_strings(reply)?;
         (quoted.len() >= 3 && quoted.len().is_multiple_of(3))
             .then(|| quoted.chunks(3).map(|t| t[2].clone()).collect())
     }
 
     /// Every quoted string in a reply, in order, single or double quotes.
-    fn quoted_strings(reply: &str) -> Vec<String> {
+    fn quoted_strings(reply: &str) -> Option<Vec<String>> {
         let mut out = Vec::new();
         let mut chars = reply.chars().peekable();
         while let Some(c) = chars.next() {
@@ -1102,15 +1272,35 @@ mod kde {
                 continue;
             }
             let mut value = String::new();
-            for inner in chars.by_ref() {
+            let mut closed = false;
+            while let Some(inner) = chars.next() {
                 if inner == c {
+                    closed = true;
                     break;
                 }
-                value.push(inner);
+                if inner == '\\' {
+                    // Both GVariant and Qt quote backslashes and delimiters.
+                    // An escaped quote belongs to this field, not the next one.
+                    match chars.next()? {
+                        quote @ ('\'' | '"' | '\\') => value.push(quote),
+                        'n' => value.push('\n'),
+                        'r' => value.push('\r'),
+                        't' => value.push('\t'),
+                        other => {
+                            value.push('\\');
+                            value.push(other);
+                        }
+                    }
+                } else {
+                    value.push(inner);
+                }
+            }
+            if !closed {
+                return None;
             }
             out.push(value);
         }
-        out
+        Some(out)
     }
 
     /// The first bare integer in a reply — `(uint32 1,)`, `u 1`, or `1`.
@@ -1161,17 +1351,13 @@ mod kde {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GNOME — org.gnome.desktop.input-sources
+// GNOME — live XKB on X11; configured sources for diagnostics on Wayland
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// GNOME manages input sources itself, above XKB, on both Wayland and X11: the
-/// list is `sources` and the live one is the index in `current`. Writing
-/// `current` is what gnome-shell watches, so it is a supported switch rather
-/// than a trick — the XKB group underneath is set back by the shell within a
-/// keystroke.
-///
-/// `gsettings` is part of GLib and therefore of GNOME itself, so unlike the KDE
-/// backend there is no client to choose between.
+/// GSettings `current` is deprecated and ignored, and `mru-sources` can lag
+/// non-interactive/per-window changes. Neither can confirm a live layout.
+/// XKB is authoritative only in an explicitly identified X11 session; native
+/// Wayland has no supported Shell API for this and must decline layout edits.
 mod gnome {
     use std::process::Command;
 
@@ -1187,9 +1373,8 @@ mod gnome {
     ///
     /// The value is `[('xkb', 'us'), ('xkb', 'il')]`, and an IBus entry —
     /// `('ibus', 'mozc-jp')` — is a real input source that is not an xkb layout.
-    /// It is kept in the list rather than dropped, because `current` is an index
-    /// into the whole thing and skipping an entry would shift every index after
-    /// it; `language_of_keymap` returns `None` for it, which is the right answer.
+    /// Keep the full configured list for diagnostics; an IBus entry does not
+    /// identify the compositor's live XKB group.
     pub fn parse_names(reply: &str) -> Option<Vec<String>> {
         let mut out = Vec::new();
         for pair in reply.split("('").skip(1) {
@@ -1203,38 +1388,54 @@ mod gnome {
     }
 
     pub fn names() -> Option<Vec<String>> {
-        parse_names(&get("sources")?)
+        if uses_x11() {
+            // Names and indices must describe the same live XKB group list.
+            super::x11::names()
+        } else {
+            // Configuration is useful for --status, but never confirms a switch.
+            super::super::desktop::request(serde_json::json!({"action":"layout"}))
+                .and_then(|v| {
+                    v["names"]
+                        .as_array()?
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .or_else(|| parse_names(&get("sources")?))
+        }
     }
 
-    /// `gsettings monitor` prints a line every time the key is written, and
-    /// keeps running until it is killed — one process for the life of the
-    /// daemon, in place of one per word that misses the cache.
     pub fn subscribe() -> Option<super::Signals> {
-        super::watch_command(
-            "gsettings",
-            &["monitor", "org.gnome.desktop.input-sources", "current"],
-            // Every line is about the key we asked to be told about, so the only
-            // thing to exclude is the blank one at the end.
-            |line| !line.trim().is_empty(),
-        )
+        None
     }
 
     pub fn current_index() -> Option<usize> {
-        // `uint32 1`
-        get("current")?
-            .split_whitespace()
-            .last()
-            .and_then(|t| t.parse().ok())
+        if uses_x11() {
+            super::x11::current_index()
+        } else {
+            super::super::desktop::request(serde_json::json!({"action":"layout"}))?["current"]
+                .as_u64()
+                .and_then(|v| usize::try_from(v).ok())
+        }
     }
 
     pub fn set_index(index: usize) -> bool {
-        super::command_output(Command::new("gsettings").args([
-            "set",
-            "org.gnome.desktop.input-sources",
-            "current",
-            &format!("uint32 {index}"),
-        ]))
-        .is_some()
+        if uses_x11() {
+            super::x11::set_index(index)
+        } else {
+            super::super::desktop::request(serde_json::json!({"action":"switch","index":index}))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        }
+    }
+
+    pub(super) fn uses_x11() -> bool {
+        std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("x11")
+    }
+
+    #[cfg(test)]
+    pub(super) fn on_x11<T>(session: Option<&str>, query: impl FnOnce() -> Option<T>) -> Option<T> {
+        (session == Some("x11")).then(query).flatten()
     }
 }
 
@@ -1255,9 +1456,10 @@ mod gnome {
 /// installed, to provide a backend such a system cannot use anyway.
 mod x11 {
     use std::ffi::{c_char, c_int, c_long, c_ulong, c_void, CString};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::{Mutex, OnceLock};
 
-    use nix::libc::{dlopen, dlsym, RTLD_LAZY};
+    use nix::libc::{dlclose, dlopen, dlsym, RTLD_LAZY};
 
     /// `XkbUseCoreKbd` — the keyboard the group applies to.
     const XKB_USE_CORE_KBD: u32 = 0x0100;
@@ -1266,6 +1468,65 @@ mod x11 {
     type Window = c_ulong;
     type Atom = c_ulong;
     type Bool = c_int;
+
+    #[repr(C)]
+    struct XErrorEvent {
+        event_type: c_int,
+        display: *mut Display,
+        resource_id: c_ulong,
+        serial: c_ulong,
+        error_code: u8,
+        request_code: u8,
+        minor_code: u8,
+    }
+
+    type XErrorHandler = unsafe extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int;
+    type XSetErrorHandlerFn = unsafe extern "C" fn(Option<XErrorHandler>) -> XErrorHandler;
+
+    struct ErrorState {
+        display: AtomicPtr<Display>,
+        bad_window: AtomicBool,
+        previous: OnceLock<XErrorHandler>,
+    }
+
+    impl ErrorState {
+        const fn new() -> Self {
+            Self {
+                display: AtomicPtr::new(std::ptr::null_mut()),
+                bad_window: AtomicBool::new(false),
+                previous: OnceLock::new(),
+            }
+        }
+
+        unsafe fn handle(&self, display: *mut Display, event: *mut XErrorEvent) -> c_int {
+            const BAD_WINDOW: u8 = 3;
+            if !display.is_null()
+                && display == self.display.load(Ordering::Acquire)
+                && !event.is_null()
+                && (*event).error_code == BAD_WINDOW
+            {
+                self.bad_window.store(true, Ordering::Release);
+                return 0;
+            }
+            // Xlib's handler is process-wide. Forward every other error,
+            // including errors from the control window's separate connection.
+            // XSetErrorHandler does not dispatch errors itself; another thread
+            // can only race the short interval before its return is published.
+            let previous = loop {
+                if let Some(previous) = self.previous.get() {
+                    break previous;
+                }
+                std::hint::spin_loop();
+            };
+            previous(display, event)
+        }
+    }
+
+    static ERRORS: ErrorState = ErrorState::new();
+
+    unsafe extern "C" fn handle_error(display: *mut Display, event: *mut XErrorEvent) -> c_int {
+        ERRORS.handle(display, event)
+    }
 
     /// The subset of `XkbStateRec` up to the field this needs. Xlib writes the
     /// whole struct, so the buffer handed to it has to be the whole size — the
@@ -1328,6 +1589,7 @@ mod x11 {
     type XFlushFn = unsafe extern "C" fn(*mut Display) -> c_int;
 
     struct Lib {
+        set_error_handler: XSetErrorHandlerFn,
         open_display: XOpenDisplayFn,
         default_root_window: XDefaultRootWindowFn,
         intern_atom: XInternAtomFn,
@@ -1352,8 +1614,23 @@ mod x11 {
     unsafe impl Send for Conn {}
 
     fn conn() -> Option<&'static Mutex<Conn>> {
-        static CONN: OnceLock<Option<Mutex<Conn>>> = OnceLock::new();
-        CONN.get_or_init(|| unsafe {
+        static CONN: OnceLock<Mutex<Conn>> = OnceLock::new();
+        static ATTEMPTED: Mutex<Option<super::Instant>> = Mutex::new(None);
+        if let Some(connection) = CONN.get() {
+            return Some(connection);
+        }
+        // The X server may not accept connections yet during session startup.
+        // Serialize and throttle retries without retaining a failed connection.
+        let mut attempted = ATTEMPTED.lock().ok()?;
+        if let Some(connection) = CONN.get() {
+            return Some(connection);
+        }
+        let now = super::Instant::now();
+        if attempted.is_some_and(|last| now.duration_since(last) < super::BACKEND_RETRY) {
+            return None;
+        }
+        *attempted = Some(now);
+        let connection = (|| unsafe {
             // No DISPLAY means no X server to talk to, and dlopen'ing the
             // library to find that out would be work for nothing.
             std::env::var("DISPLAY").ok()?;
@@ -1373,12 +1650,14 @@ mod x11 {
                     let s = CString::new($name).ok()?;
                     let p = dlsym(handle, s.as_ptr());
                     if p.is_null() {
+                        dlclose(handle);
                         return None;
                     }
                     std::mem::transmute::<*mut c_void, $ty>(p)
                 }};
             }
             let lib = Lib {
+                set_error_handler: sym!("XSetErrorHandler", XSetErrorHandlerFn),
                 open_display: sym!("XOpenDisplay", XOpenDisplayFn),
                 default_root_window: sym!("XDefaultRootWindow", XDefaultRootWindowFn),
                 intern_atom: sym!("XInternAtom", XInternAtomFn),
@@ -1392,11 +1671,16 @@ mod x11 {
             };
             let display = (lib.open_display)(std::ptr::null());
             if display.is_null() {
+                dlclose(handle);
                 return None;
             }
+            ERRORS.display.store(display, Ordering::Release);
+            let previous = (lib.set_error_handler)(Some(handle_error));
+            let _ = ERRORS.previous.set(previous);
             Some(Mutex::new(Conn { lib, display }))
-        })
-        .as_ref()
+        })()?;
+        let _ = CONN.set(connection);
+        CONN.get()
     }
 
     pub fn available() -> bool {
@@ -1405,25 +1689,33 @@ mod x11 {
 
     pub fn focused_target() -> Option<super::Focus> {
         let c = conn()?.lock().ok()?;
+        ERRORS.bad_window.store(false, Ordering::Release);
         let mut window = 0;
         let mut revert = 0;
         unsafe {
             (c.lib.get_input_focus)(c.display, &mut window, &mut revert);
         }
         // None and PointerRoot do not identify a text target.
-        (window > 1).then(|| super::Focus {
+        if window <= 1 {
+            return None;
+        }
+        let app = window_class(&c, window).ok()?;
+        if ERRORS.bad_window.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        Some(super::Focus {
             id: window.to_string(),
-            app: window_class(&c, window),
+            app,
         })
     }
 
     /// Child controls often have no WM_CLASS; walk to their owning window.
-    fn window_class(c: &Conn, mut window: Window) -> Option<String> {
+    fn window_class(c: &Conn, mut window: Window) -> Result<Option<String>, ()> {
         unsafe {
-            let name = CString::new("WM_CLASS").ok()?;
+            let name = CString::new("WM_CLASS").map_err(|_| ())?;
             let atom = (c.lib.intern_atom)(c.display, name.as_ptr(), 1);
             if atom == 0 {
-                return None;
+                return Ok(None);
             }
             for _ in 0..32 {
                 let (mut actual_type, mut format, mut count, mut remaining) = (0, 0, 0, 0);
@@ -1455,8 +1747,14 @@ mod x11 {
                 if !data.is_null() {
                     (c.lib.free)(data.cast());
                 }
+                // The GUI toolkit can replace Xlib's process-wide handler.
+                // A failed property request must still invalidate this focus,
+                // rather than look like a valid window with no application ID.
+                if status != 0 {
+                    return Err(());
+                }
                 if class.is_some() {
-                    return class;
+                    return Ok(class);
                 }
                 let (mut root, mut parent, mut count) = (0, 0, 0);
                 let mut children = std::ptr::null_mut();
@@ -1471,12 +1769,15 @@ mod x11 {
                 if !children.is_null() {
                     (c.lib.free)(children.cast());
                 }
-                if ok == 0 || parent == 0 || parent == window {
-                    return None;
+                if ok == 0 {
+                    return Err(());
+                }
+                if parent == 0 || parent == window {
+                    return Ok(None);
                 }
                 window = parent;
             }
-            None
+            Ok(None)
         }
     }
 
@@ -1528,11 +1829,8 @@ mod x11 {
             (c.lib.free)(data as *mut c_void);
             // rules, model, layout, …
             let layouts = fields.get(2)?;
-            let list: Vec<String> = layouts
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let list =
+                super::with_variants(layouts, fields.get(3).map(String::as_str).unwrap_or(""));
             (!list.is_empty()).then_some(list)
         }
     }
@@ -1563,11 +1861,163 @@ mod x11 {
             ok
         }
     }
+
+    #[cfg(test)]
+    mod error_tests {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+
+        static FORWARDED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn previous_handler(_: *mut Display, _: *mut XErrorEvent) -> c_int {
+            FORWARDED.fetch_add(1, Ordering::SeqCst);
+            7
+        }
+
+        #[test]
+        fn disappearing_focus_is_nonfatal_without_swallowing_other_x11_errors() {
+            let mut displays = [0u8; 2];
+            let owned = displays.as_mut_ptr().cast();
+            let other = unsafe { displays.as_mut_ptr().add(1).cast() };
+            let state = ErrorState::new();
+            state.display.store(owned, Ordering::Release);
+            state.previous.set(previous_handler).unwrap();
+            let mut event = XErrorEvent {
+                event_type: 0,
+                display: owned,
+                resource_id: 42,
+                serial: 1,
+                error_code: 3,
+                request_code: 20,
+                minor_code: 0,
+            };
+            assert_eq!(unsafe { state.handle(owned, &mut event) }, 0);
+            assert!(state.bad_window.swap(false, Ordering::AcqRel));
+            assert_eq!(FORWARDED.load(Ordering::SeqCst), 0);
+
+            // A control-window connection retains its existing error policy.
+            assert_eq!(unsafe { state.handle(other, &mut event) }, 7);
+            assert!(!state.bad_window.load(Ordering::Acquire));
+            event.error_code = 2;
+            assert_eq!(unsafe { state.handle(owned, &mut event) }, 7);
+            assert!(!state.bad_window.load(Ordering::Acquire));
+            assert_eq!(FORWARDED.load(Ordering::SeqCst), 2);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compositor_startup_hints_take_precedence_over_xwayland() {
+        for (desktop, hyprland, sway, expected) in [
+            ("Hyprland", false, false, Backend::Hyprland),
+            ("sway", false, false, Backend::Sway),
+            ("", true, false, Backend::Hyprland),
+            ("", false, true, Backend::Sway),
+        ] {
+            assert_eq!(
+                auto_backend(desktop, Some("wayland"), hyprland, sway, false, || {
+                    panic!("XWayland must not override a known Wayland session")
+                }),
+                Some(expected)
+            );
+        }
+        // An ordinary X11/i3 session retains the existing XKB fallback.
+        for desktop in ["", "i3"] {
+            assert_eq!(
+                auto_backend(desktop, Some("x11"), false, false, false, || true),
+                Some(Backend::X11)
+            );
+        }
+        assert_eq!(auto_backend("", None, false, false, false, || false), None);
+    }
+
+    #[test]
+    fn unsupported_wayland_sessions_never_probe_xwayland_as_a_layout_backend() {
+        for desktop in ["", "river", "labwc", "niri"] {
+            assert_eq!(
+                auto_backend(desktop, Some("wayland"), false, false, false, || {
+                    panic!("XWayland must not be probed for an unsupported Wayland session")
+                }),
+                None,
+                "XWayland cannot confirm native Wayland layouts for {desktop:?}"
+            );
+        }
+        // Missing session metadata retains the established X11 discovery path.
+        assert_eq!(
+            auto_backend("", None, false, false, false, || true),
+            Some(Backend::X11)
+        );
+    }
+
+    #[test]
+    fn backend_discovery_retries_a_missing_session_then_retains_success() {
+        let mut probe = BackendProbe {
+            chosen: None,
+            attempted: None,
+        };
+        let now = Instant::now();
+        assert_eq!(probe.resolve(now, || None), Backend::None);
+        assert!(
+            !probe.explicitly_disabled(),
+            "a watcher must keep retrying when automatic discovery has no session yet"
+        );
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY / 2, || panic!("probe retried too soon")),
+            Backend::None
+        );
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY, || Some(Backend::Hyprland)),
+            Backend::Hyprland
+        );
+        assert!(!probe.explicitly_disabled());
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY * 10, || panic!("lost chosen backend")),
+            Backend::Hyprland
+        );
+    }
+
+    #[test]
+    fn explicitly_disabled_backend_is_not_rediscovered() {
+        let mut probe = BackendProbe {
+            chosen: None,
+            attempted: None,
+        };
+        let now = Instant::now();
+        assert_eq!(probe.resolve(now, || Some(Backend::None)), Backend::None);
+        assert!(
+            probe.explicitly_disabled(),
+            "an explicitly disabled backend must stop its watcher"
+        );
+        assert_eq!(
+            probe.resolve(now + BACKEND_RETRY * 10, || panic!(
+                "explicit off was ignored"
+            )),
+            Backend::None
+        );
+    }
+
+    #[test]
+    fn disconnected_notification_commands_are_stopped_and_reaped() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec 1>&-; exec sleep 10"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        let reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut signals = Lines::stream(reader, |_| true, Some(child));
+        assert_eq!(signals.next(), None);
+        drop(signals);
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD),
+            "a disconnected watcher must not leave a child behind when reconnecting"
+        );
+    }
 
     #[test]
     fn layout_commands_capture_output_and_reap_timeouts() {
@@ -1626,6 +2076,92 @@ mod tests {
     #[test]
     fn the_layout_comes_from_a_keyboard_someone_types_on() {
         assert_eq!(hypr::parse_layout(DEVICES), Some(Language::Hebrew));
+    }
+
+    #[test]
+    fn hyprland_physical_keyboard_outranks_a_disagreeing_main_input_method() {
+        let devices = r#"{"keyboards": [
+            {"name": "at-keyboard", "layout": "il,us", "active_keymap": "Hebrew", "main": false},
+            {"name": "hl-virtual-keyboard-fcitx5", "layout": "us,il,ru", "active_keymap": "English (US)", "main": true},
+            {"name": "recast-injector", "layout": "us,il,ru,de", "active_keymap": "English (US)", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(devices), Some(Language::Hebrew));
+        assert_eq!(
+            hypr::parse_names(devices),
+            Some(vec!["il".to_string(), "us".to_string()])
+        );
+        // The same selected physical device must remain authoritative when
+        // its live language is unsupported instead of borrowing virtual English.
+        assert_eq!(
+            hypr::parse_layout(&devices.replace(
+                "\"active_keymap\": \"Hebrew\"",
+                "\"active_keymap\": \"Russian\""
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn compositor_json_strings_do_not_split_or_reclassify_keyboards() {
+        for virtual_name in ["virtual-{fcitx5", "USB \"virtual-fcitx5\""] {
+            let virtual_name = serde_json::to_string(virtual_name).unwrap();
+            let devices = format!(
+                r#"{{"keyboards":[
+                    {{"name":"physical","layout":"us,il","active_keymap":"Hebrew","main":false}},
+                    {{"name":{virtual_name},"layout":"us,il","active_keymap":"English (US)","main":true}}
+                ]}}"#
+            );
+            serde_json::from_str::<serde_json::Value>(&devices).unwrap();
+            assert_eq!(hypr::parse_layout(&devices), Some(Language::Hebrew));
+            assert_eq!(
+                hypr::parse_names(&devices),
+                Some(vec!["us".into(), "il".into()])
+            );
+        }
+
+        let inputs = r#"[
+            {"identifier":"1:1:kbd","name":"physical","type":"keyboard",
+             "xkb_layout_names":["English (US) {custom}","Hebrew"],"xkb_active_layout_index":1},
+            {"identifier":"virtual","name":"virtual","type":"keyboard",
+             "xkb_layout_names":["English (US)"],"xkb_active_layout_index":0}
+        ]"#;
+        serde_json::from_str::<serde_json::Value>(inputs).unwrap();
+        assert_eq!(
+            sway::parse_names(inputs),
+            Some(vec!["English (US) {custom}".into(), "Hebrew".into()])
+        );
+        assert_eq!(sway::parse_index(inputs), Some(1));
+    }
+
+    #[test]
+    fn hyprland_prefers_a_bilingual_physical_keyboard_and_keeps_virtual_fallback() {
+        let devices = r#"{"keyboards": [
+            {"name": "at-keyboard", "layout": "il,us", "active_keymap": "Hebrew", "main": false},
+            {"name": "media-keyboard", "layout": "us", "active_keymap": "English (US)", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(devices), Some(Language::Hebrew));
+        assert_eq!(
+            hypr::parse_names(devices),
+            Some(vec!["il".to_string(), "us".to_string()])
+        );
+        let virtual_only = r#"{"keyboards": [
+            {"name": "recast-injector", "layout": "us,il,ru", "active_keymap": "English (US)", "main": true},
+            {"name": "hl-virtual-keyboard-fcitx5", "layout": "us,il", "active_keymap": "Hebrew", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(virtual_only), Some(Language::Hebrew));
+        assert_eq!(
+            hypr::parse_names(virtual_only),
+            Some(vec!["us".to_string(), "il".to_string()])
+        );
+    }
+
+    #[test]
+    fn hyprland_can_read_an_active_keymap_without_a_configured_layout_list() {
+        let devices = r#"{"keyboards": [
+            {"name": "at-keyboard", "active_keymap": "Hebrew", "main": true}
+        ]}"#;
+        assert_eq!(hypr::parse_layout(devices), Some(Language::Hebrew));
+        assert_eq!(hypr::parse_names(devices), None);
     }
 
     #[test]
@@ -1740,12 +2276,46 @@ mod tests {
     }
 
     #[test]
+    fn kde_escaped_badges_do_not_change_layout_triples() {
+        for reply in [
+            r#"([('us', 'A\'B\\C', 'English (US)'), ('il', 'D"E', 'Hebrew')],)"#,
+            r#"a(sss) 2 "us" "A\"B\\C" "English (US)" "il" "D'E" "Hebrew""#,
+            r#"[Argument: a(sss) {[Argument: (sss) "us", "A\"B\\C", "English (US)"], [Argument: (sss) "il", "D'E", "Hebrew"]}]"#,
+        ] {
+            assert_eq!(
+                kde::parse_names(reply),
+                Some(vec!["English (US)".into(), "Hebrew".into()])
+            );
+        }
+        assert_eq!(
+            kde::parse_names(r#"'us' '' 'English (US)' 'il' '' 'Hebrew"#),
+            None
+        );
+    }
+
+    #[test]
     fn kde_reports_the_live_layout_as_an_index() {
         assert_eq!(
             kde::parse_index("(uint32 1,)".replace("uint32", " ").as_str()),
             Some(1)
         );
         assert_eq!(kde::parse_index("0"), Some(0));
+    }
+
+    #[test]
+    fn kde_localized_names_keep_languages_and_third_layout_indices() {
+        for reply in [
+            "([('ru', 'us', 'Русский'), ('us', '', 'אנגלית (ארה״ב)'), ('il', '', 'עברית'), ('', '', 'Hebrew')],)",
+            r#"a(sss) 4 "ru" "us" "Русский" "us" "" "אנגלית (ארה״ב)" "il" "" "עברית" "" "" "Hebrew""#,
+            r#"[Argument: a(sss) {[Argument: (sss) "ru", "us", "Русский"], [Argument: (sss) "us", "", "אנגלית (ארה״ב)"], [Argument: (sss) "il", "", "עברית"], [Argument: (sss) "", "", "Hebrew"]}]"#,
+        ] {
+            let names = kde::parse_names(reply).unwrap();
+            assert_eq!(names, ["Русский", "אנגלית (ארה״ב)", "עברית", "Hebrew"]);
+            assert_eq!(language_of_keymap(&names[0]), None);
+            assert_eq!(compatible_keymap(&names[1]), None);
+            assert_eq!(compatible_keymap(&names[2]), None);
+            assert_eq!(language_of_keymap(&names[3]), Some(Language::Hebrew));
+        }
     }
 
     // ── GNOME ────────────────────────────────────────────────────────────────
@@ -1786,16 +2356,144 @@ mod tests {
     }
 
     #[test]
-    fn json_helpers_read_what_the_compositors_send() {
-        let block = r#""name": "kbd", "index": 12, "list": ["a", "b c"], "flag": true"#;
-        assert_eq!(json_str(block, "name"), Some("kbd"));
-        assert_eq!(json_num(block, "index"), Some(12));
+    fn malformed_compositor_replies_cannot_supply_partial_layouts() {
+        for devices in [
+            "",
+            "[]",
+            r#"{"keyboards":null}"#,
+            r#"{"keyboards":[{"name":"kbd","layout":"us,il","active_keymap":"Hebrew"}"#,
+        ] {
+            assert_eq!(hypr::parse_names(devices), None);
+            assert_eq!(hypr::parse_layout(devices), None);
+        }
+        for inputs in [
+            "",
+            "{}",
+            r#"[{"type":"keyboard","xkb_layout_names":["English (US)","Hebrew"],"xkb_active_layout_index":1}"#,
+            r#"[{"type":"keyboard","xkb_layout_names":["us",1,"il"],"xkb_active_layout_index":1}]"#,
+        ] {
+            assert_eq!(sway::parse_names(inputs), None);
+            assert_eq!(sway::parse_index(inputs), None);
+        }
+        // Never combine one keyboard's list with another keyboard's live index.
+        for index in ["null", "3", "-1", "1.5"] {
+            let inputs = format!(
+                r#"[
+                {{"type":"keyboard","name":"physical","xkb_layout_names":["English (US)","Hebrew"],"xkb_active_layout_index":{index}}},
+                {{"type":"keyboard","name":"virtual","xkb_layout_names":["English (US)"],"xkb_active_layout_index":0}}
+            ]"#
+            );
+            assert_eq!(
+                sway::parse_names(&inputs),
+                Some(vec!["English (US)".into(), "Hebrew".into()])
+            );
+            assert_eq!(sway::parse_index(&inputs), None);
+        }
+    }
+
+    #[test]
+    fn sway_layout_names_keep_json_delimiters_and_layout_indices() {
+        let inputs = r#"[{"type":"keyboard","identifier":"kbd","name":"kbd",
+            "xkb_layout_names":["English (US, intl., with dead keys)","Hebrew"],
+            "xkb_active_layout_index":1}]"#;
+        let names = sway::parse_names(inputs).unwrap();
+        assert_eq!(names, ["English (US, intl., with dead keys)", "Hebrew"]);
+        assert_eq!(sway::parse_index(inputs), Some(1));
         assert_eq!(
-            json_str_array(block, "list"),
-            Some(vec!["a".to_string(), "b c".to_string()])
+            language_of_keymap(&names[sway::parse_index(inputs).unwrap()]),
+            Some(Language::Hebrew)
         );
-        assert_eq!(json_str(block, "absent"), None);
-        assert_eq!(json_num(block, "absent"), None);
+        let quoted = r#"[{"type":"keyboard","xkb_layout_names":["name, with ] and \"quotes\"","il"],"xkb_active_layout_index":1}]"#;
+        assert_eq!(
+            sway::parse_names(quoted),
+            Some(vec!["name, with ] and \"quotes\"".into(), "il".into()])
+        );
+        assert_eq!(sway::parse_index(quoted), Some(1));
+    }
+
+    #[test]
+    fn kde_accepts_gdbus_with_its_supported_help_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recast-gdbus-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("gdbus");
+        // Match the real client's availability contract: --version is an error.
+        std::fs::write(&bin, "#!/bin/sh\n[ \"$1\" = help ]\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(kde::client_available(
+            bin.to_str().unwrap(),
+            kde::Style::Gdbus
+        ));
+        assert!(!kde::client_available(
+            bin.to_str().unwrap(),
+            kde::Style::Busctl
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn kde_qdbus_reads_structured_layouts_without_changing_scalar_calls() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("recast-qdbus-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("qdbus6");
+        // Qt requires --literal for a(sss); its default diagnostic still exits successfully.
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+literal=
+if [ "$1" = --literal ]; then literal=yes; shift; fi
+[ "$1" = org.kde.keyboard ] && [ "$2" = /Layouts ] || exit 64
+case "$3" in
+    org.kde.KeyboardLayouts.getLayoutsList)
+        if [ "$literal" = yes ]; then
+            printf '%s\n' '[Argument: a(sss) {[Argument: (sss) "us", "", "English (US)"], [Argument: (sss) "il", "", "Hebrew"]}]'
+        else
+            printf "%s\n" "qdbus: I don't know how to display an argument of type 'a(sss)', run with --literal."
+        fi
+        ;;
+    org.kde.KeyboardLayouts.getLayout)
+        [ -z "$literal" ] && [ "$#" = 3 ] || exit 65
+        printf '1\n'
+        ;;
+    org.kde.KeyboardLayouts.setLayout)
+        [ -z "$literal" ] && [ "$#" = 4 ] && [ "$4" = 1 ] || exit 66
+        printf 'true\n'
+        ;;
+    *) exit 67 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let call = |method, arg| {
+            kde::call_with_client(bin.to_str().unwrap(), kde::Style::Qdbus, method, arg)
+                .expect("the fake client should accept the production command")
+        };
+        let names = kde::parse_names(&call("getLayoutsList", None));
+        // Clean up before assertions so the failing regression leaves no executable behind.
+        let index = kde::parse_index(&call("getLayout", None));
+        let switched = call("setLayout", Some(1));
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(names, Some(vec!["English (US)".into(), "Hebrew".into()]));
+        assert_eq!(index, Some(1));
+        assert_eq!(switched.trim(), "true");
+    }
+
+    #[test]
+    fn gnome_never_uses_xwayland_or_saved_settings_to_confirm_a_layout() {
+        for session in [Some("wayland"), Some("tty"), Some(""), None] {
+            assert_eq!(
+                gnome::on_x11(session, || -> Option<usize> {
+                    panic!("unverified sessions must not query or change XWayland")
+                }),
+                None
+            );
+        }
+        assert_eq!(gnome::on_x11(Some("x11"), || Some(2)), Some(2));
+        assert_eq!(gnome::on_x11(Some("x11"), || None::<usize>), None);
     }
 
     /// Against the session that is actually running, when it is one we can

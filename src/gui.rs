@@ -11,11 +11,18 @@ struct App {
     last_app: Option<(String, String)>,
     last_app_check: std::time::Instant,
     error: Option<String>,
+    history_error: Option<String>,
     show_shortcuts: bool,
+    rule_editor: Option<crate::complete::RuleEditor>,
+    show_log: bool,
     health: String,
     show_practice: bool,
     practice_text: String,
     practice_offered: bool,
+    settings_page: usize,
+    example: usize,
+    preview_hebrew: bool,
+    preview: String,
 }
 
 impl eframe::App for App {
@@ -29,6 +36,7 @@ impl eframe::App for App {
             }
             self.last_app_check = std::time::Instant::now();
             self.health = crate::platform::status(&self.control);
+            self.control.live_log.observe_health(&self.health);
         }
         if !self.practice_offered
             && self
@@ -54,6 +62,15 @@ impl eframe::App for App {
                 }
                 ui.label(crate::practice::feedback(&self.control));
                 ui.label(&self.health);
+                let config = crate::config::Config::global();
+                ui.label(config.undo_setup_hint());
+                if config.undo_shortcut == "none" {
+                    if let Some(key) = config.recommended_undo() {
+                        if ui.button(format!("Enable {} undo", crate::config::modifier_label(key))).clicked() {
+                            self.error = crate::settings::set_live(&self.control, "undo_shortcut", key).err();
+                        }
+                    }
+                }
                 ui.label("Close to skip. Reopen Practice from the controls anytime.");
             });
         self.control
@@ -63,8 +80,75 @@ impl eframe::App for App {
         egui::Window::new("Typing shortcuts")
             .open(&mut self.show_shortcuts)
             .show(ctx, |ui| {
-                ui.label(crate::notify::SHORTCUTS);
+                ui.label(crate::notify::shortcuts());
             });
+
+        let was_showing_log = self.show_log;
+        egui::Window::new("Live log")
+            .open(&mut self.show_log)
+            .default_size([720.0, 400.0])
+            .show(ctx, |ui| {
+                if self.control.live_log.active() {
+                    if ui.button("Stop logging").clicked() {
+                        self.control.live_log.stop();
+                    }
+                } else if ui.button("Start logging").clicked() {
+                    self.control.live_log.start();
+                    self.control.live_log.observe_health(&self.health);
+                }
+                ui.small("Memory only. Closing this window stops logging. New sessions clear earlier entries.");
+                egui::ScrollArea::both().stick_to_bottom(true).show(ui, |ui| {
+                    ui.monospace(self.control.live_log.text());
+                });
+            });
+        if was_showing_log && !self.show_log {
+            self.control.live_log.close();
+        }
+
+        if let Some(editor) = &mut self.rule_editor {
+            let mut open = true;
+            let mut done = false;
+            egui::Window::new(editor.kind.title())
+                .open(&mut open)
+                .default_size([600.0, 420.0])
+                .show(ctx, |ui| {
+                    ui.label(editor.kind.hint());
+                    ui.label("Correction pauses while this editor is open.");
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut editor.text)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(12),
+                            );
+                        });
+                    if let Some(error) = &self.error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            match editor.save() {
+                                Ok(()) => {
+                                    done = true;
+                                    self.error = None;
+                                }
+                                Err(error) => self.error = Some(error),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            done = true;
+                        }
+                    });
+                });
+            if done || !open {
+                self.rule_editor = None;
+                self.error = None;
+                self.control
+                    .word_rules_open
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -77,7 +161,20 @@ impl eframe::App for App {
                         .color(egui::Color32::LIGHT_GRAY),
                 );
                 ui.add_space(12.0);
-                ui.label(&self.health);
+                let (state, detail) = self.health.split_once(" — ").unwrap_or((&self.health, ""));
+                ui.heading(state);
+                ui.label(detail);
+
+                if let Some((name, id)) = &self.last_app {
+                    ui.label(format!("Correction in {name}"));
+                    ui.horizontal_wrapped(|ui| {
+                        for mode in crate::config::AppMode::ALL {
+                            if ui.selectable_label(self.control.app_mode(Some(id)) == Some(mode), mode.label()).clicked() {
+                                self.error = crate::settings::set_app_mode(&self.control, id, mode).err();
+                            }
+                        }
+                    });
+                }
 
                 // Keep the saved switch distinct from the temporary pause.
                 let mut enabled = self.control.is_switched_on();
@@ -92,7 +189,11 @@ impl eframe::App for App {
                 response.on_hover_ui(|ui| {
                     ui.label("Layout switching, spelling and completion — the one switch for all three");
                 });
+                ui.small("Turning this off keeps correction disabled after restarting ReCast.");
 
+                ui.group(|ui| {
+                ui.label("Pause correction");
+                ui.add_enabled_ui(enabled, |ui| {
                 if let Some(left) = self.control.pause_remaining() {
                     if ui.button(format!("Resume (paused, {} min left)", left.as_secs() / 60 + 1)).clicked() {
                         self.control.resume();
@@ -112,11 +213,13 @@ impl eframe::App for App {
                 } else {
                     ui.add_enabled(false, egui::Button::new("Pause in application (waiting for focus)"));
                 }
+                });
+                });
 
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(format!("Words fixed: {}", self.control.fixed_count()))
-                        .size(18.0)
+                        .size(14.0)
                         .color(egui::Color32::LIGHT_GRAY),
                 );
                 // Shown next to the fixed count, and only once there is
@@ -141,36 +244,114 @@ impl eframe::App for App {
                 ui.separator();
                 let history = self.control.history();
                 ui.collapsing(format!("Recent corrections ({})", history.len()), |ui| {
-                    ui.label("Click a correction to stop correcting that word.");
+                    ui.label("Expand a correction to inspect why it changed.");
+                    ui.small(format!("Undo while typing: {}. Ignoring a word prevents future automatic changes; it does not undo existing text.", crate::config::Config::global().undo_gesture()));
+                    if let Some(error) = &self.history_error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
                     if history.is_empty() {
                         ui.label("No corrections yet.");
                     }
                     for correction in history {
                         let ignored = crate::complete::ignored(&correction.from);
-                        let label = format!("{}{} → {} ({}){}",
-                            if correction.undone { "Undone: " } else { "" },
-                            correction.from, correction.to, correction.kind.tag(),
-                            if ignored { " — ignored" } else { "" });
-                        if ui.add_enabled(!ignored, egui::Button::new(label)).clicked() {
-                            crate::complete::ignore_word(&correction.from);
-                        }
+                        let label = format!("\u{2068}{}\u{2069} → \u{2068}{}\u{2069} · {} · {}{}", correction.from, correction.to, correction.at.format("%H:%M:%S"), if correction.undone { "Undone" } else { "Applied" }, if ignored { " · ignored" } else { "" });
+                        ui.push_id(correction.at, |ui| { ui.collapsing(label, |ui| {
+                            for (label, word) in [("Original", &correction.from), ("Replacement", &correction.to)] {
+                                ui.label(label);
+                                let rtl = word.chars().find(|c| c.is_alphabetic()).is_some_and(|c| ('א'..='ת').contains(&c));
+                                ui.with_layout(if rtl { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) }, |ui| { ui.label(word); });
+                            }
+                            ui.label(correction.inspection());
+                            if ui.button(if ignored { "Allow again" } else { "Ignore this word" }).on_hover_text(if ignored { "Remove this ignored word. Separate learned exceptions still apply." } else { "Leave this word alone in future automatic corrections. You can allow it again here." }).clicked() {
+                                self.history_error = crate::complete::set_word_ignored(&correction.from, !ignored).err();
+                            }
+                            if ignored { ui.small("Protected from future automatic corrections. Allow again removes it from ignored words."); }
+                        }); });
                     }
                 });
                 ui.separator();
                 ui.heading("Settings");
+                ui.horizontal_wrapped(|ui| {
+                    for (page, title) in ["General", "Shortcuts", "Applications", "Word rules"].iter().enumerate() {
+                        ui.selectable_value(&mut self.settings_page, page, *title);
+                    }
+                });
+                if self.settings_page == 3 { ui.group(|ui| {
+                    for kind in crate::complete::RuleKind::ALL {
+                        if ui.add_enabled(self.rule_editor.is_none(), egui::Button::new(kind.title())).clicked() {
+                            match crate::complete::RuleEditor::open(kind) {
+                                Ok(editor) => {
+                                    self.rule_editor = Some(editor);
+                                    self.error = None;
+                                    self.control.word_rules_open.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(error) => self.error = Some(error),
+                            }
+                        }
+                    }
+                });
+                }
                 let cfg = crate::config::Config::global();
+                if self.settings_page == 0 {
+                ui.label("Language preference");
+                let mut preference = cfg.language_preference;
+                egui::ComboBox::from_id_source("prefer").selected_text(preference.label()).show_ui(ui, |ui| {
+                    for value in crate::config::LanguagePreference::ALL {
+                        ui.selectable_value(&mut preference, value, value.label());
+                    }
+                });
+                ui.small("Switching away from your preferred language requires stronger evidence.");
+                if preference != cfg.language_preference {
+                    self.error = crate::settings::set_live(&self.control, "prefer", preference.value()).err();
+                }
                 for (label, key, mut checked) in [
-                    ("Correct English spelling", "spell", cfg.spell_enabled),
+                    ("Correct English/Hebrew spelling", "spell", cfg.spell_enabled),
                     ("Word completion and abbreviations", "complete", cfg.complete_enabled),
-                    ("Conservative spelling (single-typo fixes)", "spell_dist", cfg.spell_max_dist == 1),
+
                 ] {
                     if ui.checkbox(&mut checked, label).changed() {
-                        let value = if key == "spell_dist" { if checked { "1" } else { "3" } } else if checked { "true" } else { "false" };
+                        let value = if checked { "true" } else { "false" };
                         self.error = crate::settings::set_live(&self.control, key, value).err();
                     }
                 }
-                ui.label("Changes are saved and applied immediately.");
-                ui.label("Extra undo shortcut (double-tap Ctrl stays available):");
+                let mut sensitivity = cfg.spell_max_dist.min(3) as usize;
+                let labels = ["No automatic spelling edits", "Conservative — common typos only", "Balanced — everyday spelling mistakes", "Flexible — more complex typos"];
+                egui::ComboBox::from_id_source("sensitivity").selected_text(labels[sensitivity]).show_ui(ui, |ui| {
+                    for (index, label) in labels.iter().enumerate() { ui.selectable_value(&mut sensitivity, index, *label); }
+                });
+                if sensitivity != cfg.spell_max_dist as usize { self.error = crate::settings::set_live(&self.control, "spell_dist", &sensitivity.to_string()).err(); }
+                ui.small("Flexible may change unfamiliar words. Short words keep stricter limits.");
+                ui.label("Preview an example with current settings");
+                egui::ComboBox::from_id_source("example").selected_text(crate::explain::EXAMPLES[self.example]).show_ui(ui, |ui| {
+                    for (index, word) in crate::explain::EXAMPLES.iter().enumerate() { ui.selectable_value(&mut self.example, index, *word); }
+                });
+                ui.checkbox(&mut self.preview_hebrew, "Hebrew keyboard (otherwise English)");
+                if ui.button("Preview").clicked() {
+                    let layout = if self.preview_hebrew { crate::types::Language::Hebrew } else { crate::types::Language::English };
+                    self.preview = match crate::explain::preview(crate::explain::EXAMPLES[self.example], layout, None) {
+                        Ok((word, reason, _)) => format!("Result: {word}\n{reason}"),
+                        Err(error) => error,
+                    };
+                }
+                ui.label(&self.preview);
+                ui.small("No typing or learning. Excludes prior words and app restrictions; preview again after changing settings.");
+                }
+                if self.settings_page == 1 {
+                for (label, key, current, choices) in [
+                    ("Double-tap action (undo / convert)", "action_shortcut", &cfg.action_shortcut, crate::config::ACTION_SHORTCUTS),
+                    ("Completion (single tap)", "completion_shortcut", &cfg.completion_shortcut, crate::config::MODIFIER_SHORTCUTS),
+                    ("Spelling suggestions (single tap)", "correction_shortcut", &cfg.correction_shortcut, crate::config::MODIFIER_SHORTCUTS),
+                ] {
+                    let mut selected = current.clone();
+                    egui::ComboBox::from_id_source(key).selected_text(crate::config::modifier_label(&selected)).show_ui(ui, |ui| {
+                        for &(value, text) in choices {
+                            ui.selectable_value(&mut selected, value.into(), text);
+                        }
+                    });
+                    ui.label(label);
+                    if &selected != current {
+                        self.error = crate::settings::set_live(&self.control, key, &selected).err();
+                    }
+                }
+                ui.label("Undo only (single tap):");
                 let mut shortcut = cfg.undo_shortcut.clone();
                 egui::ComboBox::from_id_source("undo_shortcut").selected_text(crate::practice::shortcut_label(&shortcut)).show_ui(ui, |ui| {
                     for value in ["none", "left_ctrl", "right_ctrl"] {
@@ -181,9 +362,13 @@ impl eframe::App for App {
                     self.error = crate::settings::set_live(&self.control, "undo_shortcut", &shortcut).err();
                 }
                 ui.separator();
+                ui.small(cfg.undo_setup_hint());
+                }
+                if self.settings_page == 2 {
                 ui.heading("Application modes");
                 let mut excluded = crate::types::lock_forgiving(&self.control.excluded_apps).clone();
                 excluded.extend(crate::types::lock_forgiving(&self.control.layout_only_apps).iter().cloned());
+                excluded.extend(crate::types::lock_forgiving(&self.control.manual_only_apps).iter().cloned());
                 excluded.sort(); excluded.dedup();
                 if !crate::layout::focus_supported() {
                     ui.label("Application detection is unavailable. Saved restrictions pause correction when the app is unknown. Restore Full below to remove a restriction.");
@@ -202,11 +387,16 @@ impl eframe::App for App {
                         self.error = crate::settings::set_app_mode(&self.control, &id, crate::config::AppMode::Full).err();
                     }
                 }
+                }
+                ui.label("Changes are saved and applied immediately.");
                 if let Some(error) = &self.error {
                     ui.colored_label(egui::Color32::LIGHT_RED, error);
                 }
                 if ui.button("Typing shortcuts…").clicked() {
                     self.show_shortcuts = true;
+                }
+                if ui.button("Live log…").clicked() {
+                    self.show_log = true;
                 }
                 if ui.button("Practice correction and undo…").clicked() {
                     self.show_practice = true;
@@ -255,11 +445,18 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
                 last_app: None,
                 last_app_check: std::time::Instant::now(),
                 error: None,
+                history_error: None,
                 show_shortcuts: false,
+                rule_editor: None,
+                show_log: false,
                 health: "Starting…".into(),
                 show_practice: false,
                 practice_text: String::new(),
                 practice_offered: false,
+                settings_page: 0,
+                example: 0,
+                preview_hebrew: false,
+                preview: String::new(),
             })
         }),
     )

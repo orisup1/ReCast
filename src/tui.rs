@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    cursor::Show,
+    event::{DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -57,34 +58,31 @@ pub fn run_tui(control: Arc<AppControl>) -> std::io::Result<()> {
     // Setup terminal
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let res = (|| {
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(&mut stdout);
+        let mut terminal = Terminal::new(backend)?;
+        let app = App {
+            control,
+            start: Instant::now(),
+            tab: 0,
+            settings_error: None,
+        };
+        run_app(&mut terminal, app)
+    })();
 
-    let app = App {
-        control,
-        start: Instant::now(),
-        tab: 0,
-    };
-    let res = run_app(&mut terminal, app);
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    res
+    // Attempt every cleanup step even when setup or another cleanup step fails.
+    let raw = disable_raw_mode();
+    let screen = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture, Show);
+    res.and(raw).and(screen)
 }
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &app))?;
         if crossterm::event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = crossterm::event::read()? {
-                match key.code {
+            if let Some(key) = command_key(crossterm::event::read()?) {
+                match key {
                     KeyCode::Char('q') => break,
                     KeyCode::Esc => break,
                     KeyCode::Left | KeyCode::Char('h') => {
@@ -113,6 +111,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Res
                     // Re-read abbrev.txt / ignore.txt now rather than waiting
                     // for the watcher's next pass.
                     KeyCode::Char('r') => crate::complete::reload_user_files(),
+                    KeyCode::Char('b') => {
+                        use crate::config::{Config, LanguagePreference};
+                        let current = Config::global().language_preference;
+                        let next = match current {
+                            LanguagePreference::Balanced => LanguagePreference::English,
+                            LanguagePreference::English => LanguagePreference::Hebrew,
+                            LanguagePreference::Hebrew => LanguagePreference::Balanced,
+                        };
+                        app.settings_error =
+                            crate::settings::set_live(&app.control, "prefer", next.value()).err();
+                    }
                     KeyCode::F(1) | KeyCode::Char('?') => app.tab = 2,
                     _ => {}
                 }
@@ -120,6 +129,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> std::io::Res
         }
     }
     Ok(())
+}
+
+fn command_key(event: Event) -> Option<KeyCode> {
+    // Releases must not execute a command twice; retain existing repeat behavior.
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => Some(key.code),
+        _ => None,
+    }
 }
 
 fn ui(f: &mut Frame, app: &App) {
@@ -253,7 +270,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Footer
     let footer = Paragraph::new(Span::styled(
-        " ← → : tab   e/Space : toggle   p : pause 30m   r : reload lists   q : quit   F1 : help ",
+        " ← → : tab   e/Space : toggle   p : pause   b : language   r : reload   q : quit   F1 : help ",
         Style::default().fg(Color::Gray),
     ))
     .block(
@@ -313,7 +330,17 @@ fn render_info(
             Span::from("Uptime: "),
             Span::styled(uptime_human(uptime), *normal),
         ]),
+        Line::from(format!(
+            "Language: {} (b to change)",
+            crate::config::Config::global().language_preference.label()
+        )),
     ];
+    if let Some(error) = &app.settings_error {
+        text.push(Line::from(Span::styled(
+            error,
+            Style::default().fg(Color::Red),
+        )));
+    }
     if let Some(hint) = app.control.tighten_hint() {
         text.push(Line::from(""));
         text.push(Line::from(Span::styled(
@@ -324,7 +351,7 @@ fn render_info(
     text.push(Line::from(""));
     text.push(Line::from(
         "ReCast retypes words you typed in the wrong keyboard layout, fixes English \
-         typos in place, and finishes words on a tap of Right Shift.",
+         typos in place, and offers word completion.",
     ));
     let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
@@ -380,16 +407,28 @@ fn render_help(f: &mut Frame, area: ratatui::layout::Rect, normal: &Style) {
         Line::from("  e / Space : turn correction on/off (remembered across restarts)"),
         Line::from("  p         : pause for 30 minutes, or resume"),
         Line::from("  r         : re-read abbrev.txt and ignore.txt now"),
+        Line::from("  b         : cycle Balanced / Prefer English / Prefer Hebrew (saved)"),
         Line::from("  q / Esc   : quit"),
         Line::from("  F1 / ?    : show this help"),
         Line::from(""),
         Line::from("While typing anywhere:"),
-        Line::from("  Right Shift (tap)  : finish the word; tap again to cycle guesses"),
-        Line::from("  Ctrl Ctrl (tap x2) : undo the correction the cursor is sitting on,"),
-        Line::from("                       and stop correcting that word. On a word that"),
-        Line::from("                       was skipped because it is listed, it does the"),
-        Line::from("                       opposite: unlists it and corrects it."),
-        Line::from("  Undo immediately: more typing or cursor movement ends the opportunity."),
+        Line::from(format!(
+            "  {}: finish the word; repeat to cycle guesses",
+            crate::config::Config::global().completion_gesture()
+        )),
+        Line::from(format!(
+            "  {}: undo correction/completion; otherwise convert layout",
+            crate::config::Config::global().action_gesture()
+        )),
+        Line::from(format!(
+            "  {}: request spelling alternatives; repeat to cycle",
+            crate::config::Config::global().correction_gesture()
+        )),
+        Line::from(
+            "                       conversion includes unknown words; repeat to convert back.",
+        ),
+        Line::from("  Enable Undo only in Settings > Shortcuts. Edit exceptions in Word rules."),
+        Line::from("  Extra spaces preserve undo; other typing or cursor movement ends it."),
         Line::from("  One undo skips a word this session; two occasions remember it."),
         Line::from(""),
         Line::from("Your files (edits are picked up within ~2s, no restart):"),
@@ -407,11 +446,44 @@ struct App {
     control: Arc<AppControl>,
     start: Instant,
     tab: usize,
+    settings_error: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_release_does_not_dispatch_another_command_and_repeat_is_preserved() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+
+        for code in [
+            KeyCode::Char('e'),
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+            KeyCode::Char('b'),
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('q'),
+        ] {
+            let commands: Vec<_> = [
+                KeyEventKind::Press,
+                KeyEventKind::Repeat,
+                KeyEventKind::Release,
+            ]
+            .into_iter()
+            .filter_map(|kind| {
+                command_key(Event::Key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    kind,
+                )))
+            })
+            .collect();
+            assert_eq!(commands, [code, code]);
+        }
+        assert_eq!(command_key(Event::Resize(80, 24)), None);
+    }
 
     #[test]
     fn uptime_reads_as_a_duration_rather_than_a_number() {

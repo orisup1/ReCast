@@ -1,8 +1,8 @@
 //! The one time ReCast interrupts you.
 //!
 //! Everything this program does happens inside other people's text fields, with
-//! no window of its own, which makes its two gestures (double-tap Ctrl to take
-//! a correction back, tap Right Shift to finish a word) invisible: they are in
+//! no window of its own, which makes its two gestures (double-tap Ctrl to undo or convert
+//! a word, tap Right Shift to finish a word) invisible: they are in
 //! the README, and the README is not where anyone is when their word is
 //! silently rewritten for the first time. So the first correction — ever, not
 //! per run — says so once, and then never again.
@@ -14,7 +14,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const SHORTCUTS: &str = "Undo: tap Ctrl twice within half a second, immediately after a correction. Typing anything else or moving the cursor ends the undo opportunity.\n\nUnchanged word: double-tap Ctrl immediately, before or after Space/Enter. A valid word in the other layout wins even if both readings are valid. Double-tap again to undo. Manual conversion does not teach an exception.\n\nSelected-text rescue (macOS): select text in an editable field, then double-tap Ctrl. Double-tap again to restore the original selection. Requires accessibility selection editing; the clipboard stays untouched.\n\nCompletion: tap Right Shift mid-word. Tap again to cycle suggestions and eventually restore your original prefix. Holding Shift to capitalize is unaffected.\n\nSettings can add a single Left Ctrl or Right Ctrl tap for undo; double-tap Ctrl stays available. Try Practice correction and undo from the menu.\n\nOne undo leaves that word alone for this session. Undoing it on two occasions remembers that preference across restarts.\n\nTo allow a word again: type the ignored word and its space, then double-tap Ctrl immediately. This removes its saved exception and may correct it.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.";
+pub fn shortcuts() -> String {
+    let config = crate::config::Config::global();
+    format!("Undo or convert: {} within half a second. Undoes the latest correction, abbreviation expansion, or completion. If the last word was unchanged, converts its layout even if it is unknown. Repeat a manual conversion to convert back. Extra spaces preserve undo; other typing, Enter, or cursor movement ends the opportunity. It also rescues selected text in supported editable fields (Linux requires the optional accessibility helper).\n\nCompletion: {} before or after Space. On macOS, a quiet strip previews choices; repeat to advance, type or Space to accept, Escape or Enter to cancel. Windows/Linux cycle replacements directly. Four choices, then your original text; keep tapping for the next page. Tracked spaces survive every choice and undo.\n\nSpelling suggestions: {} before or after Space; repeat to cycle alternatives, including short and already valid words. On macOS, a quiet caret strip previews choices without editing: repeat to move the highlight, then type or press Space to accept. Original is a no-op. Enter cancels and passes through unchanged. Escape, navigation, clicks, focus changes, pause and disable dismiss it. The strip anchors to the caret or a single-line search field; unavailable context leaves text untouched. Windows/Linux retain direct replacement cycling. Works independently of automatic spelling and completion.\n\nUndo only (single tap): {}. Enable it in Settings to undo corrections only; it never converts unchanged words or changes their exceptions. When it shares the action key, undo waits half a second so double taps take priority.\n\nOnly bare taps count; holding a modifier or using a chord does not trigger a gesture. Completion and spelling suggestions must use separate keys from each other and action/undo.\n\nOne undo leaves that word alone for this session; two occasions save the exception. Manual layout conversion does not change saved exceptions.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.", config.action_gesture(), config.completion_gesture(), config.correction_gesture(), crate::practice::shortcut_label(&config.undo_shortcut))
+}
 
 /// Explicitly requested help may use a dialog; typing notifications must not.
 #[cfg(target_os = "macos")]
@@ -90,12 +93,12 @@ pub fn dialog_with_destination(
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn show_shortcuts() {
     #[cfg(target_os = "macos")]
-    dialog("Typing shortcuts", SHORTCUTS, &["Done"]);
+    dialog("Typing shortcuts", &shortcuts(), &["Done"]);
     #[cfg(target_os = "windows")]
     unsafe {
         use winapi::um::winuser::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
         let title: Vec<u16> = "Typing shortcuts".encode_utf16().chain(Some(0)).collect();
-        let body: Vec<u16> = SHORTCUTS.encode_utf16().chain(Some(0)).collect();
+        let body: Vec<u16> = shortcuts().encode_utf16().chain(Some(0)).collect();
         MessageBoxW(
             std::ptr::null_mut(),
             body.as_ptr(),
@@ -137,9 +140,11 @@ pub fn first_correction_hint() {
         crate::prefs::mark_welcomed();
         notify(
             "ReCast just corrected a word",
-            "Ctrl twice immediately undoes a correction and skips that word this session. \
-             Repeated undos remember it. Right Shift completes; tap again to cycle. \
-             See Typing shortcuts for help.",
+            &format!(
+                "Undo: {}. Completion: {}. Set an undo-only key in Settings > Shortcuts. See Typing shortcuts for conversion help.",
+                crate::practice::restore_instruction(&crate::config::Config::global()),
+                crate::config::Config::global().completion_gesture()
+            ),
         );
     });
 }

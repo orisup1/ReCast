@@ -1,6 +1,6 @@
 [package]
 name = "recast"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Ori Supino <ori@supino.org>"]
 description = "Automatic English/Hebrew keyboard-layout correction that lives in your tray/menubar and retypes words you typed in the wrong layout."
@@ -38,6 +38,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 winresource = "0.1"
 
 [dependencies]
+getrandom = "0.3" # already in the graph; authenticate local status queries
 dirs = "4.0"
 # `inotify` powers the list watcher on Linux (complete::watch_forever) and
 # `signal` lets --stop send SIGTERM directly instead of forking /bin/kill.
@@ -57,6 +58,7 @@ cocoa = "0.24"
 objc = "0.2"  # needed for raw msg_send! to NSAlert (cocoa 0.24 does not expose NSAlert); see src/platform/tray.rs
 
 [target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_System_Com", "Win32_UI_Accessibility"] }
 rdev = "0.5.3"
 tray-icon = "0.24"
 tao = "0.35"
@@ -66,7 +68,7 @@ winapi = { version = "0.3", features = [
     # though release builds run under `windows_subsystem = "windows"` (see
     # platform::windows::attach_parent_console).
     "wincon", "consoleapi", "processenv", "winbase",
-    "fileapi", "handleapi", "winnt",
+    "fileapi", "handleapi", "winnt", "commctrl", "libloaderapi",
     # "Start at login": the per-user Run key (see prefs::windows_autostart).
     # Listed explicitly rather than relied on through tao/tray-icon's own
     # feature set, which cargo happens to unify with ours today.
@@ -74,7 +76,7 @@ winapi = { version = "0.3", features = [
     # Finding and stopping an already-running ReCast at startup
     # (src/instance.rs): the Toolhelp snapshot enumerates processes,
     # OpenProcess/TerminateProcess stops them, WaitForSingleObject waits.
-    "tlhelp32", "processthreadsapi", "synchapi",
+    "tlhelp32", "processthreadsapi", "synchapi", "psapi",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

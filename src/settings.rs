@@ -49,9 +49,25 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
     match key {
         "spell" | "complete" if parse_flag(value).is_some() => (),
         "spell_dist" if parse_number("RECAST_SPELL_DIST", value).is_ok() => (),
-        "exclude_apps" | "layout_only_apps" if !value.contains(['\n', '\r', '"', '#', '\\']) => (),
+        "prefer" if crate::config::LanguagePreference::parse(value).is_some() => (),
+        "exclude_apps" | "layout_only_apps" | "manual_only_apps"
+            if !value.contains(['\n', '\r', '"', '\\']) => {}
         "undo_shortcut" if crate::config::valid_undo_shortcut(value) => (),
+        "action_shortcut" if crate::config::valid_action_shortcut(value) => (),
+        "completion_shortcut" if crate::config::valid_completion_shortcut(value) => (),
+        "correction_shortcut" if crate::config::valid_completion_shortcut(value) => (),
         _ => return Err("Invalid setting value".into()),
+    }
+    let mut candidate = crate::config::Config::global();
+    match key {
+        "undo_shortcut" => candidate.undo_shortcut = value.into(),
+        "action_shortcut" => candidate.action_shortcut = value.into(),
+        "completion_shortcut" => candidate.completion_shortcut = value.into(),
+        "correction_shortcut" => candidate.correction_shortcut = value.into(),
+        _ => (),
+    }
+    if candidate.shortcut_conflict() {
+        return Err("Completion and correction must use different keys from each other, double-tap actions, and extra undo. Disable or move the conflicting shortcut first.".into());
     }
     let path = file_path().ok_or("No config directory available")?;
     save_value(&path, key, value).map_err(|e| format!("Could not save settings: {e}"))?;
@@ -59,9 +75,16 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
         "spell" => cfg.spell_enabled = parse_flag(value).unwrap(),
         "complete" => cfg.complete_enabled = parse_flag(value).unwrap(),
         "spell_dist" => cfg.spell_max_dist = value.trim().parse().unwrap(),
+        "prefer" => {
+            cfg.language_preference = crate::config::LanguagePreference::parse(value).unwrap()
+        }
         "exclude_apps" => cfg.excluded_apps = crate::config::parse_excluded_apps(value),
         "layout_only_apps" => cfg.layout_only_apps = crate::config::parse_excluded_apps(value),
+        "manual_only_apps" => cfg.manual_only_apps = crate::config::parse_excluded_apps(value),
         "undo_shortcut" => cfg.undo_shortcut = value.into(),
+        "action_shortcut" => cfg.action_shortcut = value.into(),
+        "completion_shortcut" => cfg.completion_shortcut = value.into(),
+        "correction_shortcut" => cfg.correction_shortcut = value.into(),
         _ => unreachable!(),
     });
     if key == "exclude_apps" {
@@ -70,6 +93,10 @@ pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> R
     }
     if key == "layout_only_apps" {
         *crate::types::lock_forgiving(&control.layout_only_apps) =
+            crate::config::parse_excluded_apps(value);
+    }
+    if key == "manual_only_apps" {
+        *crate::types::lock_forgiving(&control.manual_only_apps) =
             crate::config::parse_excluded_apps(value);
     }
     Ok(())
@@ -107,6 +134,16 @@ fn save_values(path: &std::path::Path, values: &[(&str, &str)]) -> std::io::Resu
     for (key, value) in values {
         text.push_str(&format!("{key} = \"{value}\"\n"));
     }
+    write_atomic(path, &text)
+}
+
+/// Replace a small user file without exposing a partial write.
+pub(crate) fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other(
+            "This file is a symlink; edit its target instead",
+        ));
+    }
     std::fs::create_dir_all(
         path.parent()
             .ok_or_else(|| std::io::Error::other("Missing settings directory"))?,
@@ -132,17 +169,21 @@ fn save_values(path: &std::path::Path, values: &[(&str, &str)]) -> std::io::Resu
     result
 }
 
-/// Save both lists together so changing modes cannot partially discard an exclusion.
+/// Save the application lists together so changing modes cannot partially discard an exclusion.
 pub fn set_app_mode(
     control: &crate::types::AppControl,
     id: &str,
     mode: crate::config::AppMode,
 ) -> Result<(), String> {
     use crate::config::AppMode;
-    if id.trim().is_empty() || id.contains([',', '\n', '\r', '"', '#', '\\']) {
+    if id.trim().is_empty() || id.contains([',', '\n', '\r', '"', '\\']) {
         return Err("This application identifier cannot be saved".into());
     }
-    for key in ["RECAST_EXCLUDE_APPS", "RECAST_LAYOUT_ONLY_APPS"] {
+    for key in [
+        "RECAST_EXCLUDE_APPS",
+        "RECAST_LAYOUT_ONLY_APPS",
+        "RECAST_MANUAL_ONLY_APPS",
+    ] {
         if std::env::var_os(key).is_some() {
             return Err(format!("{key} controls application modes. Remove the override and relaunch to change them here."));
         }
@@ -150,30 +191,56 @@ pub fn set_app_mode(
     let id = id.trim().to_lowercase();
     let mut excluded = crate::types::lock_forgiving(&control.excluded_apps).clone();
     let mut layout = crate::types::lock_forgiving(&control.layout_only_apps).clone();
+    let mut manual = crate::types::lock_forgiving(&control.manual_only_apps).clone();
+    let path = file_path().ok_or("No config directory available")?;
+    let saved = load_file(&path);
+    if let Some(error) = saved.read_error {
+        return Err(format!("Could not read application modes: {error}"));
+    }
+    // Configuration edits wait for a restart. Never replace pending app-list
+    // changes with the running process's older snapshot when editing another ID.
+    let same_apps = |live: &[String], key: &str| {
+        let saved = saved
+            .settings
+            .get(key)
+            .map(|value| crate::config::parse_excluded_apps(value))
+            .unwrap_or_default();
+        live.iter().all(|app| saved.contains(app)) && saved.iter().all(|app| live.contains(app))
+    };
+    if !same_apps(&excluded, "exclude_apps")
+        || !same_apps(&layout, "layout_only_apps")
+        || !same_apps(&manual, "manual_only_apps")
+    {
+        return Err("Application modes changed in config.toml. Relaunch ReCast to load those changes before saving here.".into());
+    }
     excluded.retain(|app| app != &id);
     layout.retain(|app| app != &id);
+    manual.retain(|app| app != &id);
     match mode {
         AppMode::Off => excluded.push(id),
         AppMode::LayoutOnly => layout.push(id),
+        AppMode::ManualOnly => manual.push(id),
         AppMode::Full => {}
     }
-    let path = file_path().ok_or("No config directory available")?;
     save_values(
         &path,
         &[
             ("exclude_apps", &excluded.join(", ")),
             ("layout_only_apps", &layout.join(", ")),
+            ("manual_only_apps", &manual.join(", ")),
         ],
     )
     .map_err(|e| format!("Could not save application modes: {e}"))?;
     crate::config::Config::update_live(|cfg| {
         cfg.excluded_apps = excluded.clone();
         cfg.layout_only_apps = layout.clone();
+        cfg.manual_only_apps = manual.clone();
     });
     let mut live_excluded = crate::types::lock_forgiving(&control.excluded_apps);
     let mut live_layout = crate::types::lock_forgiving(&control.layout_only_apps);
     *live_excluded = excluded;
     *live_layout = layout;
+    *crate::types::lock_forgiving(&control.manual_only_apps) = manual;
     Ok(())
 }
 
@@ -255,12 +322,8 @@ fn parse(text: &str) -> Parsed {
             out.malformed.push(n + 1);
             continue;
         };
-        // Values are scalars, so `#` can only begin the inline explanation
-        // used by the generated sample file.
-        let value = value
-            .split_once('#')
-            .map_or(value, |(value, _)| value)
-            .trim();
+        // String settings can contain literal # characters, including app IDs.
+        let value = without_inline_comment(value).trim();
         // Quotes are stripped so `spell = "0"` and `spell = 0` mean the same
         // thing. A TOML string is what an editor's autocomplete will offer, and
         // the difference between the two is not one worth having an opinion
@@ -273,6 +336,24 @@ fn parse(text: &str) -> Parsed {
             .insert(key.trim().to_lowercase(), value.to_string());
     }
     out
+}
+
+fn without_inline_comment(value: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else {
+            match character {
+                '\\' if quoted => escaped = true,
+                '"' => quoted = !quoted,
+                '#' if !quoted => return &value[..index],
+                _ => (),
+            }
+        }
+    }
+    value
 }
 
 /// Where a value came from, so a complaint about it can say where to fix it.
@@ -341,10 +422,57 @@ pub fn parse_number(key: &str, raw: &str) -> Result<u64, String> {
 /// these out.
 pub fn complaints(numeric_keys: &[&str], boolean_keys: &[&str], all_keys: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
+    if let Some((raw, source)) = lookup("RECAST_PREFER") {
+        if crate::config::LanguagePreference::parse(&raw).is_none() {
+            out.push(format!(
+                "{}={raw:?} must be balanced, english, or hebrew — using balanced.",
+                source.describe("RECAST_PREFER")
+            ));
+        }
+    }
     if let Some(value) = get("RECAST_UNDO_SHORTCUT") {
         if !crate::config::valid_undo_shortcut(&value) {
             out.push("undo_shortcut must be none, left_ctrl, or right_ctrl — using none.".into());
         }
+    }
+
+    for (key, default, valid) in [
+        (
+            "RECAST_ACTION_SHORTCUT",
+            "ctrl",
+            crate::config::valid_action_shortcut as fn(&str) -> bool,
+        ),
+        (
+            "RECAST_COMPLETION_SHORTCUT",
+            "right_shift",
+            crate::config::valid_completion_shortcut,
+        ),
+        (
+            "RECAST_CORRECTION_SHORTCUT",
+            "left_shift",
+            crate::config::valid_completion_shortcut,
+        ),
+    ] {
+        if get(key).is_some_and(|value| !valid(&value)) {
+            out.push(format!("{} is invalid — using {default}.", file_key(key)));
+        }
+    }
+    let mut shortcuts = crate::config::Config::from_env();
+    shortcuts.completion_shortcut = get("RECAST_COMPLETION_SHORTCUT")
+        .filter(|value| crate::config::valid_completion_shortcut(value))
+        .unwrap_or_else(|| "right_shift".into());
+    shortcuts.correction_shortcut = get("RECAST_CORRECTION_SHORTCUT")
+        .filter(|value| crate::config::valid_completion_shortcut(value))
+        .unwrap_or_else(|| "left_shift".into());
+    if shortcuts.completion_conflict() {
+        out.push(
+            "Completion shortcut conflicts with an action/undo key — completion shortcut disabled."
+                .into(),
+        );
+        shortcuts.completion_shortcut = "none".into();
+    }
+    if shortcuts.correction_conflict() {
+        out.push("Correction shortcut conflicts with completion or an action/undo key — correction shortcut disabled.".into());
     }
 
     for key in numeric_keys {
@@ -404,25 +532,32 @@ pub fn sample() -> String {
 # Read once at startup, so changes take effect on the next launch.
 
 # Correction pipelines
+#prefer = \"balanced\"  # balanced, english, hebrew; stricter switches away from your preference
 #exclude_apps = \"\"    # exact app IDs where correction is Off
 #layout_only_apps = \"\" # exact app IDs where only layout correction is allowed
-#undo_shortcut = \"none\" # none, left_ctrl, or right_ctrl; double-tap Ctrl stays active
+#manual_only_apps = \"\" # exact app IDs where edits require an explicit gesture
+#undo_shortcut = \"none\" # optional single-tap undo: none, left_ctrl, right_ctrl
+#action_shortcut = \"ctrl\" # double-tap: ctrl, left_ctrl, right_ctrl, left_shift, right_shift, none
+#completion_shortcut = \"right_shift\" # single-tap: left_ctrl, right_ctrl, left_shift, right_shift, none
+#correction_shortcut = \"left_shift\" # explicit spelling offers; separate from completion/action/undo
 #personal = false      # persist local word/correction/timing data (privacy-sensitive)
-#short = true          # short switches: rank <= 20000; false restricts to <= 500
-#split = false         # missing-space split fallback (opt-in; can mis-split)
+#rule_stats = false    # persist aggregate correction, undo, and completion-use counts
+#short = true          # short switches: rank <= 30000 (50000 with language history); false limits to 500
+#split = true          # correct only the last word of a merged token
 #freq = true           # homograph frequency tie-break
-#spell = true          # English spelling autocorrect
+#spell = true          # English and Hebrew spelling autocorrect
 #spell_min = {spell_min}           # shortest word the speller may fix
 #spell_rank = {spell_rank}      # worst frequency rank a suggestion may have
 #spell_dist = {spell_dist}          # maximum edit distance, 0 to 3 (0 disables)
 #complete = true       # word completion + abbreviation expansion
 #complete_min = {complete_min}        # shortest prefix that will be completed
-#complete_rank = {complete_rank}   # worst frequency rank a completion may have
+#complete_rank = {complete_rank}   # ordinary completion cutoff; long exact dictionary matches may exceed it
 #debug = false         # log every word check and switch decision
 
 # Linux only: what drives the keyboard layout. Detected from the session when
 # unset — set it if the guess is wrong. One of hyprland, sway, kde, gnome,
 # x11, none. `recast --status` prints what was chosen and the layouts it found.
+#desktop_helper = false # optional Linux AT-SPI helper; requires Python GI/Atspi
 #layout_backend = x11
 
 # Injection timings, in microseconds. Only worth touching if corrections come
@@ -500,6 +635,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn application_mode_changes_preserve_pending_external_edits() {
+        const CHILD: &str = "RECAST_APP_MODE_EXTERNAL_EDITS_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "settings::tests::application_mode_changes_preserve_pending_external_edits",
+                ])
+                .env(CHILD, "1")
+                .env_remove("RECAST_EXCLUDE_APPS")
+                .env_remove("RECAST_LAYOUT_ONLY_APPS")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use crate::config::AppMode;
+        let control = crate::types::AppControl::new_for_test();
+        set_app_mode(&control, "Editor", AppMode::Off).unwrap();
+        let path = file_path().unwrap();
+        for pending in [
+            "exclude_apps = \"Editor, Secret\"\nlayout_only_apps = \"\"\n",
+            "exclude_apps = \"Editor\"\nlayout_only_apps = \"Secret\"\n",
+            "exclude_apps = \"\"\nlayout_only_apps = \"\"\n",
+        ] {
+            std::fs::write(&path, pending).unwrap();
+            assert!(set_app_mode(&control, "Terminal", AppMode::LayoutOnly).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), pending);
+            assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));
+            assert_eq!(control.app_mode(Some("Secret")), Some(AppMode::Full));
+            assert_eq!(control.app_mode(Some("Terminal")), Some(AppMode::Full));
+            assert_eq!(crate::config::Config::global().excluded_apps, ["editor"]);
+            assert!(crate::config::Config::global().layout_only_apps.is_empty());
+        }
+        // Equivalent formatting and unrelated settings must not block a save
+        // or apply restart-only changes to the running process.
+        std::fs::write(&path, "exclude_apps = \"EDITOR, editor\"\nspell = false\n").unwrap();
+        set_app_mode(&control, "Terminal", AppMode::LayoutOnly).unwrap();
+        assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));
+        assert_eq!(
+            control.app_mode(Some("Terminal")),
+            Some(AppMode::LayoutOnly)
+        );
+        assert_eq!(load_file(&path).settings["spell"], "false");
+        assert!(crate::config::Config::global().spell_enabled);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn inline_comments_preserve_quoted_application_ids() {
+        let parsed = parse(
+            "exclude_apps = \"org.example#client, עורך#פרטי\" # protected apps\n\
+             layout_only_apps = \"layout#client\"\n\
+             spell = false # disabled\n\
+             spell_dist = 1 # conservative\n",
+        );
+        assert_eq!(
+            parsed.settings["exclude_apps"],
+            "org.example#client, עורך#פרטי"
+        );
+        assert_eq!(parsed.settings["layout_only_apps"], "layout#client");
+        assert_eq!(parsed.settings["spell"], "false");
+        assert_eq!(parsed.settings["spell_dist"], "1");
+        let excluded = crate::config::parse_excluded_apps(&parsed.settings["exclude_apps"]);
+        assert!(!crate::config::app_allowed(
+            &excluded,
+            Some("org.example#client")
+        ));
+        assert!(!crate::config::app_allowed(&excluded, Some("עורך#פרטי")));
+        assert!(crate::config::app_allowed(&excluded, Some("other-client")));
+
+        // Escaped quotes must not end a quoted value when locating its comment.
+        let parsed = parse(r##"exclude_apps = "app\"#client" # comment"##);
+        assert_eq!(parsed.settings["exclude_apps"], r##"app\"#client"##);
+    }
+
+    #[test]
     fn live_menu_changes_apply_and_persist() {
         // Isolate process-global config from the parallel dictionary tests.
         if std::env::var_os("RECAST_MENU_TEST_CHILD").is_none() {
@@ -513,6 +730,7 @@ mod tests {
                 .env_remove("RECAST_COMPLETE")
                 .env_remove("RECAST_SPELL_DIST")
                 .env_remove("RECAST_EXCLUDE_APPS")
+                .env_remove("RECAST_PREFER")
                 .output()
                 .unwrap();
             assert!(
@@ -524,6 +742,67 @@ mod tests {
             return;
         }
         let control = crate::types::AppControl::new_for_test();
+        use crate::config::LanguagePreference;
+        assert_eq!(
+            crate::config::Config::global().language_preference,
+            LanguagePreference::Balanced
+        );
+        for preference in LanguagePreference::ALL {
+            set_live(&control, "prefer", preference.value()).unwrap();
+            assert_eq!(
+                crate::config::Config::global().language_preference,
+                preference
+            );
+            assert_eq!(
+                load_file(&file_path().unwrap()).settings["prefer"],
+                preference.value()
+            );
+        }
+        assert!(set_live(&control, "prefer", "engish").is_err());
+        std::env::set_var("RECAST_PREFER", "english");
+        assert!(set_live(&control, "prefer", "balanced").is_err());
+        assert_eq!(
+            crate::config::Config::from_env().language_preference,
+            LanguagePreference::English
+        );
+        std::env::remove_var("RECAST_PREFER");
+        set_live(&control, "prefer", "english").unwrap();
+        let keys: Vec<_> = "thbyrby".chars().zip("אינטרנט".chars()).collect();
+        let mut history = crate::dictionary::History::default();
+        let check = |current, run| {
+            crate::dictionary::check_and_correct(
+                &keys,
+                |k| Some(k.0),
+                |k| Some(k.1),
+                |_| false,
+                run,
+                crate::dictionary::en_dict(),
+                crate::dictionary::he_dict(),
+                Some(current),
+                false,
+                |_| crate::layout::LayoutSwitch::Switched,
+            )
+        };
+        for _ in 0..3 {
+            let outcome = check(crate::types::Language::English, history.run());
+            assert!(outcome.fix.is_none());
+            assert!(
+                outcome.lang.is_none(),
+                "a rejected switch must not seed language history"
+            );
+            assert!(outcome
+                .details
+                .contains("Layout preserved by language preference"));
+        }
+        for _ in 0..2 {
+            let outcome = check(crate::types::Language::Hebrew, history.run());
+            assert!(outcome.fix.is_none());
+            history.push(outcome.lang.unwrap());
+        }
+        assert!(check(crate::types::Language::English, history.run())
+            .fix
+            .is_some());
+        set_live(&control, "prefer", "balanced").unwrap();
         let dict = crate::dictionary::Dict::of(&["hello"]);
         let freq = crate::dictionary::Freq::of(&[("hello", 1)]);
         assert_eq!(
@@ -556,7 +835,15 @@ mod tests {
         set_app_mode(&control, "EDITOR", crate::config::AppMode::Full).unwrap();
         assert!(crate::types::lock_forgiving(&control.excluded_apps).is_empty());
         use crate::config::AppMode;
+        set_app_mode(&control, "Editor", AppMode::ManualOnly).unwrap();
+        assert_eq!(control.app_mode(Some("EDITOR")), Some(AppMode::ManualOnly));
+        assert_eq!(control.app_mode(None), None);
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["manual_only_apps"],
+            "editor"
+        );
         set_app_mode(&control, "Editor", AppMode::LayoutOnly).unwrap();
+        assert!(crate::types::lock_forgiving(&control.manual_only_apps).is_empty());
         assert_eq!(control.app_mode(Some("EDITOR")), Some(AppMode::LayoutOnly));
         assert_eq!(
             load_file(&file_path().unwrap()).settings["layout_only_apps"],
@@ -570,9 +857,71 @@ mod tests {
             load_file(&file_path().unwrap()).settings["exclude_apps"],
             "editor"
         );
+        set_app_mode(&control, "Org.Example#Client", AppMode::Off).unwrap();
+        set_app_mode(&control, "Layout#Client", AppMode::LayoutOnly).unwrap();
+        assert_eq!(
+            control.app_mode(Some("Org.Example#Client")),
+            Some(AppMode::Off)
+        );
+        assert_eq!(
+            control.app_mode(Some("Layout#Client")),
+            Some(AppMode::LayoutOnly)
+        );
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["layout_only_apps"],
+            "layout#client"
+        );
+        set_live(
+            &control,
+            "exclude_apps",
+            "Editor, Org.Example#Client, CLI#Client",
+        )
+        .unwrap();
+        assert_eq!(control.app_mode(Some("CLI#Client")), Some(AppMode::Off));
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["exclude_apps"],
+            "Editor, Org.Example#Client, CLI#Client"
+        );
         set_live(&control, "undo_shortcut", "right_ctrl").unwrap();
         assert_eq!(crate::config::Config::global().undo_shortcut, "right_ctrl");
         assert!(set_live(&control, "undo_shortcut", "ctrl+z").is_err());
+        assert!(set_live(&control, "completion_shortcut", "left_ctrl").is_err());
+        assert_eq!(
+            crate::config::Config::global().completion_shortcut,
+            "right_shift"
+        );
+        assert!(set_live(&control, "action_shortcut", "right_shift").is_err());
+        assert!(set_live(&control, "correction_shortcut", "right_shift").is_err());
+        assert!(set_live(&control, "correction_shortcut", "left_ctrl").is_err());
+        assert!(set_live(&control, "correction_shortcut", "tab").is_err());
+        set_live(&control, "correction_shortcut", "none").unwrap();
+        set_live(&control, "action_shortcut", "left_shift").unwrap();
+        assert!(set_live(&control, "completion_shortcut", "right_ctrl").is_err());
+        set_live(&control, "completion_shortcut", "left_ctrl").unwrap();
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["completion_shortcut"],
+            "left_ctrl"
+        );
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["action_shortcut"],
+            "left_shift"
+        );
+        assert!(set_live(&control, "undo_shortcut", "left_ctrl").is_err());
+        assert!(set_live(&control, "action_shortcut", "ctrl+z").is_err());
+        assert!(set_live(&control, "completion_shortcut", "tab").is_err());
+        std::env::set_var("RECAST_ACTION_SHORTCUT", "ctrl");
+        assert!(set_live(&control, "action_shortcut", "none").is_err());
+        std::env::remove_var("RECAST_ACTION_SHORTCUT");
+        set_live(&control, "action_shortcut", "none").unwrap();
+        set_live(&control, "completion_shortcut", "none").unwrap();
+        set_live(&control, "correction_shortcut", "right_shift").unwrap();
+        assert_eq!(
+            load_file(&file_path().unwrap()).settings["correction_shortcut"],
+            "right_shift"
+        );
+        std::env::set_var("RECAST_CORRECTION_SHORTCUT", "left_shift");
+        assert!(set_live(&control, "correction_shortcut", "none").is_err());
+        std::env::remove_var("RECAST_CORRECTION_SHORTCUT");
         std::fs::write(file_path().unwrap(), [0xff]).unwrap();
         assert!(set_app_mode(&control, "Editor", AppMode::Full).is_err());
         assert_eq!(control.app_mode(Some("Editor")), Some(AppMode::Off));
