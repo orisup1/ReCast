@@ -5,7 +5,7 @@ use crate::dictionary::History;
 use crate::types::{Language, Replaceable, WordBuffer};
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Keep correction undo bounded while the cursor advances through spaces.
@@ -49,6 +49,8 @@ pub enum LastAction<P: Platform> {
 /// It survives bounded trailing spaces. Other text or cursor movement drops it
 /// because undo erases backwards from the cursor (see [`super::Engine::key_press`]).
 pub struct LastFix<P: Platform> {
+    /// Exact injected suffix, including its original terminator, for native undo.
+    pub(super) expected: String,
     /// Physical keys of the visible final word, including any unchanged prefix.
     pub(super) visible: Vec<Typed<P::Key>>,
     pub(super) visible_layout: Language,
@@ -97,8 +99,8 @@ pub struct LastSkip<P: Platform> {
     pub(super) word: String,
 }
 
-/// A completion cycle: the guesses on offer for the word being typed, and which
-/// one is currently on screen.
+/// A suggestion cycle: candidates for the tracked word and the current choice.
+/// A passive preview highlights that choice without changing document text.
 ///
 /// `index == candidates.len()` is the entry past the end — what the user typed
 /// — so tapping through the whole list always arrives back at their own text
@@ -106,6 +108,8 @@ pub struct LastSkip<P: Platform> {
 /// feature's safety property**: a wrong guess costs a keypress, not a deletion,
 /// which is what lets the completer guess at all.
 pub struct Cycle<P: Platform> {
+    pub(super) preview: bool,
+    pub(super) preview_ready: bool,
     /// The word buffer as the user typed it, before any completion.
     pub(super) typed: Vec<Typed<P::Key>>,
     /// Separators already following a finished word, preserved on every offer.
@@ -139,6 +143,8 @@ impl<P: Platform> LastAction<P> {
 impl<P: Platform> Clone for Cycle<P> {
     fn clone(&self) -> Self {
         Self {
+            preview: self.preview,
+            preview_ready: self.preview_ready,
             typed: self.typed.clone(),
             trailing_spaces: self.trailing_spaces.clone(),
             candidates: self.candidates.clone(),
@@ -156,6 +162,7 @@ impl<P: Platform> Clone for Cycle<P> {
 impl<P: Platform> Clone for LastFix<P> {
     fn clone(&self) -> Self {
         Self {
+            expected: self.expected.clone(),
             visible: self.visible.clone(),
             visible_layout: self.visible_layout,
             manual_conversion: self.manual_conversion,
@@ -227,6 +234,8 @@ pub struct AppState<P: Platform> {
     pub last_action: Option<LastAction<P>>,
     /// The completion cycle in progress, if the user is tapping through guesses.
     pub cycle: Option<Cycle<P>>,
+    pub(super) suggestion_requests: VecDeque<bool>,
+    pub(super) suggestion_worker: bool,
     pub(super) pending_learning: Option<PendingLearning>,
     pub(super) phrase: crate::complete::PhraseContext,
     pub(super) completion_use: Option<bool>,
@@ -276,6 +285,8 @@ impl<P: Platform> AppState<P> {
             layout_hotkey: false,
             last_action: None,
             cycle: None,
+            suggestion_requests: VecDeque::new(),
+            suggestion_worker: false,
             pending_learning: None,
             phrase: crate::complete::PhraseContext::default(),
             completion_use: None,

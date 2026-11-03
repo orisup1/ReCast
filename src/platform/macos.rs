@@ -15,6 +15,13 @@ impl Platform for Mac {
     type Retype = String;
     type Injector = AtomicBool;
     type Focus = Focus;
+    const PREVIEW_ALTERNATIVES: bool = true;
+    fn show_preview(engine: Arc<Engine<Self>>, generation: u64, choices: Vec<String>) {
+        candidate_strip::show(engine, generation, choices);
+    }
+    fn hide_preview() {
+        candidate_strip::hide();
+    }
     const REQUIRES_FOCUS: bool = true;
     const QUEUE_UNDO_DURING_REPLACEMENT: bool = true;
     const SHIFT_LEFT: Key = textkeys::SHIFT_LEFT;
@@ -529,18 +536,21 @@ fn deferred_input() -> &'static Mutex<NativeDeferredInput> {
 
 fn begin_injection(engine: &Engine<Mac>, generation: u64) -> Option<()> {
     // Serialize validation and gating with capture; never dispatch with the state locked.
-    dispatch::Queue::main().exec_sync(|| {
-        if !engine.replacement_valid(generation) {
-            return None;
-        }
-        let mut input = crate::types::lock_forgiving(deferred_input());
-        let tag = FINISH_EVENT | i64::from(input.input.next_ticket());
-        let event = keyboard_event_with_tag(0, false, false, tag)?;
-        input.input.begin();
-        input.finish = Some(DeferredEvent { kind: 0, event });
-        engine.injector.store(true, Ordering::Relaxed);
-        Some(())
-    })
+    dispatch::Queue::main().exec_sync(|| arm_deferred_input(engine, generation))
+}
+
+/// Main thread only. Retain any acceptance event queued before the worker starts.
+fn arm_deferred_input(engine: &Engine<Mac>, generation: u64) -> Option<()> {
+    if !engine.replacement_valid(generation) {
+        return None;
+    }
+    let mut input = crate::types::lock_forgiving(deferred_input());
+    let tag = FINISH_EVENT | i64::from(input.input.next_ticket());
+    let event = keyboard_event_with_tag(0, false, false, tag)?;
+    input.input.begin();
+    input.finish = Some(DeferredEvent { kind: 0, event });
+    engine.injector.store(true, Ordering::Relaxed);
+    Some(())
 }
 
 fn gesture_input(kind: u32, key: Key, flags: u64) -> bool {
@@ -742,8 +752,42 @@ unsafe extern "C" fn tap_callback(
         }
     }
 
+    if event_type == KCG_EVENT_KEY_DOWN && ctx.has_ready_preview() {
+        let key =
+            key_from_code(CGEventGetIntegerValueField(cg_event, KCG_KEYBOARD_EVENT_KEYCODE) as u16);
+        let flags = CGEventGetFlags(cg_event);
+        let accepts = preview_acceptance_key(key, flags);
+        if accepts
+            && focused_target().as_ref().and_then(Mac::app_id).as_deref()
+                == Some("com.apple.Spotlight")
+        {
+            if let Some(generation) = ctx.commit_preview() {
+                if arm_deferred_input(ctx, generation).is_some() {
+                    // Spotlight must not commit its own inline autocomplete first.
+                    let event = core_foundation_sys::base::CFRetain(cg_event.cast()).cast_mut();
+                    crate::types::lock_forgiving(deferred_input())
+                        .input
+                        .events
+                        .push(DeferredEvent {
+                            kind: event_type,
+                            event,
+                        });
+                    return std::ptr::null_mut();
+                }
+                ctx.forget_everything();
+            }
+        }
+    }
     capture_event(ctx, event_type, cg_event);
     cg_event
+}
+
+fn preview_acceptance_key(key: Key, flags: u64) -> bool {
+    key != Key::Return
+        && flags & 0x001c_0000 == 0
+        && (Mac::is_terminator(key)
+            || Mac::english_char_plain(key).is_some()
+            || Mac::hebrew_char(key).is_some())
 }
 
 unsafe fn capture_event(ctx: &Arc<Engine<Mac>>, event_type: u32, cg_event: CGEventRef) {
@@ -893,6 +937,7 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
         std::process::exit(1);
     };
     crate::platform::tray::run(control);
+    candidate_strip::shutdown();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1212,6 +1257,7 @@ fn paste_text(text: &str) -> Option<()> {
 
 fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<Typed>> {
     let Plan {
+        expected,
         erase,
         retype: text,
         terminator,
@@ -1225,6 +1271,17 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     }
     begin_injection(engine, generation)?;
     let buf = engine.buffered();
+    let focus = focused_target()?;
+    if Mac::app_id(&focus).as_deref() == Some("com.apple.Spotlight") {
+        let replacement = format!("{text}{}", if terminator.is_some() { " " } else { "" });
+        replace_spotlight_query(engine, &focus, &expected, &replacement, &buf, generation)?;
+        return Some(buf);
+    }
+    // A host selection is not a counted run of characters: its first Backspace
+    // would delete the selection rather than one character of our tracked word.
+    if selected_range(&focus).is_some_and(|range| range.length != 0) {
+        return None;
+    }
     // Press + release a single key with pacing that macOS won't drop. Only the
     // backspaces and the odd replayed key go through this; the replacement
     // text uses bounded Unicode event payloads.
@@ -1480,6 +1537,20 @@ mod setup_tests {
     use std::path::Path;
 
     #[test]
+    fn preview_acceptance_defers_space_and_letters_but_never_enter_or_shortcuts() {
+        for key in [Key::Space, Key::KeyA, Key::Dot] {
+            assert!(preview_acceptance_key(key, 0));
+            assert!(preview_acceptance_key(key, 0x0002_0000));
+            for flags in [0x0004_0000, 0x0008_0000, 0x0010_0000] {
+                assert!(!preview_acceptance_key(key, flags));
+            }
+        }
+        for key in [Key::Return, Key::Escape, Key::Backspace, Key::ShiftLeft] {
+            assert!(!preview_acceptance_key(key, 0));
+        }
+    }
+
+    #[test]
     fn modifier_snapshots_preserve_sides_and_reject_aggregate_only_flags() {
         let empty = modifier_snapshot(FLAG_ALPHA_SHIFT).unwrap();
         assert_eq!(modifier_snapshot(0), Some(empty));
@@ -1701,4 +1772,15 @@ mod setup_tests {
         assert!(SetupAction::Reveal.settings_url(true).is_none());
         assert!(SetupAction::Quit.settings_url(true).is_none());
     }
+}
+
+mod candidate_strip;
+mod spotlight;
+use spotlight::{replace_spotlight_query, selected_range};
+
+pub(crate) fn dismiss_candidates() {
+    if let Some(engine) = CTX.get() {
+        engine.forget_everything();
+    }
+    candidate_strip::hide();
 }

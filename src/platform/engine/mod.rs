@@ -61,6 +61,43 @@ impl<P: Platform> Engine<P> {
         })
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    pub fn preview_ready(&self, generation: u64) -> bool {
+        let mut st = self.lock();
+        if st.generation != generation {
+            return false;
+        }
+        if let Some(cycle) = st.cycle.as_mut().filter(|cycle| cycle.preview) {
+            cycle.preview_ready = true;
+            return true;
+        }
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn has_ready_preview(&self) -> bool {
+        self.lock()
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.preview && cycle.preview_ready)
+    }
+
+    /// Native search fields must receive the acceptance key after the replacement.
+    #[cfg(target_os = "macos")]
+    pub fn commit_preview(self: &Arc<Self>) -> Option<u64> {
+        let st = self.lock();
+        if !st
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.preview && cycle.preview_ready)
+        {
+            return None;
+        }
+        self.accept_preview(st);
+        let st = self.lock();
+        st.is_replacing.then_some(st.generation)
+    }
+
     fn lock(&self) -> MutexGuard<'_, AppState<P>> {
         lock_forgiving(&self.state)
     }

@@ -19,16 +19,7 @@ pub fn opened(control: &AppControl) {
 }
 
 pub(crate) fn restore_instruction(config: &crate::config::Config) -> String {
-    if config.undo_shortcut != "none" {
-        format!(
-            "tap {}",
-            crate::config::modifier_label(&config.undo_shortcut)
-        )
-    } else if config.action_shortcut != "none" {
-        config.action_gesture()
-    } else {
-        "enable an undo shortcut in Settings, then use it".into()
-    }
+    config.undo_gesture()
 }
 
 #[cfg(target_os = "linux")]
@@ -36,6 +27,20 @@ pub fn instructions() -> String {
     let config = crate::config::Config::global();
     format!(
     "1. Select your English keyboard. In the field below, press Space, type akuo, then Space. Watch it become שלום.\n2. Immediately {} to restore akuo.\n3. Select all and delete. Press Space, type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", restore_instruction(&config), config.completion_gesture())
+}
+
+fn completion_instruction(config: &crate::config::Config) -> String {
+    if cfg!(target_os = "macos") {
+        format!(
+            "type keyb, then {} to preview keyboard. Press Space to accept.",
+            config.completion_gesture()
+        )
+    } else {
+        format!(
+            "type keyb, then {} to complete keyboard.",
+            config.completion_gesture()
+        )
+    }
 }
 
 pub fn shortcut_label(value: &str) -> &'static str {
@@ -52,7 +57,7 @@ pub fn step_instruction(stage: u8) -> String {
     match stage {
         0 => "Select your English keyboard. Click the field below, press Space, type akuo, then Space. Watch it become שלום.\nPractice is local; no learning or correction counts.".into(),
         1 => format!("Immediately {} to restore akuo. Keep the cursor in the field; do not click or type first.", restore_instruction(&config)),
-        2 => format!("Select all and delete in the field. Press Space, type keyb, then {} to complete keyboard.", config.completion_gesture()),
+        2 => format!("Select all and delete in the field. Press Space, {}", completion_instruction(&config)),
         _ => "You tried correction, undo, and completion. Choose Done and keep typing anywhere. Practice does not save learned words or change your correction counts.".into(),
     }
 }
@@ -65,8 +70,8 @@ pub fn feedback(control: &AppControl) -> String {
         restore_instruction(&config)
     );
     let completion_step = format!(
-        "Restoration worked. Clear the field, press Space, type keyb, then {}.",
-        config.completion_gesture()
+        "Restoration worked. Clear the field, press Space, {}",
+        completion_instruction(&config)
     );
     let step = match stage {
         0 if crate::complete::ignored("akuo") || crate::complete::learned("akuo") || crate::complete::suppressed("akuo") => "The practice word akuo is ignored. Allow it in your word lists before trying this exercise; practice will not change your exceptions.",

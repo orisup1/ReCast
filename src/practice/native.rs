@@ -46,6 +46,11 @@ impl Window {
                     refocus = true;
                 }
                 11 => return Ok(true),
+                26 => {
+                    if let Some(key) = crate::config::Config::global().recommended_undo() {
+                        crate::settings::set_live(control, "undo_shortcut", key)?;
+                    }
+                }
                 23 => {
                     let values = ["none", "left_ctrl", "right_ctrl"];
                     if let Some(value) = values.get(self.form.selection(23)) {
@@ -173,10 +178,45 @@ impl Window {
         }
         let config = crate::config::Config::global();
         scene.extend([
-            E::new(24, K::Label, "Undo only (optional): never converts unchanged words", [24.0, 104.0, width - 48.0, 24.0]),
-            E::new(23, K::Choice(vec!["Disabled".into(), "Tap Left Ctrl".into(), "Tap Right Ctrl".into()], ["none", "left_ctrl", "right_ctrl"].iter().position(|v| *v == config.undo_shortcut).unwrap_or(0)), "Undo-only shortcut", [24.0, 132.0, 220.0, 34.0]),
-            E::new(25, K::Label, "For instant undo, use a different key for double-tap actions in Settings > Shortcuts. Shared keys wait half a second.", [260.0, 128.0, width - 284.0, 68.0]),
+            E::new(
+                24,
+                K::Label,
+                "Undo only: one tap, one clear action",
+                [24.0, 104.0, width - 48.0, 24.0],
+            ),
+            E::new(
+                23,
+                K::Choice(
+                    vec![
+                        "Disabled".into(),
+                        "Tap Left Ctrl".into(),
+                        "Tap Right Ctrl".into(),
+                    ],
+                    ["none", "left_ctrl", "right_ctrl"]
+                        .iter()
+                        .position(|v| *v == config.undo_shortcut)
+                        .unwrap_or(0),
+                ),
+                "Undo-only shortcut",
+                [24.0, 132.0, 220.0, 34.0],
+            ),
+            E::new(
+                25,
+                K::Label,
+                config.undo_setup_hint(),
+                [260.0, 128.0, width - 284.0, 68.0],
+            ),
         ]);
+        if config.undo_shortcut == "none" {
+            if let Some(key) = config.recommended_undo() {
+                scene.push(E::new(
+                    26,
+                    K::Button,
+                    format!("Enable {} undo", crate::config::modifier_label(key)),
+                    [24.0, 174.0, 220.0, 30.0],
+                ));
+            }
+        }
         self.form.render_scrolling(scene)?;
         if refocus {
             self.focus();

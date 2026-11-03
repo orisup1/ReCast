@@ -711,6 +711,7 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
         erase,
         retype,
         terminator,
+        expected: _expected,
     } = plan;
     if terminator.is_some_and(Linux::is_line_break) {
         return None;

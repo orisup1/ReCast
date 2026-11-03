@@ -210,6 +210,22 @@ impl<P: Platform> Engine<P> {
         if !is_action {
             st.last_action_tap = None;
         }
+        if st.suggestion_worker && !st.is_replacing && is_action {
+            st.suggestion_requests.clear();
+            st.generation = st.generation.wrapping_add(1);
+        }
+        let mut accepted_preview = false;
+        if st.cycle.as_ref().is_some_and(|cycle| cycle.preview) {
+            let text = P::english_char_plain(key).is_some() || P::hebrew_char(key).is_some();
+            if !chorded_shortcut && !P::is_line_break(key) && (text || P::is_terminator(key)) {
+                self.accept_preview(st);
+                st = self.lock();
+                accepted_preview = st.is_replacing;
+            } else if !is_correction && !is_completion && !is_shift {
+                P::hide_preview();
+                st.cycle = None;
+            }
+        }
         let preserve_spaces = P::is_terminator(key)
             && !P::is_line_break(key)
             && !chorded_shortcut
@@ -226,7 +242,11 @@ impl<P: Platform> Engine<P> {
                         .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))));
         if !is_action && !is_completion && !is_correction && !preserve_spaces {
             st.forget_gestures();
-        } else if preserve_spaces {
+        } else if preserve_spaces && !accepted_preview {
+            if st.suggestion_worker && !st.is_replacing {
+                st.generation = st.generation.wrapping_add(1);
+                st.suggestion_requests.clear();
+            }
             st.cycle = None;
         }
         let shift = if P::english_char_plain(key).is_some_and(|c| c.is_ascii_alphabetic()) {
@@ -550,6 +570,22 @@ impl<P: Platform> Engine<P> {
             }
             return;
         }
-        self.request_suggestion(st, is_correction);
+        if st.suggestion_requests.len() < 32 {
+            st.suggestion_requests.push_back(is_correction);
+        }
+        if st.suggestion_worker {
+            return;
+        }
+        st.suggestion_worker = true;
+        drop(st);
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            let mut st = engine.lock();
+            let Some(correction) = st.suggestion_requests.pop_front() else {
+                st.suggestion_worker = false;
+                return;
+            };
+            engine.request_suggestion(st, correction);
+        });
     }
 }

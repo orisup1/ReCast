@@ -138,6 +138,7 @@ scrambled, or if you want them faster and are willing to measure):
 Auto-complete:
   Default shortcuts (change in Settings or config.toml):
   Tap Right Shift before or after Space to complete the tracked word.
+  macOS previews choices first: type or Space to accept; Enter cancels.
   Four choices, then your original text; keep tapping for the next page.
   Tracked trailing spaces survive every choice and undo.
   Abbreviations expand when a word is finished, and are offered by the
@@ -147,6 +148,9 @@ Auto-complete:
 Spelling suggestions:
   Tap Left Shift before or after Space; tap again to cycle alternatives and
   return to your original text. Includes short and already valid words.
+  macOS previews in a passive caret strip: typing or Space accepts; Enter cancels.
+  Original is a no-op. The strip anchors to the caret or a single-line search field.
+  Windows/Linux retain direct replacement cycling.
   This explicit gesture works when automatic spelling or completion is off.
 
 Undo or convert (Ctrl tapped twice within half a second):
@@ -156,7 +160,8 @@ Undo or convert (Ctrl tapped twice within half a second):
   changing saved word exceptions. Extra spaces preserve undo. Other typing,
   Enter, or cursor movement ends the gesture. Enter never triggers a rewrite.
   The optional single-Ctrl undo shortcut only restores corrections; it never unlists
-  skipped words. Shared bindings wait half a second so double taps take priority.
+  skipped words. Practice recommends an available separate Ctrl for immediate undo.
+  Existing bindings are preserved. Shared bindings wait half a second so double taps take priority.
   Select text in a supported editable field and double-tap Ctrl to convert
   its layout. Repeat to restore the original. Requires accessibility selection
   editing (Linux needs the optional desktop helper); the clipboard is untouched.

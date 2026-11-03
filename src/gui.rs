@@ -11,6 +11,7 @@ struct App {
     last_app: Option<(String, String)>,
     last_app_check: std::time::Instant,
     error: Option<String>,
+    history_error: Option<String>,
     show_shortcuts: bool,
     rule_editor: Option<crate::complete::RuleEditor>,
     show_log: bool,
@@ -61,7 +62,15 @@ impl eframe::App for App {
                 }
                 ui.label(crate::practice::feedback(&self.control));
                 ui.label(&self.health);
-                ui.label("Set an undo-only key in Settings > Shortcuts. It never converts unchanged words.");
+                let config = crate::config::Config::global();
+                ui.label(config.undo_setup_hint());
+                if config.undo_shortcut == "none" {
+                    if let Some(key) = config.recommended_undo() {
+                        if ui.button(format!("Enable {} undo", crate::config::modifier_label(key))).clicked() {
+                            self.error = crate::settings::set_live(&self.control, "undo_shortcut", key).err();
+                        }
+                    }
+                }
                 ui.label("Close to skip. Reopen Practice from the controls anytime.");
             });
         self.control
@@ -236,12 +245,14 @@ impl eframe::App for App {
                 let history = self.control.history();
                 ui.collapsing(format!("Recent corrections ({})", history.len()), |ui| {
                     ui.label("Expand a correction to inspect why it changed.");
+                    ui.small(format!("Undo while typing: {}. Ignoring a word prevents future automatic changes; it does not undo existing text.", crate::config::Config::global().undo_gesture()));
+                    if let Some(error) = &self.history_error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
                     if history.is_empty() {
                         ui.label("No corrections yet.");
                     }
                     for correction in history {
                         let ignored = crate::complete::ignored(&correction.from);
-                        let label = format!("{} · {} · {}{}", correction.at.format("%H:%M:%S"), correction.kind.tag(), if correction.undone { "Undone" } else { "Applied" }, if ignored { " · ignored" } else { "" });
+                        let label = format!("\u{2068}{}\u{2069} → \u{2068}{}\u{2069} · {} · {}{}", correction.from, correction.to, correction.at.format("%H:%M:%S"), if correction.undone { "Undone" } else { "Applied" }, if ignored { " · ignored" } else { "" });
                         ui.push_id(correction.at, |ui| { ui.collapsing(label, |ui| {
                             for (label, word) in [("Original", &correction.from), ("Replacement", &correction.to)] {
                                 ui.label(label);
@@ -249,9 +260,10 @@ impl eframe::App for App {
                                 ui.with_layout(if rtl { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) }, |ui| { ui.label(word); });
                             }
                             ui.label(correction.inspection());
-                            if ui.add_enabled(!ignored, egui::Button::new(if ignored { "Already ignored" } else { "Ignore this word" })).clicked() {
-                                crate::complete::ignore_word(&correction.from);
+                            if ui.button(if ignored { "Allow again" } else { "Ignore this word" }).on_hover_text(if ignored { "Remove this ignored word. Separate learned exceptions still apply." } else { "Leave this word alone in future automatic corrections. You can allow it again here." }).clicked() {
+                                self.history_error = crate::complete::set_word_ignored(&correction.from, !ignored).err();
                             }
+                            if ignored { ui.small("Protected from future automatic corrections. Allow again removes it from ignored words."); }
                         }); });
                     }
                 });
@@ -350,7 +362,7 @@ impl eframe::App for App {
                     self.error = crate::settings::set_live(&self.control, "undo_shortcut", &shortcut).err();
                 }
                 ui.separator();
-                ui.small("Undo only never converts unchanged words. For immediate undo, use a different Ctrl key from the double-tap action. Shared keys wait half a second.");
+                ui.small(cfg.undo_setup_hint());
                 }
                 if self.settings_page == 2 {
                 ui.heading("Application modes");
@@ -433,6 +445,7 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
                 last_app: None,
                 last_app_check: std::time::Instant::now(),
                 error: None,
+                history_error: None,
                 show_shortcuts: false,
                 rule_editor: None,
                 show_log: false,

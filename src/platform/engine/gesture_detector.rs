@@ -43,6 +43,10 @@ impl<P: Platform> AppState<P> {
                     && correction == &config.correction_shortcut
             })
         {
+            if self.suggestion_worker && !self.is_replacing {
+                self.generation = self.generation.wrapping_add(1);
+            }
+            self.suggestion_requests.clear();
             self.action_down = None;
             self.completion_down = None;
             self.last_action_tap = None;
@@ -62,6 +66,13 @@ impl<P: Platform> AppState<P> {
     /// cursor right now. Anything that moves the text on makes both claims
     /// about something that is no longer there.
     pub(super) fn forget_gestures(&mut self) {
+        if self.suggestion_worker && !self.is_replacing {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.suggestion_requests.clear();
+        if self.cycle.as_ref().is_some_and(|cycle| cycle.preview) {
+            P::hide_preview();
+        }
         self.last_action = None;
         self.cycle = None;
         self.last_action_tap = None;

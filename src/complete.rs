@@ -54,7 +54,7 @@ const RARE_SUFFIX_MAX: usize = 8;
 
 /// Phrase evidence is local to one uninterrupted typing context, never persisted.
 /// Two observations are required before a learned pair influences ranking.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PhraseContext {
     history: crate::intent::Context,
     pairs: HashMap<(String, String), u16>,
@@ -756,7 +756,14 @@ fn abbreviation(key: &str) -> Option<String> {
 /// thresholds until nobody's vocabulary is served, this is the escape hatch for
 /// the handful of words each user actually types.
 pub fn ignored(word: &str) -> bool {
-    ignore_list().lock().is_ok_and(|list| list.contains(word))
+    let word = word.trim();
+    ignore_list().lock().is_ok_and(|list| {
+        if word.chars().any(char::is_uppercase) {
+            list.contains(&word.to_lowercase())
+        } else {
+            list.contains(word)
+        }
+    })
 }
 
 /// Clear test fixtures from suppression, learning, and ignored-word lists.
@@ -1058,7 +1065,7 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
 
 /// The ignore list, read from disk on first use. Behind a `Mutex` rather than
 /// straight in a `OnceLock` because it is not immutable for the life of the
-/// process: [`unlist`] takes entries out of it, [`ignore_word`] puts them in,
+/// process: [`set_word_ignored`] changes entries,
 /// and [`reload_user_files`] replaces it wholesale when the file is edited.
 fn ignore_list() -> &'static Mutex<HashSet<String>> {
     static LIST: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -1105,43 +1112,29 @@ pub fn reload_user_files() {
     }
 }
 
-/// Add `word` to the ignore list and to `ignore.txt`, so nothing corrects it
-/// again — the counterpart of [`unlist`], for the user who has just seen a
-/// correction they never want repeated.
-///
-/// Appends rather than rewrites: the file belongs to the user, and adding a
-/// line is the smallest possible edit to it.
-///
-/// Used by the tray and Linux window's recent-corrections lists.
-pub fn ignore_word(word: &str) {
+/// Change one ignored word using the editor's atomic save and conflict checks.
+/// Live rules change only after persistence succeeds; unrelated lines survive.
+pub fn set_word_ignored(word: &str, ignored: bool) -> Result<(), String> {
     let word = word.trim().to_lowercase();
-    if word.is_empty() {
-        return;
-    }
-    let already = ignore_list()
-        .lock()
-        .map(|mut list| !list.insert(word.clone()))
-        .unwrap_or(true);
-    if already {
-        return;
-    }
-    let Some(path) = user_path("ignore.txt") else {
-        return;
-    };
-    if let Some(dir) = path.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    if word.is_empty()
+        || word.starts_with('#')
+        || word.chars().any(|c| c.is_whitespace() || c.is_control())
     {
-        let _ = file.write_all(appended_line(&existing, &word).as_bytes());
+        return Err("Choose a single word without spaces to change its ignored status.".into());
     }
+    let mut editor = RuleEditor::open(RuleKind::Ignored)?;
+    if ignored {
+        if !parse_ignore_list(&editor.text).contains(&word) {
+            editor.text.push_str(&appended_line(&editor.text, &word));
+        }
+    } else {
+        editor.text = editor
+            .text
+            .split_inclusive('\n')
+            .filter(|line| line.trim().to_lowercase() != word)
+            .collect();
+    }
+    editor.save()
 }
 
 /// What to append to `existing` to list `word`.
@@ -3056,6 +3049,54 @@ impl RuleEditor {
 #[cfg(test)]
 mod rule_editor_tests {
     use super::*;
+
+    #[test]
+    fn history_ignore_is_reversible_and_failed_saves_leave_live_rules_unchanged() {
+        const CHILD: &str = "RECAST_HISTORY_IGNORE_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "complete::rule_editor_tests::history_ignore_is_reversible_and_failed_saves_leave_live_rules_unchanged"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut editor = RuleEditor::open(RuleKind::Ignored).unwrap();
+        editor.text = "# Names\nSupino\nשלום".into();
+        editor.save().unwrap();
+        assert!(ignored(" Supino "));
+        set_word_ignored("HOSTNAME", true).unwrap();
+        set_word_ignored("Hostname", true).unwrap();
+        assert_eq!(
+            read_user_file("ignore.txt"),
+            "# Names\nSupino\nשלום\nhostname\n"
+        );
+        suppress("supino");
+        set_word_ignored("SUPINO", false).unwrap();
+        assert!(!ignored("Supino") && !suppressed("supino"));
+        assert!(ignored("שלום") && ignored("HOSTNAME"));
+        assert_eq!(read_user_file("ignore.txt"), "# Names\nשלום\nhostname\n");
+        set_word_ignored("hostname", false).unwrap();
+        assert!(!ignored("hostname"));
+        let before = read_user_file("ignore.txt");
+        for invalid in ["", "two words", "#comment", "one\ntwo"] {
+            assert!(set_word_ignored(invalid, true).is_err());
+        }
+        assert_eq!(read_user_file("ignore.txt"), before);
+        let temp = user_path("ignore.txt")
+            .unwrap()
+            .with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&temp, "occupied").unwrap();
+        assert!(set_word_ignored("hostname", true).is_err());
+        assert!(!ignored("hostname"));
+        assert!(set_word_ignored("שלום", false).is_err());
+        assert!(ignored("שלום"));
+        assert_eq!(read_user_file("ignore.txt"), before);
+        std::fs::remove_dir_all(config_dir().unwrap()).unwrap();
+    }
 
     #[test]
     fn rules_save_apply_validate_and_preserve_concurrent_edits() {

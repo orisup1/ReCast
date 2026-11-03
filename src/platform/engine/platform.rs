@@ -3,6 +3,7 @@
 use super::{Engine, Plan, Typed};
 use crate::types::Language;
 use std::hash::Hash;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Keep explicit accessibility edits and their undo payload bounded.
@@ -82,6 +83,14 @@ pub trait Platform: Sized + Send + Sync + 'static {
     ) -> Option<Selection> {
         None
     }
+
+    /// Only backends with a safe caret-anchored, nonactivating presenter opt in.
+    const PREVIEW_ALTERNATIVES: bool = false;
+    fn preview_alternatives() -> bool {
+        Self::PREVIEW_ALTERNATIVES
+    }
+    fn show_preview(_engine: Arc<Engine<Self>>, _generation: u64, _choices: Vec<String>) {}
+    fn hide_preview() {}
 
     // ── the keys the state machine names ────────────────────────────────────
 

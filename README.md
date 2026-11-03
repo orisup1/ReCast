@@ -194,6 +194,10 @@ of each other. Holding a modifier or using it in a chord keeps its normal behavi
 Completion and spelling-suggestion Shift taps may overlap the release of the
 last typed letter. Rapid suggestion taps while an offer is landing queue one
 additional step; typing, cursor movement, or a focus change cancels that step.
+On every platform, suggestion search runs off the keyboard capture thread, so
+slow lookups do not hold up your next keystroke. Rapid taps during a search are
+queued; typing, adding spaces, navigation, or changing shortcuts cancels stale
+results before they can edit your text.
 If a layout query or requested switch temporarily fails before editing starts,
 the same gesture can retry the tracked word without retyping it.
 After cursor movement, an explicit request can complete, correct, or convert the
@@ -205,15 +209,15 @@ correction until a word boundary, protecting incomplete editing fragments.
 
 | Action | Gesture or control |
 | --- | --- |
-| Request spelling alternatives | Tap **Left Shift** before or after Space; repeat to cycle choices and back to your original text |
-| Complete an English or Hebrew word | Tap **Right Shift** before or after Space; tap again to cycle through suggestions and back to your prefix |
+| Request spelling alternatives | Tap **Left Shift** before or after Space; on macOS, preview choices in a quiet caret strip, repeat to advance, type or Space to accept. Windows/Linux cycle replacements directly. |
+| Complete an English or Hebrew word | Tap your completion key (**Right Shift** by default) before or after Space. On macOS, preview choices; repeat to advance, type or Space to accept. Windows/Linux cycle replacements directly. |
 | Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space |
 | Rescue selected text (supported controls) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Convert an unchanged last word to the other layout | Tap **Ctrl twice within half a second**, even for unknown words |
 | Undo the latest correction or completion | Tap **Ctrl twice** immediately, or use the optional single-Ctrl undo shortcut |
-| Allow an ignored word again | Edit your word lists in Settings > Word rules |
+| Allow an ignored word again | Choose **Allow again** beside it in Recent corrections, or edit Settings > Word rules |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
-| Inspect or ignore a correction | Open **Recent corrections…** in the tray, then choose **Details** or **Ignore**; in the Linux window, expand a correction and choose **Ignore this word** |
+| Inspect or ignore a correction | Open **Recent corrections…** in the tray, then choose **Details** or **Ignore word**; in the Linux window, expand a correction and choose **Ignore this word**. **Allow again** reverses ignoring. Save failures appear beside the action. |
 | Inspect live activity | **Help > Start live log…** in the tray/menubar, or **Live log…** in the Linux control window |
 | Review gestures | **Help > Typing shortcuts** in the tray, or **Typing shortcuts** in the Linux control window |
 
@@ -225,6 +229,30 @@ separator. Repeating a manual conversion converts the word back without changing
 saved exceptions or training spelling replacements. Up to 32 extra spaces preserve
 correction undo and explicit suggestions, and are restored with the original word. Other typing, Enter, or
 moving the cursor ends the opportunity to act on a finished word.
+
+On macOS, completion and spelling alternatives appear only on explicit request in a compact, passive
+strip near the caret. The original sentence and keyboard layout stay unchanged while
+you browse. Each page includes your original text; choosing it makes no edit and does
+not train learning or count a correction. Typing (including punctuation) or Space
+accepts the highlighted alternative and preserves that input. Enter cancels the
+preview and reaches the application once, unchanged; it never accepts, erases or
+replays a possible send/execute action. Escape, Backspace, navigation, command chords,
+clicks, focus changes, pause and disable dismiss the preview. Holding Shift for
+capitals still works. The strip follows your configured keys, including Left Shift when assigned to completion.
+The active choice has a filled highlight, with cycling, acceptance, and dismissal
+hints below it. Choices size to their text; long labels truncate to fit the screen.
+Near the bottom edge, the strip opens above the caret to keep your text visible.
+
+The strip anchors to an accessible caret, or below an accessible single-line search
+field such as Spotlight. If neither is available, macOS leaves text untouched
+instead of opening an unanchored window. Unsupported individual accessibility
+notifications do not prevent the strip; application switches still dismiss it.
+Spotlight replacements validate the typed suffix and update its search field
+directly, preserving earlier query text and discarding only its selected inline
+autocomplete suffix. If safe field access is unavailable, no Backspaces are sent.
+Windows and Linux retain their existing direct replacement cycling; passive native
+candidate strips are not implemented there. Native appearance and accessibility
+support vary by application.
 
 The optional single-Ctrl shortcut only undoes corrections. It never converts unchanged words or removes saved exceptions. If it shares the action
 key, the single-tap action waits half a second so double taps take priority.
@@ -278,7 +306,7 @@ example previews using the current correction settings without typing, changing
 the keyboard layout, or learning. Previews exclude prior words and application
 restrictions; choose Preview again after changing settings. The tray exposes the
 last detected application's mode and temporary pause directly below status.
-Practice offers an undo-only shortcut without changing existing bindings automatically.
+Practice offers one-click enablement of an available, separate Ctrl for immediate undo without changing existing bindings automatically. If both Ctrl keys are occupied (including Either Ctrl for the double-tap action), practice explains which bindings need separating in Settings > Shortcuts.
 For immediate undo, assign a Ctrl key different from the double-tap action; sharing
 a key retains the half-second wait needed to distinguish taps.
 
@@ -442,7 +470,9 @@ disables both abbreviations and word completion.
 The separate spelling-suggestion gesture (Left Shift by default) requests
 alternatives in the current language, including short misspellings (`hte` → `the`)
 and valid English words (`form` / `from`). It works with automatic spelling and
-completion disabled, stays in the word's language, and uses the same cycling and undo.
+completion disabled and stays in the word's language. On macOS it previews choices
+without editing until typing or Space accepts; Enter cancels. Windows/Linux keep
+direct cycling. Accepted replacements use the existing undo gesture.
 Requests stay bounded to four choices and preserve capitalization and trailing
 punctuation. Choosing an alternative to a valid dictionary word does not train
 an automatic replacement for that word.

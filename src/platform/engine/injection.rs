@@ -87,6 +87,8 @@ pub(super) enum Commit {
 
 /// What injection is being asked to do.
 pub struct Plan<P: Platform> {
+    /// Exact suffix being replaced, for native controls with inline autocomplete.
+    pub expected: String,
     /// How many characters have to come off the screen, the terminator the user
     /// typed included.
     pub erase: usize,

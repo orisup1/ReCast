@@ -65,9 +65,47 @@ impl Window {
                         self.corrections.get(self.page * self.page_size + slot)
                     {
                         match action % 10 {
-                            3 => self.details = correction.inspection(),
+                            3 => {
+                                self.details = format!(
+                                    "Original: {}\nReplacement: {}\n\n{}",
+                                    correction.from,
+                                    correction.to,
+                                    correction.inspection()
+                                )
+                            }
                             4 => {
-                                crate::complete::ignore_word(&correction.from);
+                                let ignored = !crate::complete::ignored(&correction.from);
+                                self.details = match crate::complete::set_word_ignored(
+                                    &correction.from,
+                                    ignored,
+                                ) {
+                                    Ok(()) => format!(
+                                        "{}: {}\n\n{} This does not change text already typed.{}",
+                                        if ignored {
+                                            "Ignored"
+                                        } else {
+                                            "Removed from ignored words"
+                                        },
+                                        correction.from,
+                                        if ignored {
+                                            "Future automatic corrections will leave this word alone."
+                                        } else {
+                                            "Normal correction rules apply again."
+                                        },
+                                        if !ignored
+                                            && (crate::complete::learned(
+                                                &correction.from.to_lowercase()
+                                            ) || crate::complete::suppressed(
+                                                &correction.from.to_lowercase()
+                                            ))
+                                        {
+                                            " A separate undo exception still protects this word; review Settings > Word rules > Learned exceptions."
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                    Err(error) => format!("Could not change ignored word: {error}"),
+                                };
                             }
                             _ => (),
                         }
@@ -96,8 +134,8 @@ impl Window {
             E::new(
                 2,
                 K::Label,
-                "Memory only. Refresh to include newer corrections.",
-                [24.0, 58.0, width - 48.0, 28.0],
+                format!("Undo while typing: {}. Ignore word prevents future automatic changes. Refresh for newer corrections.", crate::config::Config::global().undo_gesture()),
+                [24.0, 58.0, width - 48.0, 44.0],
             ),
             E::new(10, K::Button, "Refresh", [width - 132.0, 20.0, 108.0, 32.0]),
             E::new(3, K::Label, "Original", [24.0, 106.0, column, 24.0]),
@@ -154,10 +192,13 @@ impl Window {
                 E::new(
                     id + 4,
                     K::Button,
-                    if ignored { "Ignored" } else { "Ignore" },
+                    if ignored {
+                        "Allow again"
+                    } else {
+                        "Ignore word"
+                    },
                     [width - 116.0, y, 92.0, 32.0],
-                )
-                .enabled(!ignored),
+                ),
             ]);
         }
         scene.extend([

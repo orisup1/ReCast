@@ -571,6 +571,7 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
         erase,
         retype: text,
         terminator,
+        expected: _expected,
     } = plan;
     if terminator == Some(Key::Return) {
         return None;

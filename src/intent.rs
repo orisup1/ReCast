@@ -77,7 +77,7 @@ impl Model {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Likelihood {
     conditional: f64,
     baseline: f64,
@@ -85,6 +85,7 @@ struct Likelihood {
 
 /// Trusted visible words from one uninterrupted typing context. Nothing here
 /// is written to disk, even when persistent personalization is enabled.
+#[derive(Clone)]
 pub(crate) struct Context {
     words: VecDeque<String>,
     // Cached context counts avoid repeating their lookups for every candidate.

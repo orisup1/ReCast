@@ -39,6 +39,12 @@ struct Screen {
     proceed: Mutex<mpsc::Receiver<()>>,
 }
 impl<const QUEUE_UNDO: bool> Platform for SimulatedPlatform<QUEUE_UNDO> {
+    fn preview_alternatives() -> bool {
+        std::env::var_os("RECAST_PREVIEW_TEST").is_some()
+    }
+    fn show_preview(engine: Arc<Engine<Self>>, generation: u64, _: Vec<String>) {
+        engine.preview_ready(generation);
+    }
     type Key = char;
     type Retype = String;
     type Injector = Screen;
@@ -217,6 +223,18 @@ impl<const QUEUE_UNDO: bool> Platform for SimulatedPlatform<QUEUE_UNDO> {
         }
         let buffered = engine.buffered();
         let mut screen = engine.injector.text.lock().unwrap();
+        assert_eq!(
+            plan.expected.chars().count(),
+            plan.erase,
+            "tracked native replacement suffix"
+        );
+        if buffered.is_empty() {
+            assert!(
+                screen.ends_with(&plan.expected),
+                "screen {screen:?} does not end with tracked suffix {:?}",
+                plan.expected
+            );
+        }
         for _ in 0..plan.erase + buffered.len() {
             assert!(
                 screen.pop().is_some(),
@@ -871,6 +889,17 @@ impl<const QUEUE_UNDO: bool> SessionWithPolicy<QUEUE_UNDO> {
     fn tap(&self, key: char) {
         self.engine.key_press(key);
         self.engine.key_release(key);
+        self.suggestions_ready();
+    }
+    fn suggestions_ready(&self) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.engine.lock().suggestion_worker {
+            assert!(
+                Instant::now() < deadline,
+                "suggestion search did not finish"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
     fn undo(&self) {
         let config = crate::config::Config::global();
@@ -1554,6 +1583,8 @@ fn explicit_requests_and_continued_typing_work_across_native_boundaries() {
     {
         let mut st = s.engine.lock();
         st.cycle = Some(Cycle {
+            preview: false,
+            preview_ready: false,
             typed: st.keys.to_vec(),
             trailing_spaces: Vec::new(),
             candidates: candidates.clone(),
@@ -2864,7 +2895,7 @@ fn completions_and_learning_require_retained_choices() {
         crate::personal::personal_correction("recieve").as_deref(),
         Some("receive")
     );
-    crate::complete::ignore_word("recieve");
+    crate::complete::set_word_ignored("recieve", true).unwrap();
     let s = Session::new();
     s.type_text("recieve ");
     assert_eq!(s.text(), "recieve ");
@@ -2915,7 +2946,7 @@ fn completions_and_learning_require_retained_choices() {
     assert!(!s.engine.lock().is_replacing);
 
     // Explicit vocabulary is available without a dictionary or frequency entry.
-    crate::complete::ignore_word("qzcustomname");
+    crate::complete::set_word_ignored("qzcustomname", true).unwrap();
     for count in 1..=2 {
         let s = Session::new();
         s.type_text("qzc");
@@ -3626,6 +3657,8 @@ fn typing_correction_undo_and_interrupted_replacements() {
             {
                 let mut st = cycle_session.engine.lock();
                 st.cycle = Some(Cycle {
+                    preview: false,
+                    preview_ready: false,
                     typed: st.keys.to_vec(),
                     trailing_spaces: Vec::new(),
                     candidates: offers.iter().map(|text| (*text).into()).collect(),
@@ -3680,6 +3713,8 @@ fn typing_correction_undo_and_interrupted_replacements() {
     {
         let mut st = s.engine.lock();
         st.cycle = Some(Cycle {
+            preview: false,
+            preview_ready: false,
             typed: st.keys.to_vec(),
             trailing_spaces: Vec::new(),
             candidates: vec!["by the way".into(), "between".into()],
@@ -4680,6 +4715,8 @@ fn explicit_correction_is_separate_and_restores_original_text() {
     {
         let mut state = session.engine.lock();
         state.cycle = Some(Cycle {
+            preview: false,
+            preview_ready: false,
             typed: state.keys.to_vec(),
             trailing_spaces: Vec::new(),
             candidates: vec!["by the waay".into()],
@@ -4704,4 +4741,324 @@ fn explicit_correction_is_separate_and_restores_original_text() {
     session.pending();
     session.finish();
     assert_eq!(session.text(), "btw ");
+}
+
+#[test]
+fn suggestion_search_keeps_capture_responsive_and_cancels_stale_work() {
+    const CHILD: &str = "RECAST_SUGGESTION_WORKER_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::suggestion_search_keeps_capture_responsive_and_cancels_stale_work"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    crate::config::Config::update_live(|cfg| {
+        cfg.action_shortcut = "left_ctrl".into();
+        cfg.undo_shortcut = "right_ctrl".into();
+        cfg.completion_shortcut = "right_shift".into();
+        cfg.correction_shortcut = "left_shift".into();
+    });
+    for cancel in [
+        "typing",
+        "navigation",
+        "click",
+        "focus",
+        "space",
+        "binding",
+        "none",
+    ] {
+        let s = Session::new();
+        s.type_text(if cancel == "space" { "keyb " } else { "keyb" });
+        s.engine.key_press(Simulated::SHIFT_RIGHT);
+        let (ready, waiting) = mpsc::sync_channel(1);
+        let (proceed, reply) = mpsc::sync_channel(1);
+        *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: reply,
+        });
+        // This must return before the focus service replies, on every backend.
+        s.engine.key_release(Simulated::SHIFT_RIGHT);
+        waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(s.engine.state.try_lock().is_ok());
+        // A second tap must not invalidate the first search or disappear.
+        s.engine.key_press(Simulated::SHIFT_RIGHT);
+        s.engine.key_release(Simulated::SHIFT_RIGHT);
+        match cancel {
+            "typing" => s.type_text("x"),
+            "navigation" => s.engine.key_press('\x10'),
+            "click" => s.engine.mouse_click(),
+            "focus" => {
+                FOCUS.store(2, Ordering::SeqCst);
+            }
+            "space" => s.type_text(" "),
+            "binding" => {
+                crate::config::Config::update_live(|cfg| cfg.completion_shortcut = "none".into());
+                s.engine
+                    .lock()
+                    .sync_shortcuts(&crate::config::Config::global());
+            }
+            _ => (),
+        }
+        proceed.send(()).unwrap();
+        s.suggestions_ready();
+        if cancel == "none" {
+            s.pending();
+            assert_eq!(s.engine.lock().cycle.as_ref().unwrap().index, 0);
+            s.proceed.send(()).unwrap();
+            s.pending();
+            assert_eq!(s.engine.lock().cycle.as_ref().unwrap().index, 1);
+            s.finish();
+            s.undo();
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "keyb");
+        } else {
+            assert!(!s.engine.lock().is_replacing, "stale suggestion: {cancel}");
+            assert!(s.ready.try_recv().is_err(), "stale injection: {cancel}");
+            assert_eq!(
+                s.text(),
+                if cancel == "typing" {
+                    "keybx"
+                } else if cancel == "space" {
+                    "keyb  "
+                } else {
+                    "keyb"
+                }
+            );
+        }
+        FOCUS.store(1, Ordering::SeqCst);
+        crate::config::Config::update_live(|cfg| cfg.completion_shortcut = "right_shift".into());
+    }
+}
+
+#[test]
+fn spelling_preview_is_passive_and_commits_only_on_trusted_typing() {
+    const CHILD: &str = "RECAST_PREVIEW_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::spelling_preview_is_passive_and_commits_only_on_trusted_typing"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    crate::config::Config::update_live(|cfg| {
+        cfg.action_shortcut = "left_ctrl".into();
+        cfg.undo_shortcut = "right_ctrl".into();
+        cfg.correction_shortcut = "left_shift".into();
+        cfg.completion_shortcut = "right_shift".into();
+    });
+    let preview = |s: &Session| {
+        s.tap(Simulated::SHIFT_LEFT);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while s.engine.lock().suggestion_worker {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(s.engine.lock().cycle.as_ref().unwrap().preview_ready);
+    };
+    // Completion may be bound to Left Shift even on a preview-capable backend.
+    crate::config::Config::update_live(|cfg| {
+        cfg.correction_shortcut = "right_shift".into();
+        cfg.completion_shortcut = "left_shift".into();
+    });
+    let completion = Session::new();
+    completion.type_text("ther");
+    for _ in 0..24 {
+        preview(&completion);
+        assert_eq!(completion.text(), "ther");
+        assert_eq!(completion.engine.control.fixed_count(), 0);
+        assert!(completion.ready.try_recv().is_err());
+    }
+    // Choose an actual offer, then accept exactly once and restore the prefix.
+    loop {
+        let original = {
+            let st = completion.engine.lock();
+            let cycle = st.cycle.as_ref().unwrap();
+            cycle.index >= cycle.candidates.len()
+        };
+        if !original {
+            break;
+        }
+        preview(&completion);
+    }
+    let expected = {
+        let st = completion.engine.lock();
+        let cycle = st.cycle.as_ref().unwrap();
+        cycle.candidates[cycle.index].clone()
+    };
+    completion.type_text(" ");
+    completion.pending();
+    completion.finish();
+    assert_eq!(completion.text(), format!("{expected} "));
+    completion.undo();
+    completion.pending();
+    completion.finish();
+    assert_eq!(completion.text(), "ther ");
+    crate::complete::unlist("ther");
+    crate::config::Config::update_live(|cfg| {
+        cfg.correction_shortcut = "left_shift".into();
+        cfg.completion_shortcut = "right_shift".into();
+    });
+    for suffix in [" ", "x", ".", "  "] {
+        let s = Session::new();
+        s.type_text("helo");
+        preview(&s);
+        assert_eq!(s.text(), "helo");
+        assert_eq!(s.engine.control.fixed_count(), 0);
+        assert!(s.engine.lock().pending_learning.is_none());
+        preview(&s);
+        let chosen = {
+            let st = s.engine.lock();
+            let cycle = st.cycle.as_ref().unwrap();
+            cycle.candidates[cycle.index].clone()
+        };
+        assert_eq!(s.text(), "helo");
+        s.type_text(suffix);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("{chosen}{suffix}"));
+        assert_eq!(s.engine.control.fixed_count(), 1);
+        if suffix.chars().all(char::is_whitespace) {
+            s.undo();
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), format!("helo{suffix}"));
+        }
+    }
+    crate::complete::unlist("helo");
+    let s = Session::new();
+    s.type_text("helo");
+    preview(&s);
+    loop {
+        let original = {
+            let st = s.engine.lock();
+            let c = st.cycle.as_ref().unwrap();
+            c.index == c.candidates.len()
+        };
+        if original {
+            break;
+        }
+        preview(&s);
+    }
+    assert_eq!(s.text(), "helo");
+    s.type_text("x");
+    assert_eq!(s.text(), "helox");
+    assert_eq!(s.engine.control.fixed_count(), 0);
+    assert!(s.engine.lock().pending_learning.is_none());
+    assert!(!crate::complete::suppressed("helo"));
+    assert!(!crate::complete::learned("helo"));
+    assert!(s.ready.try_recv().is_err());
+    let original_space = Session::new();
+    original_space.type_text("helo");
+    preview(&original_space);
+    loop {
+        let original = {
+            let st = original_space.engine.lock();
+            let c = st.cycle.as_ref().unwrap();
+            c.index >= c.candidates.len()
+        };
+        if original {
+            break;
+        }
+        preview(&original_space);
+    }
+    original_space.type_text(" ");
+    assert_eq!(original_space.text(), "helo ");
+    assert!(original_space.ready.try_recv().is_err());
+    assert_eq!(original_space.engine.control.fixed_count(), 0);
+    for cancel in ['\n', '\x1b', '\x10', '\x08', Simulated::CTRL_LEFT] {
+        let s = Session::new();
+        s.type_text("helo");
+        preview(&s);
+        s.tap(cancel);
+        assert!(s.engine.lock().cycle.is_none());
+        assert_eq!(s.text(), "helo");
+        assert!(s.ready.try_recv().is_err());
+    }
+    let s = Session::new();
+    s.type_text("helo");
+    preview(&s);
+    let generation = s.engine.lock().generation;
+    s.engine.mouse_click();
+    assert!(!s.engine.preview_ready(generation));
+    assert_eq!(s.text(), "helo");
+    let spaced = Session::new();
+    spaced.type_text("hello  ");
+    preview(&spaced);
+    let chosen = {
+        let st = spaced.engine.lock();
+        let c = st.cycle.as_ref().unwrap();
+        c.candidates[c.index].clone()
+    };
+    assert_eq!(spaced.text(), "hello  ");
+    spaced.type_text("x");
+    spaced.pending();
+    spaced.finish();
+    assert_eq!(spaced.text(), format!("{chosen}  x"));
+    // Rapid requests are drained in order, without replacing the source.
+    let rapid = Session::new();
+    rapid.type_text("helo");
+    preview(&rapid);
+    let (mut expected_index, mut expected_resume, count) = {
+        let st = rapid.engine.lock();
+        let cycle = st.cycle.as_ref().unwrap();
+        (cycle.index, cycle.resume_index, cycle.candidates.len())
+    };
+    for _ in 0..8 {
+        if expected_index >= count {
+            expected_index = expected_resume;
+        } else if expected_index + 1 == count
+            || (expected_index + 1) % crate::complete::MAX_CANDIDATES == 0
+        {
+            expected_resume = (expected_index + 1) % count;
+            expected_index = count;
+        } else {
+            expected_index += 1;
+        }
+        rapid.tap(Simulated::SHIFT_LEFT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while rapid.engine.lock().suggestion_worker {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert!(rapid.engine.lock().cycle.as_ref().unwrap().preview);
+    assert_eq!(
+        rapid.engine.lock().cycle.as_ref().unwrap().index,
+        expected_index
+    );
+    assert_eq!(rapid.text(), "helo");
+    assert_eq!(rapid.engine.control.fixed_count(), 0);
+    assert!(rapid.ready.try_recv().is_err());
+    for blocked in [false, true] {
+        let s = Session::new();
+        s.type_text("helo");
+        preview(&s);
+        if blocked {
+            INPUT_ALLOWED.store(false, Ordering::SeqCst);
+        } else {
+            s.engine.control.pause_for(Duration::from_secs(60));
+        }
+        s.type_text("x");
+        assert_eq!(s.text(), "helox");
+        assert!(s.ready.try_recv().is_err());
+        assert!(s.engine.lock().cycle.is_none());
+        INPUT_ALLOWED.store(true, Ordering::SeqCst);
+    }
+    let s = Session::new();
+    s.type_text("helo");
+    preview(&s);
+    FOCUS.store(2, Ordering::SeqCst);
+    s.type_text("x");
+    assert_eq!(s.text(), "helox");
+    assert!(s.ready.try_recv().is_err());
 }

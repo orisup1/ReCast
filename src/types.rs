@@ -546,6 +546,8 @@ impl AppControl {
     }
 
     pub fn pause_in_app(&self, app: &str) {
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::dismiss_candidates();
         if !app.trim().is_empty() {
             *lock_forgiving(&self.paused_app) = Some(app.to_lowercase());
         }
@@ -609,6 +611,8 @@ impl AppControl {
     /// Flip the switch, and remember it: an app that forgets it was turned off
     /// every time the machine reboots is one the user has to turn off twice.
     pub fn set_enabled(&self, value: bool) {
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::dismiss_candidates();
         self.enabled.store(value, Ordering::Relaxed);
         self.resume();
         crate::prefs::save_enabled(value);
@@ -616,6 +620,8 @@ impl AppControl {
 
     /// Stop correcting for `how_long`, then carry on by itself.
     pub fn pause_for(&self, how_long: Duration) {
+        #[cfg(target_os = "macos")]
+        crate::platform::macos::dismiss_candidates();
         if let Ok(mut until) = self.paused_until.lock() {
             *until = Some(Instant::now() + how_long);
         }

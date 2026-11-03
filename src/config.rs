@@ -235,6 +235,29 @@ pub fn modifier_label(value: &str) -> &'static str {
 }
 
 impl Config {
+    /// Recommend only an unused Ctrl; never silently change existing bindings.
+    pub fn recommended_undo(&self) -> Option<&'static str> {
+        ["right_ctrl", "left_ctrl"].into_iter().find(|key| {
+            self.action_shortcut != "ctrl"
+                && self.action_shortcut != *key
+                && self.completion_shortcut != *key
+                && self.correction_shortcut != *key
+        })
+    }
+
+    pub fn undo_setup_hint(&self) -> String {
+        if self.undo_shortcut != "none" {
+            if self.action_shortcut == "ctrl" || self.action_shortcut == self.undo_shortcut {
+                return "Your undo key shares the double-tap action: it waits 500 ms. Choose separate Ctrl keys in Settings > Shortcuts for immediate undo.".into();
+            }
+            return "Your undo-only key acts immediately. It never converts unchanged text.".into();
+        }
+        match self.recommended_undo() {
+            Some(key) => format!("Recommended: tap {} for immediate undo. Enable it below; existing bindings stay unchanged.", modifier_label(key)),
+            None => "No separate Ctrl is free. In Settings > Shortcuts, assign the double-tap action to one Ctrl and undo only to the other; move any conflicting completion or spelling binding first. Shared keys wait 500 ms.".into(),
+        }
+    }
+
     pub fn shortcut_conflict(&self) -> bool {
         self.completion_conflict() || self.correction_conflict()
     }
@@ -257,6 +280,23 @@ impl Config {
             "double-tap action disabled".into()
         } else {
             format!("double-tap {}", modifier_label(&self.action_shortcut))
+        }
+    }
+    pub fn undo_gesture(&self) -> String {
+        if self.undo_shortcut != "none" {
+            if self.action_shortcut == "ctrl" || self.action_shortcut == self.undo_shortcut {
+                format!(
+                    "tap {} (wait 500 ms), or {}",
+                    modifier_label(&self.undo_shortcut),
+                    self.action_gesture()
+                )
+            } else {
+                format!("tap {}", modifier_label(&self.undo_shortcut))
+            }
+        } else if self.action_shortcut != "none" {
+            self.action_gesture()
+        } else {
+            "enable an undo shortcut in Settings > Shortcuts".into()
         }
     }
     pub fn completion_gesture(&self) -> String {
@@ -479,5 +519,50 @@ mod tests {
                 "{key} is a real setting but not in --help"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod undo_recommendation_tests {
+    use super::*;
+    #[test]
+    fn undo_hint_tracks_enabled_binding_and_shared_key_delay() {
+        let mut config = Config::global().clone();
+        config.action_shortcut = "none".into();
+        config.undo_shortcut = "right_ctrl".into();
+        assert_eq!(config.undo_gesture(), "tap Right Ctrl");
+        config.undo_shortcut = "none".into();
+        assert!(config.undo_gesture().contains("enable an undo shortcut"));
+        config.action_shortcut = "left_ctrl".into();
+        assert_eq!(config.undo_gesture(), "double-tap Left Ctrl");
+        config.undo_shortcut = "left_ctrl".into();
+        assert!(config.undo_gesture().contains("500 ms"));
+        assert!(config.undo_gesture().contains("double-tap Left Ctrl"));
+        config.action_shortcut = "ctrl".into();
+        assert!(config.undo_gesture().contains("500 ms"));
+        config.undo_shortcut = "right_ctrl".into();
+        config.action_shortcut = "left_ctrl".into();
+        assert_eq!(config.undo_gesture(), "tap Right Ctrl");
+    }
+    #[test]
+    fn recommends_only_an_available_separate_ctrl_without_remapping() {
+        let mut config = Config::global().clone();
+        config.action_shortcut = "ctrl".into();
+        config.undo_shortcut = "none".into();
+        config.completion_shortcut = "right_shift".into();
+        config.correction_shortcut = "left_shift".into();
+        assert_eq!(config.recommended_undo(), None);
+        config.action_shortcut = "left_ctrl".into();
+        assert_eq!(config.recommended_undo(), Some("right_ctrl"));
+        assert_eq!(config.undo_shortcut, "none");
+        config.correction_shortcut = "right_ctrl".into();
+        assert_eq!(config.recommended_undo(), None);
+        config.undo_shortcut = "right_ctrl".into();
+        assert!(config.shortcut_conflict());
+        config.correction_shortcut = "left_shift".into();
+        assert!(!config.shortcut_conflict());
+        assert!(config.undo_setup_hint().contains("immediately"));
+        config.action_shortcut = "ctrl".into();
+        assert!(config.undo_setup_hint().contains("500 ms"));
     }
 }

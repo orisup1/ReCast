@@ -430,7 +430,12 @@ impl Window {
                 E::new(33, K::Label, "Preview excludes prior words and application restrictions. Choose Preview again after changing settings.", [24.0, 744.0, content, 40.0]),
             ]);
         } else if self.page == 1 {
-            scene.push(E::new(30, K::Label, "Undo only never converts an unchanged word. For immediate undo, choose a different Ctrl key from the double-tap action. Shared keys wait half a second. Existing bindings stay unchanged until you edit them.", [24.0, 476.0, content, 90.0]));
+            scene.push(E::new(
+                30,
+                K::Label,
+                config.undo_setup_hint(),
+                [24.0, 476.0, content, 90.0],
+            ));
         }
         scene.push(E::new(
             90,

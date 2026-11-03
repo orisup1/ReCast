@@ -86,6 +86,28 @@ For each supported combination:
    custom mappings using unchanged standard names are outside name validation.
 6. Disable/re-enable the helper or GNOME extension, switch windows, and test
    lock/unlock. Missing required layout/focus information must decline edits.
+7. On macOS, bind completion to Left Shift, type `ther`, and cycle through at
+   least 24 offers, including original-text checkpoints. Repeat with quick taps
+   and deliberate taps. The source must stay `ther` while a small strip changes its highlighted offer.
+   Verify the filled highlight remains legible in light and dark appearance,
+   including the original-text choice. Check the shortcut hints, long English
+   and Hebrew choices, and a caret near each screen edge (including a secondary
+   display): the strip must stay on screen and open above a low caret.
+   Space accepts exactly once; no leftover first letters such as `wtthrough`.
+   Repeat in Spotlight with its inline autocomplete visible; earlier query text
+   must survive acceptance, and Enter must cancel without a duplicate launch. Include a word before the prefix
+   and trailing spaces; undo must restore `ther` and preserve surrounding text.
+8. On Windows, Linux, and macOS, request spelling and completion while typing
+   quickly. Rapid taps must continue cycling without freezing input. During a
+   slow lookup, type another letter, add spaces, navigate, click another field,
+   or change the shortcut: no stale replacement may appear. Repeat with app
+   rules enabled. In Recent corrections, verify the original/replacement are
+   identifiable and Ignore word explains that it affects future corrections.
+9. In Recent corrections, ignore a capitalized word, then choose Allow again.
+   The button and protection status must update immediately; unrelated word
+   rules must survive. Check a failed save shows an error and leaves protection
+   unchanged. With only single-tap undo enabled, history and practice must name
+   that key; shared undo/action keys must mention the 500 ms delay.
 
 An optional Windows native integration test opens its own disposable Edit control,
 takes focus, checks cancellation, replacement, stale selection, exact undo, and

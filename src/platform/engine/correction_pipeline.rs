@@ -194,10 +194,19 @@ impl<P: Platform> Engine<P> {
                 trailing_spaces: Vec::new(),
                 layout: Some(rep.previous_layout.unwrap_or(rep.target_layout)),
             });
+            let source = reading::<P>(&st.keys, rep.previous_layout.unwrap_or(rep.target_layout));
+            let expected = format!(
+                "{} ",
+                source
+                    .chars()
+                    .skip(st.keys.len() - rep.erase)
+                    .collect::<String>()
+            );
             st.keys.clear();
             self.start_replacement(
                 st,
                 Plan {
+                    expected,
                     erase,
                     retype: rep.retype,
                     terminator: Some(key),
@@ -267,27 +276,76 @@ impl<P: Platform> Engine<P> {
         st.keys.clear();
     }
 
-    pub(super) fn request_suggestion(
-        self: &Arc<Self>,
-        st: MutexGuard<'_, AppState<P>>,
+    pub(super) fn request_suggestion<'a>(
+        self: &'a Arc<Self>,
+        st: MutexGuard<'a, AppState<P>>,
         correction: bool,
     ) {
         if !self.control.is_enabled() {
             return;
         }
-        let Some((mut st, focus)) = self.refresh_focus(st) else {
+        if st.is_replacing {
+            let mut st = st;
+            if !st.selection_replacing && st.cycle.is_some() {
+                st.pending_suggestion = Some(correction);
+            }
             return;
+        }
+        let (mut st, focus) = {
+            // Bare rapid taps may change event revision while focus is queried.
+            // Text/cursor changes cancel this worker through generation instead.
+            let generation = st.generation;
+            drop(st);
+            let (focus, mode) = self.read_focus();
+            let mut st = self.lock();
+            if st.generation != generation {
+                return;
+            }
+            if mode.is_none_or(|mode| mode == crate::config::AppMode::Off || mode != st.mode) {
+                st.invalidate_text();
+                return;
+            }
+            (st, focus)
         };
         if (P::requires_focus() && st.focus.is_none()) || st.focus != focus || !P::input_allowed() {
             st.invalidate_text();
             return;
         }
-        self.suggestion_tap(st, correction);
+        if st.is_replacing {
+            return;
+        }
+        self.suggestion_tap(st, correction, false);
+    }
+
+    pub(super) fn accept_preview<'a>(self: &'a Arc<Self>, st: MutexGuard<'a, AppState<P>>) {
+        P::hide_preview();
+        let Some((mut st, focus)) = self.refresh_focus(st) else {
+            return;
+        };
+        if st.focus != focus || !self.control.is_enabled() || !P::input_allowed() {
+            st.invalidate_text();
+            return;
+        }
+        if st
+            .cycle
+            .as_ref()
+            .is_some_and(|cycle| cycle.preview && cycle.preview_ready)
+        {
+            let correction = st.cycle.as_ref().unwrap().correction;
+            self.suggestion_tap(st, correction, true);
+        } else {
+            st.cycle = None;
+        }
     }
 
     /// Completion and explicit correction share cycling and undo, but search
     /// separately so an exact completion cannot hide spelling alternatives.
-    fn suggestion_tap(self: &Arc<Self>, mut st: MutexGuard<'_, AppState<P>>, correction: bool) {
+    fn suggestion_tap<'a>(
+        self: &'a Arc<Self>,
+        mut st: MutexGuard<'a, AppState<P>>,
+        correction: bool,
+        accept: bool,
+    ) {
         if !matches!(
             st.mode,
             crate::config::AppMode::Full | crate::config::AppMode::ManualOnly
@@ -357,12 +415,12 @@ impl<P: Platform> Engine<P> {
             None
         };
         let current = match switched.as_ref().or(st.cycle.as_ref()) {
-            Some(cycle) => cycle
+            Some(cycle) if !cycle.preview => cycle
                 .candidates
                 .get(cycle.index)
                 .cloned()
                 .unwrap_or_else(|| reading::<P>(&cycle.typed, cycle.original_lang)),
-            None => reading::<P>(&source_keys, lang),
+            _ => reading::<P>(&source_keys, lang),
         };
         let (
             typed,
@@ -375,7 +433,9 @@ impl<P: Platform> Engine<P> {
             trailing_spaces,
         ) = match st.cycle.take() {
             Some(cycle) => {
-                let (next, resume) = if cycle.index >= cycle.candidates.len() {
+                let (next, resume) = if accept {
+                    (cycle.index, cycle.resume_index)
+                } else if cycle.index >= cycle.candidates.len() {
                     (cycle.resume_index, cycle.resume_index)
                 } else if cycle.index + 1 == cycle.candidates.len()
                     || (cycle.index + 1) % crate::complete::MAX_CANDIDATES == 0
@@ -422,6 +482,11 @@ impl<P: Platform> Engine<P> {
                         .flatten(),
                     }
                 };
+                // Candidate search can be expensive. Snapshot bounded context so
+                // capture can keep canceling/replaying input without waiting for it.
+                let generation = st.generation;
+                let phrase = (!st.practice).then(|| st.phrase.clone());
+                drop(st);
                 let offers = |candidate_lang| {
                     let candidates = if correction {
                         correction_candidates
@@ -438,7 +503,7 @@ impl<P: Platform> Engine<P> {
                             self.he_dict
                         },
                         Some(candidate_lang),
-                        (!st.practice).then_some(&st.phrase),
+                        phrase.as_ref(),
                     )
                 };
                 let typeable_offers = |lang| {
@@ -492,6 +557,10 @@ impl<P: Platform> Engine<P> {
                         }
                     }
                 }
+                st = self.lock();
+                if st.generation != generation || st.is_replacing {
+                    return;
+                }
                 if candidates.is_empty() {
                     st.cycle = switched;
                     return;
@@ -527,6 +596,57 @@ impl<P: Platform> Engine<P> {
             }
         };
 
+        if P::preview_alternatives() && !accept {
+            let original = reading::<P>(&typed, original_lang);
+            let page = if index >= candidates.len() {
+                resume_index
+            } else {
+                index / crate::complete::MAX_CANDIDATES * crate::complete::MAX_CANDIDATES
+            };
+            let mut choices: Vec<String> = candidates
+                .iter()
+                .enumerate()
+                .skip(page)
+                .take(crate::complete::MAX_CANDIDATES)
+                .map(|(i, word)| format!("{}{}", if i == index { "• " } else { "" }, word))
+                .collect();
+            choices.push(format!(
+                "{}{} (original)",
+                if index >= candidates.len() {
+                    "• "
+                } else {
+                    ""
+                },
+                original
+            ));
+            let generation = st.generation;
+            st.cycle = Some(Cycle {
+                preview: true,
+                preview_ready: false,
+                typed,
+                trailing_spaces,
+                candidates,
+                candidate_langs,
+                index,
+                resume_index,
+                on_screen: erase,
+                lang: active_lang,
+                original_lang,
+                correction,
+            });
+            drop(st);
+            P::show_preview(Arc::clone(self), generation, choices);
+            return;
+        }
+        if accept && index >= candidates.len() {
+            // Choosing the original is not an edit, undo, exception or learning event.
+            if !st.keys.is_empty() {
+                st.no_fix = true;
+            }
+            P::hide_preview();
+            return;
+        }
+
         // Past the end of the list is the user's own text, taken from the keys
         // they pressed rather than from a candidate — the odd irreproducible
         // capitalisation (`sHiFtY`) survives that way.
@@ -561,7 +681,7 @@ impl<P: Platform> Engine<P> {
                 rule: None,
                 learning_pair: None,
             })
-        } else if index == 0 {
+        } else if accept || index == 0 {
             let first_page = candidates
                 .iter()
                 .take(crate::complete::MAX_CANDIDATES)
@@ -631,6 +751,14 @@ impl<P: Platform> Engine<P> {
         // when it has just handed back the user's own text, which is nothing to
         // undo.
         let undo = (!back_to_typed).then(|| LastFix {
+            expected: format!(
+                "{}{}",
+                target.chars().skip(undo_prefix).collect::<String>(),
+                reading::<P>(
+                    &trailing_spaces.iter().take(1).copied().collect::<Vec<_>>(),
+                    target_lang
+                )
+            ),
             visible,
             visible_layout: target_lang,
             manual_conversion: false,
@@ -661,6 +789,8 @@ impl<P: Platform> Engine<P> {
         }
         retry.clear_phrase_on_commit |= !trailing_spaces.is_empty();
         st.cycle = Some(Cycle {
+            preview: false,
+            preview_ready: false,
             typed,
             trailing_spaces: trailing_spaces.clone(),
             candidates,
@@ -677,6 +807,11 @@ impl<P: Platform> Engine<P> {
         self.start_replacement(
             st,
             Plan {
+                expected: format!(
+                    "{}{}",
+                    current.chars().skip(prefix).collect::<String>(),
+                    reading::<P>(&trailing_spaces, active_lang)
+                ),
                 erase: erase - prefix + trailing_spaces.len(),
                 retype: suffix,
                 terminator: None,
@@ -735,6 +870,7 @@ impl<P: Platform> Engine<P> {
             lang: layout.other(),
         });
         let note = fix.as_ref().map(|fix| note_of::<P>(&keys, fix));
+        let source = reading::<P>(&keys, layout);
         let Some(mut rep) = replacement::<P>(&keys, fix) else {
             return;
         };
@@ -760,6 +896,7 @@ impl<P: Platform> Engine<P> {
         self.start_replacement(
             st,
             Plan {
+                expected: format!("{}{}", source.chars().skip(source.chars().count() - rep.erase).collect::<String>(), reading::<P>(&separators, layout)),
                 erase: rep.erase + separators.len(),
                 retype: rep.retype,
                 terminator: None,
@@ -794,10 +931,17 @@ impl<P: Platform> Engine<P> {
             restore.push(Typed { key, shift: false });
         }
         restore.extend(fix.trailing_spaces.iter().copied());
+        let erase = fix.on_screen + fix.trailing_spaces.len();
+        let expected = format!(
+            "{}{}",
+            fix.expected,
+            reading::<P>(&fix.trailing_spaces, fix.visible_layout)
+        );
         self.start_replacement(
             st,
             Plan {
-                erase: fix.on_screen + fix.trailing_spaces.len(),
+                expected,
+                erase,
                 retype: P::retype_original(&restore, fix.restore_layout),
                 terminator: None,
             },
@@ -844,6 +988,7 @@ impl<P: Platform> Engine<P> {
 
 /// What a [`Fix`] turns into for the injection thread.
 pub(super) struct Replacement<P: Platform> {
+    pub(super) text: String,
     /// How many of the characters the user typed have to be erased.
     pub(super) erase: usize,
     /// What to put in their place.
@@ -868,6 +1013,7 @@ pub(super) fn replacement<P: Platform>(
         Fix::Layout { start, text, lang } => Some(Replacement {
             erase: keys.len() - start,
             retype: P::retype_layout(&keys[start..], &text, lang)?,
+            text,
             previous_layout: Some(lang.other()),
             target_layout: lang,
             original_start: start,
@@ -880,6 +1026,7 @@ pub(super) fn replacement<P: Platform>(
         } => Some(Replacement {
             erase: keys.len(),
             retype: P::retype_completion(&text, lang)?,
+            text,
             previous_layout,
             target_layout: lang,
             original_start: 0,
@@ -887,6 +1034,7 @@ pub(super) fn replacement<P: Platform>(
         Fix::LayoutSpelling { text, lang } => Some(Replacement {
             erase: keys.len(),
             retype: P::retype_completion(&text, lang)?,
+            text,
             previous_layout: Some(lang.other()),
             target_layout: lang,
             original_start: 0,
@@ -904,6 +1052,7 @@ pub(super) fn replacement<P: Platform>(
             Some(Replacement {
                 erase: keys.len() - prefix,
                 retype: P::retype_completion(&suffix, lang)?,
+                text: suffix,
                 previous_layout: None,
                 target_layout: lang,
                 original_start: 0,
@@ -929,6 +1078,17 @@ pub(super) fn undo_of<P: Platform>(
     };
     visible.extend(suffix);
     LastFix {
+        expected: format!(
+            "{}{}",
+            rep.text,
+            reading::<P>(
+                &terminator
+                    .into_iter()
+                    .map(|key| Typed { key, shift: false })
+                    .collect::<Vec<_>>(),
+                rep.target_layout
+            )
+        ),
         visible,
         manual_conversion: false,
         visible_layout: rep.target_layout,
