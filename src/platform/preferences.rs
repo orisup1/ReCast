@@ -187,6 +187,9 @@ impl Window {
                         .ok_or_else(|| "Choose a shortcut.".to_string())
                         .and_then(|(value, _)| crate::settings::set_live(control, key, value))
                 }
+                206 => crate::config::Config::global().recommended_undo()
+                    .ok_or_else(|| "No separate Ctrl key is available. Choose separate action and undo bindings first.".to_string())
+                    .and_then(|key| crate::settings::set_live(control, "undo_shortcut", key)),
                 301 => {
                     self.selected_app = self.form.selection(301);
                     // Render this application's mode before accepting another action.
@@ -436,6 +439,16 @@ impl Window {
                 config.undo_setup_hint(),
                 [24.0, 476.0, content, 90.0],
             ));
+            if config.undo_shortcut == "none" {
+                if let Some(key) = config.recommended_undo() {
+                    scene.push(E::new(
+                        206,
+                        K::Button,
+                        format!("Enable {} undo", crate::config::modifier_label(key)),
+                        [24.0, 570.0, 260.0, 32.0],
+                    ));
+                }
+            }
         }
         scene.push(E::new(
             90,

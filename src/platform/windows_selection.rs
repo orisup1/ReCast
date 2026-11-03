@@ -57,6 +57,82 @@ fn range(focus: usize) -> Option<(u32, u32)> {
     (end > start && end - start <= MAX_SELECTION_BYTES as u32).then_some((start, end))
 }
 
+/// Replace the exact `expected` suffix standing immediately before the
+/// caret, preserving everything before and after it.
+///
+/// Alignment is only trusted where `EM_GETSEL` and `WM_GETTEXT` necessarily
+/// agree — the caret at the very end of the control — so anything ambiguous
+/// (a selection, multi-line offset drift, unreadable text) fails closed and
+/// changes nothing. Edit and RichEdit controls only.
+pub(super) fn replace_expected_suffix(
+    focus: usize,
+    expected: &str,
+    replacement: &str,
+    valid: impl Fn() -> bool,
+) -> Option<()> {
+    let units: Vec<u16> = expected.encode_utf16().collect();
+    let replacement_wide: Vec<u16> = replacement.encode_utf16().chain(Some(0)).collect();
+    if units.is_empty() || replacement.is_empty() || replacement_wide.len() > MAX_SELECTION_BYTES {
+        return None;
+    }
+    if !writable(focus) || !valid() {
+        return None;
+    }
+    let (mut start, mut end) = (0u32, 0u32);
+    message(
+        focus,
+        EM_GETSEL as u32,
+        &mut start as *mut u32 as usize,
+        &mut end as *mut u32 as isize,
+    )?;
+    if start != end {
+        // A selection is not ours to collapse.
+        return None;
+    }
+    let caret = start as usize;
+    let length = message(focus, WM_GETTEXTLENGTH, 0, 0)?;
+    if length == 0 || length > MAX_SELECTION_BYTES {
+        return None;
+    }
+    let mut text = vec![0u16; length + 1];
+    let copied = message(focus, WM_GETTEXT, length + 1, text.as_mut_ptr() as isize)?;
+    text.truncate(copied);
+    if caret != text.len() || !text.ends_with(&units) || !valid() {
+        return None;
+    }
+    let begin = caret - units.len();
+    let new_caret = begin + replacement.encode_utf16().count();
+    message(focus, EM_SETSEL as u32, begin, caret as isize)?;
+    let (mut selected_start, mut selected_end) = (0u32, 0u32);
+    message(
+        focus,
+        EM_GETSEL as u32,
+        &mut selected_start as *mut u32 as usize,
+        &mut selected_end as *mut u32 as isize,
+    )?;
+    if !valid()
+        || Windows::focus() != Some(focus)
+        || selected_start as usize != begin
+        || selected_end as usize != caret
+    {
+        if Windows::focus() == Some(focus)
+            && selected_start as usize == begin
+            && selected_end as usize == caret
+        {
+            message(focus, EM_SETSEL as u32, caret, caret as isize)?;
+        }
+        return None;
+    }
+    message(
+        focus,
+        EM_REPLACESEL as u32,
+        1,
+        replacement_wide.as_ptr() as isize,
+    )?;
+    message(focus, EM_SETSEL as u32, new_caret, new_caret as isize)?;
+    Some(())
+}
+
 pub(super) fn selection(focus: usize) -> Option<Selection> {
     if Windows::focus() != Some(focus) || !writable(focus) {
         return None;

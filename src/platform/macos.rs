@@ -1261,6 +1261,7 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         erase,
         retype: text,
         terminator,
+        verify,
     } = plan;
     let gaps = crate::timing::injection();
     if terminator == Some(Key::Return) {
@@ -1271,11 +1272,31 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     }
     begin_injection(engine, generation)?;
     let buf = engine.buffered();
+    if let Some(check) = &verify {
+        // A verified replacement must land atomically or not at all; input
+        // that arrived while the worker was queued moves the caret.
+        if !buf.is_empty() {
+            return None;
+        }
+        let focus = focused_target()?;
+        replace_expected_suffix(engine, &focus, check, &text, generation)?;
+        return Some(Vec::new());
+    }
     let focus = focused_target()?;
     if Mac::app_id(&focus).as_deref() == Some("com.apple.Spotlight") {
         let replacement = format!("{text}{}", if terminator.is_some() { " " } else { "" });
         replace_spotlight_query(engine, &focus, &expected, &replacement, &buf, generation)?;
         return Some(buf);
+    }
+    // Prefer a single native text edit when the control exposes a writable range.
+    if buf.is_empty() {
+        let replacement = format!("{text}{}", if terminator.is_some() { " " } else { "" });
+        if replace_expected_suffix(engine, &focus, &expected, &replacement, generation).is_some() {
+            return Some(buf);
+        }
+        if !engine.replacement_valid(generation) {
+            return None;
+        }
     }
     // A host selection is not a counted run of characters: its first Backspace
     // would delete the selection rather than one character of our tracked word.
@@ -1776,7 +1797,7 @@ mod setup_tests {
 
 mod candidate_strip;
 mod spotlight;
-use spotlight::{replace_spotlight_query, selected_range};
+use spotlight::{replace_expected_suffix, replace_spotlight_query, selected_range};
 
 pub(crate) fn dismiss_candidates() {
     if let Some(engine) = CTX.get() {

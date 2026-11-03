@@ -132,3 +132,18 @@ GNOME/KDE harness. macOS Carbon main-thread/worker access is checked separately 
 No new native Windows/Linux editing trials were executed during this implementation.
 Cross-target compilation, engine simulations, and fixture checks must not be
 reported as native acceptance or measured end-to-end typing latency.
+
+## Fluid correction regression checks
+
+- In TextEdit plain and rich text, correct a word in the middle of a document.
+  Check that surrounding formatting, text, and caret survive native replacement.
+  Repeat in a control without writable Accessibility text ranges; keyboard fallback
+  must preserve the same text. Check host Undo as well as ReCast undo.
+- After `recieve ` becomes `receive `, type `next` then use ReCast undo.
+  Supported macOS fields and Windows native Edit/RichEdit controls must contain
+  `recieve next`. Repeat with Backspace, 32/33 suffix characters, multiple spaces,
+  Hebrew, and input arriving during replacement. Unsupported controls must decline
+  extended undo without deleting anything; spaces-only undo remains available.
+- Change text externally, move the caret, or switch focus before extended undo.
+  Stale text must never be rewritten. Verify separate single-Ctrl undo acts without
+  the shared-key 500 ms wait, and Settings explains shared bindings.

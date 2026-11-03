@@ -227,8 +227,11 @@ it converts the word to the other keyboard layout, even if neither reading is a
 dictionary word. Conversion works before or after Space and preserves the
 separator. Repeating a manual conversion converts the word back without changing
 saved exceptions or training spelling replacements. Up to 32 extra spaces preserve
-correction undo and explicit suggestions, and are restored with the original word. Other typing, Enter, or
-moving the cursor ends the opportunity to act on a finished word.
+correction undo and explicit suggestions, and are restored with the original word. Enter or moving the cursor ends the opportunity to act on a finished word.
+On supported macOS text fields and Windows native Edit/RichEdit controls, undo
+also survives up to 32 characters typed after a correction. Those characters
+are preserved verbatim; the text before the caret must still match. Linux and
+unsupported controls retain undo across spaces only.
 
 On macOS, completion and spelling alternatives appear only on explicit request in a compact, passive
 strip near the caret. The original sentence and keyboard layout stay unchanged while
@@ -279,13 +282,16 @@ Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures
 Left Ctrl or Right Ctrl. The configured double-tap action remains available unless disabled. Holding Ctrl or using
 it in a chord never triggers the extra shortcut; the same cursor/focus safeguards
 apply to both gestures.
-Extra spaces preserve undo. Other typing, Enter, or cursor movement ends the undo
+Extra spaces preserve undo. Supported native controls also preserve undo across
+a bounded typed suffix, as described above. Enter or cursor movement ends the undo
 opportunity. Undo restores the original text and, when changed, the previous layout.
 One undo suppresses that word
 for the session; undo counts are saved in `learned.txt`, and two occasions make the
 exception survive restarts. Allowing the word again clears its saved exception.
 On macOS, an undo gesture completed while a correction is landing waits for that
 correction to finish; later typing or cursor movement still cancels the queued undo.
+macOS prefers a verified native range replacement when the field supports it,
+preserving surrounding text and formatting. Other fields use paced keyboard events.
 During the destructive part of a macOS rewrite, keyboard events and mouse button
 events wait briefly until the replacement is complete, then replay in their original
 order. This keeps continued typing from canceling a partly erased word. Unsafe queued

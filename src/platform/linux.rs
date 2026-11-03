@@ -712,7 +712,13 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
         retype,
         terminator,
         expected: _expected,
+        verify,
     } = plan;
+    if verify.is_some() {
+        // The AT-SPI helper cannot re-read a suffix to verify it; an
+        // unverified edit must not erase. Plain undo is unaffected.
+        return None;
+    }
     if terminator.is_some_and(Linux::is_line_break) {
         return None;
     }

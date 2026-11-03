@@ -1,7 +1,7 @@
 //! Replacement workers, guarded injection, replay, and retry context.
 
 use super::correction_pipeline::completion_correction;
-use super::word_buffer::{PendingLearning, MAX_UNDO_SPACES};
+use super::word_buffer::{PendingLearning, MAX_UNDO_SPACES, MAX_UNDO_SUFFIX};
 use super::{
     reading, AppState, Cycle, Engine, LastAction, LastFix, LastSkip, Platform, Typed,
     MAX_SELECTION_BYTES,
@@ -98,6 +98,12 @@ pub struct Plan<P: Platform> {
     /// completion, which is triggered by a key that types nothing and therefore
     /// has nothing to restore.
     pub terminator: Option<P::Key>,
+    /// When set, only a verified native replacement may run: the text
+    /// immediately before the caret must equal this string, and the
+    /// replacement is applied around it atomically. `None` for the normal
+    /// erase-and-retype flow. Platforms that cannot verify must refuse
+    /// rather than erase.
+    pub verify: Option<String>,
 }
 
 impl<P: Platform> AppState<P> {
@@ -469,12 +475,24 @@ impl<P: Platform> Engine<P> {
                 && buffered
                     .iter()
                     .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key));
-            if only_spaces && !buffered.is_empty() {
+            // Undo stays possible across spaces typed while the replacement
+            // lands; once the bounded suffix overflows, the correction is
+            // dropped instead of erased past.
+            let suffix_full = undo
+                .as_ref()
+                .is_some_and(|fix| fix.suffix.chars().count() + buffered.len() > MAX_UNDO_SUFFIX);
+            if only_spaces && !buffered.is_empty() && !suffix_full {
                 st.keys.clear();
                 if let Some(fix) = &mut undo {
                     fix.trailing_spaces.extend(buffered.iter().copied());
                     fix.keep.clear();
+                    for _ in &buffered {
+                        fix.suffix.push(' ');
+                    }
                 }
+            } else if only_spaces && !buffered.is_empty() {
+                st.keys.clear();
+                undo = None;
             } else if let Some(boundary) = buffered
                 .iter()
                 .rposition(|typed| P::is_terminator(typed.key))
@@ -490,26 +508,41 @@ impl<P: Platform> Engine<P> {
                 st.keys.replace_with(keep);
                 st.keys.extend(buffered.iter().copied());
             }
-            // Only tracked spaces may follow a correction that can still be undone.
-            st.last_action = if only_spaces {
-                undo.map(LastAction::Fixed).or_else(|| {
-                    let cycle = st.cycle.as_ref()?;
-                    if cycle.index < cycle.candidates.len() || cycle.trailing_spaces.is_empty() {
-                        return None;
+            if !only_spaces {
+                if let Some(fix) = &mut undo {
+                    let suffix = reading::<P>(&buffered, fix.visible_layout);
+                    if buffered.iter().any(|t| P::is_line_break(t.key))
+                        || fix.suffix.chars().count() + suffix.chars().count() > MAX_UNDO_SUFFIX
+                    {
+                        undo = None;
+                    } else {
+                        fix.suffix.push_str(&suffix);
                     }
-                    let mut trailing_spaces: Vec<_> =
-                        cycle.trailing_spaces.iter().skip(1).copied().collect();
-                    trailing_spaces.extend_from_slice(&buffered);
-                    Some(LastAction::Unchanged {
-                        keys: cycle.typed.clone(),
-                        terminator: cycle.trailing_spaces.first().map(|typed| typed.key),
-                        trailing_spaces,
-                        layout: Some(cycle.original_lang),
-                    })
-                })
-            } else {
-                None
-            };
+                }
+            }
+            // Keep one correction and its exact bounded suffix for undo.
+            st.last_action = undo.map(LastAction::Fixed).or_else(|| {
+                if only_spaces {
+                    (|| {
+                        let cycle = st.cycle.as_ref()?;
+                        if cycle.index < cycle.candidates.len() || cycle.trailing_spaces.is_empty()
+                        {
+                            return None;
+                        }
+                        let mut trailing_spaces: Vec<_> =
+                            cycle.trailing_spaces.iter().skip(1).copied().collect();
+                        trailing_spaces.extend_from_slice(&buffered);
+                        Some(LastAction::Unchanged {
+                            keys: cycle.typed.clone(),
+                            terminator: cycle.trailing_spaces.first().map(|typed| typed.key),
+                            trailing_spaces,
+                            layout: Some(cycle.original_lang),
+                        })
+                    })()
+                } else {
+                    None
+                }
+            });
             st.deletion_tail = match &st.last_action {
                 Some(LastAction::Fixed(fix))
                     if fix.terminator.is_some() && !fix.visible.is_empty() =>

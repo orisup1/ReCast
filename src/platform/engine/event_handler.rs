@@ -154,6 +154,7 @@ impl<P: Platform> Engine<P> {
             return;
         }
         st.revision = st.revision.wrapping_add(1);
+        st.press_revision = st.press_revision.wrapping_add(1);
         if self
             .control
             .word_rules_open
@@ -241,7 +242,7 @@ impl<P: Platform> Engine<P> {
                         .iter()
                         .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))));
         if !is_action && !is_completion && !is_correction && !preserve_spaces {
-            st.forget_gestures();
+            st.forget_gestures_typed();
         } else if preserve_spaces && !accepted_preview {
             if st.suggestion_worker && !st.is_replacing {
                 st.generation = st.generation.wrapping_add(1);
@@ -407,6 +408,7 @@ impl<P: Platform> Engine<P> {
                 if st.keys.is_empty() && !st.no_fix {
                     st.deletion_tail = Some(Vec::new());
                 }
+                st.pop_fix_suffix();
             } else if let Some(mut tail) = st.deletion_tail.take() {
                 tail.pop();
                 // Re-enter the known word only after its separators are gone.
@@ -424,6 +426,7 @@ impl<P: Platform> Engine<P> {
                 } else {
                     st.deletion_tail = Some(tail);
                 }
+                st.pop_fix_suffix();
                 st.no_fix = false;
             } else {
                 // A cursor move, shortcut, or unknown prefix still requires a boundary.
@@ -458,7 +461,11 @@ impl<P: Platform> Engine<P> {
                     st.no_fix = false;
                 }
             }
-            st.push_key(Typed { key, shift });
+            let typed = Typed { key, shift };
+            st.push_key(typed);
+            if !st.is_replacing {
+                st.push_fix_suffix_key(typed);
+            }
             if st.is_replacing && st.buffered_keys.is_empty() {
                 // An overflowing replay buffer cannot describe the visible suffix.
                 st.invalidate_text();

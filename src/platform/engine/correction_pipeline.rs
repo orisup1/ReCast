@@ -7,7 +7,7 @@ use super::{
 };
 use crate::dictionary::{
     all_completion_candidates, check_and_correct_in_context, correction_candidates,
-    declined_by_list, Fix, Outcome, Run,
+    declined_by_list, Fix,
 };
 use crate::types::{FixKind, Language};
 use std::sync::{Arc, MutexGuard};
@@ -43,6 +43,11 @@ impl<P: Platform> Engine<P> {
                 st.invalidate_text();
             }
             return;
+        }
+        // A correction stays undoable while the user types into the next
+        // word; the terminator joins the tracked suffix.
+        if P::is_terminator(key) && !P::is_line_break(key) {
+            st.push_fix_suffix_key(Typed { key, shift });
         }
         if st.keys.is_empty() {
             // A manual mid-word conversion leaves no word to recheck, but
@@ -162,7 +167,49 @@ impl<P: Platform> Engine<P> {
             st.phrase.clear();
             return;
         }
-        let outcome = self.check(&st.keys, st.history.run(), st.mode, &st.phrase);
+        let keys = st.keys.to_vec();
+        let run = st.history.run();
+        let mode = st.mode;
+        let phrase = st.phrase.clone();
+        let layout = P::current_layout();
+        let generation = st.generation;
+        let presses = st.press_revision;
+        st.keys.clear();
+        drop(st);
+        #[cfg(test)]
+        super::tests::pause_word_check();
+        // Pure search must not block releases or cancellation on the state lock.
+        let outcome = check_and_correct_in_context(
+            &keys,
+            |t: Typed<P::Key>| P::english_char(t.key, t.shift),
+            hebrew_char::<P>,
+            |t: Typed<P::Key>| t.shift,
+            run,
+            self.en_dict,
+            self.he_dict,
+            layout,
+            mode == crate::config::AppMode::LayoutOnly,
+            Some(&phrase),
+            |_| crate::layout::LayoutSwitch::Switched,
+        );
+        let st = self.lock();
+        let Some((mut st, current_focus)) = self.refresh_focus(st) else {
+            return;
+        };
+        if st.generation != generation
+            || st.press_revision != presses
+            || st.focus != current_focus
+            || current_focus != focus
+            || st.mode != mode
+            || P::current_layout() != layout
+            || st.is_replacing
+            || !self.control.is_enabled()
+        {
+            return;
+        }
+
+        st.keys.extend(keys);
+
         // Record what this word turned out to be before anything else happens
         // to it: the next word is decided with this one behind it. A word whose
         // language could not be told is not recorded at all — see
@@ -210,6 +257,7 @@ impl<P: Platform> Engine<P> {
                     erase,
                     retype: rep.retype,
                     terminator: Some(key),
+                    verify: None,
                 },
                 Vec::new(),
                 Some(undo),
@@ -781,6 +829,10 @@ impl<P: Platform> Engine<P> {
             },
             suppress: non_empty(was.clone()),
             rule: None,
+            suffix: reading::<P>(
+                &trailing_spaces.iter().skip(1).copied().collect::<Vec<_>>(),
+                target_lang,
+            ),
         });
 
         if switched.is_some() {
@@ -815,6 +867,7 @@ impl<P: Platform> Engine<P> {
                 erase: erase - prefix + trailing_spaces.len(),
                 retype: suffix,
                 terminator: None,
+                verify: None,
             },
             keep,
             undo,
@@ -830,7 +883,7 @@ impl<P: Platform> Engine<P> {
         fix: LastFix<P>,
         retry: RetryContext<P>,
     ) {
-        if !fix.manual_conversion || !fix.trailing_spaces.is_empty() {
+        if !fix.manual_conversion || !fix.trailing_spaces.is_empty() || !fix.suffix.is_empty() {
             self.undo_fix(st, fix, retry);
         } else {
             self.manual_correct(
@@ -881,6 +934,7 @@ impl<P: Platform> Engine<P> {
         if terminator.is_none() && trailing_spaces.is_empty() {
             undo.keep = keys;
         }
+        undo.suffix = reading::<P>(&trailing_spaces, rep.target_layout);
         undo.trailing_spaces = trailing_spaces;
         let mut separators = Vec::with_capacity(undo.trailing_spaces.len() + 1);
         if let Some(key) = terminator {
@@ -900,6 +954,7 @@ impl<P: Platform> Engine<P> {
                 erase: rep.erase + separators.len(),
                 retype: rep.retype,
                 terminator: None,
+                verify: None,
             },
             Vec::new(),
             Some(undo),
@@ -916,6 +971,13 @@ impl<P: Platform> Engine<P> {
     }
 
     /// Put back what the user typed before the correction on screen replaced it.
+    ///
+    /// Everything the user typed after the correction landed is carried along
+    /// verbatim: the correction is erased along with that suffix and the
+    /// original text, the suffix included, is put back in its place. When
+    /// the suffix contains more than spaces, the edit only happens if text before the
+    /// caret still matches exactly — see the `verify` contract on
+    /// [`super::Plan`].
     pub(super) fn undo_fix(
         self: &Arc<Self>,
         mut st: MutexGuard<'_, AppState<P>>,
@@ -926,26 +988,51 @@ impl<P: Platform> Engine<P> {
         retry.clear_phrase_on_commit = true;
         retry.finish_completion_on_commit = true;
         st.cycle = None;
+        let suffix = fix.suffix.clone();
+        let suffix_chars = suffix.chars().count();
+        // The suffix must be expressed verbatim — never approximated.
+        let suffix_tail = if !suffix.is_empty() {
+            match P::retype_completion(&suffix, fix.visible_layout) {
+                Some(tail) => Some(tail),
+                None => {
+                    st.last_action = Some(LastAction::Fixed(fix));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut restore = fix.restore;
         if let Some(key) = fix.terminator {
             restore.push(Typed { key, shift: false });
         }
-        restore.extend(fix.trailing_spaces.iter().copied());
-        let erase = fix.on_screen + fix.trailing_spaces.len();
-        let expected = format!(
-            "{}{}",
-            fix.expected,
-            reading::<P>(&fix.trailing_spaces, fix.visible_layout)
-        );
+        let erase = fix.on_screen + suffix_chars;
+        let expected = format!("{}{}", fix.expected, suffix);
+        let mut retype = P::retype_original(&restore, fix.restore_layout);
+        if let Some(tail) = suffix_tail {
+            P::append_retype(&mut retype, tail);
+        }
+        let extended = suffix.chars().any(|ch| ch != ' ');
+        let verify = extended.then(|| expected.clone());
+        let keep = if extended {
+            // The restored word/layout can change the meaning of tracked key positions.
+            // Resume automatic tracking at the next boundary, never reuse stale keys.
+            st.keys.clear();
+            st.no_fix = true;
+            Vec::new()
+        } else {
+            fix.keep
+        };
         self.start_replacement(
             st,
             Plan {
                 expected,
                 erase,
-                retype: P::retype_original(&restore, fix.restore_layout),
+                retype,
                 terminator: None,
+                verify,
             },
-            fix.keep,
+            keep,
             // Undoing an undo would be a redo, which is a different gesture.
             None,
             Some(Commit::Undo {
@@ -956,33 +1043,6 @@ impl<P: Platform> Engine<P> {
             }),
             Some(retry),
         );
-    }
-
-    /// Run the pipelines over a finished word. `run` is the language of the
-    /// words before it, which the caller reads off [`AppState::history`] while
-    /// it still holds the lock.
-    fn check(
-        &self,
-        keys: &[Typed<P::Key>],
-        run: Run,
-        mode: crate::config::AppMode,
-        context: &crate::complete::PhraseContext,
-    ) -> Outcome {
-        check_and_correct_in_context(
-            keys,
-            |t: Typed<P::Key>| P::english_char(t.key, t.shift),
-            hebrew_char::<P>,
-            |t: Typed<P::Key>| t.shift,
-            run,
-            self.en_dict,
-            self.he_dict,
-            P::current_layout(),
-            mode == crate::config::AppMode::LayoutOnly,
-            Some(context),
-            // Planning never waits for the compositor while holding typing state.
-            // The replacement worker performs and confirms the requested switch.
-            |_| crate::layout::LayoutSwitch::Switched,
-        )
     }
 }
 
@@ -1106,6 +1166,7 @@ pub(super) fn undo_of<P: Platform>(
         suppress: non_empty(reading::<P>(&keys[rep.original_start..], was)),
         rule: None,
         learning_pair: None,
+        suffix: String::new(),
     }
 }
 

@@ -29,6 +29,14 @@ struct FocusGate {
 static FOCUS_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static LAYOUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static INJECT_RETURN_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
+static CHECK_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
+pub(super) fn pause_word_check() {
+    let gate = CHECK_GATE.lock().unwrap().take();
+    if let Some(gate) = gate {
+        gate.ready.send(()).unwrap();
+        gate.proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+}
 struct SimulatedPlatform<const QUEUE_UNDO: bool>;
 type Simulated = SimulatedPlatform<true>;
 struct Screen {
@@ -223,6 +231,13 @@ impl<const QUEUE_UNDO: bool> Platform for SimulatedPlatform<QUEUE_UNDO> {
         }
         let buffered = engine.buffered();
         let mut screen = engine.injector.text.lock().unwrap();
+        if plan
+            .verify
+            .as_ref()
+            .is_some_and(|expected| !buffered.is_empty() || !screen.ends_with(expected))
+        {
+            return None;
+        }
         assert_eq!(
             plan.expected.chars().count(),
             plan.erase,
@@ -1732,7 +1747,10 @@ fn finished_words_remain_available_to_explicit_suggestions() {
         "next"
     );
     assert!(s.engine.lock().completion_use.is_none());
-    assert!(s.engine.lock().last_action.is_none());
+    assert!(matches!(
+        s.engine.lock().last_action,
+        Some(LastAction::Fixed(_))
+    ));
 
     // A rapid second request also works with no in-progress word buffer.
     let s = Session::new();
@@ -1801,7 +1819,10 @@ fn finished_words_remain_available_to_explicit_suggestions() {
         reading::<Simulated>(&s.engine.lock().keys, Language::English),
         "next"
     );
-    assert!(s.engine.lock().last_action.is_none());
+    assert!(matches!(
+        s.engine.lock().last_action,
+        Some(LastAction::Fixed(_))
+    ));
 
     let s = Session::new();
     s.type_text("keyb  ");
@@ -3148,6 +3169,57 @@ fn typing_correction_undo_and_interrupted_replacements() {
         );
         return;
     }
+    // Search owns a snapshot, not the state lock. Releases stay responsive;
+    // input that moves the cursor cancels the snapshot before any edit.
+    for cancel in ["release", "click", "typing"] {
+        let s = Session::new();
+        s.type_text("recieve");
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        let engine = Arc::clone(&s.engine);
+        let worker = thread::spawn(move || engine.key_press(' '));
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            s.engine.state.try_lock().is_ok(),
+            "search must release typing state"
+        );
+        s.engine.key_release(' ');
+        s.engine.injector.text.lock().unwrap().push(' ');
+        if cancel == "click" {
+            s.engine.mouse_click();
+        }
+        if cancel == "typing" {
+            s.type_text("x");
+        }
+        proceed.send(()).unwrap();
+        worker.join().unwrap();
+        if cancel != "release" {
+            assert!(s.ready.try_recv().is_err());
+            assert_eq!(
+                s.text(),
+                if cancel == "typing" {
+                    "recieve x"
+                } else {
+                    "recieve "
+                }
+            );
+            if cancel == "typing" {
+                assert_eq!(
+                    reading::<Simulated>(&s.engine.lock().keys, Language::English),
+                    "x"
+                );
+            }
+        } else {
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "receive ");
+        }
+    }
+
     // Manual mode preserves commands while retaining explicit repair and undo.
     for word in ["recieve", "akuo", "hellorecieve"] {
         let s = Session::new();
@@ -3322,14 +3394,13 @@ fn typing_correction_undo_and_interrupted_replacements() {
     crate::complete::unlist("keyb");
 
     // Cursor/focus changes, Enter, and the space bound still invalidate undo.
-    for interrupt in ["typing", "enter", "click", "focus", "bound"] {
+    for interrupt in ["enter", "click", "focus", "bound"] {
         let s = Session::new();
         s.type_text("recieve ");
         s.pending();
         s.finish();
         s.type_text("  ");
         match interrupt {
-            "typing" => s.type_text("x"),
             "enter" => s.type_text("\n"),
             "click" => s.engine.mouse_click(),
             "focus" => {
@@ -3340,11 +3411,87 @@ fn typing_correction_undo_and_interrupted_replacements() {
         }
         let text = s.text();
         s.undo();
+        s.idle();
         assert_eq!(s.text(), text, "{interrupt}");
         assert!(!s.engine.lock().is_replacing, "{interrupt}");
         assert!(s.engine.lock().last_action.is_none(), "{interrupt}");
         assert_eq!(s.engine.control.undo_count(), 0);
         FOCUS.store(1, Ordering::SeqCst);
+    }
+
+    // Typing into the next word keeps one correction undoable: the suffix is
+    // restored verbatim after the original word is brought back.
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive ");
+    s.type_text("  x");
+    let text = s.text();
+    assert_eq!(text, "receive   x");
+    s.undo();
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "recieve   x");
+    assert!(s.engine.lock().keys.is_empty());
+    s.type_text("y ");
+    assert_eq!(s.text(), "recieve   xy ");
+    assert!(s.ready.try_recv().is_err());
+    assert!(!s.engine.lock().is_replacing);
+    assert!(!matches!(
+        s.engine.lock().last_action,
+        Some(LastAction::Fixed(_))
+    ));
+    assert_eq!(s.engine.control.undo_count(), 1);
+    crate::complete::unlist("recieve");
+
+    for length in [32, 33] {
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.type_text(&"x".repeat(length));
+        s.undo();
+        if length == 32 {
+            s.pending();
+            s.finish();
+        }
+        assert_eq!(
+            s.text(),
+            format!(
+                "{} {}",
+                if length == 32 { "recieve" } else { "receive" },
+                "x".repeat(length)
+            )
+        );
+        assert!(s.ready.try_recv().is_err());
+        crate::complete::unlist("recieve");
+    }
+
+    // Backspace updates the suffix; native text mismatches refuse extended undo.
+    for mismatch in [false, true] {
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.type_text("nextx");
+        s.backspace();
+        if mismatch {
+            s.engine.injector.text.lock().unwrap().push('!');
+        }
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(
+            s.text(),
+            if mismatch {
+                "receive next!"
+            } else {
+                "recieve next"
+            }
+        );
+        assert_eq!(s.engine.control.undo_count(), u64::from(!mismatch));
+        crate::complete::unlist("recieve");
     }
 
     // An eager undo during injection waits for the correction to finish;
@@ -3454,26 +3601,32 @@ fn typing_correction_undo_and_interrupted_replacements() {
     s.finish();
     assert_eq!(s.text(), "recieve receive ");
 
-    // Fast typing is replayed, and undo cannot eat those later keys.
+    // Fast typing is replayed; undo preserves those later keys.
     let s = Session::new();
     s.type_text("recieve ");
     s.pending();
     s.type_text("next");
     s.finish();
     assert_eq!(s.text(), "receive next");
-    assert!(s.engine.lock().last_action.is_none());
+    s.undo();
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "recieve next");
+    crate::complete::unlist("recieve");
 
-    // A complete second word arriving during injection must remain intact;
-    // its terminator must not let undo erase either word afterward.
+    // A complete second word arriving during injection survives undo too.
     let s = Session::new();
     s.type_text("recieve ");
     s.pending();
     s.type_text("next ");
     s.finish();
     s.undo();
-    assert_eq!(s.text(), "receive next ");
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "recieve next ");
     assert!(!s.engine.lock().is_replacing);
-    assert_eq!(s.engine.control.undo_count(), 0);
+    assert_eq!(s.engine.control.undo_count(), 1);
+    crate::complete::unlist("recieve");
 
     // Pausing or disabling while a worker is waiting cancels that rewrite.
     for pause in [true, false] {
@@ -4138,8 +4291,7 @@ fn typing_correction_undo_and_interrupted_replacements() {
     assert_eq!(s.engine.control.undo_count(), 1);
     crate::complete::unlist("keyb");
 
-    // A double tap must never undo the preceding correction once a new,
-    // unchanged word occupies the cursor; only that new word is converted.
+    // A bounded unchanged word after a correction is preserved during undo.
     SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
     let s = Session::new();
     s.type_text("recieve ");
@@ -4150,8 +4302,9 @@ fn typing_correction_undo_and_interrupted_replacements() {
     s.tap(Simulated::CTRL_LEFT);
     s.pending();
     s.finish();
-    assert_eq!(s.text(), "receive גם ");
-    assert_eq!(s.engine.control.undo_count(), 0);
+    assert_eq!(s.text(), "recieve do ");
+    assert_eq!(s.engine.control.undo_count(), 1);
+    crate::complete::unlist("recieve");
 
     // A dedicated undo key never converts an unchanged or ignored word.
     crate::config::Config::update_live(|cfg| {

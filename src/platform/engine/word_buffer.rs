@@ -11,6 +11,12 @@ use std::time::{Duration, Instant, SystemTime};
 /// Keep correction undo bounded while the cursor advances through spaces.
 pub(super) const MAX_UNDO_SPACES: usize = 32;
 
+/// Keep a correction undoable while the user types into the next word,
+/// bounded so the erase/restore math stays small. Everything typed after a
+/// correction — letters and spaces both — is recorded here; past the limit
+/// the correction can no longer be undone.
+pub(super) const MAX_UNDO_SUFFIX: usize = MAX_UNDO_SPACES;
+
 /// One key of the word being typed, with the shift state it was typed under.
 /// The buffer holds key *positions*, which carry no case of their own, so the
 /// shift has to be recorded here or the capitalization is lost by the time a
@@ -46,8 +52,10 @@ pub enum LastAction<P: Platform> {
 /// immediately after it, with both visible keys for conversion and the original
 /// text for the optional undo gesture.
 ///
-/// It survives bounded trailing spaces. Other text or cursor movement drops it
-/// because undo erases backwards from the cursor (see [`super::Engine::key_press`]).
+/// It survives bounded trailing spaces and a bounded suffix of whatever the
+/// user typed next; past [`MAX_UNDO_SUFFIX`] chars, or on cursor movement, it
+/// is dropped because undo erases backwards from the cursor (see
+/// [`super::Engine::key_press`]).
 pub struct LastFix<P: Platform> {
     /// Exact injected suffix, including its original terminator, for native undo.
     pub(super) expected: String,
@@ -70,6 +78,11 @@ pub struct LastFix<P: Platform> {
     /// it. Restoring the letters without restoring the layout would leave the
     /// user typing the wrong language into the word they just rescued.
     pub(super) layout: Option<Language>,
+    /// Everything typed after the correction landed: letters, spaces and
+    /// completed words, in order, capped at [`MAX_UNDO_SUFFIX`] chars. Undo
+    /// erases this along with the correction and retypes it verbatim, so it
+    /// must hold exactly the characters that reached the screen.
+    pub(super) suffix: String,
     /// Word buffer to leave behind: a completion's original prefix, empty for a
     /// word the terminator already finished.
     pub(super) keep: Vec<Typed<P::Key>>,
@@ -175,6 +188,7 @@ impl<P: Platform> Clone for LastFix<P> {
             keep: self.keep.clone(),
             suppress: self.suppress.clone(),
             rule: self.rule,
+            suffix: self.suffix.clone(),
             learning_pair: self.learning_pair.clone(),
         }
     }
@@ -236,6 +250,7 @@ pub struct AppState<P: Platform> {
     pub cycle: Option<Cycle<P>>,
     pub(super) suggestion_requests: VecDeque<bool>,
     pub(super) suggestion_worker: bool,
+    pub(super) press_revision: u64,
     pub(super) pending_learning: Option<PendingLearning>,
     pub(super) phrase: crate::complete::PhraseContext,
     pub(super) completion_use: Option<bool>,
@@ -287,6 +302,7 @@ impl<P: Platform> AppState<P> {
             cycle: None,
             suggestion_requests: VecDeque::new(),
             suggestion_worker: false,
+            press_revision: 0,
             pending_learning: None,
             phrase: crate::complete::PhraseContext::default(),
             completion_use: None,
@@ -357,6 +373,48 @@ impl<P: Platform> AppState<P> {
         let held =
             self.held_keys.contains(&P::SHIFT_LEFT) || self.held_keys.contains(&P::SHIFT_RIGHT);
         held != self.caps_lock
+    }
+
+    /// Record one character that reached the screen after a correction.
+    /// Drops the correction once the bounded suffix is full — undo cannot
+    /// erase backwards across more text than that.
+    pub(super) fn push_fix_suffix(&mut self, ch: char) {
+        if let Some(LastAction::Fixed(fix)) = &mut self.last_action {
+            if fix.suffix.chars().count() >= MAX_UNDO_SUFFIX {
+                self.last_action = None;
+            } else {
+                fix.suffix.push(ch);
+            }
+        }
+    }
+
+    /// Record the character that one typed key put on screen. Resolving the
+    /// key needs the live layout; without one, the correction can no longer
+    /// be trusted for undo.
+    pub(super) fn push_fix_suffix_key(&mut self, typed: super::Typed<P::Key>) {
+        if !matches!(self.last_action, Some(LastAction::Fixed(_))) {
+            return;
+        }
+        match P::current_layout().map(|lang| super::reading::<P>(&[typed], lang)) {
+            Some(text) => {
+                for ch in text.chars() {
+                    self.push_fix_suffix(ch);
+                }
+            }
+            None => self.last_action = None,
+        }
+    }
+
+    /// Forget the last character of the tracked suffix after a backspace.
+    /// Once nothing after the correction remains, the next erased character
+    /// reaches into the correction itself — the correction can no longer be
+    /// undone.
+    pub(super) fn pop_fix_suffix(&mut self) {
+        if let Some(LastAction::Fixed(fix)) = &mut self.last_action {
+            if fix.suffix.pop().is_none() {
+                self.last_action = None;
+            }
+        }
     }
 
     /// Add a key to whichever buffer is live: the word being typed, or the one

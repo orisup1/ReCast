@@ -111,12 +111,11 @@ and layout races. No debounce or injection delay was added in the module split.
    string slices could remove the temporary vector allocations. Keep Unicode
    boundaries and candidate deduplication intact; benchmark Hebrew as well as
    English.
-2. **Typing-state lock duration.** `Engine::word_finished` runs the planner while
-   holding the state mutex. Moving pure search onto an owned snapshot could let
-   key releases and cancellation proceed during slower searches. This requires
-   separating layout changes from planning and validating revision, generation,
-   focus, and modifiers before committing a result. Existing fresh focus checks
-   must remain immediately before injection.
+2. **Automatic search scheduling.** Finished-word search now runs outside the
+   typing-state mutex on an owned snapshot. Press revision, generation, focus,
+   mode, and layout are checked before applying it; releases do not invalidate
+   the search. Search still runs on the caller thread. Moving it off the native
+   event callback would need separate ordered scheduling and replay tests.
 3. **Phrase lookup allocation.** `PhraseContext::boost` clones the previous word
    and allocates the candidate to look up a tuple key. Nested maps with borrowed
    string lookups could avoid those allocations. Preserve the 256-pair limit,

@@ -66,6 +66,16 @@ impl<P: Platform> AppState<P> {
     /// cursor right now. Anything that moves the text on makes both claims
     /// about something that is no longer there.
     pub(super) fn forget_gestures(&mut self) {
+        self.forget_gestures_inner(false);
+    }
+
+    /// Text typed after a correction keeps that correction undoable,
+    /// bounded by its tracked suffix; every other gesture is dropped.
+    pub(super) fn forget_gestures_typed(&mut self) {
+        self.forget_gestures_inner(true);
+    }
+
+    fn forget_gestures_inner(&mut self, keep_fix: bool) {
         if self.suggestion_worker && !self.is_replacing {
             self.generation = self.generation.wrapping_add(1);
         }
@@ -73,7 +83,9 @@ impl<P: Platform> AppState<P> {
         if self.cycle.as_ref().is_some_and(|cycle| cycle.preview) {
             P::hide_preview();
         }
-        self.last_action = None;
+        if !(keep_fix && matches!(self.last_action, Some(LastAction::Fixed(_)))) {
+            self.last_action = None;
+        }
         self.cycle = None;
         self.last_action_tap = None;
         self.pending_undo = false;

@@ -572,6 +572,7 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
         retype: text,
         terminator,
         expected: _expected,
+        verify,
     } = plan;
     if terminator == Some(Key::Return) {
         return None;
@@ -582,6 +583,18 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
     }
     engine.injector.store(true, Ordering::Relaxed);
     let buf = engine.buffered();
+    if let Some(check) = &verify {
+        // A verified replacement must land atomically or not at all; input
+        // that arrived while the worker was queued moves the caret.
+        if !buf.is_empty() {
+            return None;
+        }
+        let focus = Windows::focus()?;
+        super::windows_selection::replace_expected_suffix(focus, check, &text, || {
+            engine.replacement_valid(generation) && engine.buffered().is_empty()
+        })?;
+        return Some(Vec::new());
+    }
     let mut inputs = replacement_inputs(erase, &text, terminator, &buf);
     if !engine.replacement_valid(generation) {
         return None;
