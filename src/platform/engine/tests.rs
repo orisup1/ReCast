@@ -907,7 +907,9 @@ impl<const QUEUE_UNDO: bool> SessionWithPolicy<QUEUE_UNDO> {
         self.suggestions_ready();
     }
     fn suggestions_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Debug corpus tests contend for CPU; release searches retain the tight deadline.
+        let seconds = if cfg!(debug_assertions) { 10 } else { 3 };
+        let deadline = Instant::now() + Duration::from_secs(seconds);
         while self.engine.lock().suggestion_worker {
             assert!(
                 Instant::now() < deadline,

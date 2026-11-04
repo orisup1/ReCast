@@ -18,6 +18,32 @@ fn report(name: &str, iterations: usize, started: Instant) {
 }
 
 #[test]
+#[ignore = "microbenchmark; run with --release --ignored --nocapture"]
+fn benchmark_explicit_dictionary_correction() {
+    let started = Instant::now();
+    let iterations = 5;
+    for _ in 0..iterations {
+        for word in ["hte", "form", "recieve", "neurodivergnet"] {
+            black_box(crate::spell::correction_suggestions(
+                black_box(word),
+                en_dict(),
+                en_freq(),
+                None,
+            ));
+        }
+        for word in ["שלומ", "אוניברסיטטהח"] {
+            black_box(crate::spell::hebrew::correction_suggestions(
+                black_box(word),
+                he_dict(),
+                he_freq(),
+                None,
+            ));
+        }
+    }
+    report("explicit dictionary correction", iterations * 6, started);
+}
+
+#[test]
 #[ignore = "microbenchmark; run with `make bench`"]
 fn benchmark_dictionary_lookup() {
     let (en, he) = (en_dict(), he_dict());

@@ -277,7 +277,7 @@ jobs:
           install -m 755 incoming/recastMac/recastMac    dist/recastMac
           install -m 755 incoming/ReCast.exe/recast.exe  dist/ReCast.exe
           cp incoming/recastMac/ReCast.app.zip           dist/ReCast.app.zip
-          cat LICENSE licenses/scowl.txt > dist/LICENSES.txt
+          cat LICENSE licenses/*.txt licenses/*.tsv > dist/LICENSES.txt
           file dist/recastLinux dist/recastMac dist/ReCast.exe
           ls -lh dist
           version=$(make version)

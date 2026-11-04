@@ -233,7 +233,7 @@ bundle: build bundle-plist
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
 	$(INSTALL) -m 755 $(BIN_SRC) $(APP_BUNDLE)/Contents/MacOS/recast
 	$(INSTALL) -m 644 assets/recast.icns $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
-	cat LICENSE licenses/scowl.txt > $(APP_BUNDLE)/Contents/Resources/LICENSES.txt
+	cat LICENSE licenses/*.txt licenses/*.tsv > $(APP_BUNDLE)/Contents/Resources/LICENSES.txt
 	$(MAKE) sign
 
 sign:

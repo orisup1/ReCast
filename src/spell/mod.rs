@@ -75,6 +75,7 @@ pub(crate) mod hebrew;
 mod lexicon;
 mod rules;
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use rules::{rules_by_last_byte, LOOKBACK, RULES};
@@ -759,6 +760,7 @@ struct Search<'a> {
     best: Option<(f32, u32, u32, String)>,
     runner_up: Option<(f32, u32, u32, String)>,
     offers: Option<Vec<(f32, u32, String)>>,
+    manual_offers: HashSet<String>,
     /// Only the dedicated correction gesture bypasses automatic rank gates.
     manual: bool,
     context: Option<&'a crate::complete::PhraseContext>,
@@ -776,6 +778,7 @@ impl<'a> Search<'a> {
             best: None,
             runner_up: None,
             offers: None,
+            manual_offers: HashSet::new(),
             manual: false,
             context: None,
             typo_counts: crate::personal::typo_counts(),
@@ -854,11 +857,13 @@ impl<'a> Search<'a> {
         // Cheap gates first: the whole point of scanning the list is that almost
         // every entry is thrown out before the matrix is touched.
         let cb = cand.as_bytes();
-        if self
-            .offers
-            .as_ref()
-            .is_some_and(|offers| offers.iter().any(|(_, _, word)| word == cand))
-        {
+        if if self.manual {
+            self.manual_offers.contains(cand)
+        } else {
+            self.offers
+                .as_ref()
+                .is_some_and(|offers| offers.iter().any(|(_, _, word)| word == cand))
+        } {
             return;
         }
         if self
@@ -871,7 +876,7 @@ impl<'a> Search<'a> {
         if rank > self.max_rank || lexicon::reviewed_misspelling(cand).is_some() {
             return;
         }
-        if self.manual && (!manual_eligible(cand, 1) || !en_dict.contains(cand)) {
+        if self.manual && !manual_eligible(cand, 1) {
             return;
         }
         // Keep candidates close enough to the winner to establish ambiguity,
@@ -904,7 +909,10 @@ impl<'a> Search<'a> {
         if let Some(offers) = &mut self.offers {
             if en_dict.contains(cand) {
                 offers.push((candidate, rank, cand.to_owned()));
-                if !self.manual {
+                if self.manual {
+                    // Full correction pages can contain hundreds of offers.
+                    self.manual_offers.insert(cand.to_owned());
+                } else {
                     offers.sort_by(|a, b| {
                         a.0.total_cmp(&b.0)
                             .then_with(|| a.1.cmp(&b.1))

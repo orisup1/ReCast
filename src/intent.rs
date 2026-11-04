@@ -415,9 +415,9 @@ mod tests {
             assert!(crate::dictionary::en_freq().rank(word).unwrap() < 20_000);
             assert!(!allowed.contains(word));
         }
-        assert!(crate::dictionary::en_dict().contains("ssh"));
+        assert!(crate::dictionary::en_dict().contains("kubectl"));
         assert!(
-            !allowed.contains("ssh"),
+            !allowed.contains("kubectl"),
             "technical additions are not public phrase trust"
         );
         for word in ["spunk", "המשרדים"] {
