@@ -364,8 +364,9 @@ fn diagnostics(control: Option<&AppControl>) -> String {
     if cfg.rule_stats_enabled {
         writeln!(
             out,
-            "    saved usefulness     {}",
-            personal::usefulness_summary()
+            "    saved usefulness     {}\n    saved abstentions    {}",
+            personal::usefulness_summary(),
+            personal::abstention_summary()
         )
         .unwrap();
     }

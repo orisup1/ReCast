@@ -36,6 +36,18 @@ const RULES: [&str; 5] = [
 ];
 
 const USEFULNESS_FILE: &str = "usefulness.txt";
+const ABSTAIN_FILE: &str = "abstains.txt";
+const ABSTAIN_TAGS: [&str; 9] = [
+    "english_no_candidate",
+    "english_candidate_gap",
+    "english_keep_original",
+    "hebrew_no_candidate",
+    "hebrew_candidate_gap",
+    "hebrew_keep_original",
+    "bilingual_ambiguous",
+    "joint_intent_ambiguous",
+    "preference_rejected",
+];
 const USE_NAMES: [&str; 7] = [
     "completion_sessions",
     "completion_cycle_taps",
@@ -46,6 +58,7 @@ const USE_NAMES: [&str; 7] = [
     "correction_undos",
 ];
 static USE_DIRTY: AtomicBool = AtomicBool::new(false);
+static ABSTAIN_DIRTY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub(crate) enum UseEvent {
@@ -207,6 +220,90 @@ fn flush_rule_stats() -> std::io::Result<()> {
         .map_err(|_| std::io::Error::other("rule statistics lock poisoned"))?;
     let out = rule_stats_text(counts);
     write_private(&path, &out)
+}
+
+fn abstain_stats() -> &'static Mutex<[[u64; 2]; ABSTAIN_TAGS.len()]> {
+    static STATS: OnceLock<Mutex<[[u64; 2]; ABSTAIN_TAGS.len()]>> = OnceLock::new();
+    STATS.get_or_init(|| {
+        let saved = personal_path(ABSTAIN_FILE)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default();
+        Mutex::new(parse_abstain_stats(&saved))
+    })
+}
+
+/// Aggregate abstentions by deciding gate. `near` counts slots with lead at
+/// least 3.0 against the shared threshold; it is a recall hint, not a score.
+fn parse_abstain_stats(text: &str) -> [[u64; 2]; ABSTAIN_TAGS.len()] {
+    let mut counts = [[0; 2]; ABSTAIN_TAGS.len()];
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let mut fields = line.split('\t');
+        let (Some(tag), Some(total), Some(near), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if let (Some(index), Ok(total), Ok(near)) = (
+            ABSTAIN_TAGS.iter().position(|known| *known == tag),
+            total.parse(),
+            near.parse(),
+        ) {
+            counts[index] = [total, near];
+        }
+    }
+    counts
+}
+
+fn abstain_stats_text(counts: [[u64; 2]; ABSTAIN_TAGS.len()]) -> String {
+    let mut out = String::from("# gate\tabstentions\tnear-threshold\n");
+    for (tag, [total, near]) in ABSTAIN_TAGS.iter().zip(counts) {
+        out.push_str(&format!("{tag}\t{total}\t{near}\n"));
+    }
+    out
+}
+
+pub(crate) fn record_abstain(abstain: crate::types::Abstain) {
+    if !Config::global().rule_stats_enabled {
+        return;
+    }
+    let Some(index) = ABSTAIN_TAGS.iter().position(|known| *known == abstain.tag) else {
+        return;
+    };
+    if let Ok(mut counts) = abstain_stats().lock() {
+        increment(&mut counts[index][0]);
+        if abstain.lead.is_some_and(|lead| lead >= 3.0) {
+            increment(&mut counts[index][1]);
+        }
+        ABSTAIN_DIRTY.store(true, Ordering::Relaxed);
+    }
+}
+
+fn flush_abstain_stats() -> std::io::Result<()> {
+    let Some(path) = personal_path(ABSTAIN_FILE) else {
+        return Ok(());
+    };
+    let counts = *abstain_stats()
+        .lock()
+        .map_err(|_| std::io::Error::other("abstention statistics lock poisoned"))?;
+    write_private(&path, &abstain_stats_text(counts))
+}
+
+pub(crate) fn abstention_summary() -> String {
+    let counts = abstain_stats()
+        .lock()
+        .map(|counts| *counts)
+        .unwrap_or_default();
+    let parts: Vec<String> = ABSTAIN_TAGS
+        .iter()
+        .zip(counts)
+        .filter(|(_, [total, _])| *total != 0)
+        .map(|(tag, [total, near])| format!("{tag}={total} ({near} near)"))
+        .collect();
+    if parts.is_empty() {
+        "none recorded".into()
+    } else {
+        parts.join(", ")
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -761,6 +858,7 @@ fn spawn_periodic_flusher() {
             flush_if_dirty(&CONFUSIONS_DIRTY, flush_confusions);
             flush_if_dirty(&PROFILE_DIRTY, flush_profile);
             flush_if_dirty(&RULE_STATS_DIRTY, flush_rule_stats);
+            flush_if_dirty(&ABSTAIN_DIRTY, flush_abstain_stats);
             flush_if_dirty(&USE_DIRTY, flush_usefulness);
         })
         .ok();
@@ -785,6 +883,7 @@ pub fn init() {
         }
         if Config::global().rule_stats_enabled {
             rule_stats();
+            abstain_stats();
             usefulness();
         }
         spawn_periodic_flusher();
@@ -820,6 +919,7 @@ fn clear_dir(dir: &std::path::Path) -> Result<(), String> {
         CONFUSIONS_FILE,
         PROFILE_FILE,
         RULE_STATS_FILE,
+        ABSTAIN_FILE,
         USEFULNESS_FILE,
     ];
     for name in names {
@@ -934,6 +1034,7 @@ mod tests {
             (CONFUSIONS_FILE, flush_confusions),
             (PROFILE_FILE, flush_profile),
             (RULE_STATS_FILE, flush_rule_stats),
+            (ABSTAIN_FILE, flush_abstain_stats),
             (USEFULNESS_FILE, flush_usefulness),
         ] {
             let path = dir.join(name);
@@ -970,6 +1071,19 @@ mod tests {
     #[test]
     fn usefulness_counts_accept_only_known_aggregate_fields() {
         assert_eq!(parse_usefulness("completion_sessions\t8\ncompletion_accepted\t3\nprivateword\t999\ncompletion_cycle_taps\tinvalid\n"), [8, 0, 3, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn abstention_counts_keep_only_fixed_tags_and_near_counts() {
+        let mut counts = [[0; 2]; ABSTAIN_TAGS.len()];
+        counts[7] = [11, 3];
+        let text = abstain_stats_text(counts);
+        assert_eq!(parse_abstain_stats(&text), counts);
+        assert!(!text.contains("privateword"));
+        assert_eq!(
+            parse_abstain_stats("privateword\t10\t1\njoint_intent_ambiguous\tinvalid\t1\n"),
+            [[0; 2]; ABSTAIN_TAGS.len()]
+        );
     }
 
     #[test]
@@ -1187,6 +1301,7 @@ mod tests {
             CONFUSIONS_FILE,
             PROFILE_FILE,
             RULE_STATS_FILE,
+            ABSTAIN_FILE,
             USEFULNESS_FILE,
         ] {
             let path = dir.join(name);
@@ -1226,6 +1341,7 @@ mod tests {
             CONFUSIONS_FILE,
             PROFILE_FILE,
             RULE_STATS_FILE,
+            ABSTAIN_FILE,
             USEFULNESS_FILE,
         ] {
             assert!(!dir.join(name).exists(), "{name} was not removed");

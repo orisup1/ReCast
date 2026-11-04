@@ -3,6 +3,7 @@
 use crate::complete::{PhraseContext, MAX_CANDIDATES};
 use crate::config::Config;
 use crate::dictionary::{hebrew_stem, ranked_hebrew_stem, Dict, Freq};
+use crate::types::Abstain;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -145,7 +146,12 @@ fn assess_with_visible(
         details.push_str(
             "\nNo Hebrew candidate passed the dictionary, final-letter, and frequency-rank gates.",
         );
-        return super::Assessment::unchanged(&details);
+        let mut assessment = super::Assessment::unchanged(&details);
+        assessment.abstain = Some(Abstain {
+            tag: "hebrew_no_candidate",
+            lead: None,
+        });
+        return assessment;
     };
     for candidate in result.candidates.iter().take(2) {
         let evidence = &candidate.evidence;
@@ -159,13 +165,14 @@ fn assess_with_visible(
             ));
         }
     }
+    let minimum_gap = MIN_SCORE_GAP;
     let clear_gap = result
         .candidates
         .get(1)
-        .is_none_or(|second| second.evidence.score - best.evidence.score >= MIN_SCORE_GAP);
+        .is_none_or(|second| second.evidence.score - best.evidence.score >= minimum_gap);
     if let Some(second) = result.candidates.get(1) {
         details.push_str(&format!(
-            "\nScore gap: {:.2}; required minimum: {MIN_SCORE_GAP:.2}.",
+            "\nScore gap: {:.2}; required minimum: {minimum_gap:.2}.",
             second.evidence.score - best.evidence.score
         ));
     }
@@ -184,14 +191,14 @@ fn assess_with_visible(
         word,
     ) - context.map_or(0.0, |context| context.automatic_discount(visible));
     details.push_str(&format!(
-        "\nKeep original: score {keep_score:.2}; replacement lead {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", keep_score - best.evidence.score
+        "\nKeep original: score {keep_score:.2}; replacement lead {:.2}; required minimum: {minimum_gap:.2}.", keep_score - best.evidence.score
     ));
     let mut scores = vec![keep_score, best.evidence.score];
     if let Some(second) = result.candidates.get(1) {
         scores.push(second.evidence.score);
     }
-    let accepted = crate::intent::select(&scores, MIN_SCORE_GAP) == Some(1);
-    let lead = crate::intent::normalized_lead(&scores, 1, MIN_SCORE_GAP);
+    let accepted = crate::intent::select(&scores, minimum_gap) == Some(1);
+    let lead = crate::intent::normalized_lead(&scores, 1, minimum_gap);
     details.push_str(if accepted {
         "\nAccepted the best Hebrew spelling candidate."
     } else if !clear_gap {
@@ -204,6 +211,14 @@ fn assess_with_visible(
         details,
         best: Some(best.evidence.clone()),
         lead,
+        abstain: (!accepted).then_some(Abstain {
+            tag: if clear_gap {
+                "hebrew_keep_original"
+            } else {
+                "hebrew_candidate_gap"
+            },
+            lead: Some(lead),
+        }),
     }
 }
 

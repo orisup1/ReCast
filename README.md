@@ -453,7 +453,7 @@ an unreadable config stops startup so exclusions are not silently discarded.
 | `welcomed` | Marker for the one-time correction hint |
 | `setup-complete` | macOS setup marker; missing requirements still reopen setup |
 | `practice-offered` | Marker for the optional first-run practice window |
-| `personal/` | Opt-in personalization files, `rules.txt` rule counts, and `usefulness.txt` usage counts |
+| `personal/` | Opt-in personalization files, `rules.txt` rule counts, `abstains.txt` aggregate near-miss counts, and `usefulness.txt` usage counts |
 
 `abbrev.txt` and `ignore.txt` reload within about two seconds of edits.
 **Settings > General > Advanced settings** opens the config file in your editor,
@@ -617,6 +617,14 @@ layout plus spelling. They contain no typed words, application names, or key
 timings. Manual conversions and completion taps are excluded. Counts update on
 successful text replacements and flush about every 30 seconds. This setting is
 independent of personalization and is off by default.
+
+The same setting saves aggregate abstention counts in `personal/abstains.txt`:
+which gate rejected a near-miss automatic decision, plus how many came within one
+unit of the shared acceptance threshold. These counters contain no typed words,
+application names, or key timings, flush about every 30 seconds, and appear in
+`recast --status`. They help tune recall gates from undo and ambiguity reports;
+ReCast does not automatically retune ranking from them. `--clear-personal-data`
+removes them.
 
 The same setting saves aggregate usefulness counters in `personal/usefulness.txt`:
 completion sessions, extra cycling taps, accepted choices, first-choice acceptance,
@@ -972,3 +980,4 @@ selection undo, and mixed-language text, are documented in
 [the native test protocol](tests/native-ui.md). The disposable
 [browser fixture](tests/native-editing.html) records local traces; it does not
 simulate physical keyboard capture.
+

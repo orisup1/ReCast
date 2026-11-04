@@ -164,6 +164,18 @@ impl<S: Replaceable> Drop for ReplaceGuard<'_, S> {
     }
 }
 
+/// Privacy-safe description of an inference that stayed unchanged.
+///
+/// Carries only a stable bucket tag and the margin to the joint threshold; it
+/// never carries a typed word. Counts are kept only when `rule_stats = true`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Abstain {
+    pub(crate) tag: &'static str,
+    /// How close the rejected winner came to the shared threshold, if it was
+    /// competitive enough to score against it.
+    pub(crate) lead: Option<f32>,
+}
+
 /// Longest run of keys that can still be treated as one word.
 ///
 /// Most speculative searches stop much earlier — spelling and edited-prefix

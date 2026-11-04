@@ -84,6 +84,7 @@ use rules::{COST_HOMOPHONE, COST_SPELLING, MAX_RULE_LEN};
 
 use crate::config::Config;
 use crate::dictionary::{Dict, Freq};
+use crate::types::Abstain;
 
 /// Longest word we try to correct. Beyond this a "word" is almost certainly a
 /// URL fragment, a path or an identifier, and scanning for a correction gets
@@ -386,6 +387,9 @@ pub(crate) struct Assessment {
     /// Minimum lead over keeping the original and the next candidate, in
     /// shared policy units: four means this language's acceptance threshold.
     pub lead: f32,
+    /// Why this assessment left the text unchanged, if it got close enough to
+    /// matter. Only a tag and score margin; never the word itself.
+    pub(crate) abstain: Option<Abstain>,
 }
 
 impl Assessment {
@@ -395,6 +399,7 @@ impl Assessment {
             details: reason.into(),
             best: None,
             lead: 0.0,
+            abstain: None,
         }
     }
 }
@@ -627,6 +632,7 @@ fn assess_with_visible_context(
                     details: format!("Reviewed misspelling: {word} / {target}; dictionary membership does not confer spelling trust.\n  {target}: score {:.2}, edit cost {}, frequency rank {}.\nThe reviewed repair passed the configured length, edit, dictionary, and rank gates.", candidate.score, candidate.cost, candidate.rank),
                     best: Some(candidate),
                     lead: 16.0,
+                    abstain: None,
                 },
                 None => Assessment::unchanged("The reviewed spelling repair failed the configured edit, dictionary, or frequency-rank gate."),
             };
@@ -674,14 +680,20 @@ fn assess_with_visible_context(
     }
 
     let Some((best_score, cost, rank, fixed)) = search.best else {
-        return Assessment::unchanged(&format!(
+        let mut assessment = Assessment::unchanged(&format!(
             "No candidate passed the spelling gates (weighted edit budget {budget}, maximum frequency rank {max_rank}; speculative edits use tighter rank limits)."
         ));
+        assessment.abstain = Some(Abstain {
+            tag: "english_no_candidate",
+            lead: None,
+        });
+        return assessment;
     };
+    let minimum_gap = MIN_SCORE_GAP;
     let clear_gap = search
         .runner_up
         .as_ref()
-        .is_none_or(|(second, ..)| second - best_score >= MIN_SCORE_GAP);
+        .is_none_or(|(second, ..)| second - best_score >= minimum_gap);
     let phrase_evidence = search
         .context
         .is_some_and(|context| context.boost(&fixed) >= 2.0);
@@ -693,8 +705,8 @@ fn assess_with_visible_context(
     if let Some((second, ..)) = &search.runner_up {
         scores.push(*second);
     }
-    let confident = crate::intent::select(&scores, MIN_SCORE_GAP) == Some(1);
-    let lead = crate::intent::normalized_lead(&scores, 1, MIN_SCORE_GAP);
+    let confident = crate::intent::select(&scores, minimum_gap) == Some(1);
+    let lead = crate::intent::normalized_lead(&scores, 1, minimum_gap);
     let rank_evidence = if en_freq.rank(&fixed).is_some() {
         "frequency rank"
     } else {
@@ -710,14 +722,14 @@ fn assess_with_visible_context(
             "inferred rank from a dictionary stem"
         };
         details.push_str(&format!(
-            "\nOther evaluated candidate: {word}: score {second:.2}, edit cost {second_cost}, {rank_evidence} {second_rank}\nScore gap: {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", second - best_score
+            "\nOther evaluated candidate: {word}: score {second:.2}, edit cost {second_cost}, {rank_evidence} {second_rank}\nScore gap: {:.2}; required minimum: {minimum_gap:.2}.", second - best_score
         ));
     } else {
         details.push_str("\nNo competing candidate was found within the confidence window.");
     }
     details.push_str(&context_details);
     details.push_str(&format!(
-        "\nKeep original: score {keep_score:.2} ({keep_reason}); replacement lead {:.2}; required minimum: {MIN_SCORE_GAP:.2}.", keep_score - best_score
+        "\nKeep original: score {keep_score:.2} ({keep_reason}); replacement lead {:.2}; required minimum: {minimum_gap:.2}.", keep_score - best_score
     ));
     details.push_str(if confident {
         "\nAccepted the best spelling candidate."
@@ -736,6 +748,14 @@ fn assess_with_visible_context(
             rank,
         }),
         lead,
+        abstain: (!confident).then_some(Abstain {
+            tag: if clear_gap {
+                "english_keep_original"
+            } else {
+                "english_candidate_gap"
+            },
+            lead: Some(lead),
+        }),
     }
 }
 

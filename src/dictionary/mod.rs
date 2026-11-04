@@ -19,7 +19,7 @@ pub(crate) mod quotes;
 pub use blob::{en_dict, en_freq, he_dict, he_freq, Dict, Freq};
 
 use crate::config::{Config, LanguagePreference};
-use crate::types::{FixKind, Language};
+use crate::types::{Abstain, FixKind, Language};
 
 /// Whether to log every word check and switch decision.
 ///
@@ -802,6 +802,9 @@ pub struct Outcome {
     pub details: String,
     /// Stable aggregate statistics tag, only for an applied correction.
     pub rule: Option<&'static str>,
+    /// Why automatic correction stayed silent, when it nearly did not.
+    /// Tags and margins only; never the typed text.
+    pub abstain: Option<Abstain>,
     /// The correction to apply, or `None` to leave the word alone.
     pub fix: Option<Fix>,
     /// The language the word turned out to be, when that is knowable at all.
@@ -913,6 +916,27 @@ struct Proposal {
     context_scored: bool,
 }
 
+struct SpellingDecision {
+    proposal: Option<Proposal>,
+    abstain: Option<Abstain>,
+}
+
+impl SpellingDecision {
+    fn accepted(proposal: Proposal) -> Self {
+        Self {
+            proposal: Some(proposal),
+            abstain: None,
+        }
+    }
+
+    fn silent(abstain: Option<Abstain>) -> Self {
+        Self {
+            proposal: None,
+            abstain,
+        }
+    }
+}
+
 /// What a spelling fix or an expansion puts on screen: the new word in the case
 /// the old one was typed in, followed by the punctuation that ended it.
 ///
@@ -969,6 +993,28 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
     );
 }
 
+#[derive(Clone)]
+struct PlanningResult {
+    plan: Option<Plan>,
+    abstain: Option<Abstain>,
+}
+
+impl PlanningResult {
+    fn accepted(plan: Plan) -> Self {
+        Self {
+            plan: Some(plan),
+            abstain: None,
+        }
+    }
+
+    fn silent(abstain: Option<Abstain>) -> Self {
+        Self {
+            plan: None,
+            abstain,
+        }
+    }
+}
+
 /// Pure planning step: decide what to do with the word, given the folded
 /// buffers, the per-key offset tables, and the live `current` layout. Kept free
 /// of any I/O so it is unit testable; the actual layout switch happens in the
@@ -998,7 +1044,7 @@ fn plan(
     context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
     suffix_allowed: &mut bool,
-) -> Option<Plan> {
+) -> PlanningResult {
     let preference = Config::global().language_preference;
     details.push_str(&format!("\nLanguage preference: {}.", preference.label()));
     let candidate = plan_candidate(
@@ -1014,16 +1060,25 @@ fn plan(
         layout_only,
         context,
         details,
-    )?;
+    );
+    let Some(candidate) = candidate.plan else {
+        return candidate;
+    };
     // A rejected whole-word proposal must not be retried as a partial word.
     *suffix_allowed = false;
     // One final gate covers exact, split, learned, and combined spelling switches.
     // Explicit expansions and spelling within the current layout pass unchanged.
-    preference_allows_plan(
+    if preference_allows_plan(
         &candidate, preference, en, he, offsets_en, offsets_he, current, run, en_dict, he_dict,
         en_freq, he_freq, details,
-    )
-    .then_some(candidate)
+    ) {
+        PlanningResult::accepted(candidate)
+    } else {
+        PlanningResult::silent(Some(Abstain {
+            tag: "preference_rejected",
+            lead: None,
+        }))
+    }
 }
 
 /// A preference is an additional precision gate, never permission to bypass the
@@ -1126,7 +1181,7 @@ fn plan_candidate(
     layout_only: bool,
     context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
-) -> Option<Plan> {
+) -> PlanningResult {
     // Every pipeline below asks about the *word* — the punctuation the user
     // finished it with is set aside by `Reading` and put back by the caller.
     let (word_en, word_he) = (en.word, he.word);
@@ -1146,7 +1201,7 @@ fn plan_candidate(
     };
     if crate::complete::suppressed(typed) || crate::complete::suppressed(visible.full) {
         details.push_str("\nProtected by an undo exception for this session.");
-        return None;
+        return PlanningResult::silent(None);
     }
 
     // An expansion the user configured by hand outranks everything we infer.
@@ -1166,7 +1221,7 @@ fn plan_candidate(
             });
         if let Some(text) = text {
             details.push_str("\nApplied the configured abbreviation before inferred corrections.");
-            return Some(Plan::Expand { text });
+            return PlanningResult::accepted(Plan::Expand { text });
         }
     }
     if current == Some(Language::English) {
@@ -1179,11 +1234,14 @@ fn plan_candidate(
                 || crate::complete::learned(word_en)
             {
                 details.push_str("\nThe curated transposition is protected by the application mode, capitalization, or a saved word rule.");
-                return None;
+                return PlanningResult::silent(None);
             }
             let assessment = crate::spell::assess(word_en, en_dict, en_freq, context);
             details.push_str(&format!("\n{}", assessment.details));
-            return assessment.correction.map(|text| Plan::Spell { text });
+            return match assessment.correction {
+                Some(text) => PlanningResult::accepted(Plan::Spell { text }),
+                None => PlanningResult::silent(assessment.abstain),
+            };
         }
     }
 
@@ -1194,7 +1252,7 @@ fn plan_candidate(
         || word_he.chars().count() < MIN_AUTOMATIC_WORD_CHARS
     {
         details.push_str("\nSingle-letter words are not corrected automatically.");
-        return None;
+        return PlanningResult::silent(None);
     }
 
     // Whole-buffer decision first — this is what fires for virtually every real
@@ -1238,28 +1296,30 @@ fn plan_candidate(
     // Establish layout matches before the joint intent comparison. Once exact
     // matching succeeds, context must not suppress it or change its spelling
     // repair. The speller likewise checks context-free alternate repairs first.
-    let spelling = (!layout_only)
-        .then(|| {
-            plan_spelling(
-                en,
-                he,
-                current,
-                whole,
-                case,
-                en_dict,
-                he_dict,
-                en_freq,
-                he_freq,
-                if whole.is_some() { None } else { context },
-                details,
-            )
-        })
-        .flatten();
+    let spelling_decision = if layout_only {
+        None
+    } else {
+        Some(plan_spelling(
+            en,
+            he,
+            current,
+            whole,
+            case,
+            en_dict,
+            he_dict,
+            en_freq,
+            he_freq,
+            if whole.is_some() { None } else { context },
+            details,
+        ))
+    };
+    let spelling_abstain = spelling_decision.as_ref().and_then(|d| d.abstain);
+    let spelling = spelling_decision.and_then(|d| d.proposal);
     if let Some(lang) = whole {
         details.push_str(
             "\nAccepted exact alternate-layout match takes precedence over contextual intent.",
         );
-        return Some(match spelling {
+        return PlanningResult::accepted(match spelling {
             Some(Proposal {
                 plan:
                     Plan::SwitchAndSpell {
@@ -1279,7 +1339,9 @@ fn plan_candidate(
         details.push_str(
             "\nAccepted alternate-layout typo repair takes precedence over contextual intent.",
         );
-        return spelling.map(|proposal| proposal.plan);
+        return spelling
+            .map(|proposal| PlanningResult::accepted(proposal.plan))
+            .unwrap_or_else(|| PlanningResult::silent(None));
     }
 
     // Retained pairs supply another hypothesis, never an unconditional return.
@@ -1304,7 +1366,15 @@ fn plan_candidate(
     if let Some(spelling) = spelling {
         candidates.push(spelling);
     }
-    select_plan(candidates, en, he, current, context, details)
+    select_plan(
+        candidates,
+        en,
+        he,
+        current,
+        context,
+        details,
+        spelling_abstain,
+    )
 }
 
 /// Rank inferred actions together with leaving the visible token alone.
@@ -1317,7 +1387,8 @@ fn select_plan(
     current: Option<Language>,
     context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
-) -> Option<Plan> {
+    abstain: Option<Abstain>,
+) -> PlanningResult {
     let typed = if current == Some(Language::Hebrew) {
         he.word
     } else {
@@ -1363,7 +1434,9 @@ fn select_plan(
         }
     }
     if distinct.is_empty() {
-        return None;
+        // Internal inconsistency or no candidate evaluated: the language-specific
+        // assessment already carries evidence when there is any.
+        return PlanningResult::silent(abstain);
     }
     let mut scores = vec![0.0];
     details.push_str(
@@ -1373,14 +1446,18 @@ fn select_plan(
         details.push_str(&format!("\n  {text:?} ({language:?}): {score:.2}."));
         scores.push(*score);
     }
-    match crate::intent::select(&scores, 4.0) {
+    let required_lead = 4.0;
+    match crate::intent::select(&scores, required_lead) {
         Some(index) if index > 0 => {
-            details.push_str("\nSelected the joint intent winner with a lead of at least 4.00 over keeping the original and every competing action.");
-            Some(distinct.swap_remove(index - 1).0.plan)
+            details.push_str(&format!("\nSelected the joint intent winner with a lead of at least {required_lead:.2} over keeping the original and every competing action."));
+            PlanningResult::accepted(distinct.swap_remove(index - 1).0.plan)
         }
         _ => {
             details.push_str("\nIntent remains ambiguous; preserved the original token.");
-            None
+            PlanningResult::silent(Some(Abstain {
+                tag: "joint_intent_ambiguous",
+                lead: Some(crate::intent::normalized_lead(&scores, 0, 4.0)),
+            }))
         }
     }
 }
@@ -1443,10 +1520,10 @@ fn plan_spelling(
     he_freq: Freq,
     context: Option<&crate::complete::PhraseContext>,
     details: &mut String,
-) -> Option<Proposal> {
+) -> SpellingDecision {
     let Some(current) = current else {
         details.push_str("\nSpelling skipped: the current keyboard layout is unknown.");
-        return None;
+        return SpellingDecision::silent(None);
     };
     let visible = if current == Language::English {
         en.word
@@ -1565,8 +1642,11 @@ fn plan_spelling(
                 } else {
                     hebrew
                 };
-                return Some(Proposal {
-                    plan: compose_spelling(current, lang, assessment.correction?),
+                let Some(correction) = assessment.correction else {
+                    return SpellingDecision::silent(assessment.abstain);
+                };
+                return SpellingDecision::accepted(Proposal {
+                    plan: compose_spelling(current, lang, correction),
                     lead,
                     context_scored: true,
                 });
@@ -1598,14 +1678,25 @@ fn plan_spelling(
             None
         }
     });
-    let lang = spelling_language(
+    let lang = match spelling_language(
         scoring_layout,
         &english,
         &hebrew,
         omitted_letters,
         phrase_layout,
         details,
-    )?;
+    ) {
+        Some(layer) => layer,
+        None => {
+            return SpellingDecision::silent(bilingual_abstain(
+                current,
+                &english,
+                &hebrew,
+                omitted_letters,
+                phrase_layout,
+            ));
+        }
+    };
     let lead = spelling_lead(
         scoring_layout,
         lang,
@@ -1619,8 +1710,11 @@ fn plan_spelling(
     } else {
         hebrew
     };
-    Some(Proposal {
-        plan: compose_spelling(current, lang, assessment.correction?),
+    let Some(correction) = assessment.correction else {
+        return SpellingDecision::silent(assessment.abstain);
+    };
+    SpellingDecision::accepted(Proposal {
+        plan: compose_spelling(current, lang, correction),
         lead,
         context_scored: true,
     })
@@ -1639,6 +1733,45 @@ fn bilingual_alternate_cost(
         90.0
     };
     layout + omitted_letters as f32 * 100.0
+}
+
+/// Describe why both languages were left alone, if they were competitive. A
+/// language-specific near miss wins over "no candidate"; otherwise a bilingual
+/// ambiguity is reported without the typed text.
+fn bilingual_abstain(
+    current: Language,
+    english: &crate::spell::Assessment,
+    hebrew: &crate::spell::Assessment,
+    omitted_letters: usize,
+    phrase_layout: Option<Language>,
+) -> Option<Abstain> {
+    if let (Some(english_best), Some(hebrew_best)) = (&english.best, &hebrew.best) {
+        let cost = bilingual_alternate_cost(current, omitted_letters, phrase_layout);
+        let scores = [
+            english_best.score
+                + if current == Language::English {
+                    0.0
+                } else {
+                    cost
+                },
+            hebrew_best.score
+                + if current == Language::Hebrew {
+                    0.0
+                } else {
+                    cost
+                },
+        ];
+        let native_index = usize::from(current == Language::Hebrew);
+        let alternate_index = usize::from(current != Language::Hebrew);
+        let native = crate::intent::normalized_lead(&scores, native_index, BILINGUAL_REQUIRED_LEAD);
+        let alternate =
+            crate::intent::normalized_lead(&scores, alternate_index, BILINGUAL_REQUIRED_LEAD);
+        return Some(Abstain {
+            tag: "bilingual_ambiguous",
+            lead: Some(native.min(alternate)),
+        });
+    }
+    english.abstain.or(hebrew.abstain)
 }
 
 /// Confidence is limited by the closest competitor in either language, even
@@ -1691,7 +1824,7 @@ fn spelling_language(
     phrase_layout: Option<Language>,
     details: &mut String,
 ) -> Option<Language> {
-    const REQUIRED_LEAD: f32 = BILINGUAL_REQUIRED_LEAD;
+    let required_lead = BILINGUAL_REQUIRED_LEAD;
     let (native, alternate) = if current == Language::English {
         (english, hebrew)
     } else {
@@ -1701,16 +1834,16 @@ fn spelling_language(
     if let (Some(native_best), Some(alternate_best)) = (&native.best, &alternate.best) {
         let alternate_score = alternate_best.score + alternate_cost;
         details.push_str(&format!(
-            "\nBilingual spelling: current-layout candidate {:?}: score {:.2}; alternate {:?}: score {:.2} plus layout/word-boundary cost {alternate_cost:.2} ({omitted_letters} source letter keys read as punctuation). Phrase language prior: {phrase_layout:?}. Required lead: {REQUIRED_LEAD:.2}.", native_best.text, native_best.score, alternate_best.text, alternate_best.score
+            "\nBilingual spelling: current-layout candidate {:?}: score {:.2}; alternate {:?}: score {:.2} plus layout/word-boundary cost {alternate_cost:.2} ({omitted_letters} source letter keys read as punctuation). Phrase language prior: {phrase_layout:?}. Required lead: {required_lead:.2}.", native_best.text, native_best.score, alternate_best.text, alternate_best.score
         ));
-        if native_best.score + REQUIRED_LEAD <= alternate_score {
+        if native_best.score + required_lead <= alternate_score {
             if native.correction.is_some() {
                 return Some(current);
             }
             details.push_str("\nLeft unchanged: the current-language candidate vetoed a layout switch but did not pass its own confidence gates.");
             return None;
         }
-        if alternate_score + REQUIRED_LEAD <= native_best.score && alternate.correction.is_some() {
+        if alternate_score + required_lead <= native_best.score && alternate.correction.is_some() {
             return Some(current.other());
         }
         details.push_str("\nLeft unchanged: competing language repairs remain ambiguous, including candidates rejected by their individual confidence gates.");
@@ -1814,6 +1947,7 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
             reason: "Protected by an undo exception",
             details: "The complete visible token was previously restored by undo; wrapper fallback must not reconsider its contents.".into(),
             rule: None, fix: None, lang: None,
+            abstain: None,
         };
     }
     let (start, end) = visible
@@ -1983,6 +2117,7 @@ fn check_unwrapped_in_context<K: Copy>(
             rule: None,
             fix: None,
             lang: None,
+            abstain: None,
         };
     }
 
@@ -2063,6 +2198,7 @@ fn check_unwrapped_in_context<K: Copy>(
             rule: None,
             fix: None,
             lang: None,
+            abstain: None,
         };
     }
     let case = Case::of(&shifted_en);
@@ -2098,7 +2234,7 @@ fn check_unwrapped_in_context<K: Copy>(
         run.len
     ));
     let mut suffix_allowed = want_offsets;
-    let Some(plan) = plan(
+    let planning = plan(
         en,
         he,
         &offsets_en,
@@ -2114,7 +2250,8 @@ fn check_unwrapped_in_context<K: Copy>(
         context,
         &mut details,
         &mut suffix_allowed,
-    ) else {
+    );
+    let Some(plan) = planning.plan else {
         if suffix_allowed {
             if let Some(mut suffix) = check_merged_suffix(
                 keys,
@@ -2143,6 +2280,7 @@ fn check_unwrapped_in_context<K: Copy>(
             details,
             rule: None,
             fix: None,
+            abstain: planning.abstain,
             // An alternate word that was not inserted must not establish its
             // own language run and eventually justify the rejected switch.
             lang: seen.filter(|&lang| {
@@ -2271,6 +2409,7 @@ fn check_unwrapped_in_context<K: Copy>(
         lang,
         reason,
         details,
+        abstain: None,
     }
 }
 
@@ -2374,6 +2513,7 @@ fn check_merged_suffix<K: Copy>(
         });
         outcome.reason = "Merged-token last-word correction";
         outcome.rule = Some("split");
+        outcome.abstain = None;
         outcome.details.push_str(&format!(
             "\nFound a recognized prefix ({prefix:?}, {start} keys); replaced the entire merged token with its corrected final word."
         ));
@@ -2660,6 +2800,55 @@ impl Freq {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
+    fn plan_option(
+        en: Reading<'_>,
+        he: Reading<'_>,
+        offsets_en: &[usize],
+        offsets_he: &[usize],
+        current: Option<Language>,
+        run: Run,
+        case: Case,
+        en_dict: Dict,
+        he_dict: Dict,
+        en_freq: Freq,
+        he_freq: Freq,
+        layout_only: bool,
+        context: Option<&crate::complete::PhraseContext>,
+        details: &mut String,
+        suffix_allowed: &mut bool,
+    ) -> Option<Plan> {
+        plan(
+            en,
+            he,
+            offsets_en,
+            offsets_he,
+            current,
+            run,
+            case,
+            en_dict,
+            he_dict,
+            en_freq,
+            he_freq,
+            layout_only,
+            context,
+            details,
+            suffix_allowed,
+        )
+        .plan
+    }
+
+    fn select_plan_option(
+        candidates: Vec<Proposal>,
+        en: Reading<'_>,
+        he: Reading<'_>,
+        current: Option<Language>,
+        context: Option<&crate::complete::PhraseContext>,
+        details: &mut String,
+    ) -> Option<Plan> {
+        select_plan(candidates, en, he, current, context, details, None).plan
+    }
+
     fn dict(words: &[&str]) -> Dict {
         Dict::of(words)
     }
@@ -2756,7 +2945,7 @@ mod tests {
             for history in [None, Some(&context)] {
                 let mut details = String::new();
                 assert_eq!(
-                    plan(
+                    plan_option(
                         Reading::of(en_word),
                         Reading::of(he_word),
                         &[],
@@ -2804,7 +2993,7 @@ mod tests {
         };
         let proposals = vec![proposal(learned.clone()), proposal(inferred.clone())];
         assert_eq!(
-            select_plan(
+            select_plan_option(
                 proposals.clone(),
                 en,
                 he,
@@ -2816,7 +3005,7 @@ mod tests {
             "conflicting equally supported actions must abstain",
         );
         assert_eq!(
-            select_plan(
+            select_plan_option(
                 proposals,
                 en,
                 he,
@@ -2828,7 +3017,7 @@ mod tests {
             "longer context can outweigh a learned replacement",
         );
         assert_eq!(
-            select_plan(
+            select_plan_option(
                 vec![proposal(learned.clone())],
                 Reading::new("bank", 4),
                 he,
@@ -2840,7 +3029,7 @@ mod tests {
             "context can favor preserving the literal token",
         );
         assert_eq!(
-            select_plan(
+            select_plan_option(
                 vec![proposal(inferred.clone()), proposal(inferred.clone())],
                 en,
                 he,
@@ -2852,7 +3041,7 @@ mod tests {
             "equivalent actions are not competing alternatives",
         );
         assert_eq!(
-            select_plan(
+            select_plan_option(
                 vec![
                     Proposal {
                         plan: learned.clone(),
@@ -2875,7 +3064,7 @@ mod tests {
             "real evidence distinguishes a strong repair from a barely accepted pair",
         );
         assert_eq!(
-            select_plan(
+            select_plan_option(
                 vec![proposal(learned.clone())],
                 Reading::new("bank", 4),
                 he,
@@ -2891,7 +3080,7 @@ mod tests {
             start: 2,
         };
         assert_eq!(
-            select_plan(
+            select_plan_option(
                 vec![proposal(split.clone())],
                 en,
                 he,
@@ -2899,7 +3088,7 @@ mod tests {
                 Some(&context),
                 &mut details
             ),
-            select_plan(
+            select_plan_option(
                 vec![proposal(split)],
                 en,
                 he,
@@ -3937,6 +4126,7 @@ mod tests {
                 cost: 100,
                 rank: 100,
             }),
+            abstain: None,
         };
         let mut english = assessment(120.0, true);
         english.lead = 16.0;
@@ -4033,7 +4223,7 @@ mod tests {
             assert!(valid_strict(word, Language::English, en, dict(&[])));
         }
         let check = |layout_only| {
-            plan(
+            plan_option(
                 Reading::of("enviroment"),
                 Reading::of("קמהןרםצקמא"),
                 &[],
@@ -5038,7 +5228,7 @@ mod tests {
         he: Dict,
         en_f: Freq,
     ) -> Option<Plan> {
-        plan(
+        plan_option(
             Reading::of(en_text),
             Reading::of(he_text),
             &[],
@@ -5118,7 +5308,7 @@ mod tests {
             (None, false, None),
         ] {
             assert_eq!(
-                plan(
+                plan_option(
                     Reading::new("akuf,", 4),
                     Reading::new("שלומ,", "שלומ".len()),
                     &[],
@@ -5143,7 +5333,7 @@ mod tests {
     #[test]
     fn combined_hebrew_repair_keeps_source_guards_and_punctuation() {
         let check = |en, en_f, current, case, layout_only| {
-            plan(
+            plan_option(
                 Reading::new("akuf.", 4),
                 Reading::of("שלומץ"),
                 &[],
@@ -5258,7 +5448,7 @@ mod tests {
         let mut context = crate::complete::PhraseContext::default();
         context.observe("birthday", false);
         let check = |current, case, he, layout_only, context| {
-            plan(
+            plan_option(
                 Reading::of("caxe"),
                 Reading::of("בשסק"),
                 &[],
@@ -5710,7 +5900,7 @@ mod tests {
         // got nothing, so ending a sentence meant losing the correction.
         let en = dict(&["hello"]);
         let he = dict(&["שלום"]);
-        let plan = plan(
+        let plan = plan_option(
             read("akuo/", true, &[]),
             read("שלום.", false, &[]),
             &[],
@@ -5753,7 +5943,7 @@ mod tests {
         let he = dict(&[]);
         let en_f = freq(&[("hello", 500)]);
         assert_eq!(
-            plan(
+            plan_option(
                 read("helo,", true, &[]),
                 read("יקךם,", false, &[]),
                 &[],

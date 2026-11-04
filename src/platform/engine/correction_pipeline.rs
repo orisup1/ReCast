@@ -243,6 +243,7 @@ impl<P: Platform> Engine<P> {
         let details = format!("Reason: {}\n{}", outcome.reason, outcome.details);
         let result = outcome.fix;
         let rule = outcome.rule;
+        let abstain = outcome.abstain;
         // Describe the fix for the history before `replacement` consumes it.
         let note = result.as_ref().map(|fix| note_of::<P>(&st.keys, fix));
         if let Some(rep) = replacement::<P>(&st.keys, result) {
@@ -298,6 +299,9 @@ impl<P: Platform> Engine<P> {
         }
 
         if !st.practice && st.mode == crate::config::AppMode::Full {
+            if let Some(abstain) = abstain {
+                crate::personal::record_abstain(abstain);
+            }
             if let Some(lang) = outcome.lang {
                 crate::personal::record_word(&reading::<P>(&st.keys, lang));
             }
