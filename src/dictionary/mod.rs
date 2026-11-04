@@ -1139,14 +1139,32 @@ fn plan_candidate(
         Some(Language::Hebrew) => word_he,
         _ => word_en,
     };
-    if crate::complete::suppressed(typed) {
+    let visible = if current == Some(Language::Hebrew) {
+        he
+    } else {
+        en
+    };
+    if crate::complete::suppressed(typed) || crate::complete::suppressed(visible.full) {
         details.push_str("\nProtected by an undo exception for this session.");
         return None;
     }
 
     // An expansion the user configured by hand outranks everything we infer.
     if current.is_some() && !layout_only {
-        if let Some(text) = crate::complete::expand(typed) {
+        let reading = if current == Some(Language::Hebrew) {
+            he
+        } else {
+            en
+        };
+        // Longest configured key wins; only unconsumed sentence punctuation remains.
+        let text = std::iter::once(reading.full.len())
+            .chain(reading.full.char_indices().rev().map(|(index, _)| index))
+            .take_while(|&end| end >= reading.word.len())
+            .find_map(|end| {
+                crate::complete::expand(&reading.full[..end])
+                    .map(|text| format!("{text}{}", &reading.full[end..]))
+            });
+        if let Some(text) = text {
             details.push_str("\nApplied the configured abbreviation before inferred corrections.");
             return Some(Plan::Expand { text });
         }
@@ -1791,6 +1809,13 @@ pub(crate) fn check_and_correct_in_context<K: Copy>(
             })
             .collect()
     });
+    if visible.as_deref().is_some_and(crate::complete::suppressed) {
+        return Outcome {
+            reason: "Protected by an undo exception",
+            details: "The complete visible token was previously restored by undo; wrapper fallback must not reconsider its contents.".into(),
+            rule: None, fix: None, lang: None,
+        };
+    }
     let (start, end) = visible
         .as_deref()
         .map(|text| frame_bounds_for_layout(text, current.unwrap()))
@@ -2186,14 +2211,16 @@ fn check_unwrapped_in_context<K: Copy>(
             }),
             Some(Language::Hebrew),
         ),
-        Plan::Expand { text } if current == Some(Language::Hebrew) => (
-            Some(Fix::Spelling {
-                text: respelled(&text, Case::Lower, he.tail),
-                lang: Language::Hebrew,
-            }),
-            Some(Language::Hebrew),
-        ),
-        Plan::Spell { text } | Plan::Expand { text } => {
+        Plan::Expand { text } => {
+            let lang = current.unwrap_or(Language::English);
+            let text = if lang == Language::English {
+                case.apply(&text)
+            } else {
+                text
+            };
+            (Some(Fix::Spelling { text, lang }), Some(lang))
+        }
+        Plan::Spell { text } => {
             // No layout call at all — the word stays in English, only its
             // letters change.
             debug_log(&full_en, &full_he, None, false);

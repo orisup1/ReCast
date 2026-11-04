@@ -471,6 +471,8 @@ addr = 1 Main Street, Tel Aviv
 
 Rules expand in the active English or Hebrew layout when you finish the word,
 and take priority over automatic corrections.
+Keys may contain punctuation, such as `c++`. The longest matching rule wins;
+additional sentence punctuation is preserved.
 Right Shift also offers an expansion. Capitalization follows your input:
 `Btw` becomes `By the way`. No abbreviations ship enabled; `complete = false`
 disables both abbreviations and word completion.

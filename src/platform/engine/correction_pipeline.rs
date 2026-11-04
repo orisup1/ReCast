@@ -40,6 +40,10 @@ fn undo_word(text: &str, language: Language) -> Option<String> {
         .map(|(index, c)| index + c.len_utf8())
         .next_back()
         .unwrap_or(0);
+    // Punctuation-only rules may own their brackets, so protect their full key.
+    if word_end == 0 {
+        return non_empty(text.to_owned());
+    }
     word.truncate(word_end);
     non_empty(word)
 }

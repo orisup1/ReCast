@@ -723,10 +723,11 @@ fn apostrophe_completions(
     let Some((stem, partial)) = prefix.split_once('\'') else {
         return Vec::new();
     };
+    let ascii_part = |part: &str| part.bytes().all(|c| c.is_ascii_graphic() && c != b'\'');
     if !(min_len..=MAX_PREFIX_LEN).contains(&prefix.len())
         || stem.is_empty()
-        || !stem.bytes().all(|c| c.is_ascii_lowercase())
-        || !partial.bytes().all(|c| c.is_ascii_lowercase())
+        || !ascii_part(stem)
+        || !ascii_part(partial)
     {
         return Vec::new();
     }
@@ -771,10 +772,8 @@ fn apostrophe_completions(
             || !word.starts_with(prefix)
             || first.is_empty()
             || last.is_empty()
-            || !first
-                .bytes()
-                .chain(last.bytes())
-                .all(|c| c.is_ascii_lowercase())
+            || !ascii_part(first)
+            || !ascii_part(last)
             || ranking.exclude == Some(word.as_str())
             || candidates.iter().any(|candidate| candidate.word == *word)
         {
@@ -1487,7 +1486,7 @@ fn parse_abbreviations(text: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((key, value)) = line.split_once('=').or_else(|| line.split_once('\t')) else {
+        let Some((key, value)) = line.split_once(['=', '\t']) else {
             continue;
         };
         let (key, value) = (key.trim(), value.trim());
@@ -1805,6 +1804,34 @@ mod tests {
     }
 
     #[test]
+    fn saved_apostrophe_identifiers_remain_reachable_after_digits_and_punctuation() {
+        let saved = ["o'co1", "o'con_nor", "o'co/nor", "user2'name3"].map(str::to_owned);
+        for (prefix, expected) in [
+            ("o'co", "o'co1"),
+            ("o'con_", "o'con_nor"),
+            ("o'co/", "o'co/nor"),
+            ("user2'na", "user2'name3"),
+        ] {
+            let offers = completions_from(
+                prefix,
+                Dict::new(""),
+                Freq::EMPTY,
+                2,
+                0,
+                &saved,
+                Ranking {
+                    all: true,
+                    ..Ranking::default()
+                },
+            );
+            assert!(
+                offers.contains(&expected.to_owned()),
+                "{prefix}: {offers:?}"
+            );
+        }
+    }
+
+    #[test]
     fn apostrophe_completion_preserves_saved_names_and_deduplicates_forms() {
         let saved = [
             "o'connor",
@@ -1814,9 +1841,7 @@ mod tests {
             "o'corin",
             "o'cove",
             "o''connor",
-            "o'con_nor",
-            "o'co1",
-            "o'co/nor",
+            "o'co nor",
             "o'coשלום",
         ]
         .map(str::to_owned);
@@ -2864,6 +2889,13 @@ mod tests {
     }
 
     #[test]
+    fn tab_separated_expansions_preserve_equals_in_the_value() {
+        let table = parse_abbreviations("sig\tname = title\ncode = x\ty = z\n");
+        assert_eq!(table.get("sig").map(String::as_str), Some("name = title"));
+        assert_eq!(table.get("code").map(String::as_str), Some("x\ty = z"));
+    }
+
+    #[test]
     fn parses_the_abbreviation_file() {
         let table = parse_abbreviations(
             "# my shortcuts\n\
@@ -3258,8 +3290,7 @@ impl RuleEditor {
             }
             let word = if self.kind == RuleKind::Abbreviations {
                 let (key, value) = line
-                    .split_once('=')
-                    .or_else(|| line.split_once('\t'))
+                    .split_once(['=', '\t'])
                     .ok_or_else(|| format!("Line {}: use shortcut = expansion", index + 1))?;
                 if value.trim().is_empty() || value.chars().any(char::is_control) {
                     return Err(format!("Line {}: enter a single-line expansion", index + 1));
@@ -3408,10 +3439,11 @@ mod rule_editor_tests {
         assert!(ignored("שלום"));
 
         let mut editor = RuleEditor::open(RuleKind::Abbreviations).unwrap();
-        editor.text = "btw = by the way\nshalom = שלום עולם\n".into();
+        editor.text = "btw = by the way\nshalom = שלום עולם\nsig\tname = title\n".into();
         editor.save().unwrap();
         assert_eq!(abbreviation("btw").as_deref(), Some("by the way"));
         assert_eq!(abbreviation("shalom").as_deref(), Some("שלום עולם"));
+        assert_eq!(abbreviation("sig").as_deref(), Some("name = title"));
         editor.text = "broken line".into();
         assert!(editor.save().is_err());
         assert_eq!(abbreviation("btw").as_deref(), Some("by the way"));

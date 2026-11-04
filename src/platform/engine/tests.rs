@@ -4430,6 +4430,41 @@ fn typing_correction_undo_and_interrupted_replacements() {
     std::fs::remove_file(&abbrev).unwrap();
     crate::complete::reload_user_files();
 
+    // A rule owns its punctuation; additional sentence punctuation survives.
+    std::fs::write(
+        &abbrev,
+        "zzpunct = fallback\nzzpunct. = exact\nc++ = c plus plus\n++ = plus\n() = pair\n(++) = wrapped\n",
+    )
+    .unwrap();
+    crate::complete::reload_user_files();
+    for (typed, expected, protected) in [
+        ("zzpunct.", "exact", "zzpunct"),
+        ("zzpunct.!", "exact!", "zzpunct"),
+        ("zzpunct?", "fallback?", "zzpunct"),
+        ("c++", "c plus plus", "c"),
+        ("++", "plus", "++"),
+        ("()", "pair", "()"),
+        ("(++)", "wrapped", "(++)"),
+    ] {
+        crate::complete::unlist(protected);
+        let s = Session::new();
+        s.type_text(&format!("{typed} "));
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("{expected} "));
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("{typed} "));
+        assert!(crate::complete::suppressed(protected));
+        s.type_text(&format!("{typed} "));
+        assert_eq!(s.text(), format!("{typed} {typed} "));
+        assert!(!s.engine.lock().is_replacing);
+        crate::complete::unlist(protected);
+    }
+    std::fs::remove_file(&abbrev).unwrap();
+    crate::complete::reload_user_files();
+
     // Hebrew rules must behave identically through automatic expansion and undo.
     std::fs::write(&abbrev, "קבד = שלום עולם\n").unwrap();
     crate::complete::reload_user_files();
