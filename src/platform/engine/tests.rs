@@ -5331,3 +5331,5 @@ fn spelling_preview_is_passive_and_commits_only_on_trusted_typing() {
     assert_eq!(s.text(), "helox");
     assert!(s.ready.try_recv().is_err());
 }
+
+mod dictionary_typing;
