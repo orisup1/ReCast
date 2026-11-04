@@ -15,6 +15,8 @@ use std::io::Write;
 use std::sync::OnceLock;
 
 mod blob;
+#[cfg(test)]
+pub(crate) mod calibration;
 pub(crate) mod quotes;
 pub use blob::{en_dict, en_freq, he_dict, he_freq, Dict, Freq};
 
@@ -1446,7 +1448,7 @@ fn select_plan(
         details.push_str(&format!("\n  {text:?} ({language:?}): {score:.2}."));
         scores.push(*score);
     }
-    let required_lead = 4.0;
+    let required_lead = crate::intent::threshold("joint", 4.0);
     match crate::intent::select(&scores, required_lead) {
         Some(index) if index > 0 => {
             details.push_str(&format!("\nSelected the joint intent winner with a lead of at least {required_lead:.2} over keeping the original and every competing action."));
@@ -1809,7 +1811,7 @@ fn spelling_lead(
         local.min(crate::intent::normalized_lead(
             &scores,
             winner,
-            BILINGUAL_REQUIRED_LEAD,
+            crate::intent::threshold("bilingual", BILINGUAL_REQUIRED_LEAD),
         ))
     } else {
         local
@@ -1824,7 +1826,7 @@ fn spelling_language(
     phrase_layout: Option<Language>,
     details: &mut String,
 ) -> Option<Language> {
-    let required_lead = BILINGUAL_REQUIRED_LEAD;
+    let required_lead = crate::intent::threshold("bilingual", BILINGUAL_REQUIRED_LEAD);
     let (native, alternate) = if current == Language::English {
         (english, hebrew)
     } else {

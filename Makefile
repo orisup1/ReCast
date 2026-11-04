@@ -327,3 +327,7 @@ help:
 	@echo "The binary is self-contained — dictionaries are embedded at"
 	@echo "compile time, so it runs identically from any working directory."
 	@echo "For Windows: use deploy.ps1 (PowerShell)."
+
+.PHONY: calibrate
+calibrate:
+	$(CARGO) test --release --bin recast dictionary::calibration::calibration_report -- --exact --ignored --nocapture --test-threads=1

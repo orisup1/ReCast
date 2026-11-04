@@ -689,7 +689,7 @@ fn assess_with_visible_context(
         });
         return assessment;
     };
-    let minimum_gap = MIN_SCORE_GAP;
+    let minimum_gap = crate::intent::threshold("english", MIN_SCORE_GAP);
     let clear_gap = search
         .runner_up
         .as_ref()

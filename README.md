@@ -981,3 +981,61 @@ selection undo, and mixed-language text, are documented in
 [browser fixture](tests/native-editing.html) records local traces; it does not
 simulate physical keyboard capture.
 
+### Offline correction calibration
+
+Run `make calibrate > /tmp/recast-calibration.txt` to replay the bundled synthetic
+corpora through the automatic correction pipeline. This is an ignored Rust test,
+not a running-app command. It uses shipped test defaults, embedded dictionaries,
+no personal data, and a simulated successful layout switch. It never captures
+keys, changes the OS layout, writes personal statistics, or retunes the app.
+You can also run the Cargo command shown in the `calibrate` Makefile target.
+
+The tab-separated report keeps the development corpus (`corrections.tsv`) and
+independent evaluation corpus (`evaluation.tsv`) separate. Desired output labels
+remain authoritative: documented existing failures and baseline updates are not
+counted as successes. Do not tune against the independent evaluation corpus;
+use it to check a change chosen on development data, then add fresh held-out cases.
+These are synthetic regression examples, not representative typing samples.
+
+Each experiment changes one required-lead family: English spelling, Hebrew
+spelling, bilingual competition, or joint intent. Scales 0.50, 0.75, and 1.25
+multiply that family's current score gap (50% lower, 25% lower, 25% higher).
+Spelling families include both candidate separation and keep-original separation.
+Their normalized evidence uses the experimental gap too, so downstream joint
+ranking evaluates the same experimental policy. Search budgets, candidate windows,
+dictionary protections, preference gates, and all other thresholds stay fixed.
+The report reruns the pipeline; it does not infer acceptance from saved margins.
+No-candidate and preference rejections are counted but not relaxed.
+
+Every experiment runs with and without phrase context, split by **input layout**
+English/Hebrew and combined. Language history remains enabled in both modes.
+Named sequences retain each replay's actual visible outputs, so changed earlier
+corrections can affect later decisions. Context resets at sequence and application
+mode boundaries, matching the existing corpus tests. Isolated rows have no phrase
+history. This models successful application of each proposed correction; live
+injection failures, undo behavior, and manual correction are outside its scope.
+
+Report rows:
+
+- `summary`: corpus, context, threshold family, scale, input layout, correct fixes,
+  unwanted changes to already-correct text, wrong replacements of typos, missed
+  fixes, correctly unchanged text, precision %, recall %, recovered fixes, newly
+  introduced false corrections, and lost previously correct outcomes.
+- `abstention`: corpus, context, family, scale, layout, reason, count.
+  `untagged_unchanged` includes protected/valid text and decisions without an
+  abstention tag; it is not evidence of a threshold failure.
+- `change`: corpus, context, family, scale, source line, original, desired,
+  baseline output, experimental output, and baseline abstention reason.
+  Text is debug-escaped. Only checked-in synthetic text appears here.
+
+Precision is correct fixes divided by all applied text changes. Recall is correct
+fixes divided by all cases needing a change, including wrong replacements.
+Undefined ratios print `n/a`. A recovered fix was unchanged at baseline and now
+matches its label. An introduced false correction was not a false correction at
+baseline. `lost` counts baseline-correct outcomes that become incorrect, including
+new abstentions. Counts are paired within the same corpus and context mode.
+Inspect changed cases as well as totals: moving one wrong replacement to another
+is still an error even though it does not increase the introduced count.
+
+Use the report to propose a deliberate, reviewed threshold change. The aggregate
+`abstains.txt` counters contain no labels and are not calibration training data.

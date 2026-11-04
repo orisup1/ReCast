@@ -165,7 +165,7 @@ fn assess_with_visible(
             ));
         }
     }
-    let minimum_gap = MIN_SCORE_GAP;
+    let minimum_gap = crate::intent::threshold("hebrew", MIN_SCORE_GAP);
     let clear_gap = result
         .candidates
         .get(1)

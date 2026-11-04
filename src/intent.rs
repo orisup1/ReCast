@@ -292,6 +292,18 @@ impl Context {
     }
 }
 
+/// Calibration overrides exist only in the test binary.
+#[inline]
+pub(crate) fn threshold(gate: &str, default: f32) -> f32 {
+    #[cfg(test)]
+    return crate::dictionary::calibration::threshold(gate, default);
+    #[cfg(not(test))]
+    {
+        let _ = gate;
+        default
+    }
+}
+
 /// Select only a finite winner with the required lead over every alternative.
 /// Callers include keeping the original as an ordinary candidate at index zero.
 pub(crate) fn select(scores: &[f32], minimum_lead: f32) -> Option<usize> {
