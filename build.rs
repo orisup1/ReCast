@@ -30,11 +30,15 @@
 // cross-compiling with the GNU (mingw-w64) toolchain we point it at the
 // prefixed windres/ar.
 
+#[path = "src/dictionary/quotes.rs"]
+mod quotes;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/dictionary/quotes.rs");
     prepare_dictionaries();
     prepare_offer_phrases();
     embed_windows_resources();
@@ -67,7 +71,7 @@ fn prepare_dictionaries() {
             if word.is_empty() {
                 continue;
             }
-            let lower = word.to_ascii_lowercase();
+            let lower = quotes::canonical(word).to_ascii_lowercase();
             if let Some(stripped) = strip_quotes(&lower) {
                 words.push(stripped);
             }
@@ -95,10 +99,11 @@ fn prepare_dictionaries() {
             if word.is_empty() {
                 continue;
             }
+            let canonical = quotes::canonical(word);
             let word = if fold {
-                word.to_ascii_lowercase()
+                canonical.to_ascii_lowercase()
             } else {
-                word.to_string()
+                canonical.into_owned()
             };
             if let Some(stripped) = strip_quotes(&word) {
                 best.entry(stripped).or_insert(rank);

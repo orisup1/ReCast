@@ -327,15 +327,51 @@ fn completions_from(
     ranking: Ranking<'_>,
 ) -> Vec<String> {
     let len = prefix.chars().count();
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    if prefix.chars().any(|c| ('א'..='ת').contains(&c)) && prefix.contains(['\'', '"', '׳', '״'])
+    {
+        return hebrew_quote_completions(prefix, dict, freq, min_len, max_rank, saved, ranking);
+    }
     if prefix.contains('\'') {
         return apostrophe_completions(prefix, dict, freq, min_len, max_rank, saved, ranking);
     }
     let english = prefix.chars().all(|c| c.is_ascii_lowercase());
-    if len < min_len
-        || len > MAX_PREFIX_LEN
-        || !(english || prefix.chars().all(|c| ('א'..='ת').contains(&c)))
-    {
+    if len < min_len || len > MAX_PREFIX_LEN {
         return Vec::new();
+    }
+    if !(english || prefix.chars().all(|c| ('א'..='ת').contains(&c))) {
+        // Saved identifiers can contain digits or punctuation. Only exact
+        // saved matches are eligible; do not infer edits or dictionary words.
+        if !prefix.bytes().all(|c| c.is_ascii_graphic()) {
+            return Vec::new();
+        }
+        let candidates = saved
+            .iter()
+            .filter(|word| {
+                word.starts_with(prefix)
+                    && word.len() > len
+                    && word.len() <= crate::types::MAX_WORD_KEYS
+                    && word.bytes().all(|c| c.is_ascii_graphic())
+                    && ranking.exclude != Some(word.as_str())
+            })
+            .map(|word| {
+                let rank = freq.rank(word).unwrap_or(1_000);
+                Candidate {
+                    word: word.clone(),
+                    saved: word.len() - len,
+                    rank,
+                    fallback: false,
+                    weight: f64::from(crate::personal::personal_boost(word))
+                        * ranking
+                            .context
+                            .map_or(1.0, |context| context.offer_boost(word))
+                        / (f64::from(rank) + 1.0),
+                }
+            })
+            .collect();
+        return ranked_completions(candidates, ranking.offset, ranking.all);
     }
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
     // Exact and edited matches compete in the same pool. A typo needs much
@@ -407,7 +443,7 @@ fn completions_from(
             if english {
                 c.is_ascii_graphic()
             } else {
-                ('א'..='ת').contains(&c)
+                ('א'..='ת').contains(&c) || matches!(c, '\'' | '"' | '׳' | '״')
             }
         });
         if valid && prefixes.iter().any(|p| word.starts_with(p)) {
@@ -513,11 +549,45 @@ fn completions_from(
             }
         }
     }
-    ranked_completions(
+    let mut out = ranked_completions(
         candidates.into_values().collect(),
         ranking.offset,
         ranking.all,
-    )
+    );
+    if ranking.all {
+        // Keep the established ranking, then make the entire exact dictionary
+        // run reachable through paging, even without corpus frequency evidence.
+        let mut seen: HashSet<String> = out.iter().cloned().collect();
+        let mut append = |word: String| {
+            if word.chars().count() > len
+                && word.chars().count() <= crate::types::MAX_WORD_KEYS
+                && ranking.exclude != Some(word.as_str())
+                && word.chars().all(|c| {
+                    if english {
+                        c.is_ascii_lowercase()
+                    } else {
+                        ('א'..='ת').contains(&c) || matches!(c, '\'' | '"')
+                    }
+                })
+                && seen.insert(word.clone())
+            {
+                out.push(word);
+            }
+        };
+        dict.for_each_with_prefix(prefix, |word| append(word.to_owned()));
+        if !english {
+            for (attached, stem_prefix) in crate::dictionary::hebrew_prefix_splits(prefix) {
+                if stem_prefix.chars().count() >= 2 {
+                    dict.for_each_with_prefix(stem_prefix, |stem| {
+                        if stem.chars().count() >= 3 {
+                            append(format!("{attached}{stem}"));
+                        }
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Banded Damerau alignment of the typed prefix against a candidate's opening.
@@ -567,6 +637,78 @@ fn technical_words() -> Dict {
     Dict::new(include_str!(concat!(env!("OUT_DIR"), "/en_tech.blob")))
 }
 
+/// Quoted Hebrew words are exact dictionary lookups, not English suffix forms.
+/// Preserve the quote characters emitted by the user's keyboard.
+fn hebrew_quote_completions(
+    prefix: &str,
+    dict: Dict,
+    freq: Freq,
+    min_len: usize,
+    max_rank: u32,
+    saved: &[String],
+    ranking: Ranking<'_>,
+) -> Vec<String> {
+    let len = prefix.chars().count();
+    if !(min_len..=MAX_PREFIX_LEN).contains(&len)
+        || !prefix
+            .chars()
+            .all(|c| ('א'..='ת').contains(&c) || matches!(c, '\'' | '"' | '׳' | '״'))
+        || !prefix.starts_with(|c: char| ('א'..='ת').contains(&c))
+    {
+        return Vec::new();
+    }
+    let canonical = crate::dictionary::quotes::canonical(prefix);
+    let single = if prefix.contains('׳') { "׳" } else { "'" };
+    let double = if prefix.contains('״') { "״" } else { "\"" };
+    let mut candidates = HashMap::new();
+    let mut consider = |word: &str, explicit: bool| {
+        let word = crate::dictionary::quotes::canonical(word);
+        if !word.starts_with(canonical.as_ref())
+            || word.chars().count() <= len
+            || word.chars().count() > crate::types::MAX_WORD_KEYS
+            || !word
+                .chars()
+                .all(|c| ('א'..='ת').contains(&c) || matches!(c, '\'' | '"'))
+        {
+            return;
+        }
+        let rank = freq.rank(&word);
+        if !explicit && !ranking.all && rank.is_none_or(|rank| rank > max_rank) {
+            return;
+        }
+        let word = word.replace('\'', single).replace('"', double);
+        if ranking.exclude == Some(word.as_str()) {
+            return;
+        }
+        let fallback = !explicit && rank.is_none_or(|rank| rank > max_rank);
+        let rank = rank.unwrap_or(if explicit { 1_000 } else { 100_000 });
+        let weight = f64::from(crate::personal::personal_boost(&word))
+            * ranking
+                .context
+                .map_or(1.0, |context| context.offer_boost(&word))
+            / (f64::from(rank) + 1.0);
+        candidates.insert(
+            word.clone(),
+            Candidate {
+                saved: word.chars().count() - len,
+                word,
+                weight,
+                rank,
+                fallback,
+            },
+        );
+    };
+    dict.for_each_with_prefix(&canonical, |word| consider(word, false));
+    for word in saved {
+        consider(word, true);
+    }
+    ranked_completions(
+        candidates.into_values().collect(),
+        ranking.offset,
+        ranking.all,
+    )
+}
+
 /// Complete supported English suffixes and explicitly saved apostrophe names.
 /// Dictionary and frequency evidence validate inferred forms.
 fn apostrophe_completions(
@@ -594,12 +736,17 @@ fn apostrophe_completions(
             continue;
         }
         let word = format!("{stem}'{suffix}");
-        if ranking.exclude == Some(word.as_str()) {
+        if word.len() > crate::types::MAX_WORD_KEYS || ranking.exclude == Some(word.as_str()) {
             continue;
         }
-        let Some(rank) = crate::dictionary::english_form_rank(&word, dict, freq)
-            .filter(|rank| *rank <= max_rank)
-        else {
+        let direct_rank = crate::dictionary::english_form_rank(&word, dict, freq);
+        let Some(rank) = direct_rank.filter(|rank| *rank <= max_rank).or_else(|| {
+            (ranking.all
+                && suffix == "s"
+                && crate::dictionary::english_form(&word).is_some()
+                && dict.contains(stem))
+            .then_some(100_000)
+        }) else {
             continue;
         };
         let weight = f64::from(crate::personal::personal_boost(&word))
@@ -612,7 +759,7 @@ fn apostrophe_completions(
             word,
             weight,
             rank,
-            fallback: false,
+            fallback: direct_rank.is_none_or(|rank| rank > max_rank),
         });
     }
     for word in saved {
@@ -744,7 +891,11 @@ pub fn expand(word: &str) -> Option<String> {
 
 /// The expansion the user defined for `key`, if any.
 fn abbreviation(key: &str) -> Option<String> {
-    abbreviations().lock().ok()?.get(key).cloned()
+    abbreviations()
+        .lock()
+        .ok()?
+        .get(&key.to_lowercase())
+        .cloned()
 }
 
 /// Whether the user has declared `word` off limits in
@@ -1530,11 +1681,93 @@ mod tests {
     }
 
     #[test]
+    fn saved_identifiers_remain_reachable_after_punctuation_and_digits() {
+        let saved =
+            ["sha256sum", "my_tool", "node.js", "tool-name", "אבוריג׳יני"].map(str::to_owned);
+        for (prefix, expected) in [
+            ("sha2", "sha256sum"),
+            ("my_", "my_tool"),
+            ("node.", "node.js"),
+            ("tool-", "tool-name"),
+            ("אבור", "אבוריג׳יני"),
+        ] {
+            let offers = completions_from(
+                prefix,
+                Dict::new(""),
+                Freq::EMPTY,
+                2,
+                0,
+                &saved,
+                Ranking {
+                    all: true,
+                    ..Ranking::default()
+                },
+            );
+            assert_eq!(offers, [expected], "{prefix}");
+        }
+    }
+
+    #[test]
     fn common_short_completions_keep_their_frequency_weight() {
         let d = dict(&["hello", "help", "helmet"]);
         let f = freq(&[("hello", 500), ("help", 140), ("helmet", 9_000)]);
         assert_eq!(finish("hel", d, f).as_deref(), Some("help"));
         assert_eq!(offers("hel", d, f), ["help", "hello", "helmet"]);
+    }
+
+    #[test]
+    fn completion_rejects_empty_prefixes_and_overlong_apostrophe_forms() {
+        let stem = "a".repeat(crate::types::MAX_WORD_KEYS - 2);
+        let folded = format!("{stem}ll");
+        let d = dict(&[&stem, &folded, "i", "ill"]);
+        let f = freq(&[(&folded, 0), (&stem, 1), ("ill", 2)]);
+        let all = |prefix: &str| {
+            completions_from(
+                prefix,
+                d,
+                f,
+                0,
+                100_000,
+                &[],
+                Ranking {
+                    all: true,
+                    ..Ranking::default()
+                },
+            )
+        };
+        assert!(all("").is_empty());
+        let offers = all(&format!("{stem}'"));
+        assert!(offers
+            .iter()
+            .all(|word| word.len() <= crate::types::MAX_WORD_KEYS));
+        assert!(offers.contains(&format!("{stem}'s")));
+        assert!(!all("i'").contains(&"i's".to_owned()));
+    }
+
+    #[test]
+    fn full_pool_completes_rare_possessives_and_hebrew_quotes() {
+        let d = dict(&["quizzical", "ג'ירפה", "צה\"ל"]);
+        for (prefix, expected) in [
+            ("quizzical'", "quizzical's"),
+            ("ג'י", "ג'ירפה"),
+            ("ג׳י", "ג׳ירפה"),
+            ("צה\"", "צה\"ל"),
+            ("צה״", "צה״ל"),
+        ] {
+            let all = completions_from(
+                prefix,
+                d,
+                Freq::EMPTY,
+                2,
+                0,
+                &[],
+                Ranking {
+                    all: true,
+                    ..Ranking::default()
+                },
+            );
+            assert!(all.iter().any(|word| word == expected), "{prefix}: {all:?}");
+        }
     }
 
     #[test]
@@ -2409,7 +2642,55 @@ mod tests {
     }
 
     #[test]
-    fn rare_dictionary_fallback_requires_a_long_exact_specific_prefix() {
+    fn full_pool_reaches_sampled_dictionary_words_without_frequency_evidence() {
+        let mut checked = 0;
+        for (dictionary, english) in [
+            (crate::dictionary::en_dict(), true),
+            (crate::dictionary::he_dict(), false),
+        ] {
+            let mut sampled = Vec::new();
+            let mut index = 0;
+            dictionary.for_each_with_prefix("", |word| {
+                if index % 4093 == 0 {
+                    sampled.push(word.to_owned());
+                }
+                index += 1;
+            });
+            for word in &sampled {
+                if word.chars().count() < 4
+                    || word.chars().count() > crate::types::MAX_WORD_KEYS
+                    || !word.chars().all(|c| {
+                        if english {
+                            c.is_ascii_lowercase()
+                        } else {
+                            ('א'..='ת').contains(&c)
+                        }
+                    })
+                {
+                    continue;
+                }
+                let prefix: String = word.chars().take(3).collect();
+                let all = completions_from(
+                    &prefix,
+                    dictionary,
+                    Freq::EMPTY,
+                    3,
+                    0,
+                    &[],
+                    Ranking {
+                        all: true,
+                        ..Ranking::default()
+                    },
+                );
+                assert!(all.iter().any(|offer| offer == word), "{prefix}: {word}");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 180, "dictionary coverage shrank: {checked}");
+    }
+
+    #[test]
+    fn full_pool_reaches_rare_dictionary_words_from_short_exact_prefixes() {
         for (prefix, words, near, typo, too_short) in [
             (
                 "specific",
@@ -2451,10 +2732,9 @@ mod tests {
             }
             assert!(!all(near).is_empty(), "{near}");
             assert!(all(typo).is_empty(), "rare fallback edited {typo}");
-            assert!(
-                all(too_short).is_empty(),
-                "rare fallback accepted {too_short}"
-            );
+            assert!(words
+                .iter()
+                .all(|word| all(too_short).contains(&word.to_string())));
             for noisy in [
                 format!("{prefix}1"),
                 format!("{prefix}_"),

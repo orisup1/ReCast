@@ -293,32 +293,79 @@ pub(crate) fn correction_suggestions(
     freq: Freq,
     context: Option<&crate::complete::PhraseContext>,
 ) -> Vec<String> {
-    if word.len() > MAX_LEN {
+    if word.len() > crate::types::MAX_WORD_KEYS {
         return Vec::new();
     }
     if let Some((stem, suffix)) = crate::dictionary::english_form(word) {
         return correction_suggestions(stem, dict, freq, context)
             .into_iter()
             .map(|stem| format!("{stem}{suffix}"))
-            .filter(|form| crate::dictionary::english_form_rank(form, dict, freq).is_some())
+            .filter(|form| {
+                form.len() <= crate::types::MAX_WORD_KEYS
+                    && (crate::dictionary::english_form_rank(form, dict, freq).is_some()
+                        || (suffix == "'s"
+                            && form
+                                .strip_suffix(suffix)
+                                .is_some_and(|stem| dict.contains(stem))))
+            })
             .collect();
     }
-    if !eligible(word, 2) {
+    if !manual_eligible(word, 2) {
         return Vec::new();
     }
     let budget = if word.len() < DIST2_MIN_LEN { 2 } else { 3 } * COST_EDIT;
-    let mut search = Search::new(word, budget, 50_000);
+    let mut search = Search::new(word, budget, u32::MAX);
     search.offers = Some(Vec::new());
     search.manual = true;
     search.context = context;
     freq.for_each_with_prefix("", |candidate, rank| search.consider(candidate, rank, dict));
+    // A dictionary-only single slip needs no corpus rank. Generate its small
+    // edit ring instead of aligning against hundreds of thousands of entries.
+    let mut consider = |bytes: &[u8]| {
+        let candidate = std::str::from_utf8(bytes).expect("ASCII spelling candidate");
+        if dict.contains(candidate) {
+            search.consider(candidate, freq.rank(candidate).unwrap_or(100_000), dict);
+        }
+    };
+    let mut edited = word.as_bytes().to_vec();
+    for index in 0..word.len() {
+        let original = edited.remove(index);
+        consider(&edited);
+        edited.insert(index, original);
+        for letter in b'a'..=b'z' {
+            edited[index] = letter;
+            consider(&edited);
+        }
+        edited[index] = original;
+        if index + 1 < edited.len() {
+            edited.swap(index, index + 1);
+            consider(&edited);
+            edited.swap(index, index + 1);
+        }
+    }
+    for index in 0..=word.len() {
+        for letter in b'a'..=b'z' {
+            edited.insert(index, letter);
+            consider(&edited);
+            edited.remove(index);
+        }
+    }
+    // Longer dictionary-only repairs keep a narrow intact opening.
+    if word.len() >= DIST2_MIN_LEN {
+        dict.for_each_with_prefix(&word[..2], |candidate| {
+            if manual_eligible(candidate, 1) {
+                search.consider(candidate, freq.rank(candidate).unwrap_or(100_000), dict);
+            }
+        });
+    }
     search.consider_derivatives(word, dict, freq);
-    search
-        .offers
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, _, word)| word)
-        .collect()
+    let mut offers = search.offers.unwrap_or_default();
+    offers.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    offers.into_iter().map(|(_, _, word)| word).collect()
 }
 
 /// Result and evidence from one spelling search. No diagnostic replay is needed.
@@ -824,7 +871,7 @@ impl<'a> Search<'a> {
         if rank > self.max_rank || lexicon::reviewed_misspelling(cand).is_some() {
             return;
         }
-        if self.manual && (!eligible(cand, 1) || !en_dict.contains(cand)) {
+        if self.manual && (!manual_eligible(cand, 1) || !en_dict.contains(cand)) {
             return;
         }
         // Keep candidates close enough to the winner to establish ambiguity,
@@ -857,12 +904,14 @@ impl<'a> Search<'a> {
         if let Some(offers) = &mut self.offers {
             if en_dict.contains(cand) {
                 offers.push((candidate, rank, cand.to_owned()));
-                offers.sort_by(|a, b| {
-                    a.0.total_cmp(&b.0)
-                        .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.2.cmp(&b.2))
-                });
-                offers.truncate(crate::complete::MAX_CANDIDATES);
+                if !self.manual {
+                    offers.sort_by(|a, b| {
+                        a.0.total_cmp(&b.0)
+                            .then_with(|| a.1.cmp(&b.1))
+                            .then_with(|| a.2.cmp(&b.2))
+                    });
+                    offers.truncate(crate::complete::MAX_CANDIDATES);
+                }
             }
             return;
         }
@@ -1106,6 +1155,14 @@ fn eligible(word: &str, min_len: usize) -> bool {
     !word.is_empty()
         && word.len() >= min_len
         && word.len() <= MAX_LEN
+        && word.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// Requested corrections can use the entire tracked word, with the same edit budget.
+fn manual_eligible(word: &str, min_len: usize) -> bool {
+    !word.is_empty()
+        && word.len() >= min_len
+        && word.len() <= crate::types::MAX_WORD_KEYS
         && word.bytes().all(|b| b.is_ascii_lowercase())
 }
 
@@ -1625,6 +1682,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_spelling_reaches_long_words_without_relaxing_automatic_limits() {
+        let target = "electroencephalographically";
+        let d = Dict::of(&[target]);
+        let typed = target.replacen("graph", "garph", 1);
+        assert!(correction_suggestions(&typed, d, Freq::EMPTY, None).contains(&target.to_owned()));
+        assert_eq!(correct_with(&typed, d, Freq::EMPTY, 4, 50_000, 3), None);
+        let target = "a".repeat(crate::types::MAX_WORD_KEYS);
+        let d = Dict::of(&[&target]);
+        let typed = format!("{}b", &target[..target.len() - 1]);
+        assert!(correction_suggestions(&typed, d, Freq::EMPTY, None).contains(&target));
+        assert!(correction_suggestions(&format!("{typed}b"), d, Freq::EMPTY, None).is_empty());
+    }
+
+    #[test]
+    fn explicit_correction_reaches_unranked_words_and_all_pages() {
+        let d = Dict::of(&[
+            "cat",
+            "bat",
+            "hat",
+            "mat",
+            "pat",
+            "rat",
+            "sat",
+            "vat",
+            "quizzical",
+        ]);
+        let offers = correction_suggestions("zat", d, Freq::EMPTY, None);
+        for expected in ["cat", "bat", "hat", "mat", "pat", "rat", "sat", "vat"] {
+            assert!(
+                offers.iter().any(|word| word == expected),
+                "{expected}: {offers:?}"
+            );
+        }
+        for typed in [
+            "quizzicla",
+            "quizzicall",
+            "quizzicl",
+            "quizzicxl",
+            "quizzicla's",
+        ] {
+            let expected = if typed.ends_with("'s") {
+                "quizzical's"
+            } else {
+                "quizzical"
+            };
+            assert!(
+                correction_suggestions(typed, d, Freq::EMPTY, None)
+                    .iter()
+                    .any(|word| word == expected),
+                "{typed}"
+            );
+            assert_eq!(correct_with(typed, d, Freq::EMPTY, 4, 50_000, 3), None);
+        }
+    }
+
+    #[test]
     fn zero_minimum_length_still_rejects_an_empty_word() {
         assert_eq!(
             correct_with("", Dict::new("hello"), Freq::new("hello\t0"), 0, 100, 3),
@@ -1842,7 +1955,7 @@ mod tests {
                 "{typed}: {offers:?}"
             );
             assert!(!offers.iter().any(|word| word == typed));
-            assert!(offers.len() <= crate::complete::MAX_CANDIDATES);
+            assert!(!offers.is_empty());
             assert_eq!(offers, correction_suggestions(typed, d, f, None));
             if typed == "hte" {
                 assert_eq!(fix(typed, d, f).as_deref(), Some("the"));

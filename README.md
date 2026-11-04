@@ -466,9 +466,11 @@ For abbreviations, add rules to `abbrev.txt`:
 ```text
 btw = by the way
 addr = 1 Main Street, Tel Aviv
+תז = תזכורת
 ```
 
-Rules expand when you finish the word and take priority over automatic corrections.
+Rules expand in the active English or Hebrew layout when you finish the word,
+and take priority over automatic corrections.
 Right Shift also offers an expansion. Capitalization follows your input:
 `Btw` becomes `By the way`. No abbreviations ship enabled; `complete = false`
 disables both abbreviations and word completion.
@@ -479,8 +481,10 @@ and valid English words (`form` / `from`). It works with automatic spelling and
 completion disabled and stays in the word's language. On macOS it previews choices
 without editing until typing or Space accepts; Enter cancels. Windows/Linux keep
 direct cycling. Accepted replacements use the existing undo gesture.
-Requests stay bounded to four choices and preserve capitalization and trailing
-punctuation. Choosing an alternative to a valid dictionary word does not train
+Requests preserve capitalization and trailing punctuation. Choices use pages of
+four, with the original text between pages; keep tapping to reach later alternatives.
+Explicit correction includes dictionary words absent from the frequency corpus
+and supports tracked words up to 64 characters. Choosing an alternative to a valid dictionary word does not train
 an automatic replacement for that word.
 
 Word completion uses the active English or Hebrew layout. Two-letter prefixes
@@ -490,14 +494,18 @@ two letters are intact. Cycling and undo always restore your original prefix. Pr
 length limits count characters in either language. English apostrophe prefixes
 such as `don'` can complete to `don't`; saved apostrophe words are also candidates.
 Saved words in `ignore.txt` and persistent undo exceptions are also completion candidates, including names
-and technical terms absent from the bundled dictionary.
+and technical terms absent from the bundled dictionary. Saved identifiers remain
+completable after digits or punctuation, such as `sha2`, `my_`, and `node.`.
 Completion presents four choices, then restores the original prefix. Keep tapping
 to reach the next page instead of repeating the same four choices forever. After
 the final page, the sequence starts again. Undo always restores the original prefix.
 Bundled technical vocabulary is available even without a general-language frequency
-rank. Long, exact prefixes can also complete specific dictionary words beyond the
-ordinary rank cutoff; short and edited prefixes retain their confidence limits.
-Opening quotes and brackets are preserved around corrections and completions.
+rank. Later pages include every exact dictionary match within the tracked word
+length limit, even from short prefixes and without a frequency rank. Edited
+prefixes retain their confidence limits.
+Opening quotes, brackets, and trailing sentence punctuation are preserved around
+corrections and completions. Hebrew dictionary lookup accepts both ASCII quotes
+and Hebrew geresh/gershayim; quoted completion preserves the typed quote style.
 Completion and spelling suggestions also work on the last finished word while
 the cursor remains after its tracked spaces. Every choice and undo preserves
 those spaces; typing the next word accepts the choice without requiring another

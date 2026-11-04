@@ -1107,6 +1107,18 @@ fn buffered_terminator_overflow_cancels_pending_edits() {
         return;
     }
 
+    for separator in [" ", "\n"] {
+        let s = Session::new();
+        let long = "x".repeat(crate::types::MAX_WORD_KEYS + 1);
+        s.type_text(&long);
+        assert!(s.engine.lock().keys.is_empty());
+        s.type_text(separator);
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("{long}{separator}receive "));
+    }
+
     let s = Session::new();
     let spaces = " ".repeat(crate::types::MAX_WORD_KEYS + 1);
     s.type_text("recieve ");
@@ -1334,9 +1346,29 @@ fn explicit_requests_and_continued_typing_work_across_native_boundaries() {
         return;
     }
     EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+    for (prefix, word) in [
+        ("sha2", "sha256sum"),
+        ("my_", "my_tool"),
+        ("node.", "node.js"),
+    ] {
+        crate::complete::set_word_ignored(word, true).unwrap();
+        let s = Session::new();
+        s.type_text(prefix);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), word);
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), prefix);
+        crate::complete::set_word_ignored(word, false).unwrap();
+    }
     for previous in ["", "existing"] {
         for (prefix, key) in [
             ("keyb", Simulated::SHIFT_RIGHT),
+            ("keyb,", Simulated::SHIFT_RIGHT),
+            ("(keyb.)", Simulated::SHIFT_RIGHT),
             ("hte", Simulated::SHIFT_LEFT),
         ] {
             let s = Session::new();
@@ -2283,11 +2315,16 @@ fn merged_tokens_reinsert_only_the_final_word_and_undo_restores_both() {
         s.finish();
         assert_eq!(s.text(), format!("{original} "), "undo: {physical}");
         assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), layout);
+        let original_word = original
+            .trim_end_matches(|c: char| !c.is_alphanumeric() && !crate::spell::hebrew::is_mark(c));
         assert!(
-            crate::complete::suppressed(&original),
-            "undo should protect the entire original token: {original:?}"
+            crate::complete::suppressed(original_word),
+            "undo should protect the entire original word: {original_word:?}"
         );
-        crate::complete::unlist(&original);
+        s.type_text(&format!("{physical} "));
+        assert_eq!(s.text(), format!("{original} {original} "));
+        assert!(!s.engine.lock().is_replacing);
+        crate::complete::unlist(original_word);
     }
     // A layout switch refused by the OS must not erase either word.
     SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
@@ -2332,7 +2369,7 @@ fn spelling_rewrites_only_the_changed_suffix_and_undo_learns_the_whole_word() {
             ),
             before
         );
-        assert_eq!(undo.suppress.as_deref(), Some(before));
+        assert_eq!(undo.suppress.as_deref(), Some(before.trim_end_matches(',')));
         assert_eq!(undo.on_screen, rep.retype.chars().count() + 1);
     }
 }
@@ -4106,7 +4143,7 @@ fn typing_correction_undo_and_interrupted_replacements() {
     s.type_text("zzpractice teh ");
     assert!(!s.engine.lock().is_replacing);
     assert!(s.text().ends_with("zzpractice teh "));
-    std::fs::remove_file(abbrev).unwrap();
+    std::fs::remove_file(&abbrev).unwrap();
     crate::complete::reload_user_files();
 
     crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "right_ctrl".into());
@@ -4351,11 +4388,34 @@ fn typing_correction_undo_and_interrupted_replacements() {
 
     crate::complete::unlist("recieve");
 
+    // Punctuation and wrappers must not become part of the undo exception.
+    for token in ["recieve.", "(recieve)"] {
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        crate::complete::unlist("recieve");
+        let s = Session::new();
+        s.type_text(&format!("{token} "));
+        s.pending();
+        s.finish();
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("{token} "));
+        assert!(crate::complete::suppressed("recieve"));
+        s.type_text("recieve ");
+        assert_eq!(s.text(), format!("{token} recieve "));
+        assert!(!s.engine.lock().is_replacing);
+        crate::complete::unlist("recieve");
+    }
+
     // Double taps undo the entire expansion, including multiple words.
     SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
     let abbrev = crate::complete::user_path("abbrev.txt").unwrap();
     std::fs::write(&abbrev, "zzconvert = hello world\n").unwrap();
     crate::complete::reload_user_files();
+    assert_eq!(
+        crate::complete::expand("ZZCONVERT").as_deref(),
+        Some("hello world")
+    );
     let s = Session::new();
     s.type_text("zzconvert ");
     s.pending();
@@ -4367,8 +4427,26 @@ fn typing_correction_undo_and_interrupted_replacements() {
     s.finish();
     assert_eq!(s.text(), "zzconvert ");
     assert_eq!(s.engine.control.undo_count(), 1);
-    std::fs::remove_file(abbrev).unwrap();
+    std::fs::remove_file(&abbrev).unwrap();
     crate::complete::reload_user_files();
+
+    // Hebrew rules must behave identically through automatic expansion and undo.
+    std::fs::write(&abbrev, "קבד = שלום עולם\n").unwrap();
+    crate::complete::reload_user_files();
+    SIMULATED_LAYOUT.store(1, Ordering::SeqCst);
+    let s = Session::new();
+    let keys = crate::keymap::hebrew_text_to_physical_english("קבד").unwrap();
+    s.type_text(&format!("{keys}/ "));
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "שלום עולם. ");
+    s.undo();
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "קבד. ");
+    std::fs::remove_file(&abbrev).unwrap();
+    crate::complete::reload_user_files();
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
 
     // An eager double tap undoes the correction after injection finishes.
     SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
@@ -4750,7 +4828,8 @@ fn explicit_correction_is_separate_and_restores_original_text() {
         .candidates
         .len();
     session.finish();
-    for _ in 0..choices {
+    let restore_taps = choices + (choices - 1) / crate::complete::MAX_CANDIDATES;
+    for _ in 0..restore_taps {
         session.tap(Simulated::SHIFT_LEFT);
         session.pending();
         session.finish();

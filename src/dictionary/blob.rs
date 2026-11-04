@@ -57,12 +57,16 @@ impl Dict {
     }
 
     pub fn contains(self, word: &str) -> bool {
+        let word = super::quotes::canonical(word);
+        let word = word.as_ref();
         let range = self.index.range(word, self.blob.len());
         lookup(&self.blob.as_bytes()[range], word.as_bytes()).is_some()
     }
 
     /// Visit the contiguous sorted run without allocating or scanning unrelated words.
     pub fn for_each_with_prefix(self, prefix: &str, mut visit: impl FnMut(&str)) {
+        let prefix = super::quotes::canonical(prefix);
+        let prefix = prefix.as_ref();
         let range = self.index.range(prefix, self.blob.len());
         let blob = &self.blob[range];
         let start = lower_bound(blob.as_bytes(), prefix.as_bytes());
@@ -85,6 +89,8 @@ impl Freq {
     }
 
     pub fn rank(self, word: &str) -> Option<u32> {
+        let word = super::quotes::canonical(word);
+        let word = word.as_ref();
         let range = self.index.range(word, self.blob.len());
         let line = lookup(&self.blob.as_bytes()[range], word.as_bytes())?;
         let tab = line.iter().position(|&byte| byte == b'\t')?;
@@ -92,6 +98,8 @@ impl Freq {
     }
 
     pub fn for_each_with_prefix(self, prefix: &str, mut visit: impl FnMut(&str, u32)) {
+        let prefix = super::quotes::canonical(prefix);
+        let prefix = prefix.as_ref();
         let range = self.index.range(prefix, self.blob.len());
         let blob = &self.blob.as_bytes()[range];
         let mut pos = lower_bound(blob, prefix.as_bytes());
@@ -226,6 +234,37 @@ pub const fn he_freq() -> Freq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hebrew_keyboard_quotes_match_dictionary_and_frequency_quotes() {
+        let dictionary = he_dict();
+        let frequency = he_freq();
+        let mut checked = 0;
+        for word in dictionary
+            .blob
+            .lines()
+            .filter(|word| word.contains(['\'', '"']))
+        {
+            let keyboard = word.replace('\'', "׳").replace('"', "״");
+            assert!(dictionary.contains(&keyboard), "{keyboard}");
+            assert_eq!(
+                frequency.rank(word),
+                frequency.rank(&keyboard),
+                "{keyboard}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 1_000, "quoted vocabulary shrank: {checked}");
+        for prefix in ["ג'י", "צה\""] {
+            let keyboard = prefix.replace('\'', "׳").replace('"', "״");
+            let mut plain = Vec::new();
+            let mut alternate = Vec::new();
+            dictionary.for_each_with_prefix(prefix, |word| plain.push(word.to_owned()));
+            dictionary.for_each_with_prefix(&keyboard, |word| alternate.push(word.to_owned()));
+            assert!(!plain.is_empty(), "{prefix}");
+            assert_eq!(plain, alternate);
+        }
+    }
 
     #[test]
     fn prefix_indexes_preserve_every_embedded_entry() {

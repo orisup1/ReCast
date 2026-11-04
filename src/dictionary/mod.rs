@@ -15,6 +15,7 @@ use std::io::Write;
 use std::sync::OnceLock;
 
 mod blob;
+pub(crate) mod quotes;
 pub use blob::{en_dict, en_freq, he_dict, he_freq, Dict, Freq};
 
 use crate::config::{Config, LanguagePreference};
@@ -973,7 +974,7 @@ fn debug_log(word_en: &str, word_he: &str, target: Option<Language>, switched: b
 /// of any I/O so it is unit testable; the actual layout switch happens in the
 /// caller.
 ///
-/// Explicit English abbreviation rules precede inference. An accepted exact or
+/// Explicit abbreviation rules in either language precede inference. An accepted exact or
 /// typo-tolerant alternate-layout match takes priority over contextual ranking.
 /// Other spelling and learned proposals compete with leaving the literal token
 /// alone. Layout eligibility checks the whole buffer before the suffix fallback;
@@ -1144,14 +1145,13 @@ fn plan_candidate(
     }
 
     // An expansion the user configured by hand outranks everything we infer.
-    if current == Some(Language::English) {
-        if let Some(text) = (!layout_only)
-            .then(|| crate::complete::expand(word_en))
-            .flatten()
-        {
+    if current.is_some() && !layout_only {
+        if let Some(text) = crate::complete::expand(typed) {
             details.push_str("\nApplied the configured abbreviation before inferred corrections.");
             return Some(Plan::Expand { text });
         }
+    }
+    if current == Some(Language::English) {
         // In English these reviewed transpositions beat accidental Hebrew words.
         // The same keys in Hebrew retain the valid Hebrew reading.
         if crate::spell::is_reviewed_short_transposition(word_en) {
@@ -1916,7 +1916,24 @@ pub(crate) fn completion_matches_prefix(prefix: &str, offer: &str) -> bool {
     let prefix: String = prefix.chars().skip(start).take(end - start).collect();
     let (start, end) = frame_bounds(offer);
     let offer: String = offer.chars().skip(start).take(end - start).collect();
-    !prefix.is_empty() && offer.starts_with(&prefix)
+    let language = |text: &str| {
+        if text.chars().any(|c| ('א'..='ת').contains(&c)) {
+            Language::Hebrew
+        } else {
+            Language::English
+        }
+    };
+    let prefix = quotes::canonical(completion_word(&prefix, language(&prefix)));
+    let offer = quotes::canonical(completion_word(&offer, language(&offer)));
+    !prefix.is_empty() && offer.starts_with(prefix.as_ref())
+}
+
+/// Keep contraction prefixes and Hebrew abbreviation quotes inside the word.
+fn completion_word(body: &str, language: Language) -> &str {
+    body.trim_end_matches(|c| {
+        matches!(c, '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}')
+            || (c == '"' && language == Language::English)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1974,6 +1991,8 @@ fn check_unwrapped_in_context<K: Copy>(
     // and the correction must not eat (see `Reading`).
     let mut word_end_en = 0usize;
     let mut word_end_he = 0usize;
+    let mut unmapped_en = false;
+    let mut unmapped_he = false;
     for &k in keys {
         let shift = shift_of(k);
         if let Some(c) = to_en(k) {
@@ -1986,17 +2005,40 @@ fn check_unwrapped_in_context<K: Copy>(
             if c.is_ascii_alphabetic() {
                 shifted_en.push(shift);
             }
+        } else {
+            unmapped_en = true;
+            full_en.push('\0');
+            word_end_en = full_en.len();
         }
         if let Some(c) = to_he(k) {
             full_he.push(c);
             if in_word(c, shift, false) {
                 word_end_he = full_he.len();
             }
+        } else {
+            unmapped_he = true;
+            full_he.push('\0');
+            word_end_he = full_he.len();
         }
         if want_offsets {
             offsets_en.push(full_en.len());
             offsets_he.push(full_he.len());
         }
+    }
+    // Unknown alternate characters invalidate that dictionary reading while
+    // retaining one character per key for suffix offsets. Never edit an unknown source.
+    if match current {
+        Some(Language::English) => unmapped_en,
+        Some(Language::Hebrew) => unmapped_he,
+        None => unmapped_en || unmapped_he,
+    } {
+        return Outcome {
+            reason: "Unmapped key in source reading",
+            details: "Correction requires a complete reading of every source key.".into(),
+            rule: None,
+            fix: None,
+            lang: None,
+        };
     }
     let case = Case::of(&shifted_en);
     let en = Reading::new(&full_en, word_end_en);
@@ -2138,6 +2180,13 @@ fn check_unwrapped_in_context<K: Copy>(
             )
         }
         Plan::HebrewSpell { text } => (
+            Some(Fix::Spelling {
+                text: respelled(&text, Case::Lower, he.tail),
+                lang: Language::Hebrew,
+            }),
+            Some(Language::Hebrew),
+        ),
+        Plan::Expand { text } if current == Some(Language::Hebrew) => (
             Some(Fix::Spelling {
                 text: respelled(&text, Case::Lower, he.tail),
                 lang: Language::Hebrew,
@@ -2431,19 +2480,31 @@ fn completion_offers<K: Copy>(
     let (start, end) = frame_bounds_for_layout(&prefix, current.unwrap());
     let head: String = prefix.chars().take(start).collect();
     let tail: String = prefix.chars().skip(end).collect();
-    let word: String = prefix.chars().skip(start).take(end - start).collect();
-    let mut words = if all {
-        crate::complete::all_completions_in_context(&word, dict, freq, context)
-    } else {
-        crate::complete::completions_in_context(&word, dict, freq, context)
+    let body: String = prefix.chars().skip(start).take(end - start).collect();
+    let complete = |word: &str| {
+        if all {
+            crate::complete::all_completions_in_context(word, dict, freq, context)
+        } else {
+            crate::complete::completions_in_context(word, dict, freq, context)
+        }
     };
-    if crate::complete::expand(&word).is_none()
-        && !words.iter().any(|offer| offer.starts_with(&word))
+    // A saved identifier such as node.js may own its trailing dot.
+    let mut word = body.as_str();
+    let mut words = complete(word);
+    if words.is_empty() {
+        let trimmed = completion_word(&body, current.unwrap());
+        if trimmed != word {
+            word = trimmed;
+            words = complete(word);
+        }
+    }
+    let punctuation = &body[word.len()..];
+    if crate::complete::expand(word).is_none() && !words.iter().any(|offer| offer.starts_with(word))
     {
         let suggestions = if current == Some(Language::Hebrew) {
-            crate::spell::hebrew::suggestions(&word, dict, freq, context)
+            crate::spell::hebrew::suggestions(word, dict, freq, context)
         } else {
-            crate::spell::suggestions(&word, dict, freq, context)
+            crate::spell::suggestions(word, dict, freq, context)
         };
         if !suggestions.is_empty() {
             let mut combined = suggestions;
@@ -2473,7 +2534,7 @@ fn completion_offers<K: Copy>(
     };
     words
         .into_iter()
-        .map(|w| format!("{head}{}{tail}", case.apply(&w)))
+        .map(|w| format!("{head}{}{punctuation}{tail}", case.apply(&w)))
         .collect()
 }
 
@@ -2517,7 +2578,10 @@ pub fn correction_candidates<K: Copy>(
     } else {
         let word_end = body
             .char_indices()
-            .filter(|(_, c)| c.is_alphanumeric())
+            .filter(|(_, c)| {
+                c.is_alphanumeric()
+                    || (current == Language::Hebrew && crate::spell::hebrew::is_mark(*c))
+            })
             .map(|(i, c)| i + c.len_utf8())
             .next_back()
             .unwrap_or(0);
@@ -2545,7 +2609,7 @@ pub fn correction_candidates<K: Copy>(
 #[cfg(test)]
 impl Dict {
     pub(crate) fn of(words: &[&str]) -> Dict {
-        let mut words: Vec<&str> = words.to_vec();
+        let mut words: Vec<_> = words.iter().map(|word| quotes::canonical(word)).collect();
         words.sort_unstable();
         words.dedup();
         Dict::new(Box::leak(words.join("\n").into_boxed_str()))
@@ -3132,7 +3196,7 @@ mod tests {
                 Some(expected),
                 "{typed}: {offers:?}"
             );
-            assert!(offers.len() <= crate::complete::MAX_CANDIDATES);
+            assert!(!offers.is_empty());
             assert!(!offers.iter().any(|word| word == typed));
         }
         let keys: Vec<_> = "תודדה!".chars().collect();
@@ -3155,6 +3219,125 @@ mod tests {
             None,
         )
         .is_empty());
+    }
+
+    #[test]
+    fn incomplete_layout_readings_never_become_truncated_dictionary_hits() {
+        for missing_source in [false, true] {
+            let keys: Vec<usize> = (0..if missing_source { 4 } else { 5 }).collect();
+            let result = check_and_correct(
+                &keys,
+                |key| {
+                    if missing_source && key == 0 {
+                        None
+                    } else {
+                        Some('z')
+                    }
+                },
+                |key| {
+                    if missing_source {
+                        "שלום".chars().nth(key)
+                    } else {
+                        key.checked_sub(1).and_then(|i| "שלום".chars().nth(i))
+                    }
+                },
+                |_| false,
+                Run::default(),
+                Dict::new(""),
+                Dict::of(&["שלום"]),
+                Some(Language::English),
+                false,
+                |_| crate::layout::LayoutSwitch::Switched,
+            );
+            assert!(result.fix.is_none(), "{}", result.details);
+        }
+        // A missing alternate mapping must still allow safe in-language spelling.
+        let keys: Vec<_> = "recieve".chars().collect();
+        let result = check_and_correct(
+            &keys,
+            Some,
+            |_| None,
+            |_| false,
+            Run::default(),
+            en_dict(),
+            he_dict(),
+            Some(Language::English),
+            false,
+            |_| crate::layout::LayoutSwitch::Switched,
+        );
+        assert!(matches!(result.fix, Some(Fix::Spelling { ref text, .. }) if text == "receive"));
+    }
+
+    #[test]
+    fn exact_completion_strength_uses_word_text_and_equivalent_quotes() {
+        for (prefix, offer) in [
+            ("keyb,", "keyboard,"),
+            ("(keyb.)", "(keyboard.)"),
+            ("משמע!", "משמעות!"),
+            ("ג׳י", "ג'ירפה"),
+            ("צה״", "צה\"ל"),
+        ] {
+            assert!(
+                completion_matches_prefix(prefix, offer),
+                "{prefix}: {offer}"
+            );
+        }
+        assert!(!completion_matches_prefix("...", "keyboard"));
+        assert!(!completion_matches_prefix("keyb,", "keychain,"));
+    }
+
+    #[test]
+    fn completions_preserve_sentence_punctuation_and_wrappers() {
+        for (lang, prefix, target, dictionary) in [
+            (Language::English, "keyb", "keyboard", en_dict()),
+            (Language::Hebrew, "משמע", "משמעות", he_dict()),
+        ] {
+            for (head, tail) in [("", ","), ("", "."), ("(", ",)"), ("[", "?!]")] {
+                let keys: Vec<_> = format!("{head}{prefix}{tail}").chars().collect();
+                let offers =
+                    all_completion_candidates(&keys, Some, |_| false, dictionary, Some(lang), None);
+                let expected = format!("{head}{target}{tail}");
+                assert!(offers.contains(&expected), "missing {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_hebrew_completions_survive_public_word_framing() {
+        for (prefix, expected) in [
+            ("ג׳י", "ג׳ירפה"),
+            ("ג'י", "ג'ירפה"),
+            ("צה״", "צה״ל"),
+            ("צה\"", "צה\"ל"),
+        ] {
+            let keys: Vec<_> = prefix.chars().collect();
+            let offers = all_completion_candidates(
+                &keys,
+                Some,
+                |_| false,
+                Dict::of(&["ג'ירפה", "צה\"ל"]),
+                Some(Language::Hebrew),
+                None,
+            );
+            assert!(
+                offers.iter().any(|word| word == expected),
+                "{prefix}: {offers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_hebrew_correction_cannot_delete_a_marked_letter() {
+        let keys: Vec<_> = "(שלוםזַ)".chars().collect();
+        let offers = correction_candidates(
+            &keys,
+            Some,
+            |_| false,
+            Dict::of(&["שלום"]),
+            Some(Language::Hebrew),
+            None,
+        );
+        assert!(!offers.contains(&"(שלוםַ)".to_owned()), "{offers:?}");
     }
 
     #[test]

@@ -72,7 +72,6 @@ pub(crate) fn correction_suggestions(
         &Config::global(),
     )
     .into_iter()
-    .take(MAX_CANDIDATES)
     .map(|(word, _)| word)
     .collect()
 }
@@ -265,8 +264,13 @@ fn search(
             Some("Hebrew spelling is disabled by the spelling setting or edit-distance limit.");
         return result;
     }
-    if !(min_len..=24).contains(&letters.len()) {
-        result.protection = Some("The word is outside the configured Hebrew spelling length limits (at least four letters for automatic repairs, at most 24).");
+    let max_len = if explicit {
+        crate::types::MAX_WORD_KEYS
+    } else {
+        24
+    };
+    if letters.len() < min_len || word.chars().count() > max_len {
+        result.protection = Some("The word is outside the Hebrew spelling length limits (at most 24 characters automatically, or the tracked word limit for explicit correction).");
         return result;
     }
     if !explicit
@@ -288,7 +292,14 @@ fn search(
     let mut consider = |candidate: Vec<(char, String)>, cost: u32, edits: u8| {
         let chars: Vec<char> = candidate.iter().map(|(letter, _)| *letter).collect();
         let text: String = chars.iter().collect();
-        if text == plain || !valid_finals(&chars) {
+        if text == plain
+            || !valid_finals(&chars)
+            || candidate
+                .iter()
+                .map(|(_, marks)| 1 + marks.chars().count())
+                .sum::<usize>()
+                > max_len
+        {
             return;
         }
         let direct_rank = dict.contains(&text).then(|| freq.rank(&text)).flatten();
@@ -297,11 +308,14 @@ fn search(
         } else {
             ranked_hebrew_stem(&text, dict, freq, 1)
         };
-        let Some(rank) = direct_rank.or_else(|| stem.map(|(_, rank)| rank)) else {
+        let Some(rank) = direct_rank
+            .or_else(|| stem.map(|(_, rank)| rank))
+            .or_else(|| (explicit && dict.contains(&text)).then_some(100_000))
+        else {
             return;
         };
         let max_rank = if explicit {
-            50_000
+            u32::MAX
         } else if automatic && cost <= super::COST_ADJACENT_DIAG {
             config.spell_max_rank
         } else {
@@ -413,7 +427,7 @@ fn search(
         } else {
             config.spell_max_rank
         };
-        search_two_edits(&plain, dict, freq, max_rank, |text, cost| {
+        search_two_edits(&plain, dict, freq, max_rank, explicit, |text, cost| {
             consider(
                 text.chars().map(|letter| (letter, String::new())).collect(),
                 cost,
@@ -438,9 +452,14 @@ fn search_two_edits(
     dict: Dict,
     freq: Freq,
     max_rank: u32,
+    explicit: bool,
     mut consider: impl FnMut(String, u32),
 ) {
-    let max_rank = max_rank.min(20_000) / 2;
+    let max_rank = if explicit {
+        u32::MAX
+    } else {
+        max_rank.min(20_000) / 2
+    };
     for (prefix, stem) in
         std::iter::once(("", word)).chain(crate::dictionary::hebrew_prefix_splits(word))
     {
@@ -449,13 +468,18 @@ fn search_two_edits(
             continue;
         }
         let anchor: String = typed.iter().take(2).map(|(letter, _)| letter).collect();
-        freq.for_each_with_prefix(&anchor, |candidate, rank| {
+        let mut visit = |candidate: &str, rank: u32| {
             if rank > max_rank || !dict.contains(candidate) {
                 return;
             }
             let intended: Vec<_> = candidate.chars().collect();
             if intended.len() < TWO_EDIT_MIN_LEN
-                || intended.len() + prefix.chars().count() > 24
+                || intended.len() + prefix.chars().count()
+                    > if explicit {
+                        crate::types::MAX_WORD_KEYS
+                    } else {
+                        24
+                    }
                 || intended.len().abs_diff(typed.len()) > 2
             {
                 return;
@@ -463,7 +487,14 @@ fn search_two_edits(
             if let Some(cost) = two_edit_cost(&typed, &intended) {
                 consider(format!("{prefix}{candidate}"), cost);
             }
-        });
+        };
+        if explicit {
+            dict.for_each_with_prefix(&anchor, |candidate| {
+                visit(candidate, freq.rank(candidate).unwrap_or(100_000));
+            });
+        } else {
+            freq.for_each_with_prefix(&anchor, visit);
+        }
     }
 }
 
@@ -471,22 +502,23 @@ fn search_two_edits(
 /// prevents three cheap repetitions or final-letter repairs from slipping in.
 fn two_edit_cost(typed: &[(char, String)], intended: &[char]) -> Option<u32> {
     let (n, m) = (typed.len(), intended.len());
-    if n > 24 || m > 24 || n.abs_diff(m) > 2 {
+    if n > crate::types::MAX_WORD_KEYS || m > crate::types::MAX_WORD_KEYS || n.abs_diff(m) > 2 {
         return None;
     }
-    let mut costs = [[[u32::MAX; 3]; 25]; 25];
-    costs[0][0][0] = 0;
+    let mut costs = vec![[u32::MAX; 3]; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    costs[at(0, 0)][0] = 0;
     for i in 0..=n {
         for j in i.saturating_sub(2)..=m.min(i + 2) {
             for edits in 0..=2 {
-                let cost = costs[i][j][edits];
+                let cost = costs[at(i, j)][edits];
                 if cost > TWO_EDIT_BUDGET {
                     continue;
                 }
                 if i < n && j < m {
                     let changed = usize::from(typed[i].0 != intended[j]);
                     if edits + changed <= 2 {
-                        let next = &mut costs[i + 1][j + 1][edits + changed];
+                        let next = &mut costs[at(i + 1, j + 1)][edits + changed];
                         *next = (*next).min(
                             cost + if changed == 0 {
                                 0
@@ -500,13 +532,13 @@ fn two_edit_cost(typed: &[(char, String)], intended: &[char]) -> Option<u32> {
                     continue;
                 }
                 if i < n {
-                    let next = &mut costs[i + 1][j][edits + 1];
+                    let next = &mut costs[at(i + 1, j)][edits + 1];
                     *next = (*next).min(cost + deletion_cost(typed, i));
                 }
                 if j < m {
                     let repeated = j.checked_sub(1).is_some_and(|k| intended[k] == intended[j])
                         || intended.get(j + 1) == Some(&intended[j]);
-                    let next = &mut costs[i][j + 1][edits + 1];
+                    let next = &mut costs[at(i, j + 1)][edits + 1];
                     *next = (*next).min(
                         cost + if repeated {
                             super::COST_DOUBLE
@@ -520,13 +552,13 @@ fn two_edit_cost(typed: &[(char, String)], intended: &[char]) -> Option<u32> {
                     && typed[i].0 == intended[j + 1]
                     && typed[i + 1].0 == intended[j]
                 {
-                    let next = &mut costs[i + 2][j + 2][edits + 1];
+                    let next = &mut costs[at(i + 2, j + 2)][edits + 1];
                     *next = (*next).min(cost + super::COST_TRANSPOSE);
                 }
             }
         }
     }
-    (costs[n][m][2] <= TWO_EDIT_BUDGET).then_some(costs[n][m][2])
+    (costs[at(n, m)][2] <= TWO_EDIT_BUDGET).then_some(costs[at(n, m)][2])
 }
 
 fn deletion_cost(letters: &[(char, String)], index: usize) -> u32 {
@@ -658,6 +690,50 @@ fn valid_finals(word: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_spelling_reaches_long_words_without_relaxing_automatic_limits() {
+        let target = "וכשלאלקטרואנצפלוגרפיותיהם";
+        let d = Dict::of(&[target]);
+        let mut chars: Vec<_> = target.chars().collect();
+        chars.swap(10, 11);
+        for extra in [false, true] {
+            let mut typed: String = chars.iter().collect();
+            if extra {
+                typed.push('ם');
+            }
+            assert!(
+                correction_suggestions(&typed, d, Freq::EMPTY, None).contains(&target.to_owned()),
+                "{typed}"
+            );
+            assert_eq!(correct(&typed, d, Freq::EMPTY, None), None);
+        }
+        let target = format!("{}ים", "אב".repeat(31));
+        let d = Dict::of(&[&target]);
+        let typed = format!("{}מ", target.chars().take(63).collect::<String>());
+        assert!(correction_suggestions(&typed, d, Freq::EMPTY, None).contains(&target));
+        assert!(correction_suggestions(&format!("{typed}מ"), d, Freq::EMPTY, None).is_empty());
+    }
+
+    #[test]
+    fn explicit_correction_reaches_unranked_words_and_all_pages() {
+        let d = Dict::of(&[
+            "שלום", "שלוב", "שלוח", "שלוט", "שלול", "שלון", "שלוף", "שלוש",
+        ]);
+        let offers = correction_suggestions("שלומ", d, Freq::EMPTY, None);
+        for expected in [
+            "שלום", "שלוב", "שלוח", "שלוט", "שלול", "שלון", "שלוף", "שלוש",
+        ] {
+            assert!(
+                offers.iter().any(|word| word == expected),
+                "{expected}: {offers:?}"
+            );
+        }
+        assert_eq!(correct("שלומ", d, Freq::EMPTY, None), None);
+        let d = Dict::of(&["אוניברסיטה"]);
+        assert!(correction_suggestions("אוניברסיטטהח", d, Freq::EMPTY, None)
+            .contains(&"אוניברסיטה".to_owned()));
+    }
 
     #[test]
     fn conversational_hebrew_never_replaces_with_a_different_word() {
@@ -818,8 +894,8 @@ mod tests {
         let d = Dict::of(&["מקלדת", "וכשמקלדת"]);
         let f = Freq::of(&[("מקלדת", 500), ("וכשמקלדת", 70_000)]);
         assert!(
-            !correction_suggestions("וכשמקלדתת", d, f, None).contains(&"וכשמקלדת".to_owned()),
-            "a directly attested rare rank must retain its frequency gate"
+            correction_suggestions("וכשמקלדתת", d, f, None).contains(&"וכשמקלדת".to_owned()),
+            "explicit correction must reach a directly attested rare word"
         );
     }
 
@@ -990,7 +1066,7 @@ mod tests {
         let offers = correction_suggestions("שלום", dict, freq, None);
         assert!(!offers.is_empty());
         assert!(!offers.iter().any(|word| word == "שלום"));
-        assert!(offers.len() <= MAX_CANDIDATES);
+        assert!(!offers.is_empty());
         assert_eq!(offers, correction_suggestions("שלום", dict, freq, None));
     }
 

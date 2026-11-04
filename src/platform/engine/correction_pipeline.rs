@@ -27,6 +27,23 @@ pub(super) fn completion_correction(
     .then(|| (from.to_lowercase(), to.to_lowercase()))
 }
 
+/// Undo exceptions use the same word boundaries as automatic correction.
+fn undo_word(text: &str, language: Language) -> Option<String> {
+    let (start, end) = crate::dictionary::frame_bounds_for_layout(text, language);
+    let mut word: String = text.chars().skip(start).take(end - start).collect();
+    let word_end = word
+        .char_indices()
+        .filter(|(_, c)| {
+            c.is_alphanumeric()
+                || (language == Language::Hebrew && crate::spell::hebrew::is_mark(*c))
+        })
+        .map(|(index, c)| index + c.len_utf8())
+        .next_back()
+        .unwrap_or(0);
+    word.truncate(word_end);
+    non_empty(word)
+}
+
 impl<P: Platform> Engine<P> {
     /// Space checks a finished word; Enter accepts an offer and clears context.
     pub(super) fn word_finished(
@@ -50,6 +67,8 @@ impl<P: Platform> Engine<P> {
             st.push_fix_suffix_key(Typed { key, shift });
         }
         if st.keys.is_empty() {
+            // An overlong token empties the buffer but keeps its give-up flag.
+            st.keys.clear();
             // A manual mid-word conversion leaves no word to recheck, but
             // spaces still belong to its undo payload.
             st.no_fix = false;
@@ -827,7 +846,7 @@ impl<P: Platform> Engine<P> {
             } else {
                 completion_correction(&was, target, original_lang, target_lang)
             },
-            suppress: non_empty(was.clone()),
+            suppress: undo_word(&was, original_lang),
             rule: None,
             suffix: reading::<P>(
                 &trailing_spaces.iter().skip(1).copied().collect::<Vec<_>>(),
@@ -1163,7 +1182,7 @@ pub(super) fn undo_of<P: Platform>(
         // The terminator has already finished this word, so nothing carries
         // over into the buffer.
         keep: Vec::new(),
-        suppress: non_empty(reading::<P>(&keys[rep.original_start..], was)),
+        suppress: undo_word(&reading::<P>(&keys[rep.original_start..], was), was),
         rule: None,
         learning_pair: None,
         suffix: String::new(),
