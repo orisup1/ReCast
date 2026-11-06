@@ -3,19 +3,9 @@
 use crate::types::{AppControl, FixKind};
 use std::sync::atomic::Ordering;
 
-pub fn first_run() -> bool {
-    crate::complete::user_path("practice-offered").is_some_and(|p| !p.exists())
-}
-
 pub fn opened(control: &AppControl) {
     control.practice_stage.store(0, Ordering::Relaxed);
     control.practice_open.store(true, Ordering::Relaxed);
-    if let Some(path) = crate::complete::user_path("practice-offered") {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            let _ = std::fs::write(path, "Practice offered\n");
-        }
-    }
 }
 
 pub(crate) fn restore_instruction(config: &crate::config::Config) -> String {
@@ -26,7 +16,7 @@ pub(crate) fn restore_instruction(config: &crate::config::Config) -> String {
 pub fn instructions() -> String {
     let config = crate::config::Config::global();
     format!(
-    "1. Select your English keyboard. In the field below, press Space, type akuo, then Space. Watch it become שלום.\n2. Immediately {} to restore akuo.\n3. Select all and delete. Press Space, type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", restore_instruction(&config), config.completion_gesture())
+    "1. Select your English keyboard. Click the field below, type akuo, then Space. Watch it become שלום.\n2. Immediately {} to restore akuo.\n3. Select all and delete. Type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", restore_instruction(&config), config.completion_gesture())
 }
 
 fn completion_instruction(config: &crate::config::Config) -> String {
@@ -55,9 +45,9 @@ pub fn shortcut_label(value: &str) -> &'static str {
 pub fn step_instruction(stage: u8) -> String {
     let config = crate::config::Config::global();
     match stage {
-        0 => "Select your English keyboard. Click the field below, press Space, type akuo, then Space. Watch it become שלום.\nPractice is local; no learning or correction counts.".into(),
+        0 => "Select your English keyboard. Click the field below, type akuo, then Space. Watch it become שלום.\nPractice is local; no learning or correction counts.".into(),
         1 => format!("Immediately {} to restore akuo. Keep the cursor in the field; do not click or type first.", restore_instruction(&config)),
-        2 => format!("Select all and delete in the field. Press Space, {}", completion_instruction(&config)),
+        2 => format!("Select all and delete in the field, then {}", completion_instruction(&config)),
         _ => "You tried correction, undo, and completion. Choose Done and keep typing anywhere. Practice does not save learned words or change your correction counts.".into(),
     }
 }
@@ -70,7 +60,7 @@ pub fn feedback(control: &AppControl) -> String {
         restore_instruction(&config)
     );
     let completion_step = format!(
-        "Restoration worked. Clear the field, press Space, {}",
+        "Restoration worked. Clear the field, then {}",
         completion_instruction(&config)
     );
     let step = match stage {

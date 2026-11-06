@@ -1802,6 +1802,44 @@ fn finished_words_remain_available_to_explicit_suggestions() {
     s.finish();
     assert_eq!(s.text(), "keyb  ");
 
+    // A retained undo must not make suggestions target the previous word.
+    crate::config::Config::update_live(|config| config.spell_enabled = true);
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.finish();
+    crate::config::Config::update_live(|config| config.spell_enabled = false);
+    s.type_text("keybo  ");
+    s.tap(Simulated::SHIFT_RIGHT);
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive keyboard  ");
+    s.undo();
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive keybo  ");
+
+    // Deleting an extra space must not leave it in the next edit's erase count.
+    let s = Session::new();
+    s.type_text("keyb ");
+    s.tap(Simulated::SHIFT_RIGHT);
+    s.pending();
+    s.finish();
+    s.type_text("  ");
+    s.backspace();
+    {
+        let st = s.engine.lock();
+        let Some(LastAction::Fixed(fix)) = &st.last_action else {
+            panic!("correction should remain undoable");
+        };
+        assert_eq!(fix.trailing_spaces.len(), 1);
+        assert_eq!(fix.suffix, " ");
+    }
+    s.undo();
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "keyb  ");
+
     // Once a correction was accepted, a fresh request starts from that
     // visible word rather than resurrecting its original misspelling.
     crate::config::Config::update_live(|config| config.spell_enabled = true);
@@ -1908,6 +1946,114 @@ fn finished_words_remain_available_to_explicit_suggestions() {
     s.finish();
     assert_eq!(s.text(), "KEYB");
     assert!(!s.engine.lock().caps_lock);
+}
+
+#[test]
+fn ordinary_release_during_focus_check_keeps_correction() {
+    const CHILD: &str = "RECAST_FOCUS_RELEASE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::ordinary_release_during_focus_check_keeps_correction",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for event in ["release", "click", "typing", "modifier"] {
+        let s = Session::new();
+        s.type_text("recieve");
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        let engine = Arc::clone(&s.engine);
+        let worker = thread::spawn(move || engine.key_press(' '));
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.engine.injector.text.lock().unwrap().push(' ');
+        s.engine.key_release(' ');
+        match event {
+            "click" => s.engine.mouse_click(),
+            "typing" => s.type_text("x"),
+            "modifier" => s.tap(Simulated::CTRL_LEFT),
+            _ => (),
+        }
+        proceed.send(()).unwrap();
+        worker.join().unwrap();
+        if event == "release" {
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "receive ");
+        } else {
+            assert!(s.ready.try_recv().is_err());
+            assert!(s.text().starts_with("recieve "));
+        }
+    }
+}
+
+#[test]
+fn action_taps_allow_typing_rollover_but_not_chords() {
+    const CHILD: &str = "RECAST_ACTION_ROLLOVER_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::action_taps_allow_typing_rollover_but_not_chords",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    crate::config::Config::update_live(|config| {
+        config.action_shortcut = "left_ctrl".into();
+        config.undo_shortcut = "right_ctrl".into();
+    });
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    for tail in ['x', ' '] {
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("qzx");
+        s.engine.key_press(tail);
+        s.engine.injector.text.lock().unwrap().push(tail);
+        s.engine.key_press(Simulated::CTRL_LEFT);
+        s.engine.key_release(tail);
+        s.engine.key_release(Simulated::CTRL_LEFT);
+        s.tap(Simulated::CTRL_LEFT);
+        s.pending();
+        s.finish();
+        assert_ne!(s.text(), format!("qzx{tail}"));
+        assert_eq!(s.text().ends_with(' '), tail == ' ');
+    }
+    // The same rollover must not turn a real Ctrl chord into an action.
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("qzx");
+    s.engine.key_press('x');
+    s.engine.key_press(Simulated::CTRL_LEFT);
+    s.engine.key_release('x');
+    s.engine.key_press('a');
+    s.engine.key_release('a');
+    s.engine.key_release(Simulated::CTRL_LEFT);
+    s.tap(Simulated::CTRL_LEFT);
+    assert!(!s.engine.lock().is_replacing);
+    assert_eq!(s.text(), "qzx");
 }
 
 #[test]

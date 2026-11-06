@@ -116,9 +116,10 @@ Use **Settings > General > Start at login** in the menubar app for autostart. Al
 `make service-uninstall` removes that service. Terminal-launched binaries may have
 permissions attributed to the terminal rather than ReCast.
 
-After the keyboard listener is ready, **Practice correction and undo** opens once
-in the tray app or Linux control window. Close it to skip, or reopen it from
-**Help > Practice correction and undo** in the tray or the Linux controls.
+Once setup is complete, keep typing in your usual apps. No practice exercise is
+required. Optional **Practice correction and undo** is available from **Help**
+in the tray or the Linux controls. The tray app still opens keyboard setup when
+a required keyboard is missing.
 On macOS and Windows, practice shows one step at a time and checks both installed
 keyboards. Windows offers a link to Language settings; the checklist updates when
 you return. The exercise uses a real local text field: try layout correction,
@@ -192,7 +193,8 @@ the conflicting binding first.
 Only bare taps shorter than 300 ms count; double taps must finish within 500 ms
 of each other. Holding a modifier or using it in a chord keeps its normal behavior.
 Completion and spelling-suggestion Shift taps may overlap the release of the
-last typed letter. Rapid suggestion taps while an offer is landing queue one
+last typed letter. Ctrl action taps also tolerate the last letter or Space still
+being released; pressing a new key under Ctrl remains a normal keyboard shortcut. Rapid suggestion taps while an offer is landing queue one
 additional step; typing, cursor movement, or a focus change cancels that step.
 On every platform, suggestion search runs off the keyboard capture thread, so
 slow lookups do not hold up your next keystroke. Rapid taps during a search are
@@ -452,7 +454,6 @@ an unreadable config stops startup so exclusions are not silently discarded.
 | `state.txt` | Saved enabled/disabled state |
 | `welcomed` | Marker for the one-time correction hint |
 | `setup-complete` | macOS setup marker; missing requirements still reopen setup |
-| `practice-offered` | Marker for the optional first-run practice window |
 | `personal/` | Opt-in personalization files, `rules.txt` rule counts, `abstains.txt` aggregate near-miss counts, and `usefulness.txt` usage counts |
 
 `abbrev.txt` and `ignore.txt` reload within about two seconds of edits.

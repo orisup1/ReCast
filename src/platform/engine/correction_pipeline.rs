@@ -450,6 +450,25 @@ impl<P: Platform> Engine<P> {
         // the cursor. Explicit requests may reconsider that word and its layout.
         let (source_keys, separators, lang) = if !st.keys.is_empty() {
             (st.keys.to_vec(), Vec::new(), active_lang)
+        } else if matches!(&st.last_action, Some(LastAction::Fixed(fix))
+            if fix.suffix.chars().any(|ch| ch != ' '))
+        {
+            // Undo may still refer to an earlier correction; suggestions follow the caret.
+            let Some(tail) = &st.deletion_tail else {
+                return;
+            };
+            let text = reading::<P>(tail, active_lang);
+            let Some(LastAction::Fixed(fix)) = &st.last_action else {
+                unreachable!();
+            };
+            if text.is_empty() || !fix.suffix.ends_with(&text) {
+                return;
+            }
+            let end = tail
+                .iter()
+                .rposition(|typed| !P::is_terminator(typed.key))
+                .map_or(0, |index| index + 1);
+            (tail[..end].to_vec(), tail[end..].to_vec(), active_lang)
         } else {
             let (keys, terminator, spaces, layout) = match &st.last_action {
                 Some(LastAction::Fixed(fix)) => (

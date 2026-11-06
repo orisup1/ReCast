@@ -18,7 +18,6 @@ struct App {
     health: String,
     show_practice: bool,
     practice_text: String,
-    practice_offered: bool,
     settings_page: usize,
     example: usize,
     preview_hebrew: bool,
@@ -37,18 +36,6 @@ impl eframe::App for App {
             self.last_app_check = std::time::Instant::now();
             self.health = crate::platform::status(&self.control);
             self.control.live_log.observe_health(&self.health);
-        }
-        if !self.practice_offered
-            && self
-                .control
-                .listener_ready
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.practice_offered = true;
-            if crate::practice::first_run() {
-                self.show_practice = true;
-                crate::practice::opened(&self.control);
-            }
         }
         egui::Window::new("Practice ReCast")
             .open(&mut self.show_practice)
@@ -452,7 +439,6 @@ pub fn run(control: Arc<AppControl>) -> Result<(), eframe::Error> {
                 health: "Starting…".into(),
                 show_practice: false,
                 practice_text: String::new(),
-                practice_offered: false,
                 settings_page: 0,
                 example: 0,
                 preview_hebrew: false,

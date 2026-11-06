@@ -262,7 +262,7 @@ pub fn run(control: Arc<AppControl>) {
         {
             practice_offered = true;
             let (english, hebrew) = crate::layout::enabled_languages();
-            if crate::practice::first_run() || !english || !hebrew {
+            if !english || !hebrew {
                 match crate::practice::native::Window::new(target, proxy.clone(), &control) {
                     Ok(window) => practice_window = Some(window),
                     Err(error) => {

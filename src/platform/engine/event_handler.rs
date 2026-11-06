@@ -207,7 +207,18 @@ impl<P: Platform> Engine<P> {
                 }));
         st.completion_down =
             ((is_completion || is_correction) && suggestion_bare).then(Instant::now);
-        st.action_down = (is_action && bare).then(Instant::now);
+        // Releasing the last typed key after Ctrl starts is normal rollover.
+        // A new key pressed under Ctrl still cancels the gesture as a chord.
+        let action_bare = bare
+            || (fresh_press
+                && !st.is_replacing
+                && st.held_keys.iter().all(|&held| {
+                    held == key
+                        || (!P::is_modifier(held)
+                            && (P::english_char_plain(held).is_some()
+                                || (P::is_terminator(held) && !P::is_line_break(held))))
+                }));
+        st.action_down = (is_action && action_bare).then(Instant::now);
         if !is_action {
             st.last_action_tap = None;
         }
@@ -505,7 +516,10 @@ impl<P: Platform> Engine<P> {
             return;
         }
         st.sync_shortcuts(&config);
-        st.revision = st.revision.wrapping_add(1);
+        // Ordinary releases change no text; do not cancel an in-flight focus check.
+        if P::is_modifier(key) {
+            st.revision = st.revision.wrapping_add(1);
+        }
         st.held_keys.remove(&key);
         if self
             .control

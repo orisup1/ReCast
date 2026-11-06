@@ -413,6 +413,8 @@ impl<P: Platform> AppState<P> {
         if let Some(LastAction::Fixed(fix)) = &mut self.last_action {
             if fix.suffix.pop().is_none() {
                 self.last_action = None;
+            } else if fix.suffix.chars().all(|ch| ch == ' ') {
+                fix.trailing_spaces.truncate(fix.suffix.len());
             }
         }
     }

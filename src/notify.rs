@@ -16,7 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn shortcuts() -> String {
     let config = crate::config::Config::global();
-    format!("Undo or convert: {} within half a second. Undoes the latest correction, abbreviation expansion, or completion. If the last word was unchanged, converts its layout even if it is unknown. Repeat a manual conversion to convert back. Extra spaces preserve undo; other typing, Enter, or cursor movement ends the opportunity. It also rescues selected text in supported editable fields (Linux requires the optional accessibility helper).\n\nCompletion: {} before or after Space. On macOS, a quiet strip previews choices; repeat to advance, type or Space to accept, Escape or Enter to cancel. Windows/Linux cycle replacements directly. Four choices, then your original text; keep tapping for the next page. Tracked spaces survive every choice and undo.\n\nSpelling suggestions: {} before or after Space; repeat to cycle alternatives, including short and already valid words. On macOS, a quiet caret strip previews choices without editing: repeat to move the highlight, then type or press Space to accept. Original is a no-op. Enter cancels and passes through unchanged. Escape, navigation, clicks, focus changes, pause and disable dismiss it. The strip anchors to the caret or a single-line search field; unavailable context leaves text untouched. Windows/Linux retain direct replacement cycling. Works independently of automatic spelling and completion.\n\nUndo only (single tap): {}. Enable it in Settings to undo corrections only; it never converts unchanged words or changes their exceptions. When it shares the action key, undo waits half a second so double taps take priority.\n\nOnly bare taps count; holding a modifier or using a chord does not trigger a gesture. Completion and spelling suggestions must use separate keys from each other and action/undo.\n\nOne undo leaves that word alone for this session; two occasions save the exception. Manual layout conversion does not change saved exceptions.\n\nReCast processes typing locally. Recent corrections stay in memory; ignored and learned words are saved locally.", config.action_gesture(), config.completion_gesture(), config.correction_gesture(), crate::practice::shortcut_label(&config.undo_shortcut))
+    format!(
+        "Keep typing normally. ReCast checks words when you press Space. Confident layout and spelling corrections happen automatically; uncertain words stay unchanged. Enter is never replayed.\n\nUndo a correction: {}. Extra spaces preserve undo. On supported macOS and Windows fields, up to 32 following characters also survive undo. Enter, cursor movement, or changing fields ends it. One undo leaves the word alone for this session; two occasions save an exception.\n\nFix an unchanged word or selected text: {}. Converts the keyboard layout, including unknown words. Repeat to restore it. Selection rescue requires a supported editable field; Linux needs the optional accessibility helper.\n\nSpelling alternatives: {} before or after Space.\nComplete a word: {} before or after Space.\nOn macOS, repeat to browse the caret strip; type or press Space to accept. Escape or Enter cancels. Windows/Linux replace directly as you cycle. Your original text is included; keep tapping for more choices.\n\nOptional undo-only key: {}. Configure in Settings > Shortcuts. A separate key acts immediately; sharing the double-tap key waits half a second.\n\nUse quick modifier taps. Holding a modifier or using a keyboard shortcut does not request correction. ReCast processes typing locally. Recent corrections stay in memory; word exceptions are saved locally.",
+        config.undo_gesture(),
+        config.action_gesture(),
+        config.correction_gesture(),
+        config.completion_gesture(),
+        crate::practice::shortcut_label(&config.undo_shortcut),
+    )
 }
 
 /// Explicitly requested help may use a dialog; typing notifications must not.
@@ -141,9 +148,8 @@ pub fn first_correction_hint() {
         notify(
             "ReCast just corrected a word",
             &format!(
-                "Undo: {}. Completion: {}. Set an undo-only key in Settings > Shortcuts. See Typing shortcuts for conversion help.",
-                crate::practice::restore_instruction(&crate::config::Config::global()),
-                crate::config::Config::global().completion_gesture()
+                "Keep typing normally. To undo, {}. More options in Help > Typing shortcuts.",
+                crate::practice::restore_instruction(&crate::config::Config::global())
             ),
         );
     });
