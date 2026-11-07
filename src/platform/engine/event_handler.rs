@@ -413,7 +413,7 @@ impl<P: Platform> Engine<P> {
             } else if !st.keys.is_empty() {
                 st.keys.pop();
                 if st.keys.is_empty() && !st.no_fix {
-                    st.deletion_tail = Some(Vec::new());
+                    st.deletion_tail.get_or_insert_with(Vec::new);
                 }
                 st.pop_fix_suffix();
             } else if let Some(mut tail) = st.deletion_tail.take() {
@@ -442,8 +442,10 @@ impl<P: Platform> Engine<P> {
         } else if P::is_terminator(key) {
             self.word_finished(st, key, shift, focus);
         } else if is_text {
-            st.deletion_tail = None;
             if st.keys.is_empty() && !st.is_replacing {
+                if st.focus != focus {
+                    st.deletion_tail = None;
+                }
                 // A new target starts a new capture. Keep this separate from
                 // action focus checks: undo must still reject the old target.
                 if st.focus.is_some() && focus.is_some() && st.focus != focus {
@@ -484,6 +486,7 @@ impl<P: Platform> Engine<P> {
             }
             if !st.is_replacing && st.keys.is_empty() {
                 // The word buffer gave up on an overlong token.
+                st.deletion_tail = None;
                 st.no_fix = true;
             }
         }

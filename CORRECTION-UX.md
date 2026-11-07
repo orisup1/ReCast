@@ -151,3 +151,26 @@ bindings, with either a held letter or Space, checks that chords do not inject,
 and verifies undo preserves the original word and separator. Existing safeguards
 for injection, navigation, focus changes, and submission remain in place. Live
 desktop timing and the remaining limitations above still need separate validation.
+
+## Follow-up pass 5: backspacing into the preceding word
+
+Ordinary editing exposed a gap between deleting a finished word immediately and
+returning to it after starting the next word. Typing the next letter discarded
+the known finished-word tail. Erasing that new word then recorded an empty tail,
+so backspacing through the separator could not recover the preceding word for
+further correction. A user could see the entire word while ReCast tracked only
+the newly appended fragment.
+
+The engine now retains its existing bounded tail while the following word is
+unfinished and preserves that tail when the following word is erased. Backspace
+can then reuse the existing recovery path. Changes in focus identity, including
+loss of focus information, discard the tail, as do cursor invalidation and word
+buffer overflow. No extra history buffer, context reads, or correction thresholds
+were added. Backtracking remains limited to the last tracked finished word.
+
+The regression failed before the fix because the recovered word buffer was empty.
+It now covers a corrected or unchanged preceding word, one or three separators,
+and ordinary correction after editing inside the recovered word, with empty-field
+probing disabled. Negative cases verify navigation, focus loss, and overlong text
+cannot reuse the older word. Live desktop timing, deeper edits, pasted context,
+and the submission/search limitations above remain outside this change.

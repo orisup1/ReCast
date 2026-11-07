@@ -210,6 +210,8 @@ Late focus or empty-field replies from an earlier cursor context cannot discard
 typing or cancel a correction in the new context.
 Keyboard navigation and deletion into untracked text still suspend automatic
 correction until a word boundary, protecting incomplete editing fragments.
+Erasing an unfinished next word and its preceding spaces keeps the previous
+tracked word available for editing and correction.
 
 | Action | Gesture or control |
 | --- | --- |

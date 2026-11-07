@@ -271,7 +271,7 @@ pub struct AppState<P: Platform> {
     pub(super) revision: u64,
     pub(super) focus: Option<P::Focus>,
     pub(super) no_fix: bool,
-    /// Known finished text immediately before the cursor, retained for deletion.
+    /// Last known finished word and separators, retained while the next word is typed.
     /// Some(empty) means the tracked word was fully erased; repeated Backspace
     /// must not suppress the next freshly captured word. None means unknown text.
     pub(super) deletion_tail: Option<Vec<Typed<P::Key>>>,

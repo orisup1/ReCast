@@ -2552,19 +2552,22 @@ fn backspacing_next_word_recovers_the_previous_tracked_word() {
                 s.backspace();
             }
             assert_eq!(s.text(), "receive");
-            assert_eq!(reading::<Simulated>(&s.engine.lock().keys, Language::English), "receive");
+            assert_eq!(
+                reading::<Simulated>(&s.engine.lock().keys, Language::English),
+                "receive"
+            );
             // Edit inside that recovered word, then let ordinary Space correct it.
-            for _ in 0.."receive".len() {
+            for _ in 0.."eive".len() {
                 s.backspace();
             }
-            s.type_text("recieve ");
+            s.type_text("ieve ");
             s.pending();
             s.finish();
             assert_eq!(s.text(), "receive ");
         }
     }
     // Lost cursor context and overlong tokens must not resurrect an older word.
-    for lost in ["navigation", "overflow"] {
+    for lost in ["navigation", "focus", "overflow"] {
         let s = Session::new();
         s.type_text("receive ");
         if lost == "navigation" {
@@ -2572,6 +2575,13 @@ fn backspacing_next_word_recovers_the_previous_tracked_word() {
             s.backspace();
             s.type_text("recieve ");
             assert!(!s.engine.lock().is_replacing);
+        } else if lost == "focus" {
+            FOCUS.store(0, Ordering::SeqCst);
+            s.type_text("next");
+            assert!(s.engine.lock().deletion_tail.is_none());
+            FOCUS.store(1, Ordering::SeqCst);
+            s.backspace();
+            assert!(s.engine.lock().no_fix);
         } else {
             s.type_text(&"x".repeat(crate::types::MAX_WORD_KEYS + 1));
             assert!(s.engine.lock().deletion_tail.is_none());
