@@ -87,7 +87,7 @@ impl<const QUEUE_UNDO: bool> Platform for SimulatedPlatform<QUEUE_UNDO> {
         Self::english_char_plain(key)
     }
     fn english_char_plain(key: char) -> Option<char> {
-        (!key.is_control()).then_some(key)
+        (!key.is_control() && !Self::is_terminator(key)).then_some(key)
     }
     fn hebrew_char(key: char) -> Option<char> {
         #[cfg(target_os = "linux")]
@@ -2159,6 +2159,90 @@ fn action_taps_allow_typing_rollover_but_not_chords() {
 }
 
 #[test]
+fn suggestion_taps_allow_typing_rollover_but_not_chords() {
+    const CHILD: &str = "RECAST_SUGGESTION_ROLLOVER_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::suggestion_taps_allow_typing_rollover_but_not_chords",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    let native_space = crate::keymap::evkey_to_english_char(evdev::KeyCode::KEY_SPACE);
+    #[cfg(not(target_os = "linux"))]
+    let native_space = crate::keymap::key_to_english_char(rdev::Key::Space);
+    assert_eq!(Simulated::english_char_plain(' '), native_space);
+    assert!(native_space.is_none());
+
+    for (binding, key) in [
+        ("left_shift", Simulated::SHIFT_LEFT),
+        ("right_shift", Simulated::SHIFT_RIGHT),
+        ("left_ctrl", Simulated::CTRL_LEFT),
+        ("right_ctrl", Simulated::CTRL_RIGHT),
+    ] {
+        for correction in [false, true] {
+            crate::config::Config::update_live(|config| {
+                config.action_shortcut = "none".into();
+                config.undo_shortcut = "none".into();
+                config.completion_shortcut = if correction { "none" } else { binding }.into();
+                config.correction_shortcut = if correction { binding } else { "none" }.into();
+                config.spell_enabled = false;
+            });
+            for space in [true, false] {
+                for chord in [false, true] {
+                    let s = Session::new();
+                    let (word, wanted) = if correction {
+                        ("hte", "the")
+                    } else {
+                        ("keyb", "keyboard")
+                    };
+                    let (prefix, tail) = if space {
+                        (word, ' ')
+                    } else {
+                        (&word[..word.len() - 1], word.chars().last().unwrap())
+                    };
+                    s.type_text(prefix);
+                    s.engine.key_press(tail);
+                    s.engine.injector.text.lock().unwrap().push(tail);
+                    s.engine.key_press(key);
+                    s.engine.key_release(tail);
+                    if chord {
+                        s.engine.key_press('x');
+                        s.engine.key_release('x');
+                    }
+                    s.engine.key_release(key);
+                    s.suggestions_ready();
+                    if chord {
+                        assert!(s.ready.try_recv().is_err(), "{binding}: {space}");
+                        assert!(!s.engine.lock().is_replacing);
+                        continue;
+                    }
+                    s.pending();
+                    s.finish();
+                    let separator = if space { " " } else { "" };
+                    assert_eq!(s.text(), format!("{wanted}{separator}"), "{binding}");
+                    s.undo();
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{word}{separator}"), "{binding}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn suggestions_and_conversion_recover_without_retyping() {
     const CHILD: &str = "RECAST_RETRY_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
@@ -2431,6 +2515,72 @@ fn unplugging_cancels_pending_work_and_releases_device_keys() {
     assert!(st.keys.is_empty() && st.no_fix);
     assert_eq!(st.held_keys, HashSet::from(['x']));
     assert!(st.action_down.is_none() && st.completion_down.is_none());
+}
+
+#[test]
+fn backspacing_next_word_recovers_the_previous_tracked_word() {
+    const CHILD: &str = "RECAST_BACKTRACK_WORD_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::backspacing_next_word_recovers_the_previous_tracked_word",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+    for corrected in [false, true] {
+        for spaces in [1, 3] {
+            let s = Session::new();
+            s.type_text(if corrected { "recieve " } else { "receive " });
+            if corrected {
+                s.pending();
+                s.finish();
+            }
+            s.type_text(&" ".repeat(spaces - 1));
+            s.type_text("next");
+            for _ in 0.."next".len() + spaces {
+                s.backspace();
+            }
+            assert_eq!(s.text(), "receive");
+            assert_eq!(reading::<Simulated>(&s.engine.lock().keys, Language::English), "receive");
+            // Edit inside that recovered word, then let ordinary Space correct it.
+            for _ in 0.."receive".len() {
+                s.backspace();
+            }
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "receive ");
+        }
+    }
+    // Lost cursor context and overlong tokens must not resurrect an older word.
+    for lost in ["navigation", "overflow"] {
+        let s = Session::new();
+        s.type_text("receive ");
+        if lost == "navigation" {
+            s.tap('\x10');
+            s.backspace();
+            s.type_text("recieve ");
+            assert!(!s.engine.lock().is_replacing);
+        } else {
+            s.type_text(&"x".repeat(crate::types::MAX_WORD_KEYS + 1));
+            assert!(s.engine.lock().deletion_tail.is_none());
+            s.type_text(" ");
+            s.backspace();
+            assert!(s.engine.lock().no_fix);
+            assert!(s.engine.lock().keys.is_empty());
+        }
+    }
 }
 
 #[test]

@@ -192,9 +192,9 @@ from each other, the double-tap action, and extra single-tap undo. Disable or mo
 the conflicting binding first.
 Only bare taps shorter than 300 ms count; double taps must finish within 500 ms
 of each other. Holding a modifier or using it in a chord keeps its normal behavior.
-Completion and spelling-suggestion Shift taps may overlap the release of the
-last typed letter. Ctrl action taps also tolerate the last letter or Space still
-being released; pressing a new key under Ctrl remains a normal keyboard shortcut. Rapid suggestion taps while an offer is landing queue one
+Completion, spelling-suggestion, and Ctrl action taps tolerate the last letter
+or Space still being released; pressing a new key under Ctrl remains a normal
+keyboard shortcut. Rapid suggestion taps while an offer is landing queue one
 additional step; typing, cursor movement, or a focus change cancels that step.
 On every platform, suggestion search runs off the keyboard capture thread, so
 slow lookups do not hold up your next keystroke. Rapid taps during a search are

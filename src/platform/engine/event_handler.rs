@@ -202,27 +202,18 @@ impl<P: Platform> Engine<P> {
         let is_completion = shortcut_matches::<P>(&config.completion_shortcut, key);
         let is_correction = shortcut_matches::<P>(&config.correction_shortcut, key);
         let bare = fresh_press && st.held_keys.len() == 1;
-        // A Shift tap may overlap the release of the prefix's final letter.
-        // A new key pressed after Shift still cancels the gesture below.
-        let suggestion_bare = bare
-            || (fresh_press
-                && is_shift
-                && st.held_keys.iter().all(|&held| {
-                    held == key || (!P::is_modifier(held) && P::english_char_plain(held).is_some())
-                }));
+        // A tap may overlap an already-held typing key; a new press still cancels it.
+        let typing_rollover = fresh_press
+            && st.held_keys.iter().all(|&held| {
+                held == key
+                    || (!P::is_modifier(held)
+                        && (P::english_char_plain(held).is_some()
+                            || (P::is_terminator(held) && !P::is_line_break(held))))
+            });
+        let suggestion_bare = bare || (typing_rollover && (is_shift || !st.is_replacing));
         st.completion_down =
             ((is_completion || is_correction) && suggestion_bare).then(Instant::now);
-        // Releasing the last typed key after Ctrl starts is normal rollover.
-        // A new key pressed under Ctrl still cancels the gesture as a chord.
-        let action_bare = bare
-            || (fresh_press
-                && !st.is_replacing
-                && st.held_keys.iter().all(|&held| {
-                    held == key
-                        || (!P::is_modifier(held)
-                            && (P::english_char_plain(held).is_some()
-                                || (P::is_terminator(held) && !P::is_line_break(held))))
-                }));
+        let action_bare = bare || (typing_rollover && !st.is_replacing);
         st.action_down = (is_action && action_bare).then(Instant::now);
         if !is_action {
             st.last_action_tap = None;

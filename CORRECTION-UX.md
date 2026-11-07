@@ -129,3 +129,25 @@ untracked pasted text, or text arriving during dictionary search. Those still ne
 validated native context rather than another demo gesture. The tests simulate
 delayed desktop replies; they do not establish live application timing or correction
 recall during everyday use.
+
+## Follow-up pass 4: requesting help without waiting for key releases
+
+Reviewing finished-word suggestions exposed another unnecessary timing ritual.
+Tapping Shift immediately after Space could silently do nothing while Space was
+still held. Rebinding spelling or completion to Ctrl also made a tap fail when
+the previous letter was still being released. The shared engine accepted letter
+overlap only for Shift suggestions and omitted Space from that allowance.
+
+Suggestions now reuse the typing-key eligibility already used by action taps,
+while retaining the existing stricter Ctrl rules during replacement. A new key
+pressed after the modifier still cancels the tap as a chord. No new gesture or
+setting is needed.
+
+The simulated keyboard incorrectly classified Space as a letter, unlike the
+native key maps, which hid the first failure. That fixture now matches native
+separator behavior. The new regression failed with no suggestion scheduled before
+the engine fix. It passes for spelling and completion on all four Shift/Ctrl
+bindings, with either a held letter or Space, checks that chords do not inject,
+and verifies undo preserves the original word and separator. Existing safeguards
+for injection, navigation, focus changes, and submission remain in place. Live
+desktop timing and the remaining limitations above still need separate validation.
