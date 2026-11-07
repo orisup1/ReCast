@@ -98,12 +98,11 @@ pub struct Plan<P: Platform> {
     /// completion, which is triggered by a key that types nothing and therefore
     /// has nothing to restore.
     pub terminator: Option<P::Key>,
-    /// When set, only a verified native replacement may run: the text
-    /// immediately before the caret must equal this string, and the
-    /// replacement is applied around it atomically. `None` for the normal
-    /// erase-and-retype flow. Platforms that cannot verify must refuse
-    /// rather than erase.
-    pub verify: Option<String>,
+    /// Require a native match of `expected` plus buffered typing read under
+    /// this source layout. Preserve that typing verbatim in the same edit,
+    /// even when undo changes the live layout. None allows keyboard fallback;
+    /// backends without native verification must refuse Some rather than erase.
+    pub verify: Option<Language>,
 }
 
 impl<P: Platform> AppState<P> {
@@ -316,6 +315,14 @@ impl<P: Platform> Engine<P> {
             return;
         }
         let phrase_boundary = plan.terminator.is_some_and(P::is_line_break);
+        let verified_layout_undo = plan.verify.is_some()
+            && matches!(
+                &commit,
+                Some(Commit::Undo {
+                    layout: Some(_),
+                    ..
+                })
+            );
         let Some(buffered) = P::inject(self, plan, generation) else {
             let mut st = self.lock();
             if st.generation == generation {
@@ -465,6 +472,40 @@ impl<P: Platform> Engine<P> {
             } else {
                 pending_learning
             };
+            // Undo may refer to an older word; editing follows the last finished replayed word.
+            let mut finished = if keep.is_empty() {
+                undo.as_ref()
+                    .filter(|fix| fix.terminator.is_none())
+                    .map_or_else(Vec::new, |fix| fix.visible.clone())
+            } else {
+                keep.clone()
+            };
+            let whole_first_word = !finished.is_empty()
+                || undo.as_ref().is_some_and(|fix| fix.terminator.is_some())
+                || (undo.is_none() && !st.no_fix);
+            finished.extend_from_slice(&buffered);
+            let finished_word = finished
+                .iter()
+                .rposition(|typed| P::is_terminator(typed.key))
+                .and_then(|end| {
+                    let word_end = finished[..=end]
+                        .iter()
+                        .rposition(|typed| !P::is_terminator(typed.key))?;
+                    let start = finished[..word_end]
+                        .iter()
+                        .rposition(|typed| P::is_terminator(typed.key))
+                        .map_or(0, |index| index + 1);
+                    Some((start, word_end, end))
+                });
+            let deletion_tail = finished_word
+                .filter(|&(start, word_end, end)| {
+                    (whole_first_word || start > 0)
+                        && word_end + 1 - start <= crate::types::MAX_WORD_KEYS
+                        && end - word_end <= MAX_UNDO_SPACES
+                        && !verified_layout_undo
+                })
+                .map(|(start, _, end)| finished[start..=end].to_vec());
+            let finished_layout = undo.as_ref().map(|fix| fix.visible_layout);
             let tracked_spaces = undo.as_ref().map_or(0, |fix| fix.trailing_spaces.len());
             let only_spaces = tracked_spaces + buffered.len() <= MAX_UNDO_SPACES
                 && buffered
@@ -478,6 +519,7 @@ impl<P: Platform> Engine<P> {
                 .is_some_and(|fix| fix.suffix.chars().count() + buffered.len() > MAX_UNDO_SUFFIX);
             if only_spaces && !buffered.is_empty() && !suffix_full {
                 st.keys.clear();
+                st.no_fix = false;
                 if let Some(fix) = &mut undo {
                     fix.trailing_spaces.extend(buffered.iter().copied());
                     fix.keep.clear();
@@ -487,6 +529,7 @@ impl<P: Platform> Engine<P> {
                 }
             } else if only_spaces && !buffered.is_empty() {
                 st.keys.clear();
+                st.no_fix = false;
                 undo = None;
             } else if let Some(boundary) = buffered
                 .iter()
@@ -502,6 +545,13 @@ impl<P: Platform> Engine<P> {
             } else {
                 st.keys.replace_with(keep);
                 st.keys.extend(buffered.iter().copied());
+            }
+            if verified_layout_undo && !buffered.is_empty() {
+                // Verbatim old-layout text cannot be tracked as keys in the restored layout.
+                st.keys.clear();
+                st.no_fix = !buffered
+                    .last()
+                    .is_some_and(|typed| P::is_terminator(typed.key));
             }
             // Respect an original-text choice until its boundary, without saving an exception.
             if let Some(cycle) = &st.cycle {
@@ -520,31 +570,59 @@ impl<P: Platform> Engine<P> {
                 }
             }
             // Keep one correction and its exact bounded suffix for undo.
-            st.last_action = undo.map(LastAction::Fixed).or_else(|| {
-                if only_spaces {
-                    (|| {
-                        let cycle = st.cycle.as_ref()?;
-                        if cycle.index < cycle.candidates.len() || cycle.trailing_spaces.is_empty()
-                        {
-                            return None;
-                        }
-                        let mut trailing_spaces: Vec<_> =
-                            cycle.trailing_spaces.iter().skip(1).copied().collect();
-                        trailing_spaces.extend_from_slice(&buffered);
-                        Some(LastAction::Unchanged {
-                            keys: cycle.typed.clone(),
-                            terminator: cycle.trailing_spaces.first().map(|typed| typed.key),
-                            trailing_spaces,
-                            layout: Some(cycle.original_lang),
-                        })
-                    })()
-                } else {
-                    None
-                }
-            });
-            st.deletion_tail = match &st.last_action {
+            st.last_action = undo
+                .map(LastAction::Fixed)
+                .or_else(|| {
+                    if only_spaces {
+                        (|| {
+                            let cycle = st.cycle.as_ref()?;
+                            if cycle.index < cycle.candidates.len()
+                                || cycle.trailing_spaces.is_empty()
+                            {
+                                return None;
+                            }
+                            let mut trailing_spaces: Vec<_> =
+                                cycle.trailing_spaces.iter().skip(1).copied().collect();
+                            trailing_spaces.extend_from_slice(&buffered);
+                            Some(LastAction::Unchanged {
+                                keys: cycle.typed.clone(),
+                                terminator: cycle.trailing_spaces.first().map(|typed| typed.key),
+                                trailing_spaces,
+                                layout: Some(cycle.original_lang),
+                            })
+                        })()
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    // Expired undo must not discard explicit help for the tracked word at the caret.
+                    if !st.keys.is_empty()
+                        || !buffered
+                            .last()
+                            .is_some_and(|typed| P::is_terminator(typed.key))
+                    {
+                        return None;
+                    }
+                    let layout = finished_layout?;
+                    let tail = deletion_tail.as_ref()?;
+                    let end = tail
+                        .iter()
+                        .rposition(|typed| !P::is_terminator(typed.key))?
+                        + 1;
+                    let (separator, spaces) = tail[end..].split_first()?;
+                    Some(LastAction::Unchanged {
+                        keys: tail[..end].to_vec(),
+                        terminator: Some(separator.key),
+                        trailing_spaces: spaces.to_vec(),
+                        layout: Some(layout),
+                    })
+                });
+            st.deletion_tail = deletion_tail.or_else(|| match &st.last_action {
                 Some(LastAction::Fixed(fix))
-                    if fix.terminator.is_some() && !fix.visible.is_empty() =>
+                    if finished_word.is_none()
+                        && fix.terminator.is_some()
+                        && !fix.visible.is_empty() =>
                 {
                     let mut tail = fix.visible.clone();
                     tail.extend(fix.terminator.map(|key| Typed { key, shift: false }));
@@ -552,7 +630,7 @@ impl<P: Platform> Engine<P> {
                     Some(tail)
                 }
                 _ => None,
-            };
+            });
             st.last_key = None;
         }
         gate.finish(&mut st);
@@ -560,9 +638,11 @@ impl<P: Platform> Engine<P> {
 
         let mut st = self.lock();
         let retry = RetryContext::capture(&st, None);
-        let pending = (!st.is_replacing && std::mem::take(&mut st.pending_undo))
-            .then(|| st.last_action.take())
-            .flatten();
+        let pending = (!st.is_replacing
+            && std::mem::take(&mut st.pending_undo)
+            && matches!(st.last_action, Some(LastAction::Fixed(_))))
+        .then(|| st.last_action.take())
+        .flatten();
         let suggestion = if st.generation == generation && !st.is_replacing && st.cycle.is_some() {
             st.pending_suggestion.take()
         } else {

@@ -1273,15 +1273,13 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     }
     begin_injection(engine, generation)?;
     let buf = engine.buffered();
-    if let Some(check) = &verify {
-        // A verified replacement must land atomically or not at all; input
-        // that arrived while the worker was queued moves the caret.
-        if !buf.is_empty() {
-            return None;
-        }
+    if let Some(source_layout) = verify {
+        let suffix = engine::reading::<Mac>(&buf, source_layout);
+        let expected = format!("{expected}{suffix}");
+        let replacement = format!("{text}{suffix}");
         let focus = focused_target()?;
-        replace_expected_suffix(engine, &focus, check, &text, generation)?;
-        return Some(Vec::new());
+        replace_expected_suffix(engine, &focus, &expected, &replacement, generation)?;
+        return Some(buf);
     }
     let focus = focused_target()?;
     if Mac::app_id(&focus).as_deref() == Some("com.apple.Spotlight") {

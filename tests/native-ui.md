@@ -135,6 +135,25 @@ reported as native acceptance or measured end-to-end typing latency.
 
 ## Fluid correction regression checks
 
+- While a correction is pending, type a short sentence ending in `keyb ` so the
+  following text exceeds 32 characters. Completion and spelling alternatives must
+  still act on the latest word; double Ctrl converts that word when the older
+  undo has expired. Undo-only must remain a no-op. Repeat at exactly 32 and 33
+  following characters, with extra spaces and Hebrew. New typing, navigation,
+  Enter, secure input, exclusions, and a focus change must not revive an old word.
+- Type `recieve Next` continuously, capitalizing with each Shift key in separate
+  trials. The first word's correction must not require waiting for Shift release,
+  and undo must preserve `Next` exactly. Repeat with an initially capitalized
+  `Recieve `. A bare configured Shift tap must still request suggestions and
+  prevent an older automatic result from changing the preview. Ctrl+Shift,
+  navigation, and real layout changes must continue canceling stale work.
+- While a correction is landing, finish another word with one or three spaces.
+  Request spelling or completion immediately afterward, then try Backspace into
+  that word. Both actions must use the latest word and preserve the earlier
+  corrected text. Separately, undo the earlier correction: later text must survive.
+  Repeat in English and Hebrew, and with Space accepting a completion while its
+  replacement is pending. Navigation, unknown fragments, and layout restoration
+  must not revive older or incomplete word tracking.
 - Type a mixed-language draft continuously, including `recieve next` and several
   extra spaces after a typo. Do not pause to let correction finish. In supported
   native fields, a delayed same-layout spelling fix must preserve the following
@@ -142,6 +161,13 @@ reported as native acceptance or measured end-to-end typing latency.
   fields: a missed fix is acceptable; blind deletion of later text is not.
   Enter, navigation, focus changes, and layout changes during lookup must cancel
   stale edits. Record correction misses separately from corruption and latency.
+- After `recieve ` becomes `receive `, type `next`, request undo, and keep typing
+  without waiting. Supported native fields should preserve the added text while
+  restoring `recieve`. Repeat with a Space before the undo gesture and a Space
+  typed while undo is pending; the next typo should correct without a warmup.
+  Repeat after a layout correction, including text typed before layout restoration:
+  its characters must survive verbatim. Text that cannot be verified, Enter,
+  focus changes, and navigation must prevent a stale edit.
 - In TextEdit plain and rich text, correct a word in the middle of a document.
   Check that surrounding formatting, text, and caret survive native replacement.
   Repeat in a control without writable Accessibility text ranges; keyboard fallback

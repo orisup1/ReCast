@@ -35,7 +35,11 @@ pub(super) fn pause_word_check() {
     let gate = CHECK_GATE.lock().unwrap().take();
     if let Some(gate) = gate {
         gate.ready.send(()).unwrap();
-        gate.proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+        // A concurrent manual search has a ten-second debug deadline under CPU contention.
+        let seconds = if cfg!(debug_assertions) { 15 } else { 3 };
+        gate.proceed
+            .recv_timeout(Duration::from_secs(seconds))
+            .unwrap();
     }
 }
 struct SimulatedPlatform<const QUEUE_UNDO: bool, const VERIFY: bool = true>;
@@ -239,11 +243,14 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
             return None;
         }
         let buffered = engine.buffered();
+        let suffix = if buffered.is_empty() {
+            String::new()
+        } else {
+            reading::<Self>(&buffered, plan.verify.or_else(Self::current_layout)?)
+        };
         let mut screen = engine.injector.text.lock().unwrap();
-        if plan
-            .verify
-            .as_ref()
-            .is_some_and(|expected| !buffered.is_empty() || !screen.ends_with(expected))
+        if plan.verify.is_some()
+            && (!VERIFY || !screen.ends_with(&format!("{}{suffix}", plan.expected)))
         {
             return None;
         }
@@ -269,7 +276,7 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
         if let Some(key) = plan.terminator {
             screen.push(key);
         }
-        screen.extend(buffered.iter().map(|t| t.key));
+        screen.push_str(&suffix);
         drop(screen);
         let gate = INJECT_RETURN_GATE.lock().unwrap().take();
         if let Some(gate) = gate {
@@ -3772,6 +3779,894 @@ fn continued_typing_during_automatic_search_keeps_the_correction() {
 }
 
 #[test]
+fn finished_word_help_survives_correction_undo_expiry() {
+    const CHILD: &str = "RECAST_EXPIRED_UNDO_HELP_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::finished_word_help_survives_correction_undo_expiry",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    for (layout, typo, corrected, prefix) in [
+        (0, "recieve", "receive", "please update the documentation "),
+        (1, "תודדה", "תודה", "בבקשה לעדכן את המסמך ולשלוח לי "),
+    ] {
+        let physical = |text: &str| {
+            if layout == 1 {
+                crate::keymap::convert_selection(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        for action in ["completion", "spelling", "convert"] {
+            let (word, wanted, gesture) = match (layout, action) {
+                (0, "completion") => ("keyb", "keyboard", Simulated::SHIFT_RIGHT),
+                (0, "spelling") => ("keyboad", "keyboard", Simulated::SHIFT_LEFT),
+                (0, _) => ("akuo", "שלום", Simulated::CTRL_LEFT),
+                (_, "completion") => ("מחש", "מחשב", Simulated::SHIFT_RIGHT),
+                (_, "spelling") => ("תודדה", "תודה", Simulated::SHIFT_LEFT),
+                _ => ("יקךךם", "hello", Simulated::CTRL_LEFT),
+            };
+            let prefixes = if layout == 0 && action == "completion" {
+                vec![
+                    prefix.to_owned(),
+                    format!("{} ", "x".repeat(26)),
+                    format!("{} ", "x".repeat(27)),
+                ]
+            } else {
+                vec![prefix.to_owned()]
+            };
+            for prefix in prefixes {
+                for spaces in [1, 3] {
+                    SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+                    let s = Session::new();
+                    s.type_text(&physical(&format!("{typo} ")));
+                    s.pending();
+                    let separators = " ".repeat(spaces);
+                    let later = format!("{prefix}{word}{separators}");
+                    assert!(later.chars().count() <= crate::types::MAX_WORD_KEYS);
+                    let expired = later.chars().count() > super::word_buffer::MAX_UNDO_SUFFIX;
+                    s.type_text(&physical(&later));
+                    s.finish();
+                    assert_eq!(s.text(), format!("{corrected} {later}"));
+                    if expired {
+                        assert!(matches!(
+                            s.engine.lock().last_action,
+                            Some(LastAction::Unchanged { .. })
+                        ));
+                        s.undo();
+                        assert!(
+                            s.ready.try_recv().is_err(),
+                            "undo-only must not convert unchanged text"
+                        );
+                    } else {
+                        assert!(matches!(
+                            s.engine.lock().last_action,
+                            Some(LastAction::Fixed(_))
+                        ));
+                    }
+                    s.tap(gesture);
+                    if action == "convert" {
+                        s.tap(gesture);
+                    }
+                    s.pending();
+                    s.finish();
+                    assert_eq!(
+                        s.text(),
+                        format!("{corrected} {prefix}{wanted}{separators}"),
+                        "{action}"
+                    );
+                    s.undo();
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{corrected} {later}"));
+                    if action == "convert" {
+                        assert!(!crate::complete::suppressed(word));
+                    }
+                    crate::complete::unlist(word);
+                }
+            }
+        }
+    }
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+    // An undo queued before the correction lands must not consume an unchanged-word action.
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.type_text("please update the documentation keyb ");
+    s.undo();
+    assert!(s.engine.lock().pending_undo);
+    s.finish();
+    assert_eq!(s.engine.control.undo_count(), 0);
+    assert!(matches!(
+        s.engine.lock().last_action,
+        Some(LastAction::Unchanged { .. })
+    ));
+    s.tap(Simulated::SHIFT_RIGHT);
+    s.pending();
+    s.finish();
+    assert_eq!(
+        s.text(),
+        "receive please update the documentation keyboard "
+    );
+    std::env::set_var("RECAST_PREVIEW_TEST", "1");
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.type_text("please update the documentation keyb ");
+    s.finish();
+    s.tap(Simulated::SHIFT_RIGHT);
+    assert!(s
+        .engine
+        .lock()
+        .cycle
+        .as_ref()
+        .is_some_and(|cycle| cycle.preview));
+    assert_eq!(s.text(), "receive please update the documentation keyb ");
+    s.type_text(" ");
+    s.pending();
+    s.finish();
+    assert_eq!(
+        s.text(),
+        "receive please update the documentation keyboard  "
+    );
+}
+
+#[test]
+fn expired_undo_word_help_stays_with_the_caret_and_focus() {
+    const CHILD: &str = "RECAST_EXPIRED_UNDO_SCOPE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::expired_undo_word_help_stays_with_the_caret_and_focus",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for cancel in [
+        "typing",
+        "enter",
+        "navigation",
+        "focus",
+        "secure",
+        "excluded",
+    ] {
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.type_text("please update the documentation keyb ");
+        s.finish();
+        assert!(matches!(
+            s.engine.lock().last_action,
+            Some(LastAction::Unchanged { .. })
+        ));
+        match cancel {
+            "typing" => s.type_text("x"),
+            "enter" => s.type_text("\n"),
+            "navigation" => s.tap('\x10'),
+            "focus" => FOCUS.store(2, Ordering::SeqCst),
+            "secure" => INPUT_ALLOWED.store(false, Ordering::SeqCst),
+            _ => *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()],
+        }
+        let expected = s.text();
+        s.tap(Simulated::SHIFT_RIGHT);
+        assert!(s.ready.try_recv().is_err(), "{cancel}");
+        assert_eq!(s.text(), expected, "{cancel}");
+        assert_eq!(s.engine.control.fixed_count(), 1);
+        FOCUS.store(1, Ordering::SeqCst);
+        INPUT_ALLOWED.store(true, Ordering::SeqCst);
+    }
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.type_text("please update the documentation keyb x");
+    s.finish();
+    assert!(s.engine.lock().last_action.is_none());
+    s.tap(Simulated::CTRL_LEFT);
+    s.tap(Simulated::CTRL_LEFT);
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive please update the documentation keyb ס");
+}
+
+#[test]
+fn capitalizing_the_next_word_keeps_automatic_correction() {
+    const CHILD: &str = "RECAST_CAPITAL_CONTINUATION_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::capitalizing_the_next_word_keeps_automatic_correction",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for phase in ["search", "focus"] {
+        for shift in [Simulated::SHIFT_LEFT, Simulated::SHIFT_RIGHT] {
+            for release_after_search in [false, true] {
+                let s = Session::new();
+                s.type_text("recieve");
+                let (ready, reached) = mpsc::sync_channel(0);
+                let (proceed, resume) = mpsc::channel();
+                *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+                    ready,
+                    proceed: resume,
+                });
+                s.type_while_checking(" ");
+                reached.recv_timeout(Duration::from_secs(3)).unwrap();
+                let focus_gate = if phase == "focus" {
+                    let (ready, reached) = mpsc::sync_channel(0);
+                    let (proceed_focus, resume) = mpsc::channel();
+                    *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+                        ready,
+                        proceed: resume,
+                    });
+                    proceed.send(()).unwrap();
+                    reached.recv_timeout(Duration::from_secs(3)).unwrap();
+                    Some(proceed_focus)
+                } else {
+                    None
+                };
+                s.engine.key_press(shift);
+                s.type_while_checking("n");
+                if !release_after_search {
+                    s.engine.key_release(shift);
+                    s.type_while_checking("ext");
+                }
+                if let Some(focus_gate) = focus_gate {
+                    focus_gate.send(()).unwrap();
+                } else {
+                    proceed.send(()).unwrap();
+                }
+                s.pending();
+                if release_after_search {
+                    s.engine.key_release(shift);
+                }
+                s.finish();
+                if release_after_search {
+                    s.type_text("ext");
+                }
+                assert_eq!(s.text(), "receive Next", "{phase}, {shift:?}");
+                assert_eq!(
+                    reading::<Simulated>(&s.engine.lock().keys, Language::English),
+                    "Next"
+                );
+                assert!(
+                    s.engine.lock().cycle.is_none(),
+                    "capitalization must not request suggestions"
+                );
+                s.undo();
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), "recieve Next");
+                crate::complete::unlist("recieve");
+            }
+        }
+    }
+    // Releasing capitalization during the first letter's focus query is harmless too.
+    let s = Session::new();
+    s.engine.key_press(Simulated::SHIFT_LEFT);
+    let (ready, reached) = mpsc::sync_channel(0);
+    let (proceed, resume) = mpsc::channel();
+    *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+        ready,
+        proceed: resume,
+    });
+    let engine = Arc::clone(&s.engine);
+    let worker = thread::spawn(move || engine.key_press('r'));
+    reached.recv_timeout(Duration::from_secs(3)).unwrap();
+    s.engine.injector.text.lock().unwrap().push('R');
+    s.engine.key_release('r');
+    s.engine.key_release(Simulated::SHIFT_LEFT);
+    proceed.send(()).unwrap();
+    worker.join().unwrap();
+    s.type_text("ecieve ");
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "Receive ");
+}
+
+#[test]
+fn deliberate_shift_taps_still_cancel_automatic_search() {
+    const CHILD: &str = "RECAST_SHIFT_SEARCH_PRIORITY_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::deliberate_shift_taps_still_cancel_automatic_search",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for preview in [false, true] {
+        if preview {
+            std::env::set_var("RECAST_PREVIEW_TEST", "1");
+        } else {
+            std::env::remove_var("RECAST_PREVIEW_TEST");
+        }
+        for binding in ["spelling", "completion", "action", "unbound"] {
+            crate::config::Config::update_live(|config| {
+                config.action_shortcut = if binding == "action" {
+                    "left_shift"
+                } else {
+                    "ctrl"
+                }
+                .into();
+                config.correction_shortcut = if binding == "spelling" {
+                    "left_shift"
+                } else {
+                    "none"
+                }
+                .into();
+                config.completion_shortcut = if binding == "completion" {
+                    "left_shift"
+                } else {
+                    "none"
+                }
+                .into();
+            });
+            let s = Session::new();
+            s.type_text("recieve");
+            let (ready, reached) = mpsc::sync_channel(0);
+            let (proceed, resume) = mpsc::channel();
+            *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+                ready,
+                proceed: resume,
+            });
+            s.type_while_checking(" ");
+            reached.recv_timeout(Duration::from_secs(3)).unwrap();
+            s.tap(Simulated::SHIFT_LEFT);
+            if !preview && matches!(binding, "spelling" | "completion") {
+                s.pending();
+                s.finish();
+            }
+            let chosen = s.text();
+            proceed.send(()).unwrap();
+            s.checks_ready();
+            if binding == "unbound" {
+                s.pending();
+                s.finish();
+                assert_eq!(s.text(), "receive ");
+            } else {
+                assert_eq!(s.text(), chosen, "{binding}");
+                assert!(
+                    s.ready.try_recv().is_err(),
+                    "stale automatic replacement after {binding}"
+                );
+                assert_eq!(
+                    s.engine.control.fixed_count(),
+                    u64::from(binding != "action" && !preview)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn replacement_replay_keeps_the_latest_finished_word_available() {
+    const CHILD: &str = "RECAST_REPLAY_FINISHED_WORD_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::replacement_replay_keeps_the_latest_finished_word_available"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+    for (layout, typo, corrected, next, completed) in [
+        (0, "recieve", "receive", "keyb", "keyboard"),
+        (1, "תודדה", "תודה", "מחש", "מחשב"),
+    ] {
+        SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+        let physical = |text: &str| {
+            if layout == 1 {
+                crate::keymap::convert_selection(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        for buffered_space_only in [false, true] {
+            for spaces in [1, 3] {
+                for action in ["complete", "backspace", "undo"] {
+                    let s = Session::new();
+                    if buffered_space_only {
+                        s.type_text(&physical(typo));
+                        let (ready, reached) = mpsc::sync_channel(0);
+                        let (proceed, resume) = mpsc::channel();
+                        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+                            ready,
+                            proceed: resume,
+                        });
+                        s.type_while_checking(" ");
+                        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+                        s.type_while_checking(&physical(next));
+                        proceed.send(()).unwrap();
+                        s.pending();
+                        s.type_text(&" ".repeat(spaces));
+                    } else {
+                        s.type_text(&physical(&format!("{typo} ")));
+                        s.pending();
+                        s.type_text(&physical(&format!("{next}{}", " ".repeat(spaces))));
+                    }
+                    s.finish();
+                    assert_eq!(
+                        s.text(),
+                        format!("{corrected} {next}{}", " ".repeat(spaces))
+                    );
+                    if action == "undo" {
+                        s.undo();
+                        s.pending();
+                        s.finish();
+                        assert_eq!(s.text(), format!("{typo} {next}{}", " ".repeat(spaces)));
+                        crate::complete::unlist(typo);
+                        continue;
+                    }
+                    if action == "backspace" {
+                        for _ in 0..spaces {
+                            s.backspace();
+                        }
+                        assert_eq!(
+                            reading::<Simulated>(
+                                &s.engine.lock().keys,
+                                Simulated::current_layout().unwrap()
+                            ),
+                            next
+                        );
+                        assert!(!s.engine.lock().no_fix);
+                    }
+                    s.tap(Simulated::SHIFT_RIGHT);
+                    s.pending();
+                    s.finish();
+                    let separators = if action == "complete" {
+                        " ".repeat(spaces)
+                    } else {
+                        String::new()
+                    };
+                    assert_eq!(s.text(), format!("{corrected} {completed}{separators}"));
+                    s.undo();
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{corrected} {next}{separators}"));
+                    crate::complete::unlist(next);
+                }
+            }
+        }
+    }
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.type_text("keyboad ");
+    s.finish();
+    s.tap(Simulated::SHIFT_LEFT);
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive keyboard ");
+    // Space can finish a completion before its replacement has landed.
+    for preview in [false, true] {
+        if preview {
+            std::env::set_var("RECAST_PREVIEW_TEST", "1");
+        }
+        let s = Session::new();
+        s.type_text("keyb");
+        s.tap(Simulated::SHIFT_RIGHT);
+        if !preview {
+            s.pending();
+        }
+        s.type_text(" ");
+        if preview {
+            s.pending();
+        }
+        s.finish();
+        s.backspace();
+        assert_eq!(s.text(), "keyboard");
+        assert_eq!(
+            reading::<Simulated>(&s.engine.lock().keys, Language::English),
+            "keyboard"
+        );
+        assert!(!s.engine.lock().no_fix);
+    }
+    std::env::remove_var("RECAST_PREVIEW_TEST");
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("akuo");
+    s.tap(Simulated::CTRL_LEFT);
+    s.tap(Simulated::CTRL_LEFT);
+    s.pending();
+    s.type_text(" ");
+    s.finish();
+    s.backspace();
+    assert_eq!(s.text(), "שלום");
+    assert_eq!(
+        reading::<Simulated>(&s.engine.lock().keys, Language::Hebrew),
+        "שלום"
+    );
+    assert!(!s.engine.lock().no_fix);
+}
+
+#[test]
+fn replacement_replay_does_not_recover_unknown_or_overlong_fragments() {
+    const CHILD: &str = "RECAST_REPLAY_WORD_SAFETY_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::replacement_replay_does_not_recover_unknown_or_overlong_fragments"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    EMPTY_INPUT_SUPPORTED.store(false, Ordering::SeqCst);
+    for suffix in ["more ", "more keyb "] {
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.type_text("next");
+        s.undo();
+        s.pending();
+        s.type_text(suffix);
+        s.finish();
+        assert_eq!(s.text(), format!("recieve next{suffix}"));
+        if suffix == "more " {
+            assert!(s.engine.lock().deletion_tail.is_none());
+            s.backspace();
+            assert!(s.engine.lock().keys.is_empty());
+            assert!(s.engine.lock().no_fix);
+        } else {
+            s.backspace();
+            assert_eq!(
+                reading::<Simulated>(&s.engine.lock().keys, Language::English),
+                "keyb"
+            );
+            s.tap(Simulated::SHIFT_RIGHT);
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "recieve nextmore keyboard");
+        }
+        crate::complete::unlist("recieve");
+    }
+    let s = Session::new();
+    s.type_text("recieve");
+    let (ready, reached) = mpsc::sync_channel(0);
+    let (proceed, resume) = mpsc::channel();
+    *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+        ready,
+        proceed: resume,
+    });
+    s.type_while_checking(" ");
+    reached.recv_timeout(Duration::from_secs(3)).unwrap();
+    s.type_while_checking("next");
+    proceed.send(()).unwrap();
+    s.pending();
+    let suffix = "x".repeat(crate::types::MAX_WORD_KEYS + 1 - "next".len());
+    s.type_text(&format!("{suffix} "));
+    s.finish();
+    assert_eq!(s.text(), format!("receive next{suffix} "));
+    assert!(s.engine.lock().deletion_tail.is_none());
+    assert!(s.engine.lock().last_action.is_none());
+    s.backspace();
+    assert!(s.engine.lock().keys.is_empty());
+    assert!(s.engine.lock().no_fix);
+}
+
+#[test]
+fn verified_edits_preserve_typing_while_waiting_to_inject() {
+    const CHILD: &str = "RECAST_VERIFIED_BUFFER_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::verified_edits_preserve_typing_while_waiting_to_inject",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for (layout, typo, corrected, next, later) in [
+        (0, "recieve", "receive", "next", "more"),
+        (1, "תודדה", "תודה", "שלום", "עולם"),
+    ] {
+        SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+        let physical = |text: &str| {
+            if layout == 1 {
+                crate::keymap::convert_selection(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        for action in ["correction", "undo"] {
+            for separator in ["", "  "] {
+                let s = Session::new();
+                if action == "correction" {
+                    s.type_text(&physical(typo));
+                    let (ready, reached) = mpsc::sync_channel(0);
+                    let (proceed, resume) = mpsc::channel();
+                    *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+                        ready,
+                        proceed: resume,
+                    });
+                    s.type_while_checking(" ");
+                    reached.recv_timeout(Duration::from_secs(3)).unwrap();
+                    s.type_while_checking(&physical(next));
+                    proceed.send(()).unwrap();
+                    s.pending();
+                } else {
+                    s.type_text(&physical(&format!("{typo} ")));
+                    s.pending();
+                    s.finish();
+                    s.type_text(&physical(next));
+                    s.undo();
+                    s.pending();
+                }
+                s.type_text(&physical(&format!("{separator}{later}")));
+                s.finish();
+                assert_eq!(
+                    s.text(),
+                    format!(
+                        "{} {next}{separator}{later}",
+                        if action == "correction" {
+                            corrected
+                        } else {
+                            typo
+                        }
+                    ),
+                    "{action}"
+                );
+                assert_eq!(
+                    s.engine.control.fixed_count(),
+                    u64::from(action == "correction")
+                );
+                if action == "correction" {
+                    let unfinished = if separator.is_empty() {
+                        format!("{next}{later}")
+                    } else {
+                        later.to_owned()
+                    };
+                    assert_eq!(
+                        reading::<Simulated>(
+                            &s.engine.lock().keys,
+                            Simulated::current_layout().unwrap()
+                        ),
+                        unfinished
+                    );
+                    s.undo();
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("{typo} {next}{separator}{later}"));
+                }
+                assert_eq!(s.engine.control.undo_count(), 1);
+                crate::complete::unlist(typo);
+            }
+        }
+    }
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+}
+
+#[test]
+fn verified_undo_resumes_after_a_tracked_word_boundary() {
+    const CHILD: &str = "RECAST_VERIFIED_UNDO_BOUNDARY_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::verified_undo_resumes_after_a_tracked_word_boundary",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for space_during_undo in [false, true] {
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.type_text(if space_during_undo { "next" } else { "next " });
+        s.undo();
+        s.pending();
+        if space_during_undo {
+            s.type_text(" ");
+        }
+        s.finish();
+        assert_eq!(s.text(), "recieve next ");
+        s.type_text("keyboad ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve next keyboard ");
+        crate::complete::unlist("recieve");
+    }
+}
+
+#[test]
+fn verified_undo_preserves_the_source_layout_of_buffered_text() {
+    const CHILD: &str = "RECAST_VERIFIED_UNDO_LAYOUT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::verified_undo_preserves_the_source_layout_of_buffered_text"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    for ending in ["", " "] {
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("akuo ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "שלום ");
+        s.type_text(&crate::keymap::convert_selection("עוד"));
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *LAYOUT_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        s.undo();
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.type_text(&crate::keymap::convert_selection(&format!(" קצת{ending}")));
+        proceed.send(()).unwrap();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), format!("akuo עוד קצת{ending}"));
+        assert_eq!(Simulated::current_layout(), Some(Language::English));
+        assert!(s.engine.lock().keys.is_empty());
+        assert!(s.engine.lock().deletion_tail.is_none());
+        assert_eq!(s.engine.lock().no_fix, ending.is_empty());
+        if ending.is_empty() {
+            s.type_text(" ");
+        }
+        s.type_text("keyboad ");
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "akuo עוד קצת keyboard ");
+        crate::complete::unlist("akuo");
+    }
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("akuo ");
+    s.pending();
+    s.finish();
+    s.type_text(&crate::keymap::convert_selection("עוד"));
+    s.undo();
+    s.pending();
+    // Later input under the restored layout must not be read as old-layout text.
+    s.type_text("more");
+    s.finish();
+    assert_eq!(s.text(), "שלום עודmore");
+    assert_eq!(s.engine.control.undo_count(), 0);
+}
+
+#[test]
+fn verified_edits_reject_stale_buffered_text_and_context() {
+    const CHILD: &str = "RECAST_VERIFIED_BUFFER_CANCEL_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::verified_edits_reject_stale_buffered_text_and_context",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    fn waiting_undo<const VERIFY: bool>() -> SessionWithPolicy<true, VERIFY> {
+        let s = SessionWithPolicy::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.type_text("next");
+        s.undo();
+        s.pending();
+        s.type_text("more");
+        s
+    }
+    for cancel in [
+        "mismatch",
+        "enter",
+        "backspace",
+        "click",
+        "focus",
+        "secure",
+        "excluded",
+    ] {
+        let s = waiting_undo::<true>();
+        match cancel {
+            "mismatch" => s.engine.injector.text.lock().unwrap().push('!'),
+            "enter" => s.type_text("\n"),
+            "backspace" => s.backspace(),
+            "click" => s.engine.mouse_click(),
+            "focus" => FOCUS.store(2, Ordering::SeqCst),
+            "secure" => INPUT_ALLOWED.store(false, Ordering::SeqCst),
+            _ => *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()],
+        }
+        let expected = s.text();
+        s.finish();
+        assert_eq!(s.text(), expected, "{cancel}");
+        assert_eq!(s.engine.control.undo_count(), 0, "{cancel}");
+        assert!(!crate::complete::suppressed("recieve"), "{cancel}");
+        FOCUS.store(1, Ordering::SeqCst);
+        INPUT_ALLOWED.store(true, Ordering::SeqCst);
+    }
+    let s = waiting_undo::<false>();
+    s.finish();
+    assert_eq!(s.text(), "receive nextmore");
+    assert_eq!(s.engine.control.undo_count(), 0);
+}
+
+#[test]
 fn automatic_search_cancels_unsafe_suffixes_and_keeps_only_the_latest_word() {
     const CHILD: &str = "RECAST_SEARCH_CANCELLATION_TEST";
     if std::env::var_os(CHILD).is_none() {
@@ -3797,6 +4692,8 @@ fn automatic_search_cancels_unsafe_suffixes_and_keeps_only_the_latest_word() {
         "click",
         "backspace",
         "modifier",
+        "shift_ctrl",
+        "both_shifts",
         "bound",
         "focus",
         "layout",
@@ -3821,6 +4718,14 @@ fn automatic_search_cancels_unsafe_suffixes_and_keeps_only_the_latest_word() {
             "click" => s.engine.mouse_click(),
             "backspace" => s.backspace(),
             "modifier" => s.tap(Simulated::CTRL_LEFT),
+            "shift_ctrl" | "both_shifts" => {
+                s.engine.key_press(Simulated::SHIFT_LEFT);
+                s.engine.key_press(if cancel == "both_shifts" {
+                    Simulated::SHIFT_RIGHT
+                } else {
+                    Simulated::CTRL_LEFT
+                });
+            }
             "bound" => s.type_while_checking(&"x".repeat(29)),
             "focus" => FOCUS.store(2, Ordering::SeqCst),
             "layout" => SIMULATED_LAYOUT.store(1, Ordering::SeqCst),

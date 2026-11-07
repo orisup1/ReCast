@@ -217,6 +217,10 @@ Keyboard navigation and deletion into untracked text still suspend automatic
 correction until a word boundary, protecting incomplete editing fragments.
 Erasing an unfinished next word and its preceding spaces keeps the previous
 tracked word available for editing and correction.
+Words finished while another correction lands also remain available for
+suggestions and Backspace editing; undo still restores the earlier correction.
+When the earlier correction's undo window expires, explicit suggestions and
+layout conversion can still use the latest fully tracked finished word.
 
 | Action | Gesture or control |
 | --- | --- |
@@ -288,7 +292,8 @@ can leave both texts rather than risk deleting the original. See the
 [integration limits](integrations/README.md).
 App exclusions, pause/disabled state, and Secure Input still apply.
 
-Holding Shift for capitals or Ctrl for shortcuts does not trigger these gestures.
+Holding Shift for capitals keeps automatic correction active without requesting
+suggestions. Ctrl chords remain ordinary shortcuts.
 **Settings > Shortcuts > Undo only** can additionally enable a single tap of
 Left Ctrl or Right Ctrl. The configured double-tap action remains available unless disabled. Holding Ctrl or using
 it in a chord never triggers the extra shortcut; the same cursor/focus safeguards
@@ -304,6 +309,10 @@ correction to finish; later typing or cursor movement still cancels the queued u
 macOS and Windows native Edit/RichEdit controls prefer a verified range replacement
 when the field supports it, preserving surrounding text and formatting. Other
 fields use keyboard events.
+Verified correction and undo preserve text typed while their worker is waiting
+to edit. Undo uses the captured source layout to keep that text verbatim even
+when restoring another keyboard layout. A tracked trailing Space lets the next
+word correct normally without an extra warmup Space.
 During the destructive part of a macOS rewrite, keyboard events and mouse button
 events wait briefly until the replacement is complete, then replay in their original
 order. This keeps continued typing from canceling a partly erased word. Unsafe queued

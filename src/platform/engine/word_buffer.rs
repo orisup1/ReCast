@@ -252,6 +252,7 @@ pub struct AppState<P: Platform> {
     pub(super) suggestion_worker: bool,
     pub(super) word_check: Option<super::correction_pipeline::WordCheck<P>>,
     pub(super) word_check_worker: bool,
+    /// Non-Shift presses, Shift chords, and deliberate taps; typing Shift adds no text event.
     pub(super) press_revision: u64,
     pub(super) pending_learning: Option<PendingLearning>,
     pub(super) phrase: crate::complete::PhraseContext,
@@ -269,7 +270,7 @@ pub struct AppState<P: Platform> {
     pub(super) last_key_at: SystemTime,
     /// Incremented whenever the cursor or text can no longer be trusted.
     pub(super) generation: u64,
-    /// Text/cursor changes and modifier events invalidate an in-flight query.
+    /// Text/cursor changes, command modifiers, and deliberate taps invalidate queries.
     pub(super) revision: u64,
     pub(super) focus: Option<P::Focus>,
     pub(super) no_fix: bool,

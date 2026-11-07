@@ -194,7 +194,7 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// terminator if there is one, and replay any keys the user got in
     /// meanwhile.
     ///
-    /// Returns those replayed keys, which the shared caller needs: keys typed
+    /// Returns those preserved keys, which the shared caller needs: keys typed
     /// during a replacement have moved the cursor on, and undo erases backwards
     /// from the cursor.
     fn inject(

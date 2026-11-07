@@ -158,8 +158,16 @@ impl<P: Platform> Engine<P> {
         if st.duplicate_press(key, repeat, timestamp, P::DEDUP_WINDOW) {
             return;
         }
-        st.revision = st.revision.wrapping_add(1);
-        st.press_revision = st.press_revision.wrapping_add(1);
+        let is_shift = key == P::SHIFT_LEFT || key == P::SHIFT_RIGHT;
+        let typing_shift = is_shift
+            && !st
+                .held_keys
+                .iter()
+                .any(|&held| held != key && P::is_modifier(held));
+        if !typing_shift {
+            st.revision = st.revision.wrapping_add(1);
+            st.press_revision = st.press_revision.wrapping_add(1);
+        }
         if self
             .control
             .word_rules_open
@@ -179,7 +187,6 @@ impl<P: Platform> Engine<P> {
         // change the text (paste, select-all, undo, etc.). The buffer no longer
         // matches what's on screen, so suppress the next correction.
         let is_modifier_key = P::is_modifier(key);
-        let is_shift = key == P::SHIFT_LEFT || key == P::SHIFT_RIGHT;
         let other_modifier_held = st.held_keys.iter().any(|&k| {
             P::is_modifier(k) && k != P::SHIFT_LEFT && k != P::SHIFT_RIGHT && k != P::CAPS_LOCK
         });
@@ -520,7 +527,8 @@ impl<P: Platform> Engine<P> {
         }
         st.sync_shortcuts(&config);
         // Ordinary releases change no text; do not cancel an in-flight focus check.
-        if P::is_modifier(key) {
+        let is_shift = key == P::SHIFT_LEFT || key == P::SHIFT_RIGHT;
+        if P::is_modifier(key) && (!is_shift || st.layout_hotkey) {
             st.revision = st.revision.wrapping_add(1);
         }
         st.held_keys.remove(&key);
@@ -549,6 +557,17 @@ impl<P: Platform> Engine<P> {
             || shortcut_matches::<P>(&config.undo_shortcut, key);
         let is_completion = shortcut_matches::<P>(&config.completion_shortcut, key);
         let is_correction = shortcut_matches::<P>(&config.correction_shortcut, key);
+        if is_shift
+            && ((is_action && st.action_down.is_some_and(|down| down.elapsed() <= TAP_MAX))
+                || ((is_completion || is_correction)
+                    && st
+                        .completion_down
+                        .is_some_and(|down| down.elapsed() <= TAP_MAX)))
+        {
+            // A deliberate Shift tap takes priority over pending automatic work.
+            st.revision = st.revision.wrapping_add(1);
+            st.press_revision = st.press_revision.wrapping_add(1);
+        }
         if !is_action && !is_completion && !is_correction && !config.personal_enabled {
             return;
         }

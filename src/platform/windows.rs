@@ -584,17 +584,15 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
     }
     engine.injector.store(true, Ordering::Relaxed);
     let buf = engine.buffered();
-    if let Some(check) = &verify {
-        // A verified replacement must land atomically or not at all; input
-        // that arrived while the worker was queued moves the caret.
-        if !buf.is_empty() {
-            return None;
-        }
+    if let Some(source_layout) = verify {
+        let suffix = engine::reading::<Windows>(&buf, source_layout);
+        let expected = format!("{expected}{suffix}");
+        let replacement = format!("{text}{suffix}");
         let focus = Windows::focus()?;
-        super::windows_selection::replace_expected_suffix(focus, check, &text, || {
-            engine.replacement_valid(generation) && engine.buffered().is_empty()
+        super::windows_selection::replace_expected_suffix(focus, &expected, &replacement, || {
+            engine.replacement_valid(generation) && engine.buffered().len() == buf.len()
         })?;
-        return Some(Vec::new());
+        return Some(buf);
     }
     if let Some(layout) = Windows::current_layout() {
         let suffix = engine::reading::<Windows>(&buf, layout);

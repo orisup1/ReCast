@@ -409,7 +409,7 @@ impl<P: Platform> Engine<P> {
             self.start_replacement(
                 st,
                 Plan {
-                    verify: extended.then(|| expected.clone()),
+                    verify: extended.then_some(rep.target_layout),
                     expected,
                     erase,
                     retype: rep.retype,
@@ -1195,12 +1195,12 @@ impl<P: Platform> Engine<P> {
             P::append_retype(&mut retype, tail);
         }
         let extended = suffix.chars().any(|ch| ch != ' ');
-        let verify = extended.then(|| expected.clone());
+        let verify = extended.then_some(fix.visible_layout);
         let keep = if extended {
             // The restored word/layout can change the meaning of tracked key positions.
-            // Resume automatic tracking at the next boundary, never reuse stale keys.
+            // A trailing Space already establishes a safe boundary for fresh typing.
             st.keys.clear();
-            st.no_fix = true;
+            st.no_fix = !suffix.ends_with(' ');
             Vec::new()
         } else {
             fix.keep
