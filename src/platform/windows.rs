@@ -32,6 +32,7 @@ thread_local! {
 
 pub struct Windows;
 impl Platform for Windows {
+    const VERIFIED_REPLACEMENT: bool = true;
     type Key = Key;
     type Retype = String;
     type Injector = AtomicBool;
@@ -571,7 +572,7 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
         erase,
         retype: text,
         terminator,
-        expected: _expected,
+        expected,
         verify,
     } = plan;
     if terminator == Some(Key::Return) {
@@ -594,6 +595,22 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
             engine.replacement_valid(generation) && engine.buffered().is_empty()
         })?;
         return Some(Vec::new());
+    }
+    if let Some(layout) = Windows::current_layout() {
+        let suffix = engine::reading::<Windows>(&buf, layout);
+        let replacement = format!(
+            "{text}{}{suffix}",
+            if terminator.is_some() { " " } else { "" }
+        );
+        let expected = format!("{expected}{suffix}");
+        let focus = Windows::focus()?;
+        if super::windows_selection::replace_expected_suffix(focus, &expected, &replacement, || {
+            engine.replacement_valid(generation) && engine.buffered().len() == buf.len()
+        })
+        .is_some()
+        {
+            return Some(buf);
+        }
     }
     let mut inputs = replacement_inputs(erase, &text, terminator, &buf);
     if !engine.replacement_valid(generation) {

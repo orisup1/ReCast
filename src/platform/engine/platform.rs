@@ -69,6 +69,9 @@ pub trait Platform: Sized + Send + Sync + 'static {
         false
     }
 
+    /// Whether this backend can require an exact native suffix match before editing.
+    const VERIFIED_REPLACEMENT: bool = false;
+
     /// Selected text is read only on an explicit gesture, never during typing.
     fn selection(_focus: &Self::Focus) -> Option<Selection> {
         None

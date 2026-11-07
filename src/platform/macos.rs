@@ -11,6 +11,7 @@ type Typed = engine::Typed<Key>;
 
 pub struct Mac;
 impl Platform for Mac {
+    const VERIFIED_REPLACEMENT: bool = true;
     type Key = Key;
     type Retype = String;
     type Injector = AtomicBool;
@@ -1289,8 +1290,13 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         return Some(buf);
     }
     // Prefer a single native text edit when the control exposes a writable range.
-    if buf.is_empty() {
-        let replacement = format!("{text}{}", if terminator.is_some() { " " } else { "" });
+    if let Some(layout) = Mac::current_layout() {
+        let suffix = engine::reading::<Mac>(&buf, layout);
+        let replacement = format!(
+            "{text}{}{suffix}",
+            if terminator.is_some() { " " } else { "" }
+        );
+        let expected = format!("{expected}{suffix}");
         if replace_expected_suffix(engine, &focus, &expected, &replacement, generation).is_some() {
             return Some(buf);
         }

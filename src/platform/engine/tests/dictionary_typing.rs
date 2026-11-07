@@ -77,8 +77,8 @@ fn session(language: Language) -> Session {
 }
 
 fn settle(session: &Session) {
-    // Word checking is synchronous; only the scheduled replacement runs on a
-    // worker. Its injector waits at this gate until native input is on screen.
+    // Session typing waits for dictionary work. The scheduled replacement waits
+    // at this gate until the captured input is on screen.
     if session.engine.lock().is_replacing {
         session.pending();
         session.finish();

@@ -13,6 +13,11 @@ clipboard is never touched.
 ## How it works
 
 ReCast checks words when you finish them with Space, preserving trailing punctuation.
+Automatic searches run off the keyboard capture thread, so a slow lookup does not
+hold up your next keystroke. Supported macOS and Windows native fields can apply a
+same-layout spelling fix after up to 32 following characters, preserving that text
+and undo; the full suffix must still match. Extra spaces also preserve pending
+correction. Navigation, submission, and layout changes still cancel stale work.
 It uses the current keyboard layout, dictionary matches, and word frequency to decide
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
 the terminator are preserved. Same-layout corrections keep an unchanged prefix
@@ -296,8 +301,9 @@ for the session; undo counts are saved in `learned.txt`, and two occasions make 
 exception survive restarts. Allowing the word again clears its saved exception.
 On macOS, an undo gesture completed while a correction is landing waits for that
 correction to finish; later typing or cursor movement still cancels the queued undo.
-macOS prefers a verified native range replacement when the field supports it,
-preserving surrounding text and formatting. Other fields use paced keyboard events.
+macOS and Windows native Edit/RichEdit controls prefer a verified range replacement
+when the field supports it, preserving surrounding text and formatting. Other
+fields use keyboard events.
 During the destructive part of a macOS rewrite, keyboard events and mouse button
 events wait briefly until the replacement is complete, then replay in their original
 order. This keeps continued typing from canceling a partly erased word. Unsafe queued

@@ -53,8 +53,9 @@ not itself establish a runtime bottleneck. The ignored `benchmark_engine_typing`
 test exercises real press/release handlers with simulated focus and the English
 word `keyboard`. It reports letter and Space latency separately after 100 warmup
 words, with 20,000 measured words and personalization disabled. Letter samples
-are averages across the word's eight press/release pairs. Space includes automatic
-planning for an unchanged known word. Assertions check that no replacement was
+are averages across the word's eight press/release pairs. Space now measures
+scheduling an automatic check; the fixture waits for search outside that timing.
+Assertions check that no replacement was
 scheduled and that the word buffer was cleared. It does not measure native focus
 queries, misspelling search, layout changes, or on-screen injection.
 
@@ -62,7 +63,7 @@ queries, misspelling search, layout changes, or on-screen injection.
 cargo test --locked --release benchmark_engine_typing -- --ignored --nocapture --test-threads=1
 ```
 
-Three consecutive local Apple Silicon macOS release runs measured letter-pair
+Before automatic search moved off capture, three consecutive local Apple Silicon macOS release runs measured letter-pair
 p50 values of 312–333 ns and Space-pair p50 values of 11.167–11.917 µs. These are
 synthetic steady-state measurements, not native keyboard-to-screen latency or a
 controlled before/after comparison. A CPU flamegraph was not captured in this
@@ -99,6 +100,11 @@ Apple describes [executable paging and virtual memory](https://developer.apple.c
 Automatic correction starts only on Space, after a word is finished. Enter clears
 context without an automatic rewrite. Continued typing during replacement is
 buffered and replayed, with cancellation for stale focus or cursor context.
+Automatic search uses one worker with at most one waiting word. Supported native
+fields can verify a same-layout correction across a bounded freshly typed suffix;
+older completed words and unverifiable suffixes are left untouched. Native macOS
+and Windows replacement includes tracked buffered text when it matches, avoiding
+erasure/replay where a verified edit is available.
 Adding an idle debounce would change when edits can safely land after the cursor
 has advanced; it requires a measured problem and coverage for replay, undo, focus,
 and layout races. No debounce or injection delay was added in the module split.
@@ -111,11 +117,11 @@ and layout races. No debounce or injection delay was added in the module split.
    string slices could remove the temporary vector allocations. Keep Unicode
    boundaries and candidate deduplication intact; benchmark Hebrew as well as
    English.
-2. **Automatic search scheduling.** Finished-word search now runs outside the
-   typing-state mutex on an owned snapshot. Press revision, generation, focus,
-   mode, and layout are checked before applying it; releases do not invalidate
-   the search. Search still runs on the caller thread. Moving it off the native
-   event callback would need separate ordered scheduling and replay tests.
+2. **Native capture latency.** Automatic dictionary search now runs off capture,
+   with stale-work and continuation tests. Focus queries still run on the capture
+   path at word boundaries and the start of a new word. Measure their desktop
+   latency before changing validation or introducing a cache that could weaken
+   focus and application-exclusion guarantees.
 3. **Phrase lookup allocation.** `PhraseContext::boost` clones the previous word
    and allocates the candidate to look up a tuple key. Nested maps with borrowed
    string lookups could avoid those allocations. Preserve the 256-pair limit,

@@ -1,7 +1,7 @@
 //! Automatic correction, explicit suggestions, and replacement planning.
 
 use super::injection::{Commit, RetryContext};
-use super::word_buffer::{hebrew_char, non_empty, MAX_UNDO_SPACES};
+use super::word_buffer::{hebrew_char, non_empty, MAX_UNDO_SPACES, MAX_UNDO_SUFFIX};
 use super::{
     reading, AppState, Cycle, Engine, LastAction, LastFix, LastSkip, Plan, Platform, Typed,
 };
@@ -11,6 +11,19 @@ use crate::dictionary::{
 };
 use crate::types::{FixKind, Language};
 use std::sync::{Arc, MutexGuard};
+
+pub(super) struct WordCheck<P: Platform> {
+    keys: Vec<Typed<P::Key>>,
+    key: P::Key,
+    shift: bool,
+    focus: Option<P::Focus>,
+    run: crate::dictionary::Run,
+    mode: crate::config::AppMode,
+    phrase: crate::complete::PhraseContext,
+    layout: Option<Language>,
+    generation: u64,
+    presses: u64,
+}
 
 pub(super) fn completion_correction(
     from: &str,
@@ -193,15 +206,59 @@ impl<P: Platform> Engine<P> {
             st.phrase.clear();
             return;
         }
-        let keys = st.keys.to_vec();
-        let run = st.history.run();
-        let mode = st.mode;
-        let phrase = st.phrase.clone();
         let layout = P::current_layout();
-        let generation = st.generation;
-        let presses = st.press_revision;
+        if st.last_action.is_none() {
+            st.last_action = Some(LastAction::Unchanged {
+                keys: st.keys.to_vec(),
+                terminator: Some(key),
+                trailing_spaces: Vec::new(),
+                layout,
+            });
+        }
+        // shortcut: retain only the newest waiting word; older words need validated caret ranges.
+        st.word_check = Some(WordCheck {
+            keys: st.keys.to_vec(),
+            key,
+            shift,
+            focus,
+            run: st.history.run(),
+            mode: st.mode,
+            phrase: st.phrase.clone(),
+            layout,
+            generation: st.generation,
+            presses: st.press_revision,
+        });
         st.keys.clear();
+        if st.word_check_worker {
+            return;
+        }
+        st.word_check_worker = true;
         drop(st);
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            let mut st = engine.lock();
+            let Some(check) = st.word_check.take() else {
+                st.word_check_worker = false;
+                return;
+            };
+            drop(st);
+            engine.check_word(check);
+        });
+    }
+
+    fn check_word(self: &Arc<Self>, check: WordCheck<P>) {
+        let WordCheck {
+            keys,
+            key,
+            shift,
+            focus,
+            run,
+            mode,
+            phrase,
+            layout,
+            generation,
+            presses,
+        } = check;
         #[cfg(test)]
         super::tests::pause_word_check();
         // Pure search must not block releases or cancellation on the state lock.
@@ -219,15 +276,39 @@ impl<P: Platform> Engine<P> {
             |_| crate::layout::LayoutSwitch::Switched,
         );
         let st = self.lock();
-        if st.generation != generation || st.press_revision != presses {
+        // The retained deletion tail contains any extra spaces before the next word.
+        let spaces = |st: &AppState<P>| {
+            st.deletion_tail
+                .as_ref()
+                .map_or(0, |tail| tail.len().saturating_sub(keys.len() + 1))
+        };
+        // Only freshly captured text and spaces may follow the checked word.
+        // Deletion, gestures and cursor changes still make its snapshot stale.
+        let current = |st: &AppState<P>| {
+            st.generation == generation
+                && st.press_revision.wrapping_sub(presses) == (spaces(st) + st.keys.len()) as u64
+                && spaces(st) + st.keys.len() <= MAX_UNDO_SUFFIX
+                && st
+                    .deletion_tail
+                    .iter()
+                    .flatten()
+                    .skip(keys.len() + 1)
+                    .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))
+                && !st.is_replacing
+        };
+        if !current(&st) {
             return;
         }
         let revision = st.revision;
+        let focus_presses = st.press_revision;
         drop(st);
         // An obsolete search must not invalidate text captured during its focus query.
         let (current_focus, current_mode) = self.read_focus();
+        let current_layout = P::current_layout();
         let mut st = self.lock();
-        if st.generation != generation || st.revision != revision || st.press_revision != presses {
+        if !current(&st)
+            || st.revision.wrapping_sub(revision) != st.press_revision.wrapping_sub(focus_presses)
+        {
             return;
         }
         if current_mode != Some(mode) {
@@ -237,7 +318,7 @@ impl<P: Platform> Engine<P> {
         if st.focus != current_focus
             || current_focus != focus
             || st.mode != mode
-            || P::current_layout() != layout
+            || current_layout != layout
             || st.is_replacing
             || !self.control.is_enabled()
         {
@@ -252,7 +333,26 @@ impl<P: Platform> Engine<P> {
             st.phrase.clear();
         }
 
-        st.keys.extend(keys);
+        let keep = st.keys.to_vec();
+        let mut following: Vec<_> = st
+            .deletion_tail
+            .iter()
+            .flatten()
+            .skip(keys.len() + 1)
+            .copied()
+            .collect();
+        following.extend_from_slice(&keep);
+        let extended = !keep.is_empty();
+        let note = outcome.fix.as_ref().map(|fix| note_of::<P>(&keys, fix));
+        let rep = replacement::<P>(&keys, outcome.fix);
+        if extended
+            && rep
+                .as_ref()
+                .is_some_and(|rep| !P::VERIFIED_REPLACEMENT || rep.previous_layout.is_some())
+        {
+            // Later keys may span a layout switch; do not guess their visible text.
+            return;
+        }
 
         // Record what this word turned out to be before anything else happens
         // to it: the next word is decided with this one behind it. A word whose
@@ -262,49 +362,60 @@ impl<P: Platform> Engine<P> {
             st.history.push(lang);
         }
         let details = format!("Reason: {}\n{}", outcome.reason, outcome.details);
-        let result = outcome.fix;
         let rule = outcome.rule;
         let abstain = outcome.abstain;
-        // Describe the fix for the history before `replacement` consumes it.
-        let note = result.as_ref().map(|fix| note_of::<P>(&st.keys, fix));
-        if let Some(rep) = replacement::<P>(&st.keys, result) {
-            let mut undo = undo_of::<P>(&st.keys, &rep, Some(key));
+        if let Some(mut rep) = rep {
+            let mut undo = undo_of::<P>(&keys, &rep, Some(key));
             undo.rule = rule;
             undo.learning_pair = note
                 .as_ref()
                 .map(|(from, to, _)| (from.clone(), to.clone()));
             // +1 for the terminator the user physically typed, which is erased
             // along with the word and pressed again afterwards.
-            let erase = rep.erase + 1;
+            let erase = rep.erase + 1 + following.len();
             let deferred_layout = rep.previous_layout.map(|_| rep.target_layout);
             let mut retry =
                 RetryContext::capture(&st, Some(rep.previous_layout.unwrap_or(rep.target_layout)));
-            retry.keys.clear();
-            retry.last_action = Some(LastAction::Unchanged {
-                keys: st.keys.to_vec(),
-                terminator: Some(key),
-                trailing_spaces: Vec::new(),
-                layout: Some(rep.previous_layout.unwrap_or(rep.target_layout)),
-            });
-            let source = reading::<P>(&st.keys, rep.previous_layout.unwrap_or(rep.target_layout));
+            if following.is_empty() {
+                retry.keys.clear();
+                retry.last_action = Some(LastAction::Unchanged {
+                    keys: keys.clone(),
+                    terminator: Some(key),
+                    trailing_spaces: Vec::new(),
+                    layout: Some(rep.previous_layout.unwrap_or(rep.target_layout)),
+                });
+            }
+            let source = reading::<P>(&keys, rep.previous_layout.unwrap_or(rep.target_layout));
+            let suffix = reading::<P>(&following, rep.target_layout);
             let expected = format!(
-                "{} ",
+                "{} {suffix}",
                 source
                     .chars()
-                    .skip(st.keys.len() - rep.erase)
+                    .skip(keys.len() - rep.erase)
                     .collect::<String>()
             );
+            let continued = !following.is_empty();
+            if continued {
+                let mut tail = vec![Typed { key, shift }];
+                tail.extend_from_slice(&following);
+                P::append_retype(
+                    &mut rep.retype,
+                    P::retype_original(&tail, rep.target_layout),
+                );
+                undo.suffix = suffix;
+                undo.trailing_spaces = following.iter().take(spaces(&st)).copied().collect();
+            }
             st.keys.clear();
             self.start_replacement(
                 st,
                 Plan {
+                    verify: extended.then(|| expected.clone()),
                     expected,
                     erase,
                     retype: rep.retype,
-                    terminator: Some(key),
-                    verify: None,
+                    terminator: (!continued).then_some(key),
                 },
-                Vec::new(),
+                keep,
                 Some(undo),
                 note.map(|(from, to, kind)| Commit::Fix {
                     from,
@@ -324,12 +435,12 @@ impl<P: Platform> Engine<P> {
                 crate::personal::record_abstain(abstain);
             }
             if let Some(lang) = outcome.lang {
-                crate::personal::record_word(&reading::<P>(&st.keys, lang));
+                crate::personal::record_word(&reading::<P>(&keys, lang));
             }
             // Phrase context describes the visible text, even for words whose
             // keystrokes happen to be valid in both languages (for example "my").
-            if let Some(lang) = P::current_layout() {
-                let word = reading::<P>(&st.keys, lang);
+            if let Some(lang) = current_layout {
+                let word = reading::<P>(&keys, lang);
                 st.retain_phrase_word(&word);
             } else {
                 st.phrase.clear();
@@ -339,14 +450,18 @@ impl<P: Platform> Engine<P> {
             st.phrase.clear();
         }
 
+        if !following.is_empty() {
+            return;
+        }
+
         if let Some(word) = (!st.practice)
             .then(|| {
                 declined_by_list(
-                    &st.keys,
+                    &keys,
                     |t: Typed<P::Key>| P::english_char(t.key, t.shift),
                     hebrew_char::<P>,
                     |t: Typed<P::Key>| t.shift,
-                    P::current_layout(),
+                    current_layout,
                 )
             })
             .flatten()
@@ -354,19 +469,19 @@ impl<P: Platform> Engine<P> {
             // Nothing happened to this word, and the only reason is that the
             // user has it listed. Keep it available for explicit conversion.
             st.last_action = Some(LastAction::Skipped(LastSkip {
-                keys: st.keys.to_vec(),
+                keys: keys.clone(),
                 terminator: Some(key),
                 trailing_spaces: Vec::new(),
-                layout: P::current_layout(),
+                layout: current_layout,
                 word,
             }));
         }
         if st.last_action.is_none() {
             st.last_action = Some(LastAction::Unchanged {
-                keys: st.keys.to_vec(),
+                keys,
                 terminator: Some(key),
                 trailing_spaces: Vec::new(),
-                layout: P::current_layout(),
+                layout: current_layout,
             });
         }
         st.keys.clear();

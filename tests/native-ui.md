@@ -135,6 +135,13 @@ reported as native acceptance or measured end-to-end typing latency.
 
 ## Fluid correction regression checks
 
+- Type a mixed-language draft continuously, including `recieve next` and several
+  extra spaces after a typo. Do not pause to let correction finish. In supported
+  native fields, a delayed same-layout spelling fix must preserve the following
+  text and remain undoable. Check Hebrew spelling too. Repeat in unsupported
+  fields: a missed fix is acceptable; blind deletion of later text is not.
+  Enter, navigation, focus changes, and layout changes during lookup must cancel
+  stale edits. Record correction misses separately from corruption and latency.
 - In TextEdit plain and rich text, correct a word in the middle of a document.
   Check that surrounding formatting, text, and caret survive native replacement.
   Repeat in a control without writable Accessibility text ranges; keyboard fallback
