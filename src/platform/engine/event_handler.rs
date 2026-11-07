@@ -33,10 +33,15 @@ impl<P: Platform> Engine<P> {
         &'a self,
         st: MutexGuard<'a, AppState<P>>,
     ) -> Option<FocusSnapshot<'a, P>> {
+        let generation = st.generation;
         let revision = st.revision;
         drop(st);
         let (focus, mode) = self.read_focus();
         let mut st = self.lock();
+        // A canceled query must not discard a newer cursor context.
+        if st.generation != generation {
+            return None;
+        }
         if st.revision != revision || matches!(mode, None | Some(crate::config::AppMode::Off)) {
             st.invalidate_text();
             return None;
@@ -454,6 +459,7 @@ impl<P: Platform> Engine<P> {
                     st.start_new_context();
                 }
                 st.focus = focus;
+                let generation = st.generation;
                 let revision = st.revision;
                 let suppressed = st.no_fix;
                 let practice = st.practice;
@@ -464,6 +470,9 @@ impl<P: Platform> Engine<P> {
                     && (!self.control.has_app_rules() || practice)
                     && P::input_empty(&self.injector);
                 st = self.lock();
+                if st.generation != generation {
+                    return;
+                }
                 if st.revision != revision {
                     st.invalidate_text();
                     return;

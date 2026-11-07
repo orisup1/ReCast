@@ -27,6 +27,7 @@ struct FocusGate {
     proceed: mpsc::Receiver<()>,
 }
 static FOCUS_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
+static EMPTY_INPUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static LAYOUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static INJECT_RETURN_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static CHECK_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
@@ -188,6 +189,11 @@ impl<const QUEUE_UNDO: bool> Platform for SimulatedPlatform<QUEUE_UNDO> {
         Some(after)
     }
     fn input_empty(screen: &Screen) -> bool {
+        let gate = EMPTY_INPUT_GATE.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.ready.send(()).unwrap();
+            gate.proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
         EMPTY_INPUT_SUPPORTED.load(Ordering::SeqCst) && screen.text.lock().unwrap().is_empty()
     }
     fn current_layout() -> Option<Language> {
@@ -1946,6 +1952,102 @@ fn finished_words_remain_available_to_explicit_suggestions() {
     s.finish();
     assert_eq!(s.text(), "KEYB");
     assert!(!s.engine.lock().caps_lock);
+}
+
+#[test]
+fn stale_context_replies_preserve_newer_typing_and_correction() {
+    const CHILD: &str = "RECAST_STALE_CONTEXT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::stale_context_replies_preserve_newer_typing_and_correction",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for query in ["focus", "empty"] {
+        for newer in ["word", "replacement", "suppressed", "overlap"] {
+            let s = Session::new();
+            if query == "empty" {
+                s.engine.forget_everything();
+            }
+            let (ready, reached) = mpsc::sync_channel(0);
+            let (proceed, resume) = mpsc::channel();
+            let gate = if query == "focus" {
+                &FOCUS_GATE
+            } else {
+                &EMPTY_INPUT_GATE
+            };
+            *gate.lock().unwrap() = Some(FocusGate {
+                ready,
+                proceed: resume,
+            });
+            let engine = Arc::clone(&s.engine);
+            let worker = thread::spawn(move || engine.key_press('x'));
+            reached.recv_timeout(Duration::from_secs(3)).unwrap();
+            s.engine.injector.text.lock().unwrap().push('x');
+            s.engine.key_release('x');
+            // A click starts a fresh field while the old target is still replying.
+            if newer != "overlap" {
+                s.engine.mouse_click();
+                s.engine.injector.text.lock().unwrap().clear();
+            }
+            if newer == "suppressed" {
+                s.engine.injector.text.lock().unwrap().push_str("prefix");
+                s.tap('\x10');
+            }
+            s.type_text("recieve");
+            if newer == "replacement" {
+                s.type_text(" ");
+                s.pending();
+            }
+            let (generation, revision) = {
+                let st = s.engine.lock();
+                (st.generation, st.revision)
+            };
+            proceed.send(()).unwrap();
+            worker.join().unwrap();
+            if newer == "overlap" {
+                // Without a new context, the delayed first key leaves an unknown prefix.
+                assert!(s.engine.lock().no_fix);
+                assert!(s.engine.lock().keys.is_empty());
+                s.type_text(" ");
+                assert!(s.ready.try_recv().is_err());
+                assert_eq!(s.text(), "xrecieve ");
+                continue;
+            }
+            {
+                let st = s.engine.lock();
+                assert_eq!(st.generation, generation, "{query}: {newer}");
+                assert_eq!(st.revision, revision, "{query}: {newer}");
+                assert_eq!(st.no_fix, newer == "suppressed");
+                if newer != "replacement" {
+                    assert_eq!(reading::<Simulated>(&st.keys, Language::English), "recieve");
+                }
+            }
+            if newer != "replacement" {
+                s.type_text(" ");
+                if newer == "suppressed" {
+                    assert!(s.ready.try_recv().is_err());
+                    assert_eq!(s.text(), "prefixrecieve ");
+                    continue;
+                }
+                s.pending();
+            }
+            s.finish();
+            assert_eq!(s.text(), "receive ");
+            assert_eq!(s.engine.control.fixed_count(), 1);
+        }
+    }
 }
 
 #[test]

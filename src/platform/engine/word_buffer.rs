@@ -267,7 +267,7 @@ pub struct AppState<P: Platform> {
     pub(super) last_key_at: SystemTime,
     /// Incremented whenever the cursor or text can no longer be trusted.
     pub(super) generation: u64,
-    /// Every input event, including releases, invalidates an in-flight query.
+    /// Text/cursor changes and modifier events invalidate an in-flight query.
     pub(super) revision: u64,
     pub(super) focus: Option<P::Focus>,
     pub(super) no_fix: bool,

@@ -206,6 +206,8 @@ After cursor movement, an explicit request can complete, correct, or convert the
 keys typed since that movement. Previously existing text stays untouched;
 clicking or starting in a newly focused target allows the first freshly typed
 word to be corrected automatically. No warmup word or Ctrl double tap is needed.
+Late focus or empty-field replies from an earlier cursor context cannot discard
+typing or cancel a correction in the new context.
 Keyboard navigation and deletion into untracked text still suspend automatic
 correction until a word boundary, protecting incomplete editing fragments.
 

@@ -103,3 +103,29 @@ submission behavior. They improve existing interactions without asking users to
 pause, add separators, or learn another workflow. Concurrent text during dictionary
 search remains a separate limitation; this change only removes cancellation caused
 by harmless releases. Native desktop timing still requires live validation.
+
+## Follow-up pass 3: changing fields during a slow desktop reply
+
+The renewed review followed automatic correction, explicit spelling and completion,
+manual layout recovery, undo, and editing after navigation. A shared context query
+could undo the benefit of immediate fresh-field capture: after a click and new
+typing, a late focus or empty-field reply from the old cursor context cleared the
+new word buffer and suppressed correction. It could also cancel a newer correction
+that was already queued. Users would then have to reach another boundary and try
+again, despite having typed a complete word in the new field.
+
+Both query paths now discard replies whose cursor-context generation has changed
+before touching current state. This covers focus validation used by typing,
+undo, and preview acceptance, plus the empty-field check used to resume capture.
+The regression failed before the fix, then passed for both query paths with a new
+word still being typed, a correction already pending, and navigation suppression
+already established. It also checks that overlapping keys without a new context
+still suppress automatic correction: a delayed first key cannot turn an unknown
+prefix into a trusted word.
+
+This removes an avoidable retry without changing correction confidence, shortcuts,
+or the set of supported native controls. It does not solve sentence submission,
+untracked pasted text, or text arriving during dictionary search. Those still need
+validated native context rather than another demo gesture. The tests simulate
+delayed desktop replies; they do not establish live application timing or correction
+recall during everyday use.
