@@ -2243,6 +2243,62 @@ fn suggestion_taps_allow_typing_rollover_but_not_chords() {
 }
 
 #[test]
+fn undoing_conversion_after_space_keeps_the_next_word_separate() {
+    const CHILD: &str = "RECAST_CONVERSION_BOUNDARY_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::undoing_conversion_after_space_keeps_the_next_word_separate",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    crate::config::Config::update_live(|config| config.action_shortcut = "left_ctrl".into());
+    for finished_before_conversion in [false, true] {
+        for count in [1, 3] {
+            SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+            let s = Session::new();
+            let spaces = " ".repeat(count);
+            s.type_text("hello");
+            if finished_before_conversion {
+                s.type_text(&spaces);
+            }
+            s.tap(Simulated::CTRL_LEFT);
+            s.tap(Simulated::CTRL_LEFT);
+            s.pending();
+            s.finish();
+            if !finished_before_conversion {
+                s.type_text(&spaces);
+            }
+            assert_eq!(s.text(), format!("יקךךם{spaces}"));
+            s.undo();
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), format!("hello{spaces}"));
+            assert!(
+                s.engine.lock().keys.is_empty(),
+                "restored word is already finished"
+            );
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), format!("hello{spaces}receive "));
+            assert!(!crate::complete::suppressed("hello"));
+        }
+    }
+}
+
+#[test]
 fn suggestions_and_conversion_recover_without_retyping() {
     const CHILD: &str = "RECAST_RETRY_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {

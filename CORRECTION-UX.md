@@ -220,3 +220,25 @@ secure input, and application exclusions prevent stale edits. The first word can
 still miss correction when typing cancels its search; this change prevents that
 miss from disrupting the next word. Native timing and the earlier submission and
 context limitations still require separate validation.
+
+## Follow-up pass 8: continuing after conversion, Space, and undo
+
+Manually converting an unfinished word saved its original keys for undo, as
+expected. Adding Space afterward updated the visible undo suffix but left those
+keys marked as an unfinished prefix. Undo restored the right document text but
+also put the already finished word into the active typing buffer. The next word
+could then be checked as if it were concatenated with the restored word, despite
+the separator still being visible.
+
+The shared word-ending path now clears that saved prefix when Space finishes a
+conversion whose active buffer is already empty. Completion acceptance and spaces
+buffered during replacement already performed the same cleanup. Undo still
+restores the original layout, text, and exact spaces; no native edit or injection
+policy changed.
+
+The regression failed before the fix because undo left a finished word in the
+active buffer. It now covers conversion before or after the boundary, one or three
+spaces, undo, and automatic correction of the next word without touching the
+restored word. It also checks that manual conversion undo saves no exception.
+Native desktop timing and the earlier remaining limitations still need separate
+validation.

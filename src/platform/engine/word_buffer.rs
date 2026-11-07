@@ -83,8 +83,8 @@ pub struct LastFix<P: Platform> {
     /// erases this along with the correction and retypes it verbatim, so it
     /// must hold exactly the characters that reached the screen.
     pub(super) suffix: String,
-    /// Word buffer to leave behind: a completion's original prefix, empty for a
-    /// word the terminator already finished.
+    /// Word buffer after undo: the original unfinished prefix, empty once a
+    /// separator has finished the word.
     pub(super) keep: Vec<Typed<P::Key>>,
     /// The reading to stop correcting for the rest of the session. Undo that
     /// only rewrote the screen would be undone again by the next repetition of

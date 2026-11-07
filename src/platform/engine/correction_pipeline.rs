@@ -89,6 +89,9 @@ impl<P: Platform> Engine<P> {
                     .and_then(LastAction::trailing_spaces_mut)
                 {
                     spaces.push(Typed { key, shift });
+                    if let Some(LastAction::Fixed(fix)) = &mut st.last_action {
+                        fix.keep.clear();
+                    }
                 }
             }
             if let Some(tail) = &mut st.deletion_tail {
