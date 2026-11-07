@@ -216,12 +216,22 @@ impl<P: Platform> Engine<P> {
             |_| crate::layout::LayoutSwitch::Switched,
         );
         let st = self.lock();
-        let Some((mut st, current_focus)) = self.refresh_focus(st) else {
+        if st.generation != generation || st.press_revision != presses {
             return;
-        };
-        if st.generation != generation
-            || st.press_revision != presses
-            || st.focus != current_focus
+        }
+        let revision = st.revision;
+        drop(st);
+        // An obsolete search must not invalidate text captured during its focus query.
+        let (current_focus, current_mode) = self.read_focus();
+        let mut st = self.lock();
+        if st.generation != generation || st.revision != revision || st.press_revision != presses {
+            return;
+        }
+        if current_mode != Some(mode) {
+            st.invalidate_text();
+            return;
+        }
+        if st.focus != current_focus
             || current_focus != focus
             || st.mode != mode
             || P::current_layout() != layout
@@ -229,6 +239,14 @@ impl<P: Platform> Engine<P> {
             || !self.control.is_enabled()
         {
             return;
+        }
+        st.practice = self
+            .control
+            .practice_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && current_focus.as_ref().is_some_and(P::is_own_focus);
+        if st.practice || st.mode != crate::config::AppMode::Full {
+            st.phrase.clear();
         }
 
         st.keys.extend(keys);

@@ -3594,6 +3594,102 @@ fn completions_and_learning_require_retained_choices() {
 }
 
 #[test]
+fn late_correction_focus_check_preserves_next_word() {
+    const CHILD: &str = "RECAST_LATE_CORRECTION_FOCUS_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::late_correction_focus_check_preserves_next_word",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for newer in [
+        "word",
+        "replacement",
+        "enter",
+        "secure",
+        "focus",
+        "excluded",
+    ] {
+        let s = Session::new();
+        s.type_text("recieve");
+        let (check_ready, checking) = mpsc::sync_channel(0);
+        let (finish_check, resume_check) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready: check_ready,
+            proceed: resume_check,
+        });
+        let engine = Arc::clone(&s.engine);
+        let worker = thread::spawn(move || engine.key_press(' '));
+        checking.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.engine.injector.text.lock().unwrap().push(' ');
+        s.engine.key_release(' ');
+        let (focus_ready, focusing) = mpsc::sync_channel(0);
+        let (finish_focus, resume_focus) = mpsc::channel();
+        *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+            ready: focus_ready,
+            proceed: resume_focus,
+        });
+        finish_check.send(()).unwrap();
+        focusing.recv_timeout(Duration::from_secs(3)).unwrap();
+        match newer {
+            "word" => s.type_text("recieve"),
+            "replacement" => {
+                s.type_text("recieve ");
+                s.pending();
+            }
+            "enter" => s.type_text("\n"),
+            "secure" => INPUT_ALLOWED.store(false, Ordering::SeqCst),
+            "focus" => FOCUS.store(2, Ordering::SeqCst),
+            _ => *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()],
+        }
+        finish_focus.send(()).unwrap();
+        worker.join().unwrap();
+        if !matches!(newer, "word" | "replacement") {
+            assert!(s.ready.try_recv().is_err());
+            assert!(!s.engine.lock().is_replacing);
+            assert_eq!(s.engine.control.fixed_count(), 0);
+            if matches!(newer, "secure" | "excluded") {
+                assert!(s.engine.lock().no_fix);
+            }
+            assert_eq!(
+                s.text(),
+                if newer == "enter" {
+                    "recieve \n"
+                } else {
+                    "recieve "
+                }
+            );
+            INPUT_ALLOWED.store(true, Ordering::SeqCst);
+            FOCUS.store(1, Ordering::SeqCst);
+            continue;
+        }
+        if newer == "word" {
+            assert_eq!(
+                reading::<Simulated>(&s.engine.lock().keys, Language::English),
+                "recieve"
+            );
+            assert!(!s.engine.lock().no_fix);
+            s.type_text(" ");
+            s.pending();
+        }
+        s.finish();
+        assert_eq!(s.text(), "recieve receive ");
+        assert_eq!(s.engine.control.fixed_count(), 1);
+    }
+}
+
+#[test]
 fn typing_correction_undo_and_interrupted_replacements() {
     // Undo changes process-wide suppression and learning state. Run this
     // scenario alone so it cannot change the parallel corpus test's results.

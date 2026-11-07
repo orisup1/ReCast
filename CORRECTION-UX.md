@@ -196,3 +196,27 @@ Space, or with Space replayed during replacement. Each case also verifies the ne
 occurrence still autocorrects and no ignore or learned exception was saved. These
 are shared-engine simulations; native desktop behavior and the earlier remaining
 limitations still need separate validation.
+
+## Follow-up pass 7: continuous typing during final correction validation
+
+The automatic path reused physical-event focus validation after dictionary
+search. If the user started the next word during that final focus query, its
+revision change made the old check clear the newer word buffer and suppress
+correction. It could also cancel a correction for the next word that had already
+been queued. Unlike the earlier cross-field case, this occurred in the same
+cursor context, so the context-generation guard did not prevent it.
+
+Post-search validation now observes focus and checks snapshot freshness before
+changing state. An obsolete outcome is discarded without touching newer typing
+or replacement state; already obsolete searches also skip the extra focus query.
+Current mode, focus, layout, input revision, replacement state, and enablement
+checks still gate any edit. A current result in an unsafe or changed application
+mode still clears context, and practice accounting remains intact.
+
+The regression pauses search and then final focus validation. It failed before
+the fix because the next tracked word disappeared. It now verifies both ongoing
+typing and an already queued newer correction survive, while Enter, focus changes,
+secure input, and application exclusions prevent stale edits. The first word can
+still miss correction when typing cancels its search; this change prevents that
+miss from disrupting the next word. Native timing and the earlier submission and
+context limitations still require separate validation.
