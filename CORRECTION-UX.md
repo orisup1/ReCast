@@ -174,3 +174,25 @@ and ordinary correction after editing inside the recovered word, with empty-fiel
 probing disabled. Negative cases verify navigation, focus loss, and overlong text
 cannot reuse the older word. Live desktop timing, deeper edits, pasted context,
 and the submission/search limitations above remain outside this change.
+
+## Follow-up pass 6: keeping an original suggestion choice
+
+The direct replacement cycle offered the original text between pages but did not
+protect that choice from automatic correction. After browsing spelling or
+completion suggestions and returning to `recieve`, Space could immediately change
+it to `receive` again. Rejecting a suggestion therefore required another action.
+The passive macOS preview already protected an accepted original choice.
+
+A successful direct cycle now suppresses automatic correction for the current
+unfinished word when the user returns to its original text. This decision is made
+after replay restores the tracked word, so a Space already present or replayed
+during replacement does not suppress the next word instead. Choosing another
+candidate still establishes trusted text. No saved exception, learning change,
+confidence adjustment, or new gesture is involved.
+
+The regression reproduced the unwanted replacement on Space before the fix. It
+passes for spelling and completion with the original chosen before Space, after
+Space, or with Space replayed during replacement. Each case also verifies the next
+occurrence still autocorrects and no ignore or learned exception was saved. These
+are shared-engine simulations; native desktop behavior and the earlier remaining
+limitations still need separate validation.

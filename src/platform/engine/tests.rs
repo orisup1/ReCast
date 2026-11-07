@@ -5514,6 +5514,91 @@ fn suggestion_search_keeps_capture_responsive_and_cancels_stale_work() {
 }
 
 #[test]
+fn cycling_to_original_keeps_that_word_without_disabling_the_next() {
+    const CHILD: &str = "RECAST_KEEP_ORIGINAL_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::cycling_to_original_keeps_that_word_without_disabling_the_next",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for key in [Simulated::SHIFT_LEFT, Simulated::SHIFT_RIGHT] {
+        for boundary in ["unfinished", "finished", "buffered"] {
+            let s = Session::new();
+            crate::config::Config::update_live(|config| {
+                config.spell_enabled = boundary != "finished";
+            });
+            s.type_text(if boundary == "finished" {
+                "recieve "
+            } else {
+                "recieve"
+            });
+            crate::config::Config::update_live(|config| config.spell_enabled = true);
+            s.tap(key);
+            s.pending();
+            s.finish();
+            let choices = s
+                .engine
+                .lock()
+                .cycle
+                .as_ref()
+                .unwrap()
+                .candidates
+                .len()
+                .min(crate::complete::MAX_CANDIDATES);
+            for step in 0..choices {
+                s.tap(key);
+                s.pending();
+                if boundary == "buffered" && step + 1 == choices {
+                    // Replay a Space that reached the field while the original was returning.
+                    s.engine.injector.text.lock().unwrap().push(' ');
+                    s.engine.lock().buffered_keys.push(Typed {
+                        key: ' ',
+                        shift: false,
+                    });
+                }
+                s.finish();
+            }
+            assert_eq!(
+                s.text(),
+                if boundary == "unfinished" {
+                    "recieve"
+                } else {
+                    "recieve "
+                }
+            );
+            assert!(!crate::complete::suppressed("recieve"));
+            assert!(!crate::complete::learned("recieve"));
+            if boundary == "unfinished" {
+                s.type_text(" ");
+                assert!(
+                    !s.engine.lock().is_replacing,
+                    "Space overrode the original choice"
+                );
+                assert!(s.ready.try_recv().is_err());
+                assert_eq!(s.text(), "recieve ");
+            }
+            // Keeping one occurrence must not suppress automatic repair elsewhere.
+            s.type_text("recieve ");
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "recieve receive ");
+        }
+    }
+}
+
+#[test]
 fn spelling_preview_is_passive_and_commits_only_on_trusted_typing() {
     const CHILD: &str = "RECAST_PREVIEW_TEST";
     if std::env::var_os(CHILD).is_none() {

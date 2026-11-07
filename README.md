@@ -518,6 +518,9 @@ the cursor remains after its tracked spaces. Every choice and undo preserves
 those spaces; typing the next word accepts the choice without requiring another
 Space. Hebrew completion can attach supported prefixes to ranked dictionary
 stems or saved words even when the combined form has no separate dictionary entry.
+Choosing original text in either suggestion cycle keeps that occurrence unchanged
+on Space. It does not save an ignored word; later occurrences remain eligible for
+automatic correction.
 
 ### Application exclusions
 

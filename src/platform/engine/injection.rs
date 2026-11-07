@@ -419,11 +419,6 @@ impl<P: Platform> Engine<P> {
             st.invalidate_text();
         }
         if st.generation == generation {
-            if st.cycle.is_some() {
-                // An explicit successful edit establishes trusted text at the
-                // cursor, even if capture began after a click into an unknown field.
-                st.no_fix = false;
-            }
             if st
                 .cycle
                 .as_ref()
@@ -507,6 +502,10 @@ impl<P: Platform> Engine<P> {
             } else {
                 st.keys.replace_with(keep);
                 st.keys.extend(buffered.iter().copied());
+            }
+            // Respect an original-text choice until its boundary, without saving an exception.
+            if let Some(cycle) = &st.cycle {
+                st.no_fix = !st.keys.is_empty() && cycle.index >= cycle.candidates.len();
             }
             if !only_spaces {
                 if let Some(fix) = &mut undo {
