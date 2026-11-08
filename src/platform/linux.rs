@@ -25,6 +25,7 @@ pub struct Injector {
 
 /// Keep literal text alongside physical keys: verified undo may restore one
 /// layout while preserving a suffix typed under the other.
+#[derive(Clone)]
 pub struct Retype {
     keys: Vec<(KeyCode, bool)>,
     text: String,
@@ -815,6 +816,40 @@ fn emit_paced(
 }
 
 fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<Vec<Typed>> {
+    let mut buffered_len = 0;
+    for _ in 0..3 {
+        let attempt = Plan {
+            erase: plan.erase,
+            retype: plan.retype.clone(),
+            terminator: plan.terminator,
+            expected: plan.expected.clone(),
+            verify: plan.verify,
+        };
+        if let Some(buffered) = inject_once(engine, attempt, generation) {
+            return Some(buffered);
+        }
+        if Linux::injection_started(&engine.injector) || !engine.replacement_valid(generation) {
+            return None;
+        }
+        let buffered = engine.buffered();
+        if buffered.len() <= buffered_len
+            || buffered
+                .iter()
+                .any(|typed| !Linux::is_terminator(typed.key) || Linux::is_line_break(typed.key))
+        {
+            return None;
+        }
+        // A queued Space can arrive between snapshot and the first write.
+        // Nothing was erased, so include the enlarged, layout-independent
+        // suffix and retry. Never retry after a potentially destructive call.
+        buffered_len = buffered.len();
+        let keys: Vec<_> = buffered.iter().map(|typed| typed.key).collect();
+        engine.wait_for_release(&keys, crate::timing::injection().held_release_timeout);
+    }
+    None
+}
+
+fn inject_once(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<Vec<Typed>> {
     use evdev::{EventType, InputEvent, KeyCode as KC, SynchronizationCode};
     let Plan {
         erase,

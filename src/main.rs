@@ -157,14 +157,15 @@ Undo or convert (Ctrl tapped twice within half a second):
   Undo the latest correction, abbreviation expansion, or completion. If the last
   word was unchanged, convert it to the other layout, even for unknown words.
   Conversion works before or after Space; repeat to convert back without
-  changing saved word exceptions. Extra spaces preserve undo. Other typing,
-  Enter, or cursor movement ends the gesture. Enter never triggers a rewrite.
+  changing saved word exceptions. Extra spaces preserve undo. Supported native
+  fields also preserve up to 32 following characters. Enter or cursor movement
+  ends the gesture. Enter never triggers a rewrite.
   The optional single-Ctrl undo shortcut only restores corrections; it never unlists
   skipped words. Practice recommends an available separate Ctrl for immediate undo.
   Existing bindings are preserved. Shared bindings wait half a second so double taps take priority.
   Select text in a supported editable field and double-tap Ctrl to convert
   its layout. Repeat to restore the original. Requires accessibility selection
-  editing (Linux needs the optional desktop helper); the clipboard is untouched.
+  editing (Linux automatically tries its desktop helper); the clipboard is untouched.
 
 Your files (<config dir>/recast/):
   config.toml `key = value` per line, everything under Settings above

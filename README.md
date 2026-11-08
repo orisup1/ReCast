@@ -286,7 +286,7 @@ line breaks, digits, and unmapped characters are preserved. Converted text stays
 selected, and double-Ctrl again restores the exact original, including case.
 It leaves the clipboard and keyboard layout untouched. macOS requires writable
 Accessibility selected-text and range attributes. Windows supports native Edit and
-RichEdit controls with UI Automation selection access. Linux uses the optional
+RichEdit controls with UI Automation selection access. Linux uses the auto-detected
 AT-SPI helper in supported editable controls. Password, read-only, and unsupported
 controls are skipped. Selections are limited to 64 KiB of UTF-8 text. Selection
 undo restores the original text; it does not promise to restore rich formatting.
@@ -309,9 +309,10 @@ for the session; undo counts are saved in `learned.txt`, and two occasions make 
 exception survive restarts. Allowing the word again clears its saved exception.
 On macOS, an undo gesture completed while a correction is landing waits for that
 correction to finish; later typing or cursor movement still cancels the queued undo.
-macOS and Windows native Edit/RichEdit controls prefer a verified range replacement
-when the field supports it, preserving surrounding text and formatting. Other
-fields use keyboard events.
+macOS, Windows native Edit/RichEdit controls, and Linux AT-SPI editable controls
+prefer verified replacement when supported, preserving surrounding text.
+Unsupported controls use keyboard events; native undo grouping and formatting
+depend on the host application.
 Verified correction and undo preserve text typed while their worker is waiting
 to edit. Undo uses the captured source layout to keep that text verbatim even
 when restoring another keyboard layout. A tracked trailing Space lets the next

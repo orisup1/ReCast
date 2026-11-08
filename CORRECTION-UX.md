@@ -247,3 +247,10 @@ corrections with next-word typing, and individual layout and extended spelling
 undo trials. Other native desktops and applications still
 require their own runtime trials. The installed binary and desktop configuration
 were not replaced.
+
+A release stress trial additionally exposed a safe keyboard-fallback miss when a
+queued Space enlarged the replay suffix between snapshot and the first write.
+Linux now retries this case at most three times, only before any destructive call
+and only for a growing spaces-only suffix. Partial edits, letters, submission,
+focus changes, and stale generations cannot enter that retry path. Runtime help
+also describes Linux extended undo and automatic helper discovery consistently.
