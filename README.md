@@ -219,6 +219,9 @@ Erasing an unfinished next word and its preceding spaces keeps the previous
 tracked word available for editing and correction.
 Words finished while another correction lands also remain available for
 suggestions and Backspace editing; undo still restores the earlier correction.
+On verified native fields, a word finished while an earlier search is still
+running is preserved by that correction and then corrected itself, so two
+typos in a row need no pause between them.
 When the earlier correction's undo window expires, explicit suggestions and
 layout conversion can still use the latest fully tracked finished word.
 

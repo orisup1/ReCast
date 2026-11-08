@@ -4667,13 +4667,13 @@ fn verified_edits_reject_stale_buffered_text_and_context() {
 }
 
 #[test]
-fn automatic_search_cancels_unsafe_suffixes_and_keeps_only_the_latest_word() {
+fn automatic_search_cancels_unsafe_suffixes_and_preserves_finished_words() {
     const CHILD: &str = "RECAST_SEARCH_CANCELLATION_TEST";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "platform::engine::tests::automatic_search_cancels_unsafe_suffixes_and_keeps_only_the_latest_word",
+                "platform::engine::tests::automatic_search_cancels_unsafe_suffixes_and_preserves_finished_words",
             ])
             .env(CHILD, "1")
             .output()
@@ -4761,8 +4761,17 @@ fn automatic_search_cancels_unsafe_suffixes_and_keeps_only_the_latest_word() {
         s.checks_ready();
         s.pending();
         s.finish();
-        assert_eq!(s.text(), format!("{earlier} old keyboard "));
-        assert_eq!(s.engine.control.fixed_count(), 1);
+        let (expected, fixed) = if earlier == "recieve" {
+            // Both finished words correct without pausing between them:
+            // the first preserves the second verbatim, then the second lands.
+            s.pending();
+            s.finish();
+            ("receive old keyboard ", 2)
+        } else {
+            ("keyboard old keyboard ", 1)
+        };
+        assert_eq!(s.text(), expected);
+        assert_eq!(s.engine.control.fixed_count(), fixed);
     }
     // A delayed fix requires the native field to match every captured character.
     let s = Session::new();
@@ -4904,21 +4913,15 @@ fn late_correction_focus_check_preserves_next_word() {
             s.type_text(" ");
             s.pending();
         } else {
+            // The finished second word is preserved by the first correction,
+            // then its own check lands after it.
+            s.pending();
+            s.finish();
             s.pending();
         }
         s.finish();
-        assert_eq!(
-            s.text(),
-            if newer == "word" {
-                "receive receive "
-            } else {
-                "recieve receive "
-            }
-        );
-        assert_eq!(
-            s.engine.control.fixed_count(),
-            if newer == "word" { 2 } else { 1 }
-        );
+        assert_eq!(s.text(), "receive receive ");
+        assert_eq!(s.engine.control.fixed_count(), 2);
     }
 }
 

@@ -447,6 +447,12 @@ impl<P: Platform> Engine<P> {
                 st.invalidate_text();
             }
         } else if P::is_terminator(key) {
+            if !P::is_line_break(key) {
+                st.tracked_text.push_back(Typed { key, shift });
+                if st.tracked_text.len() > 256 {
+                    st.tracked_text.pop_front();
+                }
+            }
             self.word_finished(st, key, shift, focus);
         } else if is_text {
             if st.keys.is_empty() && !st.is_replacing {
@@ -483,6 +489,10 @@ impl<P: Platform> Engine<P> {
             }
             let typed = Typed { key, shift };
             st.push_key(typed);
+            st.tracked_text.push_back(typed);
+            if st.tracked_text.len() > 256 {
+                st.tracked_text.pop_front();
+            }
             if !st.is_replacing {
                 st.push_fix_suffix_key(typed);
             }

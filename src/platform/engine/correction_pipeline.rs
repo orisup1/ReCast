@@ -215,7 +215,9 @@ impl<P: Platform> Engine<P> {
                 layout,
             });
         }
-        // shortcut: retain only the newest waiting word; older words need validated caret ranges.
+        // One waiting check at a time; an older check whose following text
+        // was tracked lands first and preserves the newest word for its own
+        // check (see preserved_word_tail).
         st.word_check = Some(WordCheck {
             keys: st.keys.to_vec(),
             key,
@@ -229,7 +231,13 @@ impl<P: Platform> Engine<P> {
             presses: st.press_revision,
         });
         st.keys.clear();
-        if st.word_check_worker {
+        drop(st);
+        self.ensure_word_check_worker();
+    }
+
+    pub(crate) fn ensure_word_check_worker(self: &Arc<Self>) {
+        let mut st = self.lock();
+        if st.word_check_worker || st.word_check.is_none() {
             return;
         }
         st.word_check_worker = true;
@@ -243,6 +251,9 @@ impl<P: Platform> Engine<P> {
             };
             drop(st);
             engine.check_word(check);
+            if !engine.lock().word_check_worker {
+                return;
+            }
         });
     }
 
@@ -275,28 +286,107 @@ impl<P: Platform> Engine<P> {
             Some(&phrase),
             |_| crate::layout::LayoutSwitch::Switched,
         );
-        let st = self.lock();
-        // The retained deletion tail contains any extra spaces before the next word.
-        let spaces = |st: &AppState<P>| {
-            st.deletion_tail
-                .as_ref()
-                .map_or(0, |tail| tail.len().saturating_sub(keys.len() + 1))
+        let mut st = self.lock();
+        // Following text is everything typed after the checked word while
+        // search ran, reconstructed from tracked presses and verified
+        // against the checked word itself. That covers extra spaces, an
+        // unfinished next word, and whole finished words typed in between.
+        // Words reconstructed by editing fall back to the deletion tail.
+        // Verified edits below decline shapes they cannot match natively.
+        let following_of = |st: &AppState<P>| -> Option<(Vec<Typed<P::Key>>, bool)> {
+            let delta = st.press_revision.wrapping_sub(presses) as usize;
+            // Fallback for words whose on-screen keys were reconstructed
+            // (backspace recovery, kept words after a correction): the
+            // deletion tail still describes them exactly.
+            let fallback = |st: &AppState<P>| -> Option<(Vec<Typed<P::Key>>, bool)> {
+                let tail = st.deletion_tail.as_ref()?;
+                if tail.len() < keys.len() + 1 {
+                    return None;
+                }
+                let spaces = tail.len() - (keys.len() + 1);
+                if delta != spaces + st.keys.len()
+                    || spaces + st.keys.len() > MAX_UNDO_SUFFIX
+                    || !tail[keys.len() + 1..]
+                        .iter()
+                        .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))
+                {
+                    return None;
+                }
+                let mut following = tail[keys.len() + 1..].to_vec();
+                following.extend_from_slice(&st.keys);
+                Some((following, false))
+            };
+            if delta > MAX_UNDO_SUFFIX || st.tracked_text.len() < delta + keys.len() + 1 {
+                return fallback(st);
+            }
+            let start = st.tracked_text.len() - delta;
+            let Some(checked_start) = start.checked_sub(keys.len() + 1) else {
+                return fallback(st);
+            };
+            let checked: Vec<_> = st
+                .tracked_text
+                .iter()
+                .skip(checked_start)
+                .take(keys.len())
+                .collect();
+            if checked
+                .iter()
+                .zip(&keys)
+                .any(|(a, b)| a.key != b.key || a.shift != b.shift)
+            {
+                return fallback(st);
+            }
+            let Some(terminator) = st.tracked_text.get(checked_start + keys.len()) else {
+                return fallback(st);
+            };
+            if terminator.key != key {
+                return fallback(st);
+            }
+            let following: Vec<_> = st.tracked_text.iter().skip(start).copied().collect();
+            // A finished word inside the following text needs its own check
+            // after this one; spaces-only and unfinished-word tails do not.
+            let preserved = following.iter().enumerate().any(|(index, typed)| {
+                !P::is_terminator(typed.key)
+                    && following[index + 1..]
+                        .iter()
+                        .any(|next| P::is_terminator(next.key))
+            });
+            Some((following, preserved))
         };
-        // Only freshly captured text and spaces may follow the checked word.
-        // Deletion, gestures and cursor changes still make its snapshot stale.
         let current = |st: &AppState<P>| {
-            st.generation == generation
-                && st.press_revision.wrapping_sub(presses) == (spaces(st) + st.keys.len()) as u64
-                && spaces(st) + st.keys.len() <= MAX_UNDO_SUFFIX
-                && st
-                    .deletion_tail
-                    .iter()
-                    .flatten()
-                    .skip(keys.len() + 1)
-                    .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))
-                && !st.is_replacing
+            st.generation == generation && following_of(st).is_some() && !st.is_replacing
         };
         if !current(&st) {
+            if st.is_replacing && st.generation == generation {
+                // An earlier correction preserving this finished word verbatim
+                // will restore its tail; defer instead of discarding it.
+                let preserved = st.preserved_word_tail.as_ref().map(|tail| {
+                    let end = tail
+                        .iter()
+                        .rposition(|typed| !P::is_terminator(typed.key))
+                        .map_or(0, |index| index + 1);
+                    end == keys.len()
+                        && tail[..end]
+                            .iter()
+                            .zip(&keys)
+                            .all(|(a, b)| a.key == b.key && a.shift == b.shift)
+                });
+                if preserved == Some(true) && st.word_check.is_none() {
+                    st.word_check = Some(WordCheck {
+                        keys,
+                        key,
+                        shift,
+                        focus,
+                        run,
+                        mode,
+                        phrase,
+                        layout,
+                        generation,
+                        presses,
+                    });
+                    st.word_check_worker = false;
+                }
+            }
             return;
         }
         let revision = st.revision;
@@ -334,15 +424,14 @@ impl<P: Platform> Engine<P> {
         }
 
         let keep = st.keys.to_vec();
-        let mut following: Vec<_> = st
-            .deletion_tail
+        let Some((following, preserved_word)) = following_of(&st) else {
+            return;
+        };
+        let leading_spaces = following
             .iter()
-            .flatten()
-            .skip(keys.len() + 1)
-            .copied()
-            .collect();
-        following.extend_from_slice(&keep);
-        let extended = !keep.is_empty();
+            .take_while(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))
+            .count();
+        let extended = following.iter().any(|typed| !P::is_terminator(typed.key));
         let note = outcome.fix.as_ref().map(|fix| note_of::<P>(&keys, fix));
         let rep = replacement::<P>(&keys, outcome.fix);
         if extended
@@ -403,7 +492,12 @@ impl<P: Platform> Engine<P> {
                     P::retype_original(&tail, rep.target_layout),
                 );
                 undo.suffix = suffix;
-                undo.trailing_spaces = following.iter().take(spaces(&st)).copied().collect();
+                undo.trailing_spaces = following[..leading_spaces].to_vec();
+            }
+            if preserved_word {
+                // The intervening finished word stays on screen verbatim;
+                // keep its tail so its own check can land after this one.
+                st.preserved_word_tail = st.deletion_tail.clone();
             }
             st.keys.clear();
             self.start_replacement(

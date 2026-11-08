@@ -278,6 +278,12 @@ pub struct AppState<P: Platform> {
     /// Some(empty) means the tracked word was fully erased; repeated Backspace
     /// must not suppress the next freshly captured word. None means unknown text.
     pub(super) deletion_tail: Option<Vec<Typed<P::Key>>>,
+    /// Finished word preserved across an earlier correction that retypes it
+    /// verbatim, so its own check can still land after that correction.
+    pub(super) preserved_word_tail: Option<Vec<Typed<P::Key>>>,
+    /// Bounded suffix of tracked text/space presses, so a delayed check can
+    /// reconstruct everything typed after the word it is checking.
+    pub(super) tracked_text: VecDeque<Typed<P::Key>>,
 }
 
 impl<P: Platform> AppState<P> {
@@ -319,6 +325,8 @@ impl<P: Platform> AppState<P> {
             focus: None,
             no_fix: false,
             deletion_tail: None,
+            preserved_word_tail: None,
+            tracked_text: VecDeque::new(),
         }
     }
 
@@ -444,6 +452,8 @@ impl<P: Platform> AppState<P> {
         self.forget_gestures();
         self.pending_learning = None;
         self.deletion_tail = None;
+        self.preserved_word_tail = None;
+        self.tracked_text.clear();
         self.phrase.clear();
         self.history.clear();
         self.no_fix = true;

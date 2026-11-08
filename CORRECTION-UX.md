@@ -107,6 +107,18 @@ window is unchanged; undo-only cannot convert this word, and a queued expired un
 cannot consume its action. Typing another word, navigation, submission, and unsafe
 focus still end the old opportunity to act. No background text reads were added.
 
+The next pass removed the pause between two finished words. A fast typist who
+finished a second word while the first word's search was still running
+previously lost the first correction and kept only the newest check. Bounded
+tracked presses now reconstruct everything typed after a checked word —
+extra spaces, an unfinished word, or whole finished words — verified against
+the checked word itself, with the deletion-tail calculation retained for
+edited and reconstructed words. On verified native fields, the first
+correction preserves the intervening text verbatim and keeps the latest
+finished word's tail, so its own check lands immediately after. Unverified
+backends still decline the extended edit rather than erase blindly, and the
+32-character following bound is unchanged.
+
 Deletion, command-modifier presses, deliberate shortcut taps, navigation, clicks,
 Enter, focus/layout changes, disabled correction, secure input, application restrictions, and suffix
 overflow still reject stale results. A native text mismatch never falls back to
@@ -121,9 +133,10 @@ policy are unchanged.
 2. **Unavailable native context:** delayed edits across following letters require
    verified native replacement. Linux and unsupported native controls decline
    them. Ordinary correction and spaces-only replay retain their existing paths.
-3. **Later layout changes or completed words:** following letters are not
-   speculatively reinterpreted under another layout. Once another word has
-   finished, an old search is discarded rather than rewriting earlier text.
+3. **Later layout changes:** following letters are not speculatively
+   reinterpreted under another layout. A finished word inside the following
+   text is preserved verbatim on verified fields and checked after the
+   earlier correction; unverified fields keep only the newest correction.
    Extremely fast input or slow accessibility services can still cause misses.
 4. **Pasted or pre-existing text:** selected-text rescue is explicit and bounded.
    Reliable caret context is needed before expanding automatic edits into unknown
@@ -169,6 +182,14 @@ and Hebrew completion, explicit spelling, conversion and undo, direct and passiv
 offers, queued undo-only, one or three spaces, and the exact 32/33-character
 boundary. Companion checks reject stale focus, secure or excluded targets,
 navigation and submission, and keep actions on freshly typed text at the caret.
+
+The queued-words regression initially failed because only the newest word
+corrected when a second finished word arrived during the first search. It now
+checks that both words correct in order on verified fields, that a valid
+first word still leaves only the second correction, and that unverified
+fields, backspace recovery, unmapped keys, and stale focus/navigation
+cancellations behave as before. Companion coverage includes a finished word
+arriving during final focus validation.
 
 Existing tests cover automatic layout/spelling, explicit suggestions, passive
 preview acceptance, manual conversion, selection rescue, exclusions, learning,

@@ -517,6 +517,7 @@ impl<P: Platform> Engine<P> {
             let suffix_full = undo
                 .as_ref()
                 .is_some_and(|fix| fix.suffix.chars().count() + buffered.len() > MAX_UNDO_SUFFIX);
+            let keep_nonempty = !keep.is_empty();
             if only_spaces && !buffered.is_empty() && !suffix_full {
                 st.keys.clear();
                 st.no_fix = false;
@@ -631,6 +632,30 @@ impl<P: Platform> Engine<P> {
                 }
                 _ => None,
             });
+            if let Some(mut preserved) = st.preserved_word_tail.take() {
+                // Restore the intervening finished word preserved verbatim by
+                // this correction, unless typing during the replacement
+                // already finished a newer word.
+                let mut seen_word = keep_nonempty;
+                let finished_newer = buffered.iter().any(|typed| {
+                    if P::is_terminator(typed.key) {
+                        seen_word
+                    } else {
+                        seen_word = true;
+                        false
+                    }
+                });
+                if !finished_newer {
+                    let leading = buffered
+                        .iter()
+                        .take_while(|typed| {
+                            P::is_terminator(typed.key) && !P::is_line_break(typed.key)
+                        })
+                        .count();
+                    preserved.extend(buffered[..leading].iter().copied());
+                    st.deletion_tail = Some(preserved);
+                }
+            }
             st.last_key = None;
         }
         gate.finish(&mut st);
@@ -658,6 +683,7 @@ impl<P: Platform> Engine<P> {
             self.request_suggestion(st, correction);
         } else {
             drop(st);
+            self.ensure_word_check_worker();
         }
         // Persistence must not extend the injection window: real typing during
         // a slow disk write used to be treated as an interrupted replacement.
@@ -668,7 +694,7 @@ impl<P: Platform> Engine<P> {
 
     /// A refused switch did not edit text. Preserve retry context only while
     /// focus and tracked input still match; never use this after injection.
-    fn abort_before_injection(&self, generation: u64, retry: Option<RetryContext<P>>) {
+    fn abort_before_injection(self: &Arc<Self>, generation: u64, retry: Option<RetryContext<P>>) {
         let (focus, mode) = self.read_focus();
         let layout = P::current_layout();
         let mut st = self.lock();
@@ -693,8 +719,11 @@ impl<P: Platform> Engine<P> {
             st.pending_undo = false;
             st.pending_conversion = false;
             st.pending_suggestion = None;
+            st.preserved_word_tail = None;
         } else {
             st.invalidate_text();
         }
+        drop(st);
+        self.ensure_word_check_worker();
     }
 }
