@@ -3672,8 +3672,8 @@ fn completions_and_learning_require_retained_choices() {
     // Saved exceptions remain completion vocabulary when personalization is off.
     crate::config::Config::update_live(|cfg| cfg.personal_enabled = false);
     crate::complete::suppress("qzlearnedname");
-    crate::complete::learn("qzlearnedname");
-    crate::complete::learn("qzlearnedname");
+    crate::complete::seed_legacy_undo("qzlearnedname");
+    crate::complete::seed_legacy_undo("qzlearnedname");
     let s = Session::new();
     s.type_text("qzl");
     s.tap(Simulated::SHIFT_RIGHT);
@@ -5303,8 +5303,8 @@ fn typing_correction_undo_and_interrupted_replacements() {
         assert_eq!(s.engine.control.undo_count(), 1);
         crate::complete::unlist("acheive");
         // A delayed learning write must not resurrect a newer unlist.
-        crate::complete::learn("acheive");
-        crate::complete::learn("acheive");
+        crate::complete::seed_legacy_undo("acheive");
+        crate::complete::seed_legacy_undo("acheive");
         assert!(!crate::complete::learned("acheive"));
     }
     crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "none".into());
@@ -7335,5 +7335,42 @@ fn automatic_correction_waits_for_a_partially_dispatched_space() {
         s.pending();
         s.finish();
         assert_eq!(s.text(), "שלום  ");
+    }
+}
+
+#[test]
+fn repeated_undos_do_not_save_word_exceptions() {
+    const CHILD: &str = "RECAST_NO_UNDO_LEARNING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::repeated_undos_do_not_save_word_exceptions",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let path = crate::complete::user_path("learned.txt").unwrap();
+    for _ in 0..3 {
+        crate::complete::unlist("recieve");
+        let before = std::fs::read(&path).ok();
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        assert!(crate::complete::suppressed("recieve"));
+        assert!(!crate::complete::learned("recieve"));
+        assert_eq!(std::fs::read(&path).ok(), before);
     }
 }

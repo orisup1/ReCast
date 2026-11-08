@@ -310,8 +310,9 @@ Extra spaces preserve undo. Supported native controls also preserve undo across
 a bounded typed suffix, as described above. Enter or cursor movement ends the undo
 opportunity. Undo restores the original text and, when changed, the previous layout.
 One undo suppresses that word
-for the session; undo counts are saved in `learned.txt`, and two occasions make the
-exception survive restarts. Allowing the word again clears its saved exception.
+for the session. Repeated undos never create persistent word exceptions.
+Use **Ignore this word** to save an explicit exception. Existing legacy exceptions
+remain editable in Word rules; allowing a word again clears its saved exception.
 On macOS, an undo gesture completed while a correction is landing waits for that
 correction to finish; later typing or cursor movement still cancels the queued undo.
 macOS, Windows native Edit/RichEdit controls, and Linux AT-SPI editable controls
@@ -478,7 +479,7 @@ an unreadable config stops startup so exclusions are not silently discarded.
 | `config.toml` | Settings; optional until created or saved from the UI |
 | `abbrev.txt` | Custom `abbr = expansion` rules; `#` comments allowed |
 | `ignore.txt` | Words to leave alone, one per line; `#` comments allowed |
-| `learned.txt` | Undo counts used for persistent exceptions |
+| `learned.txt` | Legacy saved exceptions; no longer populated by undo |
 | `state.txt` | Saved enabled/disabled state |
 | `welcomed` | Marker for the one-time correction hint |
 | `setup-complete` | macOS setup marker; missing requirements still reopen setup |
@@ -607,7 +608,7 @@ Open **Settings** in the tray/menubar and select the **Word rules** section, or
 expand **Settings > Word rules** in the Linux control window.
 Choose **Ignored words**, **Learned exceptions**, or **Abbreviations**. Add or
 remove words one per line; write abbreviations as `shortcut = expansion`.
-Learned exceptions shows saved exceptions from repeated undos; single-undo
+Learned exceptions shows legacy saved exceptions; new undos never add entries. Single-undo
 session exceptions are not listed. Other lists still apply when you remove a word.
 
 **Save** applies changes immediately. **Cancel** leaves the rules unchanged.

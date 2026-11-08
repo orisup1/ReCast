@@ -402,7 +402,6 @@ impl<P: Platform> Engine<P> {
             }
             (st.practice, st.mode)
         };
-        let mut learn = None;
         let mut pending_learning = None;
         match commit {
             Some(Commit::Fix {
@@ -456,7 +455,6 @@ impl<P: Platform> Engine<P> {
                 }
                 if let Some(word) = suppress.filter(|_| !practice) {
                     crate::complete::suppress(&word);
-                    learn = Some(word);
                 }
                 if !practice {
                     self.control.record_undo();
@@ -707,11 +705,6 @@ impl<P: Platform> Engine<P> {
             self.request_suggestion(st, correction);
         } else {
             drop(st);
-        }
-        // Persistence must not extend the injection window: real typing during
-        // a slow disk write used to be treated as an interrupted replacement.
-        if let Some(word) = learn {
-            crate::complete::learn(&word);
         }
     }
 
