@@ -9,7 +9,7 @@ use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode, 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -21,6 +21,21 @@ pub struct Linux;
 pub struct Injector {
     device: Mutex<VirtualDevice>,
     started: AtomicBool,
+    capturing: AtomicUsize,
+}
+
+/// Injection must not freeze a suffix halfway through a fetched evdev batch.
+struct InputBatchGuard<'a>(&'a AtomicUsize);
+impl<'a> InputBatchGuard<'a> {
+    fn new(pending: &'a AtomicUsize) -> Self {
+        pending.fetch_add(1, Ordering::AcqRel);
+        Self(pending)
+    }
+}
+impl Drop for InputBatchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Keep literal text alongside physical keys: verified undo may restore one
@@ -288,6 +303,9 @@ impl Platform for Linux {
             .map(|&(key, shift)| Typed { key, shift })
             .collect()
     }
+    fn capture_pending(injector: &Self::Injector) -> bool {
+        injector.capturing.load(Ordering::Acquire) != 0
+    }
     fn injection_started(injector: &Self::Injector) -> bool {
         injector.started.load(Ordering::Acquire)
     }
@@ -353,6 +371,9 @@ impl Platform for Linux {
     ) -> bool {
         engine.injector.started.store(false, Ordering::Release);
         if plan.terminator.is_some_and(Self::is_line_break) {
+            return false;
+        }
+        if !engine.wait_for_capture(generation, crate::timing::injection().held_release_timeout) {
             return false;
         }
         if plan.verify.is_some() {
@@ -541,6 +562,7 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
     let injector = Injector {
         device: Mutex::new(injector),
         started: AtomicBool::new(false),
+        capturing: AtomicUsize::new(0),
     };
 
     // Start accessibility discovery before the first correction without putting
@@ -611,6 +633,16 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                         }
                     };
 
+                    let _batch = events
+                        .iter()
+                        .any(|event| {
+                            // Releases cannot add to the visible suffix. In
+                            // particular, an unrelated key-up must not interrupt
+                            // a replay that has already started deleting.
+                            (event.event_type() == evdev::EventType::KEY && event.value() != 0)
+                                || event.event_type() == evdev::EventType::LED
+                        })
+                        .then(|| InputBatchGuard::new(&engine.injector.capturing));
                     for event in events {
                         let timestamp = event.timestamp();
                         match event.destructure() {
@@ -829,6 +861,9 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
             return Some(buffered);
         }
         if Linux::injection_started(&engine.injector) || !engine.replacement_valid(generation) {
+            return None;
+        }
+        if !engine.wait_for_capture(generation, crate::timing::injection().held_release_timeout) {
             return None;
         }
         let buffered = engine.buffered();

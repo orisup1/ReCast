@@ -232,7 +232,7 @@ It preserves the original focused window/layout and can optionally restore a
 previously running standalone binary. No installed binary is replaced by tests.
 
 
-Follow-up validation: 461 unit tests and eight CLI tests passed; 11 unit tests
+Follow-up validation: 462 unit tests and eight CLI tests passed; 11 unit tests
 were intentionally ignored. All 27 Python checks and both JavaScript fixture
 suites passed. Formatting, whitespace checks, and Clippy with Rust warnings
 denied passed for Linux, macOS, and Windows. The Windows resource compiler is
@@ -241,12 +241,14 @@ not run. macOS dependencies also report an existing future-compatibility warning
 A process-identity test exposed a fork/exec timing race under the full suite;
 its fixture now waits for the unrelated executable before asserting identity.
 
-Live Hyprland/GTK trials passed six queued layout conversions, six spelling
-corrections with a deliberately mismatched injector group, six delayed spelling
-corrections with next-word typing, and individual layout and extended spelling
-undo trials. Other native desktops and applications still
-require their own runtime trials. The installed binary and desktop configuration
-were not replaced.
+The final uninstrumented Linux release passed all 31 Hyprland/GTK trials:
+16 spelling corrections with a deliberately mismatched injector group, six
+queued layout conversions, six delayed spelling corrections with next-word
+typing, and three individual undo trials (native layout, keyboard layout, and
+extended spelling). Each undo trial checked both restored text and layout.
+All eight release CLI tests passed as well. Other native desktops and
+applications still require their own runtime trials. The installed binary and
+desktop configuration were not replaced.
 
 A release stress trial additionally exposed a safe keyboard-fallback miss when a
 queued Space enlarged the replay suffix between snapshot and the first write.
@@ -254,3 +256,16 @@ Linux now retries this case at most three times, only before any destructive cal
 and only for a growing spaces-only suffix. Partial edits, letters, submission,
 focus changes, and stale generations cannot enter that retry path. Runtime help
 also describes Linux extended undo and automatic helper discovery consistently.
+
+Queued evdev input also requires reader-side coordination. Readers publish an
+unwind-safe pending count while dispatching a fetched batch of presses, repeats,
+or lock-state updates. Native preparation, keycode snapshots, and pre-edit retries
+wait for dispatch to finish. Release-only batches do not participate: an unrelated
+key-up must not interrupt a replay that already started deleting. Physical holds
+remain independent of this barrier, so verified native edits need not wait for
+the user's fingers. A regression covers pending batches, their completed suffix,
+and cancellation while waiting.
+
+Injector confirmation also accepts Hyprland's older `active_keymap` metadata
+without requiring the newer numeric group field; the parser regression covers
+both formats and independent injector layout ordering.

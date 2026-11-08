@@ -900,8 +900,17 @@ mod hypr {
             keyboard["layout"].as_str()?,
             keyboard["variant"].as_str().unwrap_or(""),
         );
-        let active = keyboard["active_layout_index"].as_u64()?.try_into().ok()?;
-        super::injector_group(&names, active, lang)
+        let desired = names
+            .iter()
+            .position(|name| super::compatible_keymap(name) == Some(lang))?;
+        // Older Hyprland releases expose the active keymap name without a
+        // numeric group. Use that native answer rather than disabling replay.
+        let ready = if let Some(name) = keyboard["active_keymap"].as_str() {
+            super::compatible_keymap(name) == Some(lang)
+        } else {
+            usize::try_from(keyboard["active_layout_index"].as_u64()?).ok()? == desired
+        };
+        Some((desired, ready))
     }
 
     #[cfg(test)]
@@ -910,6 +919,9 @@ mod hypr {
         let json = r#"{"keyboards":[{"name":"physical","layout":"us,il","active_layout_index":1},{"name":"recast-injector","layout":"il,us","active_layout_index":1}]}"#;
         assert_eq!(injector_state(json, Language::Hebrew), Some((0, false)));
         assert_eq!(injector_state(json, Language::English), Some((1, true)));
+        let older = r#"{"keyboards":[{"name":"recast-injector","layout":"il,us","active_keymap":"English (US)"}]}"#;
+        assert_eq!(injector_state(older, Language::Hebrew), Some((0, false)));
+        assert_eq!(injector_state(older, Language::English), Some((1, true)));
         assert_eq!(injector_state("{}", Language::English), None);
     }
 

@@ -150,6 +150,25 @@ impl<P: Platform> Engine<P> {
         }
     }
 
+    /// Drain an already-fetched input batch before freezing a replay suffix.
+    /// This does not require physical keys to be released for native text edits.
+    #[cfg(target_os = "linux")]
+    pub fn wait_for_capture(&self, generation: u64, ceiling: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.lock().generation != generation {
+                return false;
+            }
+            if !P::capture_pending(&self.injector) {
+                return true;
+            }
+            if start.elapsed() >= ceiling {
+                return false;
+            }
+            crate::timing::pause(crate::timing::injection().held_poll);
+        }
+    }
+
     /// Snapshot the replay suffix only after replay keys and modifiers are up.
     /// The suffix can grow during a release wait, so inspect it together with
     /// held keys under one lock. A timeout must leave the visible text intact.
@@ -168,7 +187,7 @@ impl<P: Platform> Engine<P> {
                 return None;
             }
             let held = st.replay_keys_held(keys);
-            if !held {
+            if !held && !P::capture_pending(&self.injector) {
                 return Some(st.buffered_keys.to_vec());
             }
             drop(st);
@@ -191,6 +210,7 @@ impl<P: Platform> Engine<P> {
         st.generation == generation
             && st.buffered_keys.len() == buffered_len
             && !st.replay_keys_held(keys)
+            && !P::capture_pending(&self.injector)
     }
 
     /// Keys the user managed to type while a correction was landing. Read while

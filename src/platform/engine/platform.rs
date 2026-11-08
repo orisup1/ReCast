@@ -214,6 +214,12 @@ pub trait Platform: Sized + Send + Sync + 'static {
         generation: u64,
     ) -> Option<Vec<Typed<Self::Key>>>;
 
+    /// A native reader is still dispatching a fetched batch of physical input.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn capture_pending(_injector: &Self::Injector) -> bool {
+        false
+    }
+
     /// False only when the backend can prove no destructive edit has begun.
     /// This permits restoring a layout changed for an abandoned replacement.
     fn injection_started(_injector: &Self::Injector) -> bool {

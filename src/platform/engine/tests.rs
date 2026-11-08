@@ -19,6 +19,7 @@ static ALLOW_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static REFUSE_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static CAPTURE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PREPARE_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static EDIT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static REJECT_UNICODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -229,6 +230,9 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
     }
     fn prepare_injection(_: &Engine<Self>, _: &Plan<Self>, _: u64, _: Option<Language>) -> bool {
         PREPARE_ALLOWED.load(Ordering::SeqCst)
+    }
+    fn capture_pending(_: &Screen) -> bool {
+        CAPTURE_PENDING.load(Ordering::SeqCst)
     }
     fn injection_started(_: &Screen) -> bool {
         EDIT_STARTED.load(Ordering::SeqCst)
@@ -7203,4 +7207,49 @@ fn preparation_and_unedited_failure_do_not_leave_layout_only_corrections() {
     s.pending();
     s.finish();
     assert_eq!(s.text(), "receive ");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fetched_input_batches_must_finish_before_replay_is_frozen() {
+    const CHILD: &str = "RECAST_BATCH_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::fetched_input_batches_must_finish_before_replay_is_frozen"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let s = Session::new();
+    s.engine.lock().focus = Some(1);
+    let generation = s.engine.lock().generation;
+    assert!(s.engine.replay_valid(&[], generation, 0));
+    CAPTURE_PENDING.store(true, Ordering::SeqCst);
+    assert!(!s.engine.wait_for_capture(generation, Duration::ZERO));
+    assert!(s
+        .engine
+        .replay_snapshot(&[], generation, Duration::ZERO)
+        .is_none());
+    assert!(!s.engine.replay_valid(&[], generation, 0));
+    // Finish dispatching keys that the app already received before the reader woke.
+    s.engine.lock().buffered_keys.push(Typed {
+        key: ' ',
+        shift: false,
+    });
+    CAPTURE_PENDING.store(false, Ordering::SeqCst);
+    assert!(s.engine.wait_for_capture(generation, Duration::ZERO));
+    let snapshot = s
+        .engine
+        .replay_snapshot(&[], generation, Duration::ZERO)
+        .unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].key, ' ');
+    assert!(s.engine.replay_valid(&[], generation, 1));
+    s.engine.forget_everything();
+    assert!(!s.engine.wait_for_capture(generation, Duration::ZERO));
 }
