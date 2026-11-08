@@ -8,12 +8,53 @@ use crate::types::{AppControl, Language};
 use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode, LedCode};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 type Typed = engine::Typed<KeyCode>;
 
 pub struct Linux;
+
+pub struct Injector {
+    device: Mutex<VirtualDevice>,
+    started: AtomicBool,
+    capturing: AtomicUsize,
+    locked_mods: AtomicU32,
+    locks_known: AtomicBool,
+    route: Mutex<InjectionRoute>,
+}
+
+#[derive(Clone)]
+enum InjectionRoute {
+    Keycodes,
+    Native(String),
+    Wayland { source: Language, target: Language },
+}
+
+/// Injection must not freeze a suffix halfway through a fetched evdev batch.
+struct InputBatchGuard<'a>(&'a AtomicUsize);
+impl<'a> InputBatchGuard<'a> {
+    fn new(pending: &'a AtomicUsize) -> Self {
+        pending.fetch_add(1, Ordering::AcqRel);
+        Self(pending)
+    }
+}
+impl Drop for InputBatchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Keep literal text alongside physical keys: verified undo may restore one
+/// layout while preserving a suffix typed under the other.
+#[derive(Clone)]
+pub struct Retype {
+    keys: Vec<(KeyCode, bool)>,
+    text: String,
+}
 
 /// Release a reader's ownership even when it unwinds before normal disconnect.
 pub(super) struct InputDeviceGuard<P: Platform> {
@@ -40,14 +81,18 @@ impl<P: Platform> Drop for InputDeviceGuard<P> {
 #[cfg(test)]
 #[test]
 fn completion_keys_match_the_active_language() {
-    let keys = Linux::retype_completion("שלום", Language::Hebrew).unwrap();
+    let keys = Linux::retype_completion("שלום", Language::Hebrew)
+        .unwrap()
+        .keys;
     let text: String = keys
         .iter()
         .filter_map(|(key, _)| evkey_to_hebrew_char(*key))
         .collect();
     assert_eq!(text, "שלום");
     assert!(keys.iter().all(|(_, shift)| !shift));
-    let keys = Linux::retype_completion("Keyboard", Language::English).unwrap();
+    let keys = Linux::retype_completion("Keyboard", Language::English)
+        .unwrap()
+        .keys;
     let text: String = keys
         .iter()
         .filter_map(|(key, shift)| {
@@ -62,6 +107,26 @@ fn completion_keys_match_the_active_language() {
         .collect();
     assert_eq!(text, "Keyboard");
     assert!(Linux::retype_completion("🙂", Language::Hebrew).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn native_undo_payload_keeps_suffix_literal_across_layouts() {
+    let original: Vec<_> = "akuo"
+        .chars()
+        .map(|c| Typed {
+            key: english_char_to_evkey_shifted(c).unwrap().0,
+            shift: false,
+        })
+        .collect();
+    let mut payload = Linux::retype_original(&original, Language::English);
+    Linux::append_retype(
+        &mut payload,
+        Linux::retype_completion(" שלום", Language::Hebrew).unwrap(),
+    );
+    assert_eq!(payload.text, "akuo שלום");
+    assert_eq!(Linux::retype_len(&payload), 9);
+    assert_eq!(payload.keys.len(), 9);
 }
 
 fn injection_shift(key: KeyCode, shift: bool, caps_lock: bool, lang: Option<Language>) -> bool {
@@ -83,7 +148,9 @@ fn english_replay_preserves_requested_case_with_caps_lock_on_or_off() {
         "Mixed(cAsE)12![];",
     ] {
         for caps_lock in [false, true] {
-            let keys = Linux::retype_completion(text, Language::English).unwrap();
+            let keys = Linux::retype_completion(text, Language::English)
+                .unwrap()
+                .keys;
             let visible: String = keys
                 .into_iter()
                 .map(|(key, shift)| {
@@ -102,10 +169,18 @@ fn english_replay_preserves_requested_case_with_caps_lock_on_or_off() {
     }
 }
 
+#[cfg(test)]
+impl Retype {
+    pub fn iter(&self) -> std::slice::Iter<'_, (KeyCode, bool)> {
+        self.keys.iter()
+    }
+}
+
 impl Platform for Linux {
     type Key = KeyCode;
-    type Retype = Vec<(KeyCode, bool)>;
-    type Injector = Arc<Mutex<VirtualDevice>>;
+    type Retype = Retype;
+    const VERIFIED_REPLACEMENT: bool = true;
+    type Injector = Injector;
     type Focus = crate::layout::Focus;
     const SHIFT_LEFT: KeyCode = KeyCode::KEY_LEFTSHIFT;
     const SHIFT_RIGHT: KeyCode = KeyCode::KEY_RIGHTSHIFT;
@@ -175,41 +250,57 @@ impl Platform for Linux {
     fn hebrew_char(key: KeyCode) -> Option<char> {
         evkey_to_hebrew_char(key)
     }
-    fn retype_original(keys: &[Typed], _: Language) -> Self::Retype {
-        keys.iter().map(|t| (t.key, t.shift)).collect()
+    fn retype_original(keys: &[Typed], lang: Language) -> Self::Retype {
+        Retype {
+            keys: keys.iter().map(|t| (t.key, t.shift)).collect(),
+            text: engine::reading::<Self>(keys, lang),
+        }
     }
     fn retype_layout(keys: &[Typed], text: &str, lang: Language) -> Option<Self::Retype> {
         if engine::reading::<Self>(keys, lang).to_lowercase() != text.to_lowercase() {
             return Self::retype_completion(text, lang);
         }
-        Some(
-            keys.iter()
+        Some(Retype {
+            text: text.to_owned(),
+            keys: keys
+                .iter()
                 .map(|t| {
                     let symbol =
                         Self::english_char_plain(t.key).is_some_and(|c| !c.is_ascii_alphabetic());
                     (t.key, t.shift && (lang == Language::English || symbol))
                 })
                 .collect(),
-        )
+        })
     }
     fn retype_text(text: &str) -> Option<Self::Retype> {
-        text.chars().map(english_char_to_evkey_shifted).collect()
+        Some(Retype {
+            keys: text
+                .chars()
+                .map(english_char_to_evkey_shifted)
+                .collect::<Option<_>>()?,
+            text: text.to_owned(),
+        })
     }
     fn retype_completion(text: &str, lang: Language) -> Option<Self::Retype> {
         if lang == Language::Hebrew {
-            Self::retype_text(&crate::keymap::hebrew_text_to_physical_english(text)?)
+            let mut retype =
+                Self::retype_text(&crate::keymap::hebrew_text_to_physical_english(text)?)?;
+            retype.text = text.to_owned();
+            Some(retype)
         } else {
             Self::retype_text(text)
         }
     }
     fn retype_len(retype: &Self::Retype) -> usize {
-        retype.len()
+        retype.text.chars().count()
     }
     fn append_retype(retype: &mut Self::Retype, tail: Self::Retype) {
-        retype.extend(tail);
+        retype.keys.extend(tail.keys);
+        retype.text.push_str(&tail.text);
     }
     fn buffer_after(retype: &Self::Retype) -> Vec<Typed> {
         retype
+            .keys
             .rsplit(|(key, _)| {
                 matches!(
                     *key,
@@ -221,6 +312,12 @@ impl Platform for Linux {
             .iter()
             .map(|&(key, shift)| Typed { key, shift })
             .collect()
+    }
+    fn capture_pending(injector: &Self::Injector) -> bool {
+        injector.capturing.load(Ordering::Acquire) != 0
+    }
+    fn injection_started(injector: &Self::Injector) -> bool {
+        injector.started.load(Ordering::Acquire)
     }
     fn injecting_flag(_: &Self::Injector) -> Option<&std::sync::atomic::AtomicBool> {
         None
@@ -275,6 +372,80 @@ impl Platform for Linux {
             .app
             .as_deref()
             .is_some_and(|app| app.eq_ignore_ascii_case("recast"))
+    }
+    fn prepare_injection(
+        engine: &Engine<Self>,
+        plan: &Plan<Self>,
+        generation: u64,
+        target_layout: Option<Language>,
+    ) -> bool {
+        engine.injector.started.store(false, Ordering::Release);
+        *crate::types::lock_forgiving(&engine.injector.route) = InjectionRoute::Keycodes;
+        if plan.terminator.is_some_and(Self::is_line_break) {
+            return false;
+        }
+        if !engine.wait_for_capture(generation, crate::timing::injection().held_release_timeout) {
+            return false;
+        }
+        if let Some(target) = crate::layout::desktop::replacement_target() {
+            // Native text edits do not press Space or replacement letters.
+            // Pin this choice before switching layouts: if the control later
+            // refuses the edit, it must never fall back to unprepared keycodes.
+            *crate::types::lock_forgiving(&engine.injector.route) = InjectionRoute::Native(target);
+            let buffered = engine.buffered();
+            if target_layout.is_some_and(|target| Self::current_layout() != Some(target))
+                && buffered.iter().any(|typed| !Self::is_terminator(typed.key))
+            {
+                return false;
+            }
+            return engine.replacement_valid(generation);
+        }
+        if plan.verify.is_some() {
+            return false;
+        }
+        let caps = crate::types::lock_forgiving(&engine.state).caps_lock;
+        let observed_caps = engine.injector.locked_mods.load(Ordering::Acquire) & 2 != 0;
+        let caps_match = if engine.injector.locks_known.load(Ordering::Acquire) {
+            caps == observed_caps
+        } else {
+            !caps
+        };
+        if caps_match && super::wayland_input::available() {
+            let Some(source) = Self::current_layout() else {
+                return false;
+            };
+            let target = target_layout.unwrap_or(source);
+            if target != source
+                && engine
+                    .buffered()
+                    .iter()
+                    .any(|typed| !Self::is_terminator(typed.key))
+            {
+                return false;
+            }
+            *crate::types::lock_forgiving(&engine.injector.route) =
+                InjectionRoute::Wayland { source, target };
+            return engine.replacement_valid(generation);
+        }
+        let gaps = crate::timing::injection();
+        let mut keys: Vec<_> = plan.retype.keys.iter().map(|(key, _)| *key).collect();
+        keys.extend([Self::SHIFT_LEFT, Self::SHIFT_RIGHT, Self::BACKSPACE]);
+        engine.wait_for_release(&keys, gaps.held_release_timeout);
+        let terminators: Vec<_> = plan.terminator.into_iter().collect();
+        engine.wait_for_release(&terminators, gaps.terminator_release_timeout);
+        keys.extend(terminators);
+        let Some(buffered) = engine.replay_snapshot(&keys, generation, gaps.held_release_timeout)
+        else {
+            return false;
+        };
+        // These keys already reached the app under the old layout. Switching
+        // now and replaying their positions would silently change the suffix.
+        if target_layout.is_some_and(|target| Self::current_layout() != Some(target))
+            && buffered.iter().any(|typed| !Self::is_terminator(typed.key))
+        {
+            return false;
+        }
+        engine.replacement_valid(generation)
     }
     fn inject(engine: &Engine<Self>, plan: Plan<Self>, generation: u64) -> Option<Vec<Typed>> {
         inject(engine, plan, generation)
@@ -432,10 +603,22 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
         }
     };
 
+    // Discover optional compositor input while uinput settles, off capture.
+    let _ = super::wayland_input::available();
     // Allow time for the OS/compositor to detect the new injection device.
     crate::timing::pause(crate::timing::injection().device_settle);
-    let injector = Arc::new(Mutex::new(injector));
+    let injector = Injector {
+        device: Mutex::new(injector),
+        started: AtomicBool::new(false),
+        capturing: AtomicUsize::new(0),
+        locked_mods: AtomicU32::new(0),
+        locks_known: AtomicBool::new(false),
+        route: Mutex::new(InjectionRoute::Keycodes),
+    };
 
+    // Start accessibility discovery before the first correction without putting
+    // a helper round trip on each captured key in compositor-aware sessions.
+    let _ = crate::layout::desktop::focus();
     let engine = Engine::<Linux>::new(en_dict, he_dict, control, injector);
     let mut readers = HashMap::new();
     // Reopened devices get new identities, distinct from any retiring reader.
@@ -472,6 +655,29 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                     .is_some_and(|leds| leds.contains(LedCode::LED_CAPSL))
                 {
                     if let Ok(leds) = dev.get_led_state() {
+                        let locks = if leds.contains(LedCode::LED_CAPSL) {
+                            2
+                        } else {
+                            0
+                        } | if leds.contains(LedCode::LED_NUML) {
+                            16
+                        } else {
+                            0
+                        };
+                        let mask = 2 | if dev
+                            .supported_leds()
+                            .is_some_and(|set| set.contains(LedCode::LED_NUML))
+                        {
+                            16
+                        } else {
+                            0
+                        };
+                        let _ = engine.injector.locked_mods.fetch_update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |current| Some((current & !mask) | (locks & mask)),
+                        );
+                        engine.injector.locks_known.store(true, Ordering::Release);
                         engine.caps_lock_changed(leds.contains(LedCode::LED_CAPSL));
                     }
                 }
@@ -501,6 +707,16 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                         }
                     };
 
+                    let _batch = events
+                        .iter()
+                        .any(|event| {
+                            // Releases cannot add to the visible suffix. In
+                            // particular, an unrelated key-up must not interrupt
+                            // a replay that has already started deleting.
+                            (event.event_type() == evdev::EventType::KEY && event.value() != 0)
+                                || event.event_type() == evdev::EventType::LED
+                        })
+                        .then(|| InputBatchGuard::new(&engine.injector.capturing));
                     for event in events {
                         let timestamp = event.timestamp();
                         match event.destructure() {
@@ -515,8 +731,24 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                                     }
                                 });
                             }
-                            EventSummary::Led(_, LedCode::LED_CAPSL, value) => {
-                                engine.caps_lock_changed(value != 0);
+                            EventSummary::Led(
+                                _,
+                                led @ (LedCode::LED_CAPSL | LedCode::LED_NUML),
+                                value,
+                            ) => {
+                                let mask = if led == LedCode::LED_CAPSL { 2 } else { 16 };
+                                if value != 0 {
+                                    engine.injector.locked_mods.fetch_or(mask, Ordering::AcqRel);
+                                } else {
+                                    engine
+                                        .injector
+                                        .locked_mods
+                                        .fetch_and(!mask, Ordering::AcqRel);
+                                }
+                                if led == LedCode::LED_CAPSL {
+                                    engine.injector.locks_known.store(true, Ordering::Release);
+                                    engine.caps_lock_changed(value != 0);
+                                }
                             }
                             _ => {}
                         }
@@ -706,22 +938,127 @@ fn emit_paced(
 }
 
 fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<Vec<Typed>> {
+    let mut buffered_len = 0;
+    for _ in 0..3 {
+        let attempt = Plan {
+            erase: plan.erase,
+            retype: plan.retype.clone(),
+            terminator: plan.terminator,
+            expected: plan.expected.clone(),
+            verify: plan.verify,
+        };
+        if let Some(buffered) = inject_once(engine, attempt, generation) {
+            return Some(buffered);
+        }
+        if Linux::injection_started(&engine.injector) || !engine.replacement_valid(generation) {
+            return None;
+        }
+        if !engine.wait_for_capture(generation, crate::timing::injection().held_release_timeout) {
+            return None;
+        }
+        let buffered = engine.buffered();
+        if buffered.len() <= buffered_len
+            || buffered
+                .iter()
+                .any(|typed| !Linux::is_terminator(typed.key) || Linux::is_line_break(typed.key))
+        {
+            return None;
+        }
+        // A queued Space can arrive between snapshot and the first write.
+        // Nothing was erased, so include the enlarged, layout-independent
+        // suffix and retry. Never retry after a potentially destructive call.
+        buffered_len = buffered.len();
+        let keys: Vec<_> = buffered.iter().map(|typed| typed.key).collect();
+        engine.wait_for_release(&keys, crate::timing::injection().held_release_timeout);
+    }
+    None
+}
+
+fn inject_once(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<Vec<Typed>> {
     use evdev::{EventType, InputEvent, KeyCode as KC, SynchronizationCode};
     let Plan {
         erase,
         retype,
         terminator,
-        expected: _expected,
+        expected,
         verify,
     } = plan;
-    if verify.is_some() {
-        // The AT-SPI helper cannot re-read a suffix to verify it; an
-        // unverified edit must not erase. Plain undo is unaffected.
-        return None;
-    }
     if terminator.is_some_and(Linux::is_line_break) {
         return None;
     }
+    // Native edits preserve literal text across layouts. Never fall back after a helper request could have edited.
+    let route = crate::types::lock_forgiving(&engine.injector.route).clone();
+    if let InjectionRoute::Wayland { source, target } = route {
+        if verify.is_some()
+            || !engine.replacement_valid(generation)
+            || Linux::current_layout() != Some(target)
+        {
+            return None;
+        }
+        let buffered = engine.buffered();
+        if source != target
+            && buffered
+                .iter()
+                .any(|typed| !Linux::is_terminator(typed.key))
+        {
+            return None;
+        }
+        let suffix = engine::reading::<Linux>(&buffered, target);
+        let text = format!(
+            "{}{}{suffix}",
+            retype.text,
+            if terminator.is_some() { " " } else { "" }
+        );
+        let held = crate::types::lock_forgiving(&engine.state)
+            .held_keys
+            .iter()
+            .map(|key| key.0)
+            .collect();
+        super::wayland_input::inject(
+            erase + buffered.len(),
+            &text,
+            &held,
+            engine.injector.locked_mods.load(Ordering::Acquire),
+            || {
+                engine.replacement_valid(generation)
+                    && engine.buffered().len() == buffered.len()
+                    && Linux::current_layout() == Some(target)
+                    && !Linux::capture_pending(&engine.injector)
+            },
+            || engine.injector.started.store(true, Ordering::Release),
+        )?;
+        return Some(buffered);
+    }
+    if let InjectionRoute::Native(target) = route {
+        let buffered = engine.buffered();
+        let source = verify.or_else(Linux::current_layout)?;
+        let suffix = engine::reading::<Linux>(&buffered, source);
+        if !engine.replacement_valid(generation) || engine.buffered().len() != buffered.len() {
+            return None;
+        }
+        engine.injector.started.store(true, Ordering::Release);
+        let response = crate::layout::desktop::request(serde_json::json!({
+            "action": "replace_suffix", "focus": target,
+            "expected": format!("{expected}{suffix}"),
+            "text": format!("{}{}{suffix}", retype.text, if terminator.is_some() { " " } else { "" }),
+        }))?;
+        match response["status"].as_str()? {
+            "applied" => return Some(buffered),
+            "unsupported" => {
+                engine.injector.started.store(false, Ordering::Release);
+                // Preparation deliberately skipped physical release waits.
+                return None;
+            }
+            "unchanged" => {
+                engine.injector.started.store(false, Ordering::Release);
+                return None;
+            }
+            _ => return None,
+        }
+    } else if verify.is_some() {
+        return None;
+    }
+    let retype = retype.keys;
     let syn = || {
         InputEvent::new(
             EventType::SYNCHRONIZATION.0,
@@ -731,53 +1068,20 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     };
 
     let gaps = crate::timing::injection();
-    // 1a. Only the keys we are about to *press* matter here: a press injected
-    //     while the physical key is still down never reaches the focused
-    //     window — the compositor already has that key down and discards the
-    //     second press as a duplicate. The erased keys are not in that set;
-    //     they only cost backspaces.
-    //
-    //     There is no injecting our way out of it. Sending a *release* first —
-    //     which is what this did when the wait ran out — does nothing at all:
-    //     the kernel tracks key state per input device, and this device never
-    //     pressed the key, so the release is discarded before any compositor
-    //     sees it. Measured against Hyprland, a press from the injector stays
-    //     swallowed for as long as the real key is down, however many
-    //     press/release pairs are sent after it. Only the user's own finger
-    //     clears it, which leaves waiting as the only thing that works.
-    let mut retyped_keys: HashSet<KeyCode> = retype.iter().map(|(k, _)| *k).collect();
-    //     Both shifts are always in the set. We inject each key with exactly the
-    //     shift state we decided on — none at all for a Hebrew target, where
-    //     shift types punctuation rather than a capital — so a shift the *user*
-    //     happens to still be holding has to come up first, and one we press
-    //     ourselves would be a duplicate of it.
-    retyped_keys.insert(KC::KEY_LEFTSHIFT);
-    retyped_keys.insert(KC::KEY_RIGHTSHIFT);
-    let mut retyped_keys: Vec<_> = retyped_keys.into_iter().collect();
-    engine.wait_for_release(&retyped_keys, gaps.held_release_timeout);
-
-    // 1b. The terminator gets its own, much longer ceiling, because it is the
-    //     one key that is *always* still down here: pressing it is what asked
-    //     for the correction, and the general ceiling is a fraction of an
-    //     ordinary keypress. Giving up on it early is what left the corrected
-    //     word with no space after it — every time, for anyone who does not
-    //     type in taps.
-    //
-    //     This is the one wait the user can feel, and it ends when they lift a
-    //     key they were lifting anyway to type the next word.
-    let terminator_keys: Vec<_> = terminator.into_iter().collect();
-    engine.wait_for_release(&terminator_keys, gaps.terminator_release_timeout);
-    retyped_keys.extend(terminator_keys);
-
-    // Input may arrive during either wait, including a held suffix key absent
-    // from the correction. Wait for the complete replay before taking its
-    // snapshot; if any key stays held, leave the original text untouched.
-    let buffered = engine.replay_snapshot(&retyped_keys, generation, gaps.held_release_timeout)?;
+    // Preparation ran before the layout switch. Recheck without waiting after
+    // it: late typing must not stretch a layout-only transition into a long wait.
+    let mut retyped_keys: Vec<_> = retype.iter().map(|(key, _)| *key).collect();
+    retyped_keys.extend([KC::KEY_LEFTSHIFT, KC::KEY_RIGHTSHIFT, KC::KEY_BACKSPACE]);
+    retyped_keys.extend(terminator);
+    let buffered = engine.replay_snapshot(&retyped_keys, generation, Duration::ZERO)?;
     if !engine.replacement_valid(generation) {
         return None;
     }
     let caps_lock = crate::types::lock_forgiving(&engine.state).caps_lock;
-    let active_layout = crate::layout::current_layout();
+    let active_layout = crate::layout::current_layout()?;
+    if !crate::layout::prepare_injector(active_layout) {
+        return None;
+    }
 
     // Build the whole erase+retype sequence before emitting bounded writes.
     // Each key is press / SYN / release / SYN so the compositor sees distinct
@@ -789,7 +1093,7 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     // A capital is Left Shift held around the letter — the only way to type one
     // through a device that speaks key positions.
     let mut push_char = |kc: KC, shift: bool| {
-        let shift = injection_shift(kc, shift, caps_lock, active_layout);
+        let shift = injection_shift(kc, shift, caps_lock, Some(active_layout));
         if shift {
             evs.push(InputEvent::new(EventType::KEY.0, KC::KEY_LEFTSHIFT.0, 1));
             evs.push(syn());
@@ -824,8 +1128,14 @@ fn inject(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Option<
     emit_paced(
         &evs,
         gaps.batch_gap,
-        || engine.replay_valid(&retyped_keys, generation, buffered.len()),
-        |chunk| engine.injector.lock().ok()?.emit(chunk).ok(),
+        || {
+            engine.replay_valid(&retyped_keys, generation, buffered.len())
+                && crate::layout::current_layout() == Some(active_layout)
+        },
+        |chunk| {
+            engine.injector.started.store(true, Ordering::Release);
+            engine.injector.device.lock().ok()?.emit(chunk).ok()
+        },
     )?;
 
     Some(buffered)

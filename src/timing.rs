@@ -1,36 +1,17 @@
 //! Every delay the correction path takes, in one place.
 //!
-//! Injecting a correction is not one action but a short sequence — wait for the
-//! user to lift the key that triggered it, erase what they typed, type the
-//! replacement, replay anything they got in meanwhile, then stop ignoring our
-//! own output — and every step needs the one before it to have landed. The
-//! operating system offers no way to be told that it has, so each gap is a
-//! guess: long enough that the event is not dropped or coalesced, short enough
-//! that the user does not watch their word being rewritten.
+//! Correction delivery differs by backend. Windows submits one `SendInput`
+//! transaction. macOS paces fallback backspaces because tightly posted events
+//! can be dropped. Linux prefers verified AT-SPI text edits, then optional
+//! compositor virtual-keyboard input, then bounded `uinput` writes.
 //!
-//! Those guesses used to be five unrelated literals spread across three
-//! platform modules — 1 ms here, 2 ms there, a bare `from_micros(100)` in a
-//! loop — with no way to tell which were measured and which were the first
-//! number that worked. Whoever wanted to make corrections feel faster had to
-//! find them all and could not try a value without a rebuild.
+//! Linux native edits do not press physical keys. Compositor input assigns text
+//! to printable positions that are not physically held. Neither route needs to
+//! wait for Space release. The `uinput` fallback must still wait for conflicting
+//! physical keys and pace writes to protect the kernel reader's event buffer.
 //!
-//! So they are named, gathered, documented with what is known about their
-//! floor, and overridable from the environment. Tuning is now a restart rather
-//! than a build, which is what makes the honest answer to "how small can these
-//! be?" — measure on the machine that matters — actually available.
-//!
-//! # What is actually slow
-//!
-//! Not, mostly, the numbers here. Linux (`uinput`) and Windows (`SendInput`)
-//! both hand the whole correction to the OS as one batch, so their entire
-//! per-key cost is zero and only [`Injection::settle`] is paid once. macOS is
-//! the outlier: `CGEvent`s posted too close together get coalesced or dropped,
-//! so backspaces are paced individually and an eight-letter word spends
-//! `8 × (press_gap + inter_key_gap)` before the replacement even starts.
-//!
-//! The other real cost is [`Injection::held_release_timeout`], and it is not a
-//! delay so much as a ceiling: the wait ends the moment the user lifts the key,
-//! and only a user still leaning on space pays it in full.
+//! These values are overridable for measurement on the target machine. Lowering
+//! fallback safety limits is not a substitute for avoiding unnecessary waits.
 
 use std::time::Duration;
 
@@ -80,9 +61,9 @@ pub struct Injection {
     /// Longest the injector will wait for the key that *ended* the word —
     /// space or enter — to come back up.
     ///
-    /// Its own setting because it is the one key guaranteed to still be held:
-    /// pressing it is what asked for the correction. Nothing can be injected
-    /// around that. A release sent from the injector is dropped by the kernel
+    /// Used by Linux's `uinput` fallback, not native text edits or compositor
+    /// input. Pressing Space asks for correction while that key is still held.
+    /// A release sent from the injector is dropped by the kernel
     /// before any compositor sees it (key state is per input device, and the
     /// injector never pressed the key), and a press sent while the real key is
     /// down stays swallowed no matter how many times it is repeated — measured
@@ -156,18 +137,15 @@ pub const DEFAULTS: Injection = Injection {
     press_gap: Duration::from_micros(700),
     inter_key_gap: Duration::from_micros(700),
     settle: Duration::from_millis(1),
-    // Linux can afford a much tighter ceiling than the other two: `uinput`
-    // events are submitted as one batch to the kernel rather than posted
-    // through a compositor's queue, so a slightly early injection is recovered
-    // from instead of scrambled.
+    // Linux's fallback declines replay if a conflicting physical key remains
+    // held after this ceiling. It does not inject early on timeout.
     #[cfg(target_os = "linux")]
     held_release_timeout: Duration::from_millis(40),
     #[cfg(not(target_os = "linux"))]
     held_release_timeout: Duration::from_millis(150),
     // Long enough to outlast a deliberate keypress rather than a brisk one.
-    // Only Linux ever waits on this: macOS and Windows insert the trailing
-    // space as *text* alongside the corrected word, so there is no key to be
-    // swallowed and nothing to wait for.
+    // Only Linux's uinput fallback waits on this. Text and compositor routes
+    // avoid sending Space through a physically held Space position.
     terminator_release_timeout: Duration::from_millis(600),
     held_poll: Duration::from_micros(100),
     device_settle: Duration::from_millis(300),

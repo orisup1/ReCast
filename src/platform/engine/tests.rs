@@ -19,6 +19,10 @@ static ALLOW_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static REFUSE_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static CAPTURE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAPTURE_OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PREPARE_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static EDIT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static REJECT_UNICODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EMPTY_INPUT_SUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -225,11 +229,27 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
         SIMULATED_LAYOUT.store(usize::from(lang == Language::Hebrew), Ordering::SeqCst);
         crate::layout::LayoutSwitch::Switched
     }
+    fn prepare_injection(_: &Engine<Self>, _: &Plan<Self>, _: u64, _: Option<Language>) -> bool {
+        PREPARE_ALLOWED.load(Ordering::SeqCst)
+    }
+    fn capture_pending(_: &Screen) -> bool {
+        let pending = CAPTURE_PENDING.load(Ordering::SeqCst);
+        if pending {
+            CAPTURE_OBSERVED.store(true, Ordering::SeqCst);
+        }
+        pending
+    }
+    fn injection_started(_: &Screen) -> bool {
+        EDIT_STARTED.load(Ordering::SeqCst)
+    }
     fn inject(
         engine: &Engine<Self>,
         plan: Plan<Self>,
         generation: u64,
     ) -> Option<Vec<Typed<char>>> {
+        if !EDIT_STARTED.load(Ordering::SeqCst) {
+            return None;
+        }
         engine.injector.erasures.lock().unwrap().push(plan.erase);
         engine.injector.ready.send(()).unwrap();
         engine
@@ -3652,8 +3672,8 @@ fn completions_and_learning_require_retained_choices() {
     // Saved exceptions remain completion vocabulary when personalization is off.
     crate::config::Config::update_live(|cfg| cfg.personal_enabled = false);
     crate::complete::suppress("qzlearnedname");
-    crate::complete::learn("qzlearnedname");
-    crate::complete::learn("qzlearnedname");
+    crate::complete::seed_legacy_undo("qzlearnedname");
+    crate::complete::seed_legacy_undo("qzlearnedname");
     let s = Session::new();
     s.type_text("qzl");
     s.tap(Simulated::SHIFT_RIGHT);
@@ -5286,8 +5306,8 @@ fn typing_correction_undo_and_interrupted_replacements() {
         assert_eq!(s.engine.control.undo_count(), 1);
         crate::complete::unlist("acheive");
         // A delayed learning write must not resurrect a newer unlist.
-        crate::complete::learn("acheive");
-        crate::complete::learn("acheive");
+        crate::complete::seed_legacy_undo("acheive");
+        crate::complete::seed_legacy_undo("acheive");
         assert!(!crate::complete::learned("acheive"));
     }
     crate::config::Config::update_live(|cfg| cfg.undo_shortcut = "none".into());
@@ -7153,3 +7173,207 @@ fn spelling_preview_is_passive_and_commits_only_on_trusted_typing() {
 }
 
 mod dictionary_typing;
+
+#[test]
+fn preparation_and_unedited_failure_do_not_leave_layout_only_corrections() {
+    const CHILD: &str = "RECAST_PREPARATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::preparation_and_unedited_failure_do_not_leave_layout_only_corrections"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    for preparation in [false, true] {
+        PREPARE_ALLOWED.store(preparation, Ordering::SeqCst);
+        EDIT_STARTED.store(false, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("akuo ");
+        s.checks_ready();
+        s.idle();
+        assert_eq!(s.text(), "akuo ");
+        assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), 0);
+        assert!(s.engine.injector.erasures.lock().unwrap().is_empty());
+        assert!(matches!(
+            s.engine.lock().last_action,
+            Some(LastAction::Unchanged { .. })
+        ));
+        assert!(!s.engine.lock().no_fix);
+    }
+    // A proven pre-edit failure must not suppress the next ordinary word.
+    PREPARE_ALLOWED.store(true, Ordering::SeqCst);
+    EDIT_STARTED.store(true, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive ");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fetched_input_batches_must_finish_before_replay_is_frozen() {
+    const CHILD: &str = "RECAST_BATCH_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::fetched_input_batches_must_finish_before_replay_is_frozen"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let s = Session::new();
+    s.engine.lock().focus = Some(1);
+    let generation = s.engine.lock().generation;
+    assert!(s.engine.replay_valid(&[], generation, 0));
+    CAPTURE_PENDING.store(true, Ordering::SeqCst);
+    assert!(!s.engine.wait_for_capture(generation, Duration::ZERO));
+    assert!(s
+        .engine
+        .replay_snapshot(&[], generation, Duration::ZERO)
+        .is_none());
+    assert!(!s.engine.replay_valid(&[], generation, 0));
+    // Finish dispatching keys that the app already received before the reader woke.
+    s.engine.lock().buffered_keys.push(Typed {
+        key: ' ',
+        shift: false,
+    });
+    CAPTURE_PENDING.store(false, Ordering::SeqCst);
+    assert!(s.engine.wait_for_capture(generation, Duration::ZERO));
+    let snapshot = s
+        .engine
+        .replay_snapshot(&[], generation, Duration::ZERO)
+        .unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].key, ' ');
+    assert!(s.engine.replay_valid(&[], generation, 1));
+    s.engine.forget_everything();
+    assert!(!s.engine.wait_for_capture(generation, Duration::ZERO));
+}
+
+#[test]
+fn automatic_correction_waits_for_a_partially_dispatched_space() {
+    const CHILD: &str = "RECAST_PARTIAL_SPACE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::automatic_correction_waits_for_a_partially_dispatched_space"])
+            .env(CHILD, "1")
+            .env("RECAST_INJECT_HELD_TIMEOUT", "2000000")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for during_focus in [false, true] {
+        ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("akuo");
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        s.type_while_checking(" ");
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        let worker_resume = if during_focus {
+            let (ready, reached) = mpsc::sync_channel(0);
+            let (focus_proceed, resume) = mpsc::channel();
+            *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+                ready,
+                proceed: resume,
+            });
+            proceed.send(()).unwrap();
+            reached.recv_timeout(Duration::from_secs(3)).unwrap();
+            focus_proceed
+        } else {
+            proceed
+        };
+        CAPTURE_PENDING.store(true, Ordering::SeqCst);
+        CAPTURE_OBSERVED.store(false, Ordering::SeqCst);
+        let (focus_ready, focus_reached) = mpsc::sync_channel(0);
+        let (focus_proceed, focus_resume) = mpsc::channel();
+        *FOCUS_GATE.lock().unwrap() = Some(FocusGate {
+            ready: focus_ready,
+            proceed: focus_resume,
+        });
+        let engine = Arc::clone(&s.engine);
+        let writer = thread::spawn(move || {
+            // The physical reader has counted this press but is still waiting
+            // on focus before adding its Space to the tracked deletion tail.
+            engine.key_press(' ');
+            engine.injector.text.lock().unwrap().push(' ');
+            engine.key_release(' ');
+            CAPTURE_PENDING.store(false, Ordering::SeqCst);
+        });
+        focus_reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        worker_resume.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !CAPTURE_OBSERVED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "search discarded the partially captured Space"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        focus_proceed.send(()).unwrap();
+        writer.join().unwrap();
+        s.checks_ready();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "שלום  ");
+    }
+}
+
+#[test]
+fn repeated_undos_do_not_save_word_exceptions() {
+    const CHILD: &str = "RECAST_NO_UNDO_LEARNING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::repeated_undos_do_not_save_word_exceptions",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+    let path = crate::complete::user_path("learned.txt").unwrap();
+    for _ in 0..3 {
+        crate::complete::unlist("recieve");
+        let before = std::fs::read(&path).ok();
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.finish();
+        s.undo();
+        s.pending();
+        s.finish();
+        assert_eq!(s.text(), "recieve ");
+        assert!(crate::complete::suppressed("recieve"));
+        assert!(!crate::complete::learned("recieve"));
+        assert_eq!(std::fs::read(&path).ok(), before);
+    }
+}

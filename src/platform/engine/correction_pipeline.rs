@@ -286,7 +286,11 @@ impl<P: Platform> Engine<P> {
             Some(&phrase),
             |_| crate::layout::LayoutSwitch::Switched,
         );
-        let mut st = self.lock();
+        let Some(mut st) =
+            self.captured_state(generation, crate::timing::injection().held_release_timeout)
+        else {
+            return;
+        };
         // Following text is everything typed after the checked word while
         // search ran, reconstructed from tracked presses and verified
         // against the checked word itself. That covers extra spaces, an
@@ -395,7 +399,11 @@ impl<P: Platform> Engine<P> {
         // An obsolete search must not invalidate text captured during its focus query.
         let (current_focus, current_mode) = self.read_focus();
         let current_layout = P::current_layout();
-        let mut st = self.lock();
+        let Some(mut st) =
+            self.captured_state(generation, crate::timing::injection().held_release_timeout)
+        else {
+            return;
+        };
         if !current(&st)
             || st.revision.wrapping_sub(revision) != st.press_revision.wrapping_sub(focus_presses)
         {

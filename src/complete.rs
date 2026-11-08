@@ -977,27 +977,11 @@ fn without_word(text: &str, word: &str) -> String {
 
 /// How many undos of the same word retire it for good.
 ///
-/// Two, not one. A single undo already stops the word being corrected for the
-/// rest of the session ([`suppress`]), which is the right answer for a word the
-/// user took back by reflex — and a reflex is not a decision. Doing it twice, on
-/// two separate occasions, is: it means the correction is not a one-off
-/// annoyance but something that will keep happening, and that is exactly what
-/// `ignore.txt` is for. This is the same conclusion reached without asking the
-/// user to go and find a file.
+/// Legacy count-file threshold, retained for saved word-rule compatibility.
+/// Undo gestures no longer create or increment persistent exceptions.
 const LEARNED_MIN: u32 = 2;
 
-/// The undo counts, read from `learned.txt` on first use.
-///
-/// The gap this fills: the session list is forgotten at restart and
-/// `ignore.txt` has to be written by hand, so a name the speller dislikes was
-/// undone once a session, for as long as the user kept using the daemon. Nothing
-/// in between remembered anything. This does — and it remembers the one signal
-/// there is real evidence behind, since an undo is the user saying, about a
-/// specific word, that we were wrong.
-///
-/// Deliberately *not* fed by "a word that was typed and not corrected": the
-/// speller only ever leaves those alone anyway, so counting them would gather
-/// evidence about every word except the ones this exists to protect.
+/// Existing saved exceptions remain editable through the word-rule editor.
 fn learned_words() -> &'static Mutex<HashMap<String, u32>> {
     static WORDS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
     WORDS.get_or_init(|| Mutex::new(parse_learned(&read_user_file(LEARNED_FILE))))
@@ -1034,8 +1018,8 @@ fn learned_text(counts: &HashMap<String, u32>) -> String {
     let mut entries: Vec<_> = counts.iter().collect();
     entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     let mut out = String::from(
-        "# Words you have taken back a correction of, and how many times.\n\
-         # Written by ReCast; safe to edit or delete.\n",
+        "# Saved word exceptions in the legacy count format.\n\
+         # Undo does not add entries; edit exceptions through Word rules.\n",
     );
     for (word, count) in entries {
         out.push_str(word);
@@ -1046,13 +1030,9 @@ fn learned_text(counts: &HashMap<String, u32>) -> String {
     out
 }
 
-/// Note that the user undid a correction of `word`.
-///
-/// Written through to disk immediately, as `ignore.txt` is: an undo is a
-/// deliberate gesture that happens a handful of times an hour, and the file is a
-/// few hundred bytes. Nothing here is on the path a keystroke takes.
-#[allow(dead_code)]
-pub fn learn(word: &str) {
+/// Seed historical count-file fixtures. Production undo never calls this.
+#[cfg(test)]
+pub fn seed_legacy_undo(word: &str) {
     let word = word.trim().to_lowercase();
     if word.is_empty() {
         return;
@@ -1097,6 +1077,7 @@ pub fn learned(word: &str) -> bool {
 /// Unlike `ignore.txt` this file is entirely ours, so it is rewritten wholesale
 /// rather than appended to a line at a time — there is no user formatting to
 /// preserve.
+#[cfg(test)]
 fn write_learned(counts: &HashMap<String, u32>) {
     let Some(path) = user_path(LEARNED_FILE) else {
         return;
@@ -1585,7 +1566,7 @@ mod learned_list {
         std::fs::write(&path, format!("example\t{}\n", u32::MAX)).unwrap();
         assert!(learned("example"));
         suppress("example");
-        learn("example");
+        seed_legacy_undo("example");
         assert!(learned("example"));
         assert_eq!(
             parse_learned(&std::fs::read_to_string(&path).unwrap())["example"],
@@ -1623,13 +1604,15 @@ mod learned_list {
     }
 
     #[test]
-    fn one_undo_is_a_reflex_and_two_are_a_decision() {
-        // The threshold is the whole design: undoing once already retires the
-        // word for the session, so this only has to catch the word that keeps
-        // coming back.
+    fn legacy_counts_retain_their_original_threshold() {
+        // Existing count files retain their interpretation for compatibility.
+        // New undo gestures never update these counts.
         let mut counts = HashMap::new();
         counts.insert("sami".to_string(), 1);
-        assert!(counts["sami"] < LEARNED_MIN, "one undo does not stick");
+        assert!(
+            counts["sami"] < LEARNED_MIN,
+            "legacy count one is below the saved threshold"
+        );
         counts.insert("sami".to_string(), 2);
         assert!(counts["sami"] >= LEARNED_MIN);
     }
@@ -3231,7 +3214,7 @@ impl RuleKind {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Ignored => "One word per line. Add words to protect them; remove words to allow correction.",
-            Self::Learned => "Saved exceptions from repeated undos, one word per line. Remove a word to allow correction, or add one to protect it.",
+            Self::Learned => "Saved exceptions, one word per line. Undo no longer adds exceptions. Remove a word to allow correction, or add one to protect it.",
             Self::Abbreviations => "One shortcut = expansion per line. Example: btw = by the way",
         }
     }
@@ -3304,7 +3287,7 @@ impl RuleEditor {
             }
         }
         let path = user_path(self.kind.file()).ok_or("No configuration directory")?;
-        // Hold the same lock as undo learning until its replacement is applied.
+        // Keep the in-memory saved exceptions consistent with their file.
         let mut counts = learned_words().lock().map_err(|_| "Word rules are busy")?;
         if read_rules(&path)? != self.original {
             return Err("These rules changed since opening. Copy your edits, then reopen the editor to review the latest rules.".into());
@@ -3456,10 +3439,10 @@ mod rule_editor_tests {
         assert_eq!(read_user_file("abbrev.txt"), "omw = on my way\n");
 
         suppress("recieve");
-        learn("recieve");
-        learn("recieve");
+        seed_legacy_undo("recieve");
+        seed_legacy_undo("recieve");
         suppress("keyboad");
-        learn("keyboad");
+        seed_legacy_undo("keyboad");
         let mut editor = RuleEditor::open(RuleKind::Learned).unwrap();
         assert_eq!(editor.text, "recieve");
         editor.text = "Supino".into();
@@ -3471,10 +3454,10 @@ mod rule_editor_tests {
             Some(&1)
         );
         // A delayed undo must not reintroduce a removed exception.
-        learn("recieve");
+        seed_legacy_undo("recieve");
         assert!(!learned("recieve"));
         let mut editor = RuleEditor::open(RuleKind::Learned).unwrap();
-        learn("keyboad");
+        seed_legacy_undo("keyboad");
         editor.text.clear();
         assert!(editor.save().unwrap_err().contains("changed since opening"));
         assert!(learned("keyboad"));

@@ -338,7 +338,7 @@ pub fn describe_backend() -> String {
             if matches!(b, Backend::Gnome | Backend::Kde)
                 && std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
             {
-                out.push_str(if crate::settings::flag("RECAST_DESKTOP_HELPER", false) {
+                out.push_str(if crate::settings::flag("RECAST_DESKTOP_HELPER", true) {
                     "  AT-SPI helper enabled; correction requires an accessible focused control."
                 } else {
                     "  ! Focus unavailable: install AT-SPI/PyGObject and enable RECAST_DESKTOP_HELPER=1."
@@ -379,14 +379,10 @@ pub fn focus_supported() -> bool {
 }
 
 pub fn focused_target() -> Option<Focus> {
-    let native = native_focused_target();
-    match (native, super::desktop::focus()) {
-        (Some(mut native), Some(accessible)) => {
-            native.id.push_str(&format!("/{}", accessible.id));
-            Some(native)
-        }
-        (native, accessible) => native.or(accessible),
-    }
+    // Do not combine identities from independent IPC queries. A busy helper
+    // must not make an unchanged native window appear to change focus.
+    // Native suffix edits separately validate their exact AT-SPI control.
+    native_focused_target().or_else(super::desktop::focus)
 }
 
 fn native_focused_target() -> Option<Focus> {
@@ -418,6 +414,23 @@ fn native_focused_target() -> Option<Focus> {
 
 pub fn query_layout() -> Option<Language> {
     backend().current()
+}
+
+/// A virtual keyboard can keep a different group from the physical keyboard,
+/// especially after reconnect or a per-device layout shortcut.
+pub fn prepare_injector(lang: Language) -> bool {
+    match backend() {
+        Backend::Hyprland => hypr::prepare_injector(lang),
+        Backend::Sway => sway::prepare_injector(lang),
+        _ => super::fresh_layout() == Some(lang),
+    }
+}
+
+fn injector_group(names: &[String], active: usize, lang: Language) -> Option<(usize, bool)> {
+    let desired = names
+        .iter()
+        .position(|name| compatible_keymap(name) == Some(lang))?;
+    Some((desired, active == desired))
 }
 
 pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
@@ -691,6 +704,7 @@ mod hypr {
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::time::Duration;
+    use std::time::Instant;
 
     use super::{language_of_keymap, Language, INJECTOR};
 
@@ -775,7 +789,10 @@ mod hypr {
         Some(
             std::mem::take(keyboards)
                 .into_iter()
-                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR))
+                .filter(|block| {
+                    block.get("active_keymap").and_then(|v| v.as_str()) != Some(INJECTOR)
+                }),
         )
     }
 
@@ -876,6 +893,76 @@ mod hypr {
         ))
     }
 
+    fn injector_state(json: &str, lang: Language) -> Option<(usize, bool)> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let keyboard = value["keyboards"]
+            .as_array()?
+            .iter()
+            .find(|keyboard| keyboard["name"].as_str() == Some(INJECTOR))?;
+        let names = super::with_variants(
+            keyboard["layout"].as_str()?,
+            keyboard["variant"].as_str().unwrap_or(""),
+        );
+        let desired = names
+            .iter()
+            .position(|name| super::compatible_keymap(name) == Some(lang))?;
+        // Older Hyprland releases expose the active keymap name without a
+        // numeric group. Use that native answer rather than disabling replay.
+        let ready = if let Some(name) = keyboard["active_keymap"].as_str() {
+            super::compatible_keymap(name) == Some(lang)
+        } else {
+            usize::try_from(keyboard["active_layout_index"].as_u64()?).ok()? == desired
+        };
+        Some((desired, ready))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn compositor_injector_does_not_replace_the_physical_layout() {
+        let json = r#"{"keyboards":[{"name":"physical","layout":"us","active_keymap":"English (US)"},{"name":"virtual-native","layout":"recast-injector","active_keymap":"recast-injector","main":true}]}"#;
+        assert_eq!(parse_layout(json), Some(Language::English));
+        assert_eq!(parse_names(json), Some(vec!["us".into()]));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn injector_uses_its_own_layout_order_and_group() {
+        let json = r#"{"keyboards":[{"name":"physical","layout":"us,il","active_layout_index":1},{"name":"recast-injector","layout":"il,us","active_layout_index":1}]}"#;
+        assert_eq!(injector_state(json, Language::Hebrew), Some((0, false)));
+        assert_eq!(injector_state(json, Language::English), Some((1, true)));
+        let older = r#"{"keyboards":[{"name":"recast-injector","layout":"il,us","active_keymap":"English (US)"}]}"#;
+        assert_eq!(injector_state(older, Language::Hebrew), Some((0, false)));
+        assert_eq!(injector_state(older, Language::English), Some((1, true)));
+        assert_eq!(injector_state("{}", Language::English), None);
+    }
+
+    pub fn prepare_injector(lang: Language) -> bool {
+        let Some((index, ready)) = devices().and_then(|json| injector_state(&json, lang)) else {
+            return false;
+        };
+        if ready {
+            return true;
+        }
+        if request(&format!("/switchxkblayout {INJECTOR} {index}"))
+            .is_none_or(|reply| reply.trim() != "ok")
+        {
+            return false;
+        }
+        let deadline = Instant::now() + crate::timing::injection().layout_confirm;
+        loop {
+            if devices()
+                .and_then(|json| injector_state(&json, lang))
+                .is_some_and(|(_, ready)| ready)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            crate::timing::pause(crate::timing::injection().layout_poll);
+        }
+    }
+
     pub fn set_index(index: usize) -> bool {
         if available() {
             // Hyprland answers "ok" and nothing else on success.
@@ -903,10 +990,12 @@ mod hypr {
 /// `i3-ipc`, a little-endian payload length, a little-endian type, then the
 /// payload; the reply has the same shape.
 mod sway {
+    use crate::types::Language;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::time::Duration;
+    use std::time::Instant;
 
     use super::INJECTOR;
 
@@ -1064,7 +1153,15 @@ mod sway {
                 .into_iter()
                 .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("keyboard"))
                 .filter(|block| block.get("identifier").and_then(|v| v.as_str()) != Some(INJECTOR))
-                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR))
+                .filter(|block| {
+                    !block
+                        .get("xkb_layout_names")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|names| {
+                            names.iter().any(|name| name.as_str() == Some(INJECTOR))
+                        })
+                }),
         )
     }
 
@@ -1113,6 +1210,83 @@ mod sway {
 
     pub fn current_index() -> Option<usize> {
         parse_index(&inputs()?)
+    }
+
+    fn injector_state(json: &str, lang: Language) -> Option<(String, usize, bool)> {
+        let values: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+        let keyboard = values
+            .iter()
+            .find(|keyboard| keyboard["name"].as_str() == Some(INJECTOR))?;
+        let names: Vec<String> = keyboard["xkb_layout_names"]
+            .as_array()?
+            .iter()
+            .map(|name| name.as_str().map(str::to_owned))
+            .collect::<Option<_>>()?;
+        let active = keyboard["xkb_active_layout_index"]
+            .as_u64()?
+            .try_into()
+            .ok()?;
+        let (index, ready) = super::injector_group(&names, active, lang)?;
+        Some((keyboard["identifier"].as_str()?.to_owned(), index, ready))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn compositor_injector_does_not_replace_the_physical_layout() {
+        let json = r#"[{"type":"keyboard","name":"physical","xkb_layout_names":["English (US)"],"xkb_active_layout_index":0},{"type":"keyboard","name":"virtual-native","xkb_layout_names":["recast-injector"],"xkb_active_layout_index":0}]"#;
+        assert_eq!(parse_names(json), Some(vec!["English (US)".into()]));
+        assert_eq!(parse_index(json), Some(0));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn injector_uses_its_own_layout_order_and_group() {
+        let json = r#"[{"name":"physical","xkb_layout_names":["English (US)","Hebrew"],"xkb_active_layout_index":1},{"name":"recast-injector","identifier":"0:0:recast-injector","xkb_layout_names":["Hebrew","English (US)"],"xkb_active_layout_index":1}]"#;
+        assert_eq!(
+            injector_state(json, Language::Hebrew),
+            Some(("0:0:recast-injector".into(), 0, false))
+        );
+        assert_eq!(
+            injector_state(json, Language::English),
+            Some(("0:0:recast-injector".into(), 1, true))
+        );
+        assert_eq!(injector_state("[]", Language::English), None);
+    }
+
+    pub fn prepare_injector(lang: Language) -> bool {
+        let Some((id, index, ready)) = inputs().and_then(|json| injector_state(&json, lang)) else {
+            return false;
+        };
+        if ready {
+            return true;
+        }
+        // JSON quoting also escapes command separators inside a quoted sway selector.
+        let selector = serde_json::to_string(&id).ok();
+        let Some(selector) = selector else {
+            return false;
+        };
+        let Some(reply) = request(
+            RUN_COMMAND,
+            &format!("input {selector} xkb_switch_layout {index}"),
+        ) else {
+            return false;
+        };
+        if !reply.contains("\"success\":true") && !reply.contains("\"success\": true") {
+            return false;
+        }
+        let deadline = Instant::now() + crate::timing::injection().layout_confirm;
+        loop {
+            if inputs()
+                .and_then(|json| injector_state(&json, lang))
+                .is_some_and(|(_, _, ready)| ready)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            crate::timing::pause(crate::timing::injection().layout_poll);
+        }
     }
 
     pub fn set_index(index: usize) -> bool {

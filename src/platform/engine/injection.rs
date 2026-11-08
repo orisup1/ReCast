@@ -9,7 +9,6 @@ use super::{
 use crate::types::{FixKind, Language, ReplaceGuard};
 use std::sync::{Arc, MutexGuard};
 use std::thread;
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 /// Restore tracked text only when a rewrite failed before injection started.
@@ -150,6 +149,37 @@ impl<P: Platform> Engine<P> {
         }
     }
 
+    /// Drain an already-fetched input batch before freezing a replay suffix.
+    /// This does not require physical keys to be released for native text edits.
+    #[cfg(target_os = "linux")]
+    pub fn wait_for_capture(&self, generation: u64, ceiling: Duration) -> bool {
+        self.captured_state(generation, ceiling).is_some()
+    }
+
+    /// A press may release the state lock for focus I/O before updating its
+    /// text tail. Workers must not treat that partial dispatch as stale text.
+    pub(super) fn captured_state(
+        &self,
+        generation: u64,
+        ceiling: Duration,
+    ) -> Option<MutexGuard<'_, AppState<P>>> {
+        let start = Instant::now();
+        loop {
+            let st = self.lock();
+            if st.generation != generation {
+                return None;
+            }
+            if !P::capture_pending(&self.injector) {
+                return Some(st);
+            }
+            drop(st);
+            if start.elapsed() >= ceiling {
+                return None;
+            }
+            crate::timing::pause(crate::timing::injection().held_poll);
+        }
+    }
+
     /// Snapshot the replay suffix only after replay keys and modifiers are up.
     /// The suffix can grow during a release wait, so inspect it together with
     /// held keys under one lock. A timeout must leave the visible text intact.
@@ -168,7 +198,7 @@ impl<P: Platform> Engine<P> {
                 return None;
             }
             let held = st.replay_keys_held(keys);
-            if !held {
+            if !held && !P::capture_pending(&self.injector) {
                 return Some(st.buffered_keys.to_vec());
             }
             drop(st);
@@ -191,13 +221,13 @@ impl<P: Platform> Engine<P> {
         st.generation == generation
             && st.buffered_keys.len() == buffered_len
             && !st.replay_keys_held(keys)
+            && !P::capture_pending(&self.injector)
     }
 
     /// Keys the user managed to type while a correction was landing. Read while
     /// holding the lock and returned by value: the injected keystrokes re-enter
     /// the listener, which needs the same lock, so holding it across an
     /// injection is a deadlock.
-    #[cfg(any(target_os = "macos", target_os = "windows", test))]
     pub fn buffered(&self) -> Vec<Typed<P::Key>> {
         self.lock().buffered_keys.to_vec()
     }
@@ -310,7 +340,21 @@ impl<P: Platform> Engine<P> {
             self.abort_before_injection(generation, retry);
             return;
         }
+        let target_layout = match &commit {
+            Some(Commit::Fix {
+                deferred_layout, ..
+            }) => *deferred_layout,
+            Some(Commit::Undo { layout, .. }) => *layout,
+            Some(Commit::Suggestion { layout }) => Some(*layout),
+            None => None,
+        };
+        if !P::prepare_injection(self, &plan, generation, target_layout) {
+            self.abort_before_injection(generation, retry);
+            return;
+        }
+        let previous_layout = P::current_layout();
         if !self.confirm_replacement_layout(commit.as_ref(), generation) {
+            self.restore_unedited_layout(generation, previous_layout);
             self.abort_before_injection(generation, retry);
             return;
         }
@@ -324,6 +368,11 @@ impl<P: Platform> Engine<P> {
                 })
             );
         let Some(buffered) = P::inject(self, plan, generation) else {
+            if !P::injection_started(&self.injector) {
+                self.restore_unedited_layout(generation, previous_layout);
+                self.abort_before_injection(generation, retry);
+                return;
+            }
             let mut st = self.lock();
             if st.generation == generation {
                 st.invalidate_text();
@@ -353,7 +402,6 @@ impl<P: Platform> Engine<P> {
             }
             (st.practice, st.mode)
         };
-        let mut learn = None;
         let mut pending_learning = None;
         match commit {
             Some(Commit::Fix {
@@ -407,7 +455,6 @@ impl<P: Platform> Engine<P> {
                 }
                 if let Some(word) = suppress.filter(|_| !practice) {
                     crate::complete::suppress(&word);
-                    learn = Some(word);
                 }
                 if !practice {
                     self.control.record_undo();
@@ -685,10 +732,13 @@ impl<P: Platform> Engine<P> {
             drop(st);
             self.ensure_word_check_worker();
         }
-        // Persistence must not extend the injection window: real typing during
-        // a slow disk write used to be treated as an interrupted replacement.
-        if let Some(word) = learn {
-            crate::complete::learn(&word);
+    }
+
+    fn restore_unedited_layout(&self, generation: u64, previous: Option<Language>) {
+        if !P::injection_started(&self.injector) && self.replacement_valid(generation) {
+            if let Some(previous) = previous.filter(|lang| P::current_layout() != Some(*lang)) {
+                let _ = P::switch_layout_to(previous);
+            }
         }
     }
 

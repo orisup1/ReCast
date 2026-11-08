@@ -255,7 +255,7 @@ fn diagnostics(control: Option<&AppControl>) -> String {
     let (abbrevs, ignored, learned) = complete::list_counts();
     writeln!(out, "  abbrev.txt:     {abbrevs} abbreviation(s)").unwrap();
     writeln!(out, "  ignore.txt:     {ignored} word(s)").unwrap();
-    writeln!(out, "  learned.txt:    {learned} word(s) retired by undo").unwrap();
+    writeln!(out, "  learned.txt:    {learned} saved legacy exception(s)").unwrap();
     writeln!(
         out,
         "  memory:         {}",

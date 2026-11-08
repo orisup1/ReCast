@@ -61,8 +61,8 @@ replaces waiting work that can no longer safely target the caret. The tracked
 unchanged word is available immediately for explicit gestures, without waiting
 for dictionary search.
 
-Extra spaces no longer discard an otherwise current result. On supported macOS
-and Windows native fields, a same-layout spelling correction can also survive up
+Extra spaces no longer discard an otherwise current result. On supported macOS, Windows,
+and Linux AT-SPI native fields, a same-layout spelling correction can also survive up
 to 32 freshly typed following characters, including spaces. The complete expected
 suffix must match before a native edit. The later text stays intact, its unfinished
 word remains tracked, and undo restores the original correction while preserving
@@ -131,8 +131,9 @@ policy are unchanged.
    pending work and is never erased or replayed. A final word submitted without
    Space may remain uncorrected.
 2. **Unavailable native context:** delayed edits across following letters require
-   verified native replacement. Linux and unsupported native controls decline
-   them. Ordinary correction and spaces-only replay retain their existing paths.
+   verified native replacement. Linux supports this in accessible AT-SPI
+   editable controls; inaccessible and unsupported controls decline it.
+   Ordinary correction and spaces-only replay retain their existing paths.
 3. **Later layout changes:** following letters are not speculatively
    reinterpreted under another layout. A finished word inside the following
    text is preserved verbatim on verified fields and checked after the
@@ -203,3 +204,128 @@ Formatting and whitespace checks passed.
 Native desktop trials remain necessary: simulations and
 cross-target checks do not establish application compatibility or typing latency.
 The installed app was not replaced or restarted during this review.
+
+
+## Cross-platform follow-up (2026-11-08)
+
+The ten-commit review covered asynchronous automatic search, continued typing,
+Shift capitalization and rollover, stale focus replies, Backspace recovery,
+finished conversion cleanup, retained suggestion choices, and queued edits.
+The decision and editing-state changes already live in the shared engine and
+therefore compile for every OS. The missing parity was in native adapters:
+
+- Linux previously rejected every verified delayed correction and extended undo.
+  AT-SPI now verifies only the captured suffix before a native edit, preserving
+  following text literally even when undo restores another layout. The helper
+  is attempted automatically when available; explicit disabling still wins.
+- The helper's PyGObject text read dispatched to the wrong interface. Explicit
+  `Atspi.Text.get_text` fixes suffix reads and existing selection rescue. Startup
+  now seeds the already-focused control, and synchronous validation refreshes its
+  state rather than relying on undispatched focus events.
+- Combining independently queried compositor/control identities caused transient
+  helper contention to resemble a focus change. Compositor-aware sessions keep
+  their native identity; AT-SPI edits independently verify the exact control.
+- Concurrent layout refreshes could turn a confirmed layout into an unknown
+  answer while a correction was switching layouts. Refreshes retain the last
+  confirmed cache entry; overlapping fresh queries can return their own native
+  answer without repopulating an overtaken cache. Actual invalidations and newer
+  completed answers still take precedence.
+- Linux kernel replay waits run before a layout switch. Pre-edit aborts restore
+  the previous layout when context remains valid. No rollback is claimed after
+  an edit might have begun. Hyprland and Sway additionally synchronize the
+  injector's own layout group using its own layout order before keycode replay.
+- Windows keyboard fallback now rejects native selections and password/read-only
+  controls, and checks that its replay suffix has not grown before `SendInput`.
+
+AT-SPI has no atomic replace-range operation. Insertion precedes deletion, with
+range, caret, and focus checks; a verified rollback removes an inserted prefix
+when continued typing interrupts the edit. An uncertain native edit never falls
+back to counted key deletion. Keyboard-only Linux controls still cannot promise
+atomic replacement during simultaneous physical input. GNOME Wayland still needs
+its live-layout extension; other sessions retain their respective native backend.
+These changes do not make macOS's passive candidate strip available on Windows
+or Linux, and do not establish compatibility with every application.
+
+The disposable Hyprland/GTK harness now covers delayed suffixes, correction undo,
+layout results, a deliberately mismatched injector layout, and helper-disabled
+fallback. It resets external IPC changes only after the documented cache TTL,
+and refuses repeated undo trials that would intentionally suppress their own word.
+It preserves the original focused window/layout and can optionally restore a
+previously running standalone binary. No installed binary is replaced by tests.
+
+
+Follow-up validation: 462 unit tests and eight CLI tests passed; 11 unit tests
+were intentionally ignored. All 27 Python checks and both JavaScript fixture
+suites passed. Formatting, whitespace checks, and Clippy with Rust warnings
+denied passed for Linux, macOS, and Windows. The Windows resource compiler is
+not installed here, so resource embedding was skipped; that target was checked,
+not run. macOS dependencies also report an existing future-compatibility warning.
+A process-identity test exposed a fork/exec timing race under the full suite;
+its fixture now waits for the unrelated executable before asserting identity.
+
+The final uninstrumented Linux release passed all 31 Hyprland/GTK trials:
+16 spelling corrections with a deliberately mismatched injector group, six
+queued layout conversions, six delayed spelling corrections with next-word
+typing, and three individual undo trials (native layout, keyboard layout, and
+extended spelling). Each undo trial checked both restored text and layout.
+All eight release CLI tests passed as well. Other native desktops and
+applications still require their own runtime trials. The installed binary and
+desktop configuration were not replaced.
+
+A release stress trial additionally exposed a safe keyboard-fallback miss when a
+queued Space enlarged the replay suffix between snapshot and the first write.
+Linux now retries this case at most three times, only before any destructive call
+and only for a growing spaces-only suffix. Partial edits, letters, submission,
+focus changes, and stale generations cannot enter that retry path. Runtime help
+also describes Linux extended undo and automatic helper discovery consistently.
+
+Queued evdev input also requires reader-side coordination. Readers publish an
+unwind-safe pending count while dispatching a fetched batch of presses, repeats,
+or lock-state updates. Native preparation, keycode snapshots, and pre-edit retries
+wait for dispatch to finish. Release-only batches do not participate: an unrelated
+key-up must not interrupt a replay that already started deleting. Physical holds
+remain independent of this barrier, so verified native edits need not wait for
+the user's fingers. A regression covers pending batches, their completed suffix,
+and cancellation while waiting.
+
+Injector confirmation also accepts Hyprland's older `active_keymap` metadata
+without requiring the newer numeric group field; the parser regression covers
+both formats and independent injector layout ordering.
+
+## Linux replacement latency follow-up
+
+Native text edits previously waited for the physical trigger Space even though
+they never press that key. Preparation now pins an editable AT-SPI target before
+the layout switch and skips unnecessary release waits. A refused native request
+cannot fall through to keyboard replay whose physical keys were not prepared.
+
+An optional compositor virtual keyboard provides literal Unicode delivery in
+supported single-seat Wayland sessions, including the tested Hyprland session.
+It excludes held printable positions, preserves lock state, confirms each keymap,
+and retains focus, generation, layout, and capture checks before sending keys.
+It uses neither clipboard contents nor an external typing process. Generated
+maps include an unused final keycode for GTK binding discovery and identical
+literal symbols in all four XKB groups so subsequent global layout switches do
+not fail. Hyprland/Sway layout discovery ignores this internal map. Native
+suffix edits remain preferred; other sessions retain safe kernel replay.
+
+Queued trials also exposed an existing miss before injection: a reader can count
+a Space, release the state lock for focus I/O, and finish updating its deletion
+tail later. The automatic worker could mistake that partial state for obsolete
+text. Both worker snapshots now wait for an already-fetched batch to finish,
+then acquire a consistent state guard. A deterministic regression pauses the
+physical Space inside its focus check, both during search and during final
+worker validation. Real cancellations still decline the edit.
+
+See [replacement measurements](PERFORMANCE.md#linux-replacement-delivery) for the
+controlled release comparison and scope. The compositor route is optional:
+`wayland_input = false` / `RECAST_WAYLAND_INPUT=0` disables it independently of
+AT-SPI. These changes do not establish native Windows or macOS performance.
+
+Final validation passed 469 unit tests and eight CLI tests (11 intentionally
+ignored unit tests), 27 Python checks, both JavaScript fixture suites, formatting,
+and all-target Clippy for Linux, macOS, and Windows with warnings denied. The
+Windows resource compiler remains unavailable here; that target received static
+analysis only. All eight release CLI checks and all 39 final Hyprland/GTK release
+trials passed. Physical Caps Lock was unavailable because this desktop remaps the
+key; generated XKB maps were checked with libxkbcommon instead.

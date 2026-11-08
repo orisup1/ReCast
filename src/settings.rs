@@ -557,7 +557,8 @@ pub fn sample() -> String {
 # Linux only: what drives the keyboard layout. Detected from the session when
 # unset — set it if the guess is wrong. One of hyprland, sway, kde, gnome,
 # x11, none. `recast --status` prints what was chosen and the layouts it found.
-#desktop_helper = false # optional Linux AT-SPI helper; requires Python GI/Atspi
+#wayland_input = true   # fast compositor text injection on supported Wayland desktops
+#desktop_helper = true  # auto Linux AT-SPI support when Python GI/Atspi is available
 #layout_backend = x11
 
 # Injection timings, in microseconds. Only worth touching if corrections come

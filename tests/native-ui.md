@@ -117,7 +117,7 @@ read-only rejection. Run in a logged-in Windows desktop and keep it foreground:
 cargo test native_selection_round_trip -- --ignored --nocapture
 ```
 
-The existing Linux/Hyprland replay runner can exercise real evdev/uinput replay:
+The Linux/Hyprland replay runner exercises real capture and replacement delivery:
 
 ```sh
 python3 scripts/check_linux_replay.py --binary /path/to/candidate/recast \
@@ -129,9 +129,10 @@ binary afterward. Read its help and use a disposable desktop session. It is not 
 GNOME/KDE harness. macOS Carbon main-thread/worker access is checked separately by
 `cargo test --test macos_layout`; that test does not prove editing correctness.
 
-No new native Windows/Linux editing trials were executed during this implementation.
-Cross-target compilation, engine simulations, and fixture checks must not be
-reported as native acceptance or measured end-to-end typing latency.
+Linux Hyprland/GTK trials are recorded in `CORRECTION-UX.md` and `PERFORMANCE.md`.
+Other native desktops and Windows still require runtime checks. Cross-target
+compilation, engine simulations, and fixture checks must not be reported as
+native acceptance or measured end-to-end typing latency.
 
 ## Fluid correction regression checks
 
@@ -180,3 +181,32 @@ reported as native acceptance or measured end-to-end typing latency.
 - Change text externally, move the caret, or switch focus before extended undo.
   Stale text must never be rewritten. Verify separate single-Ctrl undo acts without
   the shared-key 500 ms wait, and Settings explains shared bindings.
+
+
+### Linux continuous typing and injector layout
+
+The disposable GTK harness requires a foreground Hyprland session, PyGObject,
+GTK 3, libevdev, and input/uinput access. It takes focus temporarily, injects
+only into its own field, and restores the prior layout/window. Stop any supervised
+instance first; use `--restore /absolute/path/to/recast` only if a standalone
+instance should be restarted afterward. The helper-enabled trial enables the GTK
+accessibility bridge in its own process, even if the invoking shell disables it.
+
+```sh
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-suffix.json --rounds 6 --queued --suffix next --spaces 1
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-undo.json --rounds 1 --queued --suffix next --spaces 1 --undo-expected 'recieve next'
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-injector.json --rounds 6 --queued --helper 0 --wayland 0 --injector-layout 1 --expected-layout 0
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-layout.json --rounds 6 --queued --helper 0 --word akuo --expected שלום --spaces 1 --expected-layout 1
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-speed.json --rounds 8 --helper 0 --spaces 1 --space-hold-ms 125 --max-latency-ms 100
+```
+
+`--helper 0 --wayland 0` explicitly tests kernel replay. `--helper 0` alone
+allows compositor input. `replacement_ms` measures the first trigger Space press
+to the expected GTK text-buffer change, not display paint. Latency checks are
+opt-in; queued trials and following text measure different workloads. Set
+`GDK_BACKEND=x11` to exercise GTK through XWayland in the same Wayland session.
+`--caps` requires an actual Caps Lock binding and rejects remapped keys.
+
+Undo deliberately suppresses a rejected word for the session, so undo trials use
+one round. Run separate trials for actual native GNOME/KDE Wayland, Sway and X11,
+and for native macOS/Windows apps; cross-compilation cannot validate their UI.

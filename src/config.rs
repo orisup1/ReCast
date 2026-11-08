@@ -14,6 +14,9 @@ pub struct Config {
     pub personal_enabled: bool,
     /// Persist only aggregate counts of automatic corrections and undos by rule.
     pub rule_stats_enabled: bool,
+    /// Use compositor virtual-keyboard input when supported (Linux only).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub wayland_input_enabled: bool,
     /// Require stronger evidence before switching away from the preferred language.
     pub language_preference: LanguagePreference,
     /// Allow short (≤3 char) switches up to frequency rank 30,000, or 50,000
@@ -155,6 +158,7 @@ impl Config {
                 .unwrap_or_else(|| "left_shift".into()),
             personal_enabled: crate::settings::flag("RECAST_PERSONAL", false),
             rule_stats_enabled: crate::settings::flag("RECAST_RULE_STATS", false),
+            wayland_input_enabled: crate::settings::flag("RECAST_WAYLAND_INPUT", true),
             language_preference: crate::settings::get("RECAST_PREFER")
                 .and_then(|value| LanguagePreference::parse(&value))
                 .unwrap_or_default(),
@@ -366,6 +370,7 @@ pub const NUMERIC_KEYS: &[&str] = &[
 /// quietly inverting the user's intent.
 pub const BOOLEAN_KEYS: &[&str] = &[
     "RECAST_DESKTOP_HELPER",
+    "RECAST_WAYLAND_INPUT",
     "RECAST_PERSONAL",
     "RECAST_RULE_STATS",
     "RECAST_SHORT",
@@ -410,9 +415,10 @@ pub const ALL_KEYS: &[&str] = &[
     "RECAST_INJECT_BATCH_GAP",
     // Debug setting (not in Config struct)
     "RECAST_DEBUG",
-    // Linux-only setting (not in Config struct)
+    // Linux desktop integration settings.
     "RECAST_LAYOUT_BACKEND",
     "RECAST_DESKTOP_HELPER",
+    "RECAST_WAYLAND_INPUT",
 ];
 
 #[cfg(test)]

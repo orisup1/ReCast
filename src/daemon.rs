@@ -375,6 +375,13 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
+        // Under a busy test run /proc can briefly still expose the forked
+        // parent's executable. Wait for the fixture to finish exec before
+        // asserting the identity of the unrelated program.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while is_our_process(child.id()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let recognized = is_our_process(child.id());
         let _ = child.kill();
         child.wait().unwrap();

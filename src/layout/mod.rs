@@ -48,7 +48,7 @@ pub use windows::switch_layout_to;
 /// only half working: the speller still fixes typos, and layout mistypes go
 /// through untouched.
 #[cfg(target_os = "linux")]
-pub use linux::{describe_backend, focus_supported, focused_target, Focus};
+pub use linux::{describe_backend, focus_supported, focused_target, prepare_injector, Focus};
 
 /// Follow the session's layout-change notifications, where it has any.
 ///
@@ -88,11 +88,15 @@ pub fn describe_backend() -> String {
 struct LayoutCache {
     value: Option<(Instant, Language)>,
     revision: u64,
+    context_revision: u64,
+    pending: bool,
 }
 
 static LAYOUT_CACHE: Mutex<LayoutCache> = Mutex::new(LayoutCache {
     value: None,
     revision: 0,
+    context_revision: 0,
+    pending: false,
 });
 const LAYOUT_TTL: Duration = Duration::from_millis(300);
 
@@ -156,7 +160,7 @@ fn read_layout(
     fresh: bool,
     query: impl FnOnce() -> Option<Language>,
 ) -> Option<Language> {
-    let revision = {
+    let (revision, context_revision) = {
         let mut guard = crate::types::lock_forgiving(cache);
         if !fresh {
             if let Some((time, lang)) = guard.value {
@@ -168,21 +172,32 @@ fn read_layout(
         // Allocate before querying: a later confirmation must not be overtaken
         // by an older query that happens to finish first.
         guard.revision = guard.revision.wrapping_add(1);
-        guard.value = None;
-        guard.revision
+        // A refresh is not evidence that the known layout disappeared.
+        // Keep the last answer until a completed query or real invalidation
+        // replaces it; otherwise watcher traffic creates false unknown states.
+        guard.pending = true;
+        (guard.revision, guard.context_revision)
     };
     let answer = query();
     let mut guard = crate::types::lock_forgiving(cache);
     if guard.revision != revision {
-        // A hotkey, watcher, or confirmed switch overtook this OS query.
+        // A fresh OS answer must not become "unsupported" merely because the
+        // watcher started another refresh. Return it without populating the
+        // cache, but never across a hotkey/confirmed switch or a newer result.
+        if fresh && guard.pending && guard.context_revision == context_revision {
+            return answer;
+        }
         return guard.value.map(|(_, lang)| lang);
     }
+    guard.pending = false;
     guard.value = answer.map(|lang| (Instant::now(), lang));
     answer
 }
 
 fn set_layout_cache(lang: Language) {
     let mut guard = crate::types::lock_forgiving(&LAYOUT_CACHE);
+    guard.context_revision = guard.context_revision.wrapping_add(1);
+    guard.pending = false;
     guard.revision = guard.revision.wrapping_add(1);
     guard.value = Some((Instant::now(), lang));
 }
@@ -192,6 +207,8 @@ fn set_layout_cache(lang: Language) {
 pub(crate) fn swap_cached_layout_for_test(lang: Option<Language>) -> Option<Language> {
     let mut guard = crate::types::lock_forgiving(&LAYOUT_CACHE);
     let previous = guard.value.map(|(_, lang)| lang);
+    guard.context_revision = guard.context_revision.wrapping_add(1);
+    guard.pending = false;
     guard.revision = guard.revision.wrapping_add(1);
     guard.value = lang.map(|lang| (Instant::now(), lang));
     previous
@@ -214,6 +231,8 @@ pub(crate) fn swap_cached_layout_for_test(lang: Option<Language>) -> Option<Lang
 #[allow(dead_code)]
 pub fn invalidate() {
     let mut guard = crate::types::lock_forgiving(&LAYOUT_CACHE);
+    guard.context_revision = guard.context_revision.wrapping_add(1);
+    guard.pending = false;
     guard.revision = guard.revision.wrapping_add(1);
     guard.value = None;
 }
@@ -327,6 +346,7 @@ mod tests {
         let cache = Mutex::new(LayoutCache {
             value: Some((Instant::now(), Language::English)),
             revision: 0,
+            ..LayoutCache::default()
         });
         assert_eq!(
             read_layout(&cache, false, || panic!("cached")),
@@ -380,6 +400,48 @@ mod tests {
         });
         assert_eq!(answer, Some(Language::Hebrew));
         assert_eq!(read_layout(&cache, false, || panic!("cache lost")), answer);
+    }
+
+    #[test]
+    fn starting_a_refresh_keeps_the_confirmed_layout_available() {
+        let cache = Mutex::new(LayoutCache {
+            value: Some((Instant::now(), Language::Hebrew)),
+            ..LayoutCache::default()
+        });
+        assert_eq!(
+            read_layout(&cache, true, || {
+                assert_eq!(
+                    read_layout(&cache, false, || panic!(
+                        "confirmed layout lost during refresh"
+                    )),
+                    Some(Language::Hebrew)
+                );
+                Some(Language::Hebrew)
+            }),
+            Some(Language::Hebrew)
+        );
+    }
+
+    #[test]
+    fn overlapping_fresh_reads_do_not_fabricate_an_unsupported_layout() {
+        for invalidated in [false, true] {
+            let cache = Mutex::new(LayoutCache::default());
+            let answer = read_layout(&cache, true, || {
+                let mut guard = cache.lock().unwrap();
+                // Model a second refresh starting before this one finishes.
+                guard.revision += 1;
+                guard.pending = true;
+                if invalidated {
+                    guard.context_revision += 1;
+                }
+                Some(Language::Hebrew)
+            });
+            assert_eq!(answer, (!invalidated).then_some(Language::Hebrew));
+            assert!(
+                cache.lock().unwrap().value.is_none(),
+                "an older query must not populate the cache"
+            );
+        }
     }
 
     #[test]
