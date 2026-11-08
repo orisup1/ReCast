@@ -9,7 +9,6 @@ use super::{
 use crate::types::{FixKind, Language, ReplaceGuard};
 use std::sync::{Arc, MutexGuard};
 use std::thread;
-#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 /// Restore tracked text only when a rewrite failed before injection started.
@@ -154,16 +153,28 @@ impl<P: Platform> Engine<P> {
     /// This does not require physical keys to be released for native text edits.
     #[cfg(target_os = "linux")]
     pub fn wait_for_capture(&self, generation: u64, ceiling: Duration) -> bool {
+        self.captured_state(generation, ceiling).is_some()
+    }
+
+    /// A press may release the state lock for focus I/O before updating its
+    /// text tail. Workers must not treat that partial dispatch as stale text.
+    pub(super) fn captured_state(
+        &self,
+        generation: u64,
+        ceiling: Duration,
+    ) -> Option<MutexGuard<'_, AppState<P>>> {
         let start = Instant::now();
         loop {
-            if self.lock().generation != generation {
-                return false;
+            let st = self.lock();
+            if st.generation != generation {
+                return None;
             }
             if !P::capture_pending(&self.injector) {
-                return true;
+                return Some(st);
             }
+            drop(st);
             if start.elapsed() >= ceiling {
-                return false;
+                return None;
             }
             crate::timing::pause(crate::timing::injection().held_poll);
         }

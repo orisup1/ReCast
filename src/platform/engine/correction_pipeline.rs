@@ -275,7 +275,11 @@ impl<P: Platform> Engine<P> {
             Some(&phrase),
             |_| crate::layout::LayoutSwitch::Switched,
         );
-        let st = self.lock();
+        let Some(st) =
+            self.captured_state(generation, crate::timing::injection().held_release_timeout)
+        else {
+            return;
+        };
         // The retained deletion tail contains any extra spaces before the next word.
         let spaces = |st: &AppState<P>| {
             st.deletion_tail
@@ -305,7 +309,11 @@ impl<P: Platform> Engine<P> {
         // An obsolete search must not invalidate text captured during its focus query.
         let (current_focus, current_mode) = self.read_focus();
         let current_layout = P::current_layout();
-        let mut st = self.lock();
+        let Some(mut st) =
+            self.captured_state(generation, crate::timing::injection().held_release_timeout)
+        else {
+            return;
+        };
         if !current(&st)
             || st.revision.wrapping_sub(revision) != st.press_revision.wrapping_sub(focus_presses)
         {
