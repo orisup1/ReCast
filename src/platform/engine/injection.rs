@@ -197,7 +197,6 @@ impl<P: Platform> Engine<P> {
     /// holding the lock and returned by value: the injected keystrokes re-enter
     /// the listener, which needs the same lock, so holding it across an
     /// injection is a deadlock.
-    #[cfg(any(target_os = "macos", target_os = "windows", test))]
     pub fn buffered(&self) -> Vec<Typed<P::Key>> {
         self.lock().buffered_keys.to_vec()
     }
@@ -310,7 +309,21 @@ impl<P: Platform> Engine<P> {
             self.abort_before_injection(generation, retry);
             return;
         }
+        let target_layout = match &commit {
+            Some(Commit::Fix {
+                deferred_layout, ..
+            }) => *deferred_layout,
+            Some(Commit::Undo { layout, .. }) => *layout,
+            Some(Commit::Suggestion { layout }) => Some(*layout),
+            None => None,
+        };
+        if !P::prepare_injection(self, &plan, generation, target_layout) {
+            self.abort_before_injection(generation, retry);
+            return;
+        }
+        let previous_layout = P::current_layout();
         if !self.confirm_replacement_layout(commit.as_ref(), generation) {
+            self.restore_unedited_layout(generation, previous_layout);
             self.abort_before_injection(generation, retry);
             return;
         }
@@ -324,6 +337,11 @@ impl<P: Platform> Engine<P> {
                 })
             );
         let Some(buffered) = P::inject(self, plan, generation) else {
+            if !P::injection_started(&self.injector) {
+                self.restore_unedited_layout(generation, previous_layout);
+                self.abort_before_injection(generation, retry);
+                return;
+            }
             let mut st = self.lock();
             if st.generation == generation {
                 st.invalidate_text();
@@ -663,6 +681,14 @@ impl<P: Platform> Engine<P> {
         // a slow disk write used to be treated as an interrupted replacement.
         if let Some(word) = learn {
             crate::complete::learn(&word);
+        }
+    }
+
+    fn restore_unedited_layout(&self, generation: u64, previous: Option<Language>) {
+        if !P::injection_started(&self.injector) && self.replacement_valid(generation) {
+            if let Some(previous) = previous.filter(|lang| P::current_layout() != Some(*lang)) {
+                let _ = P::switch_layout_to(previous);
+            }
         }
     }
 

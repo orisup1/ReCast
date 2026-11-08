@@ -189,6 +189,17 @@ pub trait Platform: Sized + Send + Sync + 'static {
 
     // ── injection ───────────────────────────────────────────────────────────
 
+    /// Finish keycode release checks before changing the desktop layout.
+    /// Text injectors need no physical release wait.
+    fn prepare_injection(
+        _engine: &Engine<Self>,
+        _plan: &Plan<Self>,
+        _generation: u64,
+        _target_layout: Option<Language>,
+    ) -> bool {
+        true
+    }
+
     /// Put the replacement on screen: wait for whatever has to be released,
     /// erase `plan.erase` characters, type the replacement, press the
     /// terminator if there is one, and replay any keys the user got in
@@ -202,6 +213,12 @@ pub trait Platform: Sized + Send + Sync + 'static {
         plan: Plan<Self>,
         generation: u64,
     ) -> Option<Vec<Typed<Self::Key>>>;
+
+    /// False only when the backend can prove no destructive edit has begun.
+    /// This permits restoring a layout changed for an abandoned replacement.
+    fn injection_started(_injector: &Self::Injector) -> bool {
+        true
+    }
 
     /// The injection lifecycle flag, when this platform has one. Native capture
     /// backends distinguish our injected events from physical input themselves;

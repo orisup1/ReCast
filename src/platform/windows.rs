@@ -610,8 +610,12 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
             return Some(buf);
         }
     }
+    let focus = Windows::focus()?;
+    if !super::windows_selection::keyboard_fallback_allowed(focus) {
+        return None;
+    }
     let mut inputs = replacement_inputs(erase, &text, terminator, &buf);
-    if !engine.replacement_valid(generation) {
+    if !engine.replacement_valid(generation) || engine.buffered().len() != buf.len() {
         return None;
     }
     // Deletion, replacement, and the deleted suffix must be submitted together.

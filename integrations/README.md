@@ -1,9 +1,10 @@
-# Optional Linux desktop integration
+# Linux desktop integration
 
 The binary embeds `scripts/linux_desktop.py`; no Python source installation is
 needed. The helper runs under your desktop user over private parent-owned pipes.
-It reads focus/application metadata during typing. It reads selected text only
-for an explicit rescue gesture and never reads the entire document or clipboard.
+It reads focus/application metadata and verifies only the bounded suffix captured
+from typing before a native correction or undo. Selected text is read only for an
+explicit rescue gesture. It never reads the entire document or clipboard.
 It does not open a network listener or write text logs.
 
 Install your distribution's Python 3, PyGObject, AT-SPI 2 introspection data, and
@@ -11,10 +12,12 @@ accessibility service. Debian/Ubuntu package names include `python3-gi` and
 `gir1.2-atspi-2.0`. Enable desktop accessibility and the application's accessibility
 support. Qt applications may also need their distribution's Qt accessibility bridge.
 
-Set `desktop_helper = true` in ReCast's configuration file, or
-`RECAST_DESKTOP_HELPER=1` in its environment, then
-restart ReCast. The helper starts asynchronously; focus another window/control
-after startup so it receives a focus event. Missing dependencies, unavailable
+ReCast automatically tries the helper when these dependencies are available.
+Set `desktop_helper = false` or `RECAST_DESKTOP_HELPER=0` to disable it. Existing
+explicit settings remain authoritative. The helper starts asynchronously and seeds
+already-focused controls from active windows with a bounded, metadata-only scan.
+Applications must expose accessibility: `NO_AT_BRIDGE=1` disables the GTK bridge;
+restart affected applications with accessibility enabled to use native suffix edits. Missing dependencies, unavailable
 focus, inaccessible applications, and timeouts cause requests to be declined.
 The helper retries startup after failures. `recast --status` identifies the
 backend and whether helper support was enabled.

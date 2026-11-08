@@ -112,7 +112,7 @@ Settings:
                       left_ctrl, right_ctrl, or none. Must not share another gesture.
   RECAST_CORRECTION_SHORTCUT=  Spelling suggestions: left_shift (default), right_shift,
                       left_ctrl, right_ctrl, or none. Must not share another gesture.
-  RECAST_DESKTOP_HELPER=1 Enable optional Linux AT-SPI focus/selection support.
+  RECAST_DESKTOP_HELPER=0 Disable automatic Linux AT-SPI focus/suffix/selection support.
   RECAST_LAYOUT_BACKEND=  Linux: what drives the keyboard layout — hyprland,
                       sway, kde, gnome, x11 or none. Detected when unset;
                       --status prints what was chosen.

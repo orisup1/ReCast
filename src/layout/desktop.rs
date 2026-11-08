@@ -117,7 +117,7 @@ impl Helper {
 static HELPER: Mutex<(Option<Helper>, Option<Instant>)> = Mutex::new((None, None));
 
 pub fn request(request: Value) -> Option<Value> {
-    if !crate::settings::flag("RECAST_DESKTOP_HELPER", false) {
+    if !crate::settings::flag("RECAST_DESKTOP_HELPER", true) {
         return None;
     }
     let mut state = HELPER.try_lock().ok()?;
@@ -139,7 +139,7 @@ pub fn request(request: Value) -> Option<Value> {
     }
     let timeout = match request["action"].as_str()? {
         "focus" => Duration::from_millis(30),
-        "replace" => Duration::from_secs(1),
+        "replace" | "replace_suffix" => Duration::from_secs(1),
         _ => Duration::from_millis(250),
     };
     let response = state.0.as_mut()?.request(request, timeout);

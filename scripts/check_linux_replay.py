@@ -3,7 +3,7 @@
 
 Requires PyGObject/GTK 3, libevdev, readable input devices, and /dev/uinput.
 The candidate replaces a standalone daemon through its normal startup path.
---restore must name the installed standalone binary to restart afterward.
+--restore can name the installed standalone binary to restart afterward.
 """
 
 import argparse
@@ -22,29 +22,40 @@ import time
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--restore", type=Path, required=True)
+    parser.add_argument("--restore", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--cold-starts", type=int, default=1)
     parser.add_argument("--queued", action="store_true",
                         help="Pause only the test daemon while typing each word.")
+    parser.add_argument("--helper", choices=['0', '1'], default='1')
+    parser.add_argument("--suffix", default='')
+    parser.add_argument("--layout", type=int, choices=[0, 1], default=0)
+    parser.add_argument("--expected-layout", type=int, choices=[0, 1])
+    parser.add_argument("--injector-layout", type=int, choices=[0, 1],
+                        help="Force a stale injector group before each trial.")
+    parser.add_argument("--undo-expected", help="Exact field text expected after double Ctrl.")
     parser.add_argument("--word", default="recieve")
     parser.add_argument("--expected", default="receive")
     parser.add_argument("--spaces", type=int, default=3)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
-    args.restore = args.restore.resolve(strict=True)
+    args.restore = args.restore.resolve(strict=True) if args.restore else None
+    if args.undo_expected is not None and args.rounds != 1:
+        parser.error("Undo suppresses the word for this session; use --rounds 1 for undo trials.")
     if args.binary.name != "recast" or min(args.rounds, args.cold_starts, args.spaces) < 1:
         parser.error("Use a binary named recast and positive trial counts/spacing.")
     codes = dict(zip("qwertyuiop", range(16, 26)))
     codes.update(zip("asdfghjkl", range(30, 39)))
     codes.update(zip("zxcvbnm", range(44, 51)))
     codes[" "] = 57
-    if any(char not in codes for char in args.word):
+    if any(char not in codes for char in args.word + args.suffix):
         parser.error("The synthetic input supports lowercase English letters only.")
-    if args.queued and len(args.word) + args.spaces > 15:
+    if args.queued and len(args.word) + args.spaces + len(args.suffix) > 15:
         parser.error("Queued trials must fit below the keyboard's 64-event input buffer.")
 
+    if args.helper == '1':
+        os.environ.pop('NO_AT_BRIDGE', None)
     import gi
     gi.require_version("Gtk", "3.0")
     from gi.repository import GLib, Gtk
@@ -169,7 +180,8 @@ def main():
                     environment = {key: value for key, value in os.environ.items()
                                    if not key.startswith("RECAST_")}
                     environment.update(XDG_CONFIG_HOME=config,
-                                       RECAST_LAYOUT_BACKEND="hyprland")
+                                       RECAST_LAYOUT_BACKEND="hyprland",
+                                       RECAST_DESKTOP_HELPER=args.helper)
                     on_main(window.present)
                     time.sleep(.1)
                     hypr("focus", "title:^" + title + "$")
@@ -196,18 +208,20 @@ def main():
                             time.sleep(.1)
 
                         hypr("focus", "title:^" + title + "$")
-                        hypr("switchxkblayout", "all", "0")
+                        hypr("switchxkblayout", "all", str(args.layout))
                         time.sleep(.1)
                         tap(1)
                         tap(57)
                         on_main(lambda: buffer.set_text(""))
-                        expected = args.expected + " " * args.spaces
+                        expected = args.expected + " " * args.spaces + args.suffix
                         for trial in range(args.rounds):
                             assert_focus()
+                            if args.injector_layout is not None:
+                                hypr("switchxkblayout", "recast-injector", str(args.injector_layout))
                             if args.queued:
                                 os.kill(candidate.pid, signal.SIGSTOP)
                             try:
-                                for char in args.word + " " * args.spaces:
+                                for char in args.word + " " * args.spaces + args.suffix:
                                     tap(codes[char])
                             finally:
                                 if args.queued:
@@ -217,12 +231,37 @@ def main():
                             while actual != expected and time.monotonic() < deadline:
                                 time.sleep(.005)
                                 actual = text()
-                            results.append({"cold_start": cold, "round": trial,
-                                            "actual": actual, "corrected": actual == expected})
+                            current_keys = json.loads(hypr("-j", "devices"))["keyboards"]
+                            physical_layout = next(key["active_layout_index"] for key in current_keys
+                                                   if key["name"] == "recast-replay-test")
+                            layout_ok = (args.expected_layout is None or physical_layout == args.expected_layout)
+                            result = {"cold_start": cold, "round": trial, "actual": actual,
+                                      "layout": physical_layout, "corrected": actual == expected and layout_ok}
+                            if args.undo_expected is not None and result['corrected']:
+                                tap(29)
+                                tap(29)
+                                deadline = time.monotonic() + 1
+                                actual = text()
+                                while actual != args.undo_expected and time.monotonic() < deadline:
+                                    time.sleep(.005)
+                                    actual = text()
+                                result['undo_actual'] = actual
+                                restored_keys = json.loads(hypr("-j", "devices"))["keyboards"]
+                                result['undo_layout'] = next(key["active_layout_index"] for key in restored_keys
+                                                             if key["name"] == "recast-replay-test")
+                                result['corrected'] &= (actual == args.undo_expected
+                                                        and result['undo_layout'] == args.layout)
+                            results.append(result)
                             for _ in actual:
                                 tap(14)
                             if text():
                                 raise RuntimeError("Exact deletion did not empty the test field")
+                            hypr("switchxkblayout", "all", str(args.layout))
+                            # External IPC switches do not generate modifier
+                            # releases. Allow the documented 300 ms cache TTL.
+                            time.sleep(.35)
+                            tap(57)
+                            on_main(lambda: buffer.set_text(""))
             except Exception as error:
                 errors.append(str(error))
             finally:
@@ -230,7 +269,7 @@ def main():
                            lambda: hypr("switchxkblayout", "all", str(old_layout))]
                 if old_focus:
                     cleanup.append(lambda: hypr("focus", "address:" + old_focus))
-                if started_candidate:
+                if started_candidate and args.restore:
                     cleanup.append(lambda: subprocess.run(
                         [str(args.restore)], check=True, timeout=8,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))

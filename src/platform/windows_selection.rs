@@ -16,18 +16,44 @@ impl Drop for Apartment {
     }
 }
 
-fn writable(focus: usize) -> bool {
+fn native_edit(focus: usize) -> bool {
     unsafe {
-        let hwnd = focus as _;
         let mut class = [0u16; 64];
-        let count = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+        let count = GetClassNameW(focus as _, class.as_mut_ptr(), class.len() as i32);
         let class = String::from_utf16_lossy(&class[..count.max(0) as usize]);
         matches!(
             class.to_ascii_lowercase().as_str(),
             "edit" | "richedit20w" | "richedit50w"
-        ) && GetWindowLongW(hwnd, GWL_STYLE) as u32 & (ES_PASSWORD | ES_READONLY) == 0
-            && IsWindowEnabled(hwnd) != 0
+        )
     }
+}
+
+fn writable(focus: usize) -> bool {
+    native_edit(focus)
+        && unsafe {
+            GetWindowLongW(focus as _, GWL_STYLE) as u32 & (ES_PASSWORD | ES_READONLY) == 0
+                && IsWindowEnabled(focus as _) != 0
+        }
+}
+
+/// A failed native attempt must not turn a host selection into counted
+/// Backspaces. Password/read-only controls must not receive fallback edits.
+pub(super) fn keyboard_fallback_allowed(focus: usize) -> bool {
+    if !native_edit(focus) {
+        return true;
+    }
+    if !writable(focus) {
+        return false;
+    }
+    let (mut start, mut end) = (0u32, 0u32);
+    message(
+        focus,
+        EM_GETSEL as u32,
+        &mut start as *mut u32 as usize,
+        &mut end as *mut u32 as isize,
+    )
+    .is_some()
+        && start == end
 }
 
 fn message(focus: usize, message: u32, wparam: usize, lparam: isize) -> Option<usize> {
@@ -262,6 +288,10 @@ mod tests {
             }
         });
         let focus = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            !keyboard_fallback_allowed(focus),
+            "a native selection must not be erased by fallback"
+        );
         let before = selection(focus)
             .expect("native Edit must expose its selected text; keep this test in foreground");
         assert_eq!(before.text, "akuo");
@@ -283,6 +313,7 @@ mod tests {
             SendMessageW(focus as _, EM_SETREADONLY as u32, 1, 0);
         }
         assert!(selection(focus).is_none());
+        assert!(!keyboard_fallback_allowed(focus));
         unsafe {
             PostMessageW(focus as _, WM_CLOSE, 0, 0);
         }

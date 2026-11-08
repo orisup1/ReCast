@@ -19,6 +19,8 @@ static ALLOW_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static REFUSE_LAYOUT_SWITCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static PREPARE_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static EDIT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static REJECT_UNICODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EMPTY_INPUT_SUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -225,11 +227,20 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
         SIMULATED_LAYOUT.store(usize::from(lang == Language::Hebrew), Ordering::SeqCst);
         crate::layout::LayoutSwitch::Switched
     }
+    fn prepare_injection(_: &Engine<Self>, _: &Plan<Self>, _: u64, _: Option<Language>) -> bool {
+        PREPARE_ALLOWED.load(Ordering::SeqCst)
+    }
+    fn injection_started(_: &Screen) -> bool {
+        EDIT_STARTED.load(Ordering::SeqCst)
+    }
     fn inject(
         engine: &Engine<Self>,
         plan: Plan<Self>,
         generation: u64,
     ) -> Option<Vec<Typed<char>>> {
+        if !EDIT_STARTED.load(Ordering::SeqCst) {
+            return None;
+        }
         engine.injector.erasures.lock().unwrap().push(plan.erase);
         engine.injector.ready.send(()).unwrap();
         engine
@@ -7150,3 +7161,46 @@ fn spelling_preview_is_passive_and_commits_only_on_trusted_typing() {
 }
 
 mod dictionary_typing;
+
+#[test]
+fn preparation_and_unedited_failure_do_not_leave_layout_only_corrections() {
+    const CHILD: &str = "RECAST_PREPARATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::preparation_and_unedited_failure_do_not_leave_layout_only_corrections"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    for preparation in [false, true] {
+        PREPARE_ALLOWED.store(preparation, Ordering::SeqCst);
+        EDIT_STARTED.store(false, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        s.type_text("akuo ");
+        s.checks_ready();
+        s.idle();
+        assert_eq!(s.text(), "akuo ");
+        assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), 0);
+        assert!(s.engine.injector.erasures.lock().unwrap().is_empty());
+        assert!(matches!(
+            s.engine.lock().last_action,
+            Some(LastAction::Unchanged { .. })
+        ));
+        assert!(!s.engine.lock().no_fix);
+    }
+    // A proven pre-edit failure must not suppress the next ordinary word.
+    PREPARE_ALLOWED.store(true, Ordering::SeqCst);
+    EDIT_STARTED.store(true, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive ");
+}

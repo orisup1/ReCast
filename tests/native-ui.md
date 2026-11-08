@@ -180,3 +180,24 @@ reported as native acceptance or measured end-to-end typing latency.
 - Change text externally, move the caret, or switch focus before extended undo.
   Stale text must never be rewritten. Verify separate single-Ctrl undo acts without
   the shared-key 500 ms wait, and Settings explains shared bindings.
+
+
+### Linux continuous typing and injector layout
+
+The disposable GTK harness requires a foreground Hyprland session, PyGObject,
+GTK 3, libevdev, and input/uinput access. It takes focus temporarily, injects
+only into its own field, and restores the prior layout/window. Stop any supervised
+instance first; use `--restore /absolute/path/to/recast` only if a standalone
+instance should be restarted afterward. The helper-enabled trial enables the GTK
+accessibility bridge in its own process, even if the invoking shell disables it.
+
+```sh
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-suffix.json --rounds 6 --queued --suffix next --spaces 1
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-undo.json --rounds 1 --queued --suffix next --spaces 1 --undo-expected 'recieve next'
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-injector.json --rounds 6 --queued --helper 0 --injector-layout 1 --expected-layout 0
+python3 scripts/check_linux_replay.py --binary target/release/recast --output /tmp/recast-layout.json --rounds 6 --queued --helper 0 --word akuo --expected שלום --spaces 1 --expected-layout 1
+```
+
+Undo deliberately suppresses a rejected word for the session, so undo trials use
+one round. Run separate trials for actual native GNOME/KDE Wayland, Sway and X11,
+and for native macOS/Windows apps; cross-compilation cannot validate their UI.

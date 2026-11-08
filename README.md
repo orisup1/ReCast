@@ -14,7 +14,7 @@ clipboard is never touched.
 
 ReCast checks words when you finish them with Space, preserving trailing punctuation.
 Automatic searches run off the keyboard capture thread, so a slow lookup does not
-hold up your next keystroke. Supported macOS and Windows native fields can apply a
+hold up your next keystroke. Supported macOS, Windows, and Linux AT-SPI fields can apply a
 same-layout spelling fix after up to 32 following characters, preserving that text
 and undo; the full suffix must still match. Extra spaces also preserve pending
 correction. Navigation, submission, and layout changes still cancel stale work.
@@ -159,7 +159,7 @@ make service-uninstall
 Layout backends support Hyprland, Sway, KDE, GNOME on X11, and X11.
 GNOME Wayland additionally needs the optional ReCast Shell extension for live
 layout queries and switching. GNOME/KDE Wayland focused-app detection uses the
-optional AT-SPI helper. See [Linux desktop integration](integrations/README.md)
+automatically detected AT-SPI helper. See [Linux desktop integration](integrations/README.md)
 for dependencies, setup, supported controls, and limitations. Missing live layout
 or required focus information pauses edits; saved GSettings values never confirm a switch.
 
@@ -243,10 +243,13 @@ dictionary word. Conversion works before or after Space and preserves the
 separator. Repeating a manual conversion converts the word back without changing
 saved exceptions or training spelling replacements. Up to 32 extra spaces preserve
 correction undo and explicit suggestions, and are restored with the original word. Enter or moving the cursor ends the opportunity to act on a finished word.
-On supported macOS text fields and Windows native Edit/RichEdit controls, undo
-also survives up to 32 characters typed after a correction. Those characters
-are preserved verbatim; the text before the caret must still match. Linux and
-unsupported controls retain undo across spaces only.
+On supported macOS text fields, Windows native Edit/RichEdit controls, and Linux
+AT-SPI editable controls, undo also survives up to 32 following characters.
+Those characters are preserved verbatim; the text before the caret must still
+match. Controls without native suffix support retain undo across spaces only.
+Linux automatically tries AT-SPI when available; `desktop_helper = false`
+disables it. Its multi-call edits and keyboard fallback have the limitations
+described in [Linux desktop integration](integrations/README.md).
 
 On macOS, completion and spelling alternatives appear only on explicit request in a compact, passive
 strip near the caret. The original sentence and keyboard layout stay unchanged while
@@ -574,7 +577,7 @@ Excluded apps receive no corrections, expansions, completion, undo rewrites,
 word logging, or learning. Global events still track key releases. Off takes
 precedence over Manual only, then Layout only, if an app appears in multiple lists. With any application restrictions
 configured, an unknown active application also suspends processing.
-On **native GNOME/KDE Wayland**, correction requires the optional AT-SPI helper
+On **native GNOME/KDE Wayland**, correction requires the AT-SPI helper
 and an accessible focused control. Application rules use the executable basename
 there; Hyprland, Sway, and X11 retain their existing application identifiers.
 After returning to an allowed app, finish the current word with Space/Enter to resume.
