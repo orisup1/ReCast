@@ -138,7 +138,7 @@ pub fn request(request: Value) -> Option<Value> {
         return None;
     }
     let timeout = match request["action"].as_str()? {
-        "focus" => Duration::from_millis(30),
+        "focus" | "replacement_target" => Duration::from_millis(30),
         "replace" | "replace_suffix" => Duration::from_secs(1),
         _ => Duration::from_millis(250),
     };
@@ -156,4 +156,11 @@ pub fn focus() -> Option<super::Focus> {
         id: value["id"].as_str()?.into(),
         app: Some(value["app"].as_str()?.into()),
     })
+}
+
+/// Probe editable-text capability without reading the control's contents.
+/// A prepared native edit can bypass waits needed only by keycode replay.
+pub fn replacement_target() -> Option<String> {
+    let value = request(json!({"action":"replacement_target"}))?;
+    Some(value["id"].as_str()?.to_owned())
 }

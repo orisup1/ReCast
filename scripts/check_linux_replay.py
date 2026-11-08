@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--queued", action="store_true",
                         help="Pause only the test daemon while typing each word.")
     parser.add_argument("--helper", choices=['0', '1'], default='1')
+    parser.add_argument("--wayland", choices=['0', '1'], default='1')
     parser.add_argument("--suffix", default='')
     parser.add_argument("--layout", type=int, choices=[0, 1], default=0)
     parser.add_argument("--expected-layout", type=int, choices=[0, 1])
@@ -38,7 +39,13 @@ def main():
     parser.add_argument("--word", default="recieve")
     parser.add_argument("--expected", default="receive")
     parser.add_argument("--spaces", type=int, default=3)
+    parser.add_argument("--caps", action="store_true", help="Check replacement with Caps Lock enabled.")
+    parser.add_argument("--max-latency-ms", type=float, help="Optional end-to-end replacement budget.")
+    parser.add_argument("--space-hold-ms", type=float, default=6,
+                        help="Physical Space hold duration for native latency trials (0–300 ms).")
     args = parser.parse_args()
+    if not 0 <= args.space_hold_ms <= 300:
+        parser.error("Space hold must be between 0 and 300 ms to avoid auto-repeat.")
     args.binary = args.binary.resolve(strict=True)
     args.restore = args.restore.resolve(strict=True) if args.restore else None
     if args.undo_expected is not None and args.rounds != 1:
@@ -83,6 +90,7 @@ def main():
     old_focus = json.loads(hypr("-j", "activewindow")).get("address")
     keyboards = json.loads(hypr("-j", "devices"))["keyboards"]
     old_layout = next(key["active_layout_index"] for key in keyboards if key["main"])
+    old_caps = next(key.get("capsLock", False) for key in keyboards if key["main"])
     device = lib.libevdev_new()
     ui = ctypes.c_void_p()
     try:
@@ -150,12 +158,28 @@ def main():
 
         def tap(code):
             assert_focus()
+            pressed_at = time.monotonic()
             emit(code, 1)
             try:
-                time.sleep(.006)
+                time.sleep(args.space_hold_ms / 1000 if code == 57 else .006)
             finally:
                 emit(code, 0)
             time.sleep(.015)
+            return pressed_at
+
+        def set_caps(enabled):
+            keys = json.loads(hypr("-j", "devices"))["keyboards"]
+            current = next(key.get("capsLock", False) for key in keys
+                           if key["name"] == "recast-replay-test")
+            if current != enabled:
+                emit(58, 1)
+                emit(58, 0)
+                time.sleep(.02)
+                keys = json.loads(hypr("-j", "devices"))["keyboards"]
+                actual = next(key.get("capsLock", False) for key in keys
+                              if key["name"] == "recast-replay-test")
+                if actual != enabled:
+                    raise RuntimeError("Caps Lock key is remapped; this caps trial is unavailable")
 
         def worker():
             candidate = None
@@ -181,7 +205,8 @@ def main():
                                    if not key.startswith("RECAST_")}
                     environment.update(XDG_CONFIG_HOME=config,
                                        RECAST_LAYOUT_BACKEND="hyprland",
-                                       RECAST_DESKTOP_HELPER=args.helper)
+                                       RECAST_DESKTOP_HELPER=args.helper,
+                                       RECAST_WAYLAND_INPUT=args.wayland)
                     on_main(window.present)
                     time.sleep(.1)
                     hypr("focus", "title:^" + title + "$")
@@ -210,6 +235,7 @@ def main():
                         hypr("focus", "title:^" + title + "$")
                         hypr("switchxkblayout", "all", str(args.layout))
                         time.sleep(.1)
+                        set_caps(args.caps)
                         tap(1)
                         tap(57)
                         on_main(lambda: buffer.set_text(""))
@@ -220,9 +246,13 @@ def main():
                                 hypr("switchxkblayout", "recast-injector", str(args.injector_layout))
                             if args.queued:
                                 os.kill(candidate.pid, signal.SIGSTOP)
+                            change_start = len(changes)
+                            trigger = None
                             try:
                                 for char in args.word + " " * args.spaces + args.suffix:
-                                    tap(codes[char])
+                                    pressed_at = tap(codes[char])
+                                    if trigger is None and char == ' ':
+                                        trigger = pressed_at
                             finally:
                                 if args.queued:
                                     os.kill(candidate.pid, signal.SIGCONT)
@@ -235,8 +265,15 @@ def main():
                             physical_layout = next(key["active_layout_index"] for key in current_keys
                                                    if key["name"] == "recast-replay-test")
                             layout_ok = (args.expected_layout is None or physical_layout == args.expected_layout)
+                            visible_at = next((stamp for stamp, value in changes[change_start:]
+                                               if value == expected and stamp >= trigger), None)
                             result = {"cold_start": cold, "round": trial, "actual": actual,
-                                      "layout": physical_layout, "corrected": actual == expected and layout_ok}
+                                      "layout": physical_layout, "corrected": actual == expected and layout_ok,
+                                      "replacement_ms": ((visible_at - trigger) * 1000
+                                                         if visible_at is not None else None)}
+                            if args.max_latency_ms is not None:
+                                result['corrected'] &= (result['replacement_ms'] is not None
+                                                        and result['replacement_ms'] <= args.max_latency_ms)
                             if args.undo_expected is not None and result['corrected']:
                                 tap(29)
                                 tap(29)
@@ -265,13 +302,17 @@ def main():
             except Exception as error:
                 errors.append(str(error))
             finally:
-                cleanup = [stop_candidate,
+                cleanup = [stop_candidate, lambda: set_caps(old_caps),
                            lambda: hypr("switchxkblayout", "all", str(old_layout))]
                 if old_focus:
                     cleanup.append(lambda: hypr("focus", "address:" + old_focus))
                 if started_candidate and args.restore:
+                    restore_environment = dict(os.environ)
+                    # The fixture may run inside a systemd-hosted terminal.
+                    # Restoring a standalone app must not inherit service mode.
+                    restore_environment.pop("INVOCATION_ID", None)
                     cleanup.append(lambda: subprocess.run(
-                        [str(args.restore)], check=True, timeout=8,
+                        [str(args.restore)], check=True, timeout=8, env=restore_environment,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
                 for action in cleanup:
                     try:
@@ -279,7 +320,7 @@ def main():
                     except Exception as error:
                         errors.append("Cleanup: " + str(error))
                 try:
-                    args.output.write_text(json.dumps({"queued": args.queued, "results": results,
+                    args.output.write_text(json.dumps({"queued": args.queued, "space_hold_ms": args.space_hold_ms, "results": results,
                                                        "changes": changes, "errors": errors}, indent=2))
                 except Exception as error:
                     errors.append("Saving results: " + str(error))

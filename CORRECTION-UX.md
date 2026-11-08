@@ -208,7 +208,7 @@ therefore compile for every OS. The missing parity was in native adapters:
   confirmed cache entry; overlapping fresh queries can return their own native
   answer without repopulating an overtaken cache. Actual invalidations and newer
   completed answers still take precedence.
-- Linux release waits now run before a layout switch. Pre-edit aborts restore
+- Linux kernel replay waits run before a layout switch. Pre-edit aborts restore
   the previous layout when context remains valid. No rollback is claimed after
   an edit might have begun. Hyprland and Sway additionally synchronize the
   injector's own layout group using its own layout order before keycode replay.
@@ -269,3 +269,41 @@ and cancellation while waiting.
 Injector confirmation also accepts Hyprland's older `active_keymap` metadata
 without requiring the newer numeric group field; the parser regression covers
 both formats and independent injector layout ordering.
+
+## Linux replacement latency follow-up
+
+Native text edits previously waited for the physical trigger Space even though
+they never press that key. Preparation now pins an editable AT-SPI target before
+the layout switch and skips unnecessary release waits. A refused native request
+cannot fall through to keyboard replay whose physical keys were not prepared.
+
+An optional compositor virtual keyboard provides literal Unicode delivery in
+supported single-seat Wayland sessions, including the tested Hyprland session.
+It excludes held printable positions, preserves lock state, confirms each keymap,
+and retains focus, generation, layout, and capture checks before sending keys.
+It uses neither clipboard contents nor an external typing process. Generated
+maps include an unused final keycode for GTK binding discovery and identical
+literal symbols in all four XKB groups so subsequent global layout switches do
+not fail. Hyprland/Sway layout discovery ignores this internal map. Native
+suffix edits remain preferred; other sessions retain safe kernel replay.
+
+Queued trials also exposed an existing miss before injection: a reader can count
+a Space, release the state lock for focus I/O, and finish updating its deletion
+tail later. The automatic worker could mistake that partial state for obsolete
+text. Both worker snapshots now wait for an already-fetched batch to finish,
+then acquire a consistent state guard. A deterministic regression pauses the
+physical Space inside its focus check, both during search and during final
+worker validation. Real cancellations still decline the edit.
+
+See [replacement measurements](PERFORMANCE.md#linux-replacement-delivery) for the
+controlled release comparison and scope. The compositor route is optional:
+`wayland_input = false` / `RECAST_WAYLAND_INPUT=0` disables it independently of
+AT-SPI. These changes do not establish native Windows or macOS performance.
+
+Final validation passed 469 unit tests and eight CLI tests (11 intentionally
+ignored unit tests), 27 Python checks, both JavaScript fixture suites, formatting,
+and all-target Clippy for Linux, macOS, and Windows with warnings denied. The
+Windows resource compiler remains unavailable here; that target received static
+analysis only. All eight release CLI checks and all 39 final Hyprland/GTK release
+trials passed. Physical Caps Lock was unavailable because this desktop remaps the
+key; generated XKB maps were checked with libxkbcommon instead.

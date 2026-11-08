@@ -22,6 +22,29 @@ focus, inaccessible applications, and timeouts cause requests to be declined.
 The helper retries startup after failures. `recast --status` identifies the
 backend and whether helper support was enabled.
 
+## Replacement delivery
+
+ReCast checks native edit capability before waiting for physical keys. Supported
+AT-SPI fields can therefore correct while Space is still held. The control and
+captured text are verified again before editing; a failed or uncertain native
+request never falls through to keyboard deletion.
+
+In a single-seat Wayland session advertising `zwp_virtual_keyboard_manager_v1`,
+ReCast can deliver literal English/Hebrew text directly through the compositor.
+This route also works without application accessibility. It assigns text only to
+printable key positions that are not physically held, preserves lock indicators,
+and confirms its keymap before sending events. It uses neither the clipboard nor
+an external typing command. The session must provide `XDG_SESSION_TYPE=wayland`
+and a working `WAYLAND_DISPLAY` connection to the daemon.
+
+This protocol is optional and is generally available on Hyprland/Sway rather than
+GNOME/KDE. Unsupported sessions, multiple seats, or unavailable connections retain
+`uinput` replay with physical-release waits and bounded writes. Disable compositor
+input with `wayland_input = false` or `RECAST_WAYLAND_INPUT=0`. Disabling only
+`desktop_helper` still permits compositor input. Focus, layout confirmation, and
+stale-input cancellation apply to every route. Keyboard delivery does not provide
+verified extended undo or an atomic application text edit.
+
 KDE keeps its existing D-Bus layout backend. GNOME Wayland also needs this Shell
 extension (GNOME on X11 keeps using live XKB):
 

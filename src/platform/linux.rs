@@ -9,7 +9,7 @@ use evdev::{uinput::VirtualDevice, AttributeSet, Device, EventSummary, KeyCode, 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -22,6 +22,16 @@ pub struct Injector {
     device: Mutex<VirtualDevice>,
     started: AtomicBool,
     capturing: AtomicUsize,
+    locked_mods: AtomicU32,
+    locks_known: AtomicBool,
+    route: Mutex<InjectionRoute>,
+}
+
+#[derive(Clone)]
+enum InjectionRoute {
+    Keycodes,
+    Native(String),
+    Wayland { source: Language, target: Language },
 }
 
 /// Injection must not freeze a suffix halfway through a fetched evdev batch.
@@ -370,15 +380,51 @@ impl Platform for Linux {
         target_layout: Option<Language>,
     ) -> bool {
         engine.injector.started.store(false, Ordering::Release);
+        *crate::types::lock_forgiving(&engine.injector.route) = InjectionRoute::Keycodes;
         if plan.terminator.is_some_and(Self::is_line_break) {
             return false;
         }
         if !engine.wait_for_capture(generation, crate::timing::injection().held_release_timeout) {
             return false;
         }
+        if let Some(target) = crate::layout::desktop::replacement_target() {
+            // Native text edits do not press Space or replacement letters.
+            // Pin this choice before switching layouts: if the control later
+            // refuses the edit, it must never fall back to unprepared keycodes.
+            *crate::types::lock_forgiving(&engine.injector.route) = InjectionRoute::Native(target);
+            let buffered = engine.buffered();
+            if target_layout.is_some_and(|target| Self::current_layout() != Some(target))
+                && buffered.iter().any(|typed| !Self::is_terminator(typed.key))
+            {
+                return false;
+            }
+            return engine.replacement_valid(generation);
+        }
         if plan.verify.is_some() {
-            // This plan can never use keycode fallback. Holding a physical key
-            // must not delay a verified text edit or its literal suffix.
+            return false;
+        }
+        let caps = crate::types::lock_forgiving(&engine.state).caps_lock;
+        let observed_caps = engine.injector.locked_mods.load(Ordering::Acquire) & 2 != 0;
+        let caps_match = if engine.injector.locks_known.load(Ordering::Acquire) {
+            caps == observed_caps
+        } else {
+            !caps
+        };
+        if caps_match && super::wayland_input::available() {
+            let Some(source) = Self::current_layout() else {
+                return false;
+            };
+            let target = target_layout.unwrap_or(source);
+            if target != source
+                && engine
+                    .buffered()
+                    .iter()
+                    .any(|typed| !Self::is_terminator(typed.key))
+            {
+                return false;
+            }
+            *crate::types::lock_forgiving(&engine.injector.route) =
+                InjectionRoute::Wayland { source, target };
             return engine.replacement_valid(generation);
         }
         let gaps = crate::timing::injection();
@@ -557,12 +603,17 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
         }
     };
 
+    // Discover optional compositor input while uinput settles, off capture.
+    let _ = super::wayland_input::available();
     // Allow time for the OS/compositor to detect the new injection device.
     crate::timing::pause(crate::timing::injection().device_settle);
     let injector = Injector {
         device: Mutex::new(injector),
         started: AtomicBool::new(false),
         capturing: AtomicUsize::new(0),
+        locked_mods: AtomicU32::new(0),
+        locks_known: AtomicBool::new(false),
+        route: Mutex::new(InjectionRoute::Keycodes),
     };
 
     // Start accessibility discovery before the first correction without putting
@@ -604,6 +655,29 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                     .is_some_and(|leds| leds.contains(LedCode::LED_CAPSL))
                 {
                     if let Ok(leds) = dev.get_led_state() {
+                        let locks = if leds.contains(LedCode::LED_CAPSL) {
+                            2
+                        } else {
+                            0
+                        } | if leds.contains(LedCode::LED_NUML) {
+                            16
+                        } else {
+                            0
+                        };
+                        let mask = 2 | if dev
+                            .supported_leds()
+                            .is_some_and(|set| set.contains(LedCode::LED_NUML))
+                        {
+                            16
+                        } else {
+                            0
+                        };
+                        let _ = engine.injector.locked_mods.fetch_update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |current| Some((current & !mask) | (locks & mask)),
+                        );
+                        engine.injector.locks_known.store(true, Ordering::Release);
                         engine.caps_lock_changed(leds.contains(LedCode::LED_CAPSL));
                     }
                 }
@@ -657,8 +731,24 @@ pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
                                     }
                                 });
                             }
-                            EventSummary::Led(_, LedCode::LED_CAPSL, value) => {
-                                engine.caps_lock_changed(value != 0);
+                            EventSummary::Led(
+                                _,
+                                led @ (LedCode::LED_CAPSL | LedCode::LED_NUML),
+                                value,
+                            ) => {
+                                let mask = if led == LedCode::LED_CAPSL { 2 } else { 16 };
+                                if value != 0 {
+                                    engine.injector.locked_mods.fetch_or(mask, Ordering::AcqRel);
+                                } else {
+                                    engine
+                                        .injector
+                                        .locked_mods
+                                        .fetch_and(!mask, Ordering::AcqRel);
+                                }
+                                if led == LedCode::LED_CAPSL {
+                                    engine.injector.locks_known.store(true, Ordering::Release);
+                                    engine.caps_lock_changed(value != 0);
+                                }
                             }
                             _ => {}
                         }
@@ -897,7 +987,49 @@ fn inject_once(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Op
         return None;
     }
     // Native edits preserve literal text across layouts. Never fall back after a helper request could have edited.
-    if let Some(target) = crate::layout::desktop::focus() {
+    let route = crate::types::lock_forgiving(&engine.injector.route).clone();
+    if let InjectionRoute::Wayland { source, target } = route {
+        if verify.is_some()
+            || !engine.replacement_valid(generation)
+            || Linux::current_layout() != Some(target)
+        {
+            return None;
+        }
+        let buffered = engine.buffered();
+        if source != target
+            && buffered
+                .iter()
+                .any(|typed| !Linux::is_terminator(typed.key))
+        {
+            return None;
+        }
+        let suffix = engine::reading::<Linux>(&buffered, target);
+        let text = format!(
+            "{}{}{suffix}",
+            retype.text,
+            if terminator.is_some() { " " } else { "" }
+        );
+        let held = crate::types::lock_forgiving(&engine.state)
+            .held_keys
+            .iter()
+            .map(|key| key.0)
+            .collect();
+        super::wayland_input::inject(
+            erase + buffered.len(),
+            &text,
+            &held,
+            engine.injector.locked_mods.load(Ordering::Acquire),
+            || {
+                engine.replacement_valid(generation)
+                    && engine.buffered().len() == buffered.len()
+                    && Linux::current_layout() == Some(target)
+                    && !Linux::capture_pending(&engine.injector)
+            },
+            || engine.injector.started.store(true, Ordering::Release),
+        )?;
+        return Some(buffered);
+    }
+    if let InjectionRoute::Native(target) = route {
         let buffered = engine.buffered();
         let source = verify.or_else(Linux::current_layout)?;
         let suffix = engine::reading::<Linux>(&buffered, source);
@@ -906,7 +1038,7 @@ fn inject_once(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Op
         }
         engine.injector.started.store(true, Ordering::Release);
         let response = crate::layout::desktop::request(serde_json::json!({
-            "action": "replace_suffix", "focus": target.id,
+            "action": "replace_suffix", "focus": target,
             "expected": format!("{expected}{suffix}"),
             "text": format!("{}{}{suffix}", retype.text, if terminator.is_some() { " " } else { "" }),
         }))?;
@@ -914,9 +1046,8 @@ fn inject_once(engine: &Engine<Linux>, plan: Plan<Linux>, generation: u64) -> Op
             "applied" => return Some(buffered),
             "unsupported" => {
                 engine.injector.started.store(false, Ordering::Release);
-                if verify.is_some() {
-                    return None;
-                }
+                // Preparation deliberately skipped physical release waits.
+                return None;
             }
             "unchanged" => {
                 engine.injector.started.store(false, Ordering::Release);

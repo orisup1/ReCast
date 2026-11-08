@@ -1,4 +1,51 @@
-# Search latency
+# Correction performance
+
+## Linux replacement delivery
+
+Linux first checks whether the focused control supports a verified AT-SPI suffix
+edit. That route does not synthesize physical Space or letter keys, so it no
+longer waits for their release. An unsupported or uncertain native edit never
+falls through to unprepared keyboard deletion.
+
+Supported single-seat Wayland sessions can instead use the compositor's virtual
+keyboard protocol. ReCast builds literal Unicode keymaps in memory, excludes
+physically held printable positions, confirms compositor acceptance, and submits
+bounded groups of key requests without kernel-buffer pacing. Maps preserve case,
+Caps/Num Lock indicators, and all four XKB layout groups. Physical layouts remain
+the source for language detection. Unsupported sessions retain the existing
+`uinput` safety waits and write pacing; no timing default was reduced.
+
+The native harness accepts `--space-hold-ms` and an optional
+`--max-latency-ms`. It measures trigger Space press to the expected GTK buffer
+change, not compositor paint. This distinguishes time spent waiting for a
+physical release from dictionary search and application delivery. Commands and
+desktop requirements are documented in [native acceptance checks](tests/native-ui.md).
+
+A controlled release trial on 2026-11-08 used this Linux machine's Intel
+Core i7-10875H, Hyprland 0.56.2, and GTK 3.24.52. Each trial typed `recieve `
+with a 125 ms trigger Space hold; each row contains eight successful trials per
+build. The baseline was `d2edf94`; both builds used the same harness and defaults.
+
+| Delivery | Before, median | After, median | After, min–max |
+| --- | ---: | ---: | ---: |
+| Accessible AT-SPI field | 132.412 ms | 25.742 ms | 7.544–33.870 ms |
+| Accessibility disabled; compositor input enabled after the change | 129.837 ms | 26.887 ms | 10.024–31.871 ms |
+
+The improvement removes the physical-release wait in this workload; it is not a
+universal speedup multiplier or a macOS/Windows comparison. Four additional GTK
+XWayland trials passed with a 32.498 ms median (16.089–38.158 ms range). The final
+release passed all 39 native trials: the 16 timed Wayland trials, four XWayland
+trials, six queued layout conversions with extra spaces, four forced kernel
+replays with a mismatched injector group, six delayed native spelling fixes with
+next-word typing, and three individual spelling/layout/extended undo checks.
+Kernel replay still waits for physical release. Physical Caps Lock trials were
+unavailable because this desktop remaps Caps to Compose; generated-map tests
+verify literal case, Hebrew, lock indicators, and all four layout groups.
+
+Windows already submits replacement text and buffered input in one Unicode
+`SendInput` transaction without a physical Space-release wait. Its fallback has
+a single 1 ms settle period. That is a code inspection finding, not a Windows
+desktop latency measurement. macOS delivery is unchanged by this follow-up.
 
 ## Implemented changes
 

@@ -136,7 +136,12 @@ can identify the active application; its field is disabled otherwise.
 
 ### Linux
 
-ReCast reads keyboards through `evdev` and writes corrections through `uinput`.
+ReCast reads keyboards through `evdev`. Corrections prefer verified AT-SPI text
+edits, then direct compositor input when the Wayland virtual-keyboard protocol
+is available (including supported Hyprland/Sway sessions), then `uinput` replay.
+The first two routes can replace text while Space is still held; kernel replay
+waits for conflicting physical keys to be released. Set `wayland_input = false`
+or `RECAST_WAYLAND_INPUT=0` to disable compositor input.
 Your user needs access to both devices. Add yourself to the `input` group, then
 log out and back in before installing the user service:
 

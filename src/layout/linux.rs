@@ -789,7 +789,10 @@ mod hypr {
         Some(
             std::mem::take(keyboards)
                 .into_iter()
-                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR))
+                .filter(|block| {
+                    block.get("active_keymap").and_then(|v| v.as_str()) != Some(INJECTOR)
+                }),
         )
     }
 
@@ -911,6 +914,14 @@ mod hypr {
             usize::try_from(keyboard["active_layout_index"].as_u64()?).ok()? == desired
         };
         Some((desired, ready))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn compositor_injector_does_not_replace_the_physical_layout() {
+        let json = r#"{"keyboards":[{"name":"physical","layout":"us","active_keymap":"English (US)"},{"name":"virtual-native","layout":"recast-injector","active_keymap":"recast-injector","main":true}]}"#;
+        assert_eq!(parse_layout(json), Some(Language::English));
+        assert_eq!(parse_names(json), Some(vec!["us".into()]));
     }
 
     #[cfg(test)]
@@ -1142,7 +1153,15 @@ mod sway {
                 .into_iter()
                 .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("keyboard"))
                 .filter(|block| block.get("identifier").and_then(|v| v.as_str()) != Some(INJECTOR))
-                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR)),
+                .filter(|block| block.get("name").and_then(|v| v.as_str()) != Some(INJECTOR))
+                .filter(|block| {
+                    !block
+                        .get("xkb_layout_names")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|names| {
+                            names.iter().any(|name| name.as_str() == Some(INJECTOR))
+                        })
+                }),
         )
     }
 
@@ -1209,6 +1228,14 @@ mod sway {
             .ok()?;
         let (index, ready) = super::injector_group(&names, active, lang)?;
         Some((keyboard["identifier"].as_str()?.to_owned(), index, ready))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn compositor_injector_does_not_replace_the_physical_layout() {
+        let json = r#"[{"type":"keyboard","name":"physical","xkb_layout_names":["English (US)"],"xkb_active_layout_index":0},{"type":"keyboard","name":"virtual-native","xkb_layout_names":["recast-injector"],"xkb_active_layout_index":0}]"#;
+        assert_eq!(parse_names(json), Some(vec!["English (US)".into()]));
+        assert_eq!(parse_index(json), Some(0));
     }
 
     #[cfg(test)]

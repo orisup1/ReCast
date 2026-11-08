@@ -2915,9 +2915,12 @@ dependencies = [
  "serde_json",
  "tao",
  "tray-icon",
+ "wayland-client",
+ "wayland-protocols-misc",
  "winapi",
  "windows 0.61.3",
  "winresource",
+ "xkbcommon-dl",
 ]
 
 [[package]]

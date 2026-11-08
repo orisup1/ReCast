@@ -193,6 +193,13 @@ def main():
             return gnome('Switch', GLib.Variant('(u)', (request['index'],)))
         if action == 'focus':
             return snapshot()
+        if action == 'replacement_target':
+            before = snapshot()
+            if before is None:
+                return None
+            # Capability checks only: no text, selection, or caret reads.
+            Target(current())
+            return before if snapshot() == before else None
         expected_id = request['focus']
         before = snapshot()
         if before is None or before['id'] != expected_id:
