@@ -135,3 +135,13 @@ a proven failure before editing restores the layout and allows the next ordinary
 word to correct. Delayed layout-changing fixes still abstain after following text,
 because silently reinterpreting those keys would risk corrupting user text. No
 manual keyboard-switching ritual was added; native support remains the next step.
+
+### Pass 7: optional help without gesture interference
+
+Repeated the review around manual correction, completion, passive previews, and
+returning to original text. Inspected gesture rollover/chord distinction and
+preview acceptance. Three regressions passed: suggestion taps tolerate typing
+rollover but reject actual chords; cycling to original text protects that choice
+without disabling the next word; previews leave text unchanged until accepted
+and reject stale context. Ordinary Shift capitalization remains covered by pass 4.
+No new shortcut, automatic completion, or forced acceptance step was added.
