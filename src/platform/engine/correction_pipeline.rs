@@ -255,6 +255,12 @@ impl<P: Platform> Engine<P> {
                 st.word_check_worker = false;
                 return;
             };
+            // Expired checks cannot land; do not delay newer words with their searches.
+            if st.generation != check.generation
+                || st.press_revision.wrapping_sub(check.presses) > MAX_UNDO_SUFFIX as u64
+            {
+                continue;
+            }
             drop(st);
             engine.check_word(check);
             if !engine.lock().word_check_worker {

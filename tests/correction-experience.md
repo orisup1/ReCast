@@ -81,3 +81,13 @@ and stale-context cancellation. The unit suite passed (422 passed, 12 ignored),
 Clippy passed with warnings denied, and formatting and whitespace checks passed.
 The final overflow regression also passed separately. Existing unrelated Windows
 and layout work was excluded from this change.
+
+### Pass 2: backlog latency
+
+Repeated the correction-path review with a burst longer than the verification
+window. Although expired checks were safely rejected, they still performed their
+dictionary searches before rejection, delaying fresh words. The worker now skips
+checks from an obsolete generation or beyond the existing suffix limit before
+search. The overflow regression covers bounded storage, expired work, and two
+recent corrections. No timing requirement or additional user action is introduced.
+Validation: the rapid-word, overflow, and cancellation regression passed.
