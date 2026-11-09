@@ -239,7 +239,7 @@ layout conversion can still use the latest fully tracked finished word.
 | Reconsider an unchanged word | Tap **Ctrl twice** immediately, before or after its Space |
 | Rescue selected text (supported controls) | Select text in an editable field, then tap **Ctrl twice**; repeat to restore it |
 | Convert an unchanged last word to the other layout | Tap **Ctrl twice within half a second**, even for unknown words |
-| Undo the latest correction or completion | Tap **Ctrl twice** immediately, or use the optional single-Ctrl undo shortcut |
+| Undo the latest correction or completion | Tap **Ctrl twice**, or use the optional single-Ctrl undo shortcut |
 | Allow an ignored word again | Choose **Allow again** beside it in Recent corrections, or edit Settings > Word rules |
 | Enable/disable or pause | Tray/menubar, Linux control window, or terminal dashboard |
 | Inspect or ignore a correction | Open **Recent corrections…** in the tray, then choose **Details** or **Ignore word**; in the Linux window, expand a correction and choose **Ignore this word**. **Allow again** reverses ignoring. Save failures appear beside the action. |
@@ -860,7 +860,7 @@ words or undo exceptions.
   and add the running copy shown in setup. `make app` resets privacy grants;
   for a manual reinstall, `tccutil reset All com.recast.app` resets them before you
   grant access again. Relaunch afterward if needed.
-- **Unwanted spelling fixes:** undo immediately, ignore the word, enable
+- **Unwanted spelling fixes:** undo the correction, ignore the word, enable
   Conservative spelling, or disable spelling in Settings.
 
 ## Development

@@ -157,3 +157,15 @@ early release: only the worker loop relinquishes ownership under the state lock.
 This prevents a replacement restart from creating two active search workers.
 Validation: stale-query and responsive-suggestion regressions passed; delayed
 focus, automatic cancellation, and burst/undo regressions each passed 10 runs.
+
+### Pass 9: submission safety and habit-neutral guidance
+
+Repeated the review for Enter, cursor changes, exclusions, secure input, and what
+help tells users to do. Verified-edit cancellation and the broader interrupted-
+replacement regression passed, including submission without replaying Enter.
+Found misleading guidance: practice demanded immediate undo before more typing,
+and shortcut help, practice, and the terminal dashboard still claimed undo could
+save exceptions. Removed the unnecessary urgency and aligned all those surfaces
+with session-only suppression and explicit ignoring. README undo guidance now
+matches. Practice progression passed unchanged; shortcuts, correction thresholds,
+and optional practice remain unchanged. Native verification limits still apply.

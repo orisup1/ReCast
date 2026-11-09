@@ -16,7 +16,7 @@ pub(crate) fn restore_instruction(config: &crate::config::Config) -> String {
 pub fn instructions() -> String {
     let config = crate::config::Config::global();
     format!(
-    "1. Select your English keyboard. Click the field below, type akuo, then Space. Watch it become שלום.\n2. Immediately {} to restore akuo.\n3. Select all and delete. Type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", restore_instruction(&config), config.completion_gesture())
+    "1. Select your English keyboard. Click the field below, type akuo, then Space. Watch it become שלום.\n2. {} to restore akuo.\n3. Select all and delete. Type keyb, then {} to complete keyboard.\n\nThis is real correction in a local practice field. Practice does not save learned words or change your correction counts.", restore_instruction(&config), config.completion_gesture())
 }
 
 fn completion_instruction(config: &crate::config::Config) -> String {
@@ -46,7 +46,7 @@ pub fn step_instruction(stage: u8) -> String {
     let config = crate::config::Config::global();
     match stage {
         0 => "Select your English keyboard. Click the field below, type akuo, then Space. Watch it become שלום.\nPractice is local; no learning or correction counts.".into(),
-        1 => format!("Immediately {} to restore akuo. Keep the cursor in the field; do not click or type first.", restore_instruction(&config)),
+        1 => format!("To restore akuo, {}. Keep the cursor in this field.", restore_instruction(&config)),
         2 => format!("Select all and delete in the field, then {}", completion_instruction(&config)),
         _ => "You tried correction, undo, and completion. Choose Done and keep typing anywhere. Practice does not save learned words or change your correction counts.".into(),
     }
@@ -56,7 +56,7 @@ pub fn feedback(control: &AppControl) -> String {
     let stage = control.practice_stage.load(Ordering::Relaxed);
     let config = crate::config::Config::global();
     let undo_step = format!(
-        "Correction worked. Now {} to restore akuo, without clicking or typing first.",
+        "Correction worked. To restore akuo, {}. Keep the cursor in this field.",
         restore_instruction(&config)
     );
     let completion_step = format!(
@@ -74,7 +74,7 @@ pub fn feedback(control: &AppControl) -> String {
         2 => &completion_step,
         _ => "You did it: correction, undo, and completion. Close this window and keep typing anywhere.",
     };
-    format!("{step}\n{}\nDouble taps undo corrections or convert unchanged words. Undo can teach exceptions; manual conversion preserves them.", shortcut_label(&config.undo_shortcut))
+    format!("{step}\n{}\nDouble taps undo corrections or convert unchanged words. Undo leaves the word alone for this session; saved exceptions stay unchanged.", shortcut_label(&config.undo_shortcut))
 }
 
 pub fn fixed(control: &AppControl, from: &str, to: &str, kind: FixKind) {
