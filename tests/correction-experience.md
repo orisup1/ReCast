@@ -44,11 +44,12 @@ app disablement. No settings or shortcuts change.
   rejects stale targets. An unwanted correction is suppressed for the session.
   The fix retains these mechanisms; it does not repurpose Backspace or the host
   application's undo shortcut.
-- **Editing existing text:** clicks, navigation, selection changes, paste, and
-  untracked deletion can invalidate captured word boundaries. An empty supported
-  field already allows immediate recovery. Nonempty fields still need a trusted
-  boundary. A future native word-before-caret query could remove this limitation
-  without asking the user to type an extra space or select a word.
+- **Editing existing text:** clicks and detected changes to the focused target
+  already start a fresh capture immediately, including nonempty fields. Deleting
+  known text also recovers without an empty-field probe. Navigation, paste, and
+  untracked deletion can still invalidate captured word boundaries and require
+  a trusted boundary. A future native word-before-caret query could improve those
+  cases without asking the user to type an extra space or select a word.
 - **Enter and Tab:** these keys can submit text, execute commands, or move focus.
   Replaying them after asynchronous correction would change ordinary app behavior.
   Enter stays a context boundary, not an automatic correction trigger.
@@ -112,3 +113,14 @@ corrections. Capitalizing the next word with either Shift keeps a pending fix
 alive and does not request suggestions. No additional production change was
 justified; punctuation-triggered asynchronous edits would need their own safety
 contract, so Space remains the automatic boundary.
+
+### Pass 5: first words and ordinary editing
+
+Repeated the review around clicking into a field and deleting/retyping text.
+Verified that first words already correct after clicks, focus changes, and layout
+shortcuts even when an empty-field probe is unavailable. Backtracking into the
+previous tracked word also preserves correction. The delete/retype regression
+exercises 240 correction/deletion cycles without an empty-field probe. All three
+regressions passed. Clarified the review's distinction between fresh capture after
+a click and unknown text after navigation/paste; no warm-up word, extra space,
+or new editing habit is introduced.
