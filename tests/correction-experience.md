@@ -221,3 +221,35 @@ ordinary speed, continue into the next word, and undo the latest correction.
 Repeat after clicking into existing text and during manual editing. Record missed
 corrections separately from text damage. No deliberate delay, extra separator,
 or rehearsed mistake should be required.
+
+## Ten-pass follow-up review
+
+These ten passes review distinct parts of the correction experience. Changes are
+grouped by related behavior rather than committing every test run. Evidence is
+source inspection and simulated typing; this is not a native usability study.
+
+### 1. Recovery after a failed correction
+
+A deterministic preparation gate reproduced a stalled queue: the first edit failed
+before touching text, but the next typo waited for another keystroke to restart.
+Failure recovery now closes its replacement gate under the state lock before
+waking queued checks. The regression verifies continued correction without more
+input, latest-only undo, and cancellation by click, Enter, focus change, secure
+input, disablement, and exclusions.
+
+The full suite also exposed an older explicit-help fixture racing the automatic
+checks added in the preceding review. That fixture now disables automatic spelling
+while testing explicit spelling, uses unknown words for explicit conversion, and
+waits for replay searches to finish. Automatic repair remains covered separately.
+
+### 2. Context during fast typing
+
+Pausing the check for `data` reproduced `data baye ` missing the existing contextual
+repair to `data base `. Queued words had captured context before earlier checks
+finished. The FIFO worker now reads phrase and language history when it starts each
+check. No confidence threshold changes. A regression verifies correction, undo,
+and no context leakage across Enter, clicks, or focus changes.
+
+Validation for passes 1–2: 425 unit tests passed, 12 ignored; all 6 CLI tests and
+the macOS input-source wrapper passed. Clippy with warnings denied, formatting,
+and whitespace checks passed. Live application editing was not exercised.

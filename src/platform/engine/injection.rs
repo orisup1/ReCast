@@ -338,7 +338,7 @@ impl<P: Platform> Engine<P> {
         let automatic = matches!(&commit, Some(Commit::Fix { rule: Some(_), .. }));
 
         if !self.replacement_valid(generation) {
-            self.abort_before_injection(generation, retry);
+            self.abort_before_injection(generation, retry, gate);
             return;
         }
         let target_layout = match &commit {
@@ -350,13 +350,13 @@ impl<P: Platform> Engine<P> {
             None => None,
         };
         if !P::prepare_injection(self, &plan, generation, target_layout) {
-            self.abort_before_injection(generation, retry);
+            self.abort_before_injection(generation, retry, gate);
             return;
         }
         let previous_layout = P::current_layout();
         if !self.confirm_replacement_layout(commit.as_ref(), generation) {
             self.restore_unedited_layout(generation, previous_layout);
-            self.abort_before_injection(generation, retry);
+            self.abort_before_injection(generation, retry, gate);
             return;
         }
         let phrase_boundary = plan.terminator.is_some_and(P::is_line_break);
@@ -371,7 +371,7 @@ impl<P: Platform> Engine<P> {
         let Some(buffered) = P::inject(self, plan, generation) else {
             if !P::injection_started(&self.injector) {
                 self.restore_unedited_layout(generation, previous_layout);
-                self.abort_before_injection(generation, retry);
+                self.abort_before_injection(generation, retry, gate);
                 return;
             }
             let mut st = self.lock();
@@ -755,7 +755,12 @@ impl<P: Platform> Engine<P> {
 
     /// A refused switch did not edit text. Preserve retry context only while
     /// focus and tracked input still match; never use this after injection.
-    fn abort_before_injection(self: &Arc<Self>, generation: u64, retry: Option<RetryContext<P>>) {
+    fn abort_before_injection(
+        self: &Arc<Self>,
+        generation: u64,
+        retry: Option<RetryContext<P>>,
+        gate: ReplaceGuard<'_, AppState<P>>,
+    ) {
         let (focus, mode) = self.read_focus();
         let layout = P::current_layout();
         let mut st = self.lock();
@@ -784,6 +789,8 @@ impl<P: Platform> Engine<P> {
         } else {
             st.invalidate_text();
         }
+        // Queued checks can restart only after the failed replacement releases its gate.
+        gate.finish(&mut st);
         drop(st);
         self.ensure_word_check_worker();
     }

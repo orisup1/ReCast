@@ -300,7 +300,7 @@ impl<P: Platform> Engine<P> {
                 st.word_check_worker = false;
                 return;
             }
-            let Some(check) = st.word_checks.pop_front() else {
+            let Some(mut check) = st.word_checks.pop_front() else {
                 st.word_check_worker = false;
                 return;
             };
@@ -310,6 +310,9 @@ impl<P: Platform> Engine<P> {
             {
                 continue;
             }
+            // Earlier queued words have now supplied the context that fast typing missed.
+            check.run = st.history.run();
+            check.phrase = st.phrase.clone();
             drop(st);
             engine.check_word(check);
         });

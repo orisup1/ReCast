@@ -35,6 +35,7 @@ static EMPTY_INPUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static LAYOUT_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static INJECT_RETURN_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 static CHECK_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
+static PREPARE_GATE: Mutex<Option<FocusGate>> = Mutex::new(None);
 pub(super) fn pause_word_check() {
     let gate = CHECK_GATE.lock().unwrap().take();
     if let Some(gate) = gate {
@@ -230,7 +231,13 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
         crate::layout::LayoutSwitch::Switched
     }
     fn prepare_injection(_: &Engine<Self>, _: &Plan<Self>, _: u64, _: Option<Language>) -> bool {
-        PREPARE_ALLOWED.load(Ordering::SeqCst)
+        let allowed = PREPARE_ALLOWED.load(Ordering::SeqCst);
+        let gate = PREPARE_GATE.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.ready.send(()).unwrap();
+            gate.proceed.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        allowed
     }
     fn capture_pending(_: &Screen) -> bool {
         let pending = CAPTURE_PENDING.load(Ordering::SeqCst);
@@ -3834,10 +3841,10 @@ fn finished_word_help_survives_correction_undo_expiry() {
             let (word, wanted, gesture) = match (layout, action) {
                 (0, "completion") => ("keyb", "keyboard", Simulated::SHIFT_RIGHT),
                 (0, "spelling") => ("keyboad", "keyboard", Simulated::SHIFT_LEFT),
-                (0, _) => ("akuo", "שלום", Simulated::CTRL_LEFT),
+                (0, _) => ("zzzz", "זזזז", Simulated::CTRL_LEFT),
                 (_, "completion") => ("מחש", "מחשב", Simulated::SHIFT_RIGHT),
                 (_, "spelling") => ("תודדה", "תודה", Simulated::SHIFT_LEFT),
-                _ => ("יקךךם", "hello", Simulated::CTRL_LEFT),
+                _ => ("זזזז", "zzzz", Simulated::CTRL_LEFT),
             };
             let prefixes = if layout == 0 && action == "completion" {
                 vec![
@@ -3854,12 +3861,18 @@ fn finished_word_help_survives_correction_undo_expiry() {
                     let s = Session::new();
                     s.type_text(&physical(&format!("{typo} ")));
                     s.pending();
+                    // This case exercises explicit help, not the replayed automatic repair.
+                    if action == "spelling" {
+                        crate::config::Config::update_live(|config| config.spell_enabled = false);
+                    }
                     let separators = " ".repeat(spaces);
                     let later = format!("{prefix}{word}{separators}");
                     assert!(later.chars().count() <= crate::types::MAX_WORD_KEYS);
                     let expired = later.chars().count() > super::word_buffer::MAX_UNDO_SUFFIX;
                     s.type_text(&physical(&later));
                     s.finish();
+                    s.checks_ready();
+                    crate::config::Config::update_live(|config| config.spell_enabled = true);
                     assert_eq!(s.text(), format!("{corrected} {later}"));
                     if expired {
                         assert!(matches!(
@@ -7209,6 +7222,88 @@ fn preparation_and_unedited_failure_do_not_leave_layout_only_corrections() {
     assert_eq!(s.text(), "receive ");
 }
 
+#[test]
+fn failed_preparation_keeps_queued_words_moving() {
+    const CHILD: &str = "RECAST_FAILED_PREPARATION_QUEUE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::failed_preparation_keeps_queued_words_moving",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for cancel in [
+        "none", "click", "enter", "focus", "secure", "disabled", "excluded",
+    ] {
+        let s = Session::new();
+        let (search_ready, search_reached) = mpsc::sync_channel(0);
+        let (search_proceed, search_resume) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready: search_ready,
+            proceed: search_resume,
+        });
+        s.type_while_checking("recieve ");
+        search_reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.type_while_checking("keyboad ");
+        let (prepare_ready, prepare_reached) = mpsc::sync_channel(0);
+        let (prepare_proceed, prepare_resume) = mpsc::channel();
+        *PREPARE_GATE.lock().unwrap() = Some(FocusGate {
+            ready: prepare_ready,
+            proceed: prepare_resume,
+        });
+        PREPARE_ALLOWED.store(false, Ordering::SeqCst);
+        search_proceed.send(()).unwrap();
+        prepare_reached
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        s.checks_ready();
+        assert_eq!(s.engine.lock().word_checks.len(), 1);
+        assert_eq!(s.text(), "recieve keyboad ");
+        match cancel {
+            "click" => s.engine.mouse_click(),
+            "enter" => s.type_while_checking("\n"),
+            "focus" => FOCUS.store(2, Ordering::SeqCst),
+            "secure" => INPUT_ALLOWED.store(false, Ordering::SeqCst),
+            "disabled" => s.engine.control.set_enabled(false),
+            "excluded" => *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()],
+            _ => {}
+        }
+        let expected = s.text();
+        PREPARE_ALLOWED.store(true, Ordering::SeqCst);
+        prepare_proceed.send(()).unwrap();
+        if cancel == "none" {
+            s.pending();
+            s.finish();
+            s.checks_ready();
+            assert_eq!(s.text(), "recieve keyboard ");
+            assert_eq!(s.engine.control.fixed_count(), 1);
+            s.undo();
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "recieve keyboad ");
+            crate::complete::unlist("keyboad");
+        } else {
+            s.idle();
+            s.checks_ready();
+            assert!(s.ready.try_recv().is_err(), "{cancel}");
+            assert_eq!(s.text(), expected, "{cancel}");
+            assert_eq!(s.engine.control.fixed_count(), 0, "{cancel}");
+        }
+        FOCUS.store(1, Ordering::SeqCst);
+        INPUT_ALLOWED.store(true, Ordering::SeqCst);
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn fetched_input_batches_must_finish_before_replay_is_frozen() {
@@ -7520,6 +7615,65 @@ fn words_finished_during_replacement_correct_without_pausing() {
         FOCUS.store(1, Ordering::SeqCst);
         SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
         INPUT_ALLOWED.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn queued_words_use_the_preceding_words_context() {
+    const CHILD: &str = "RECAST_QUEUED_CONTEXT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::queued_words_use_the_preceding_words_context",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for reset in ["none", "enter", "click", "focus"] {
+        let s = Session::new();
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        s.type_while_checking("data ");
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        match reset {
+            "enter" => s.type_while_checking("\n"),
+            "click" => s.engine.mouse_click(),
+            "focus" => FOCUS.store(2, Ordering::SeqCst),
+            _ => {}
+        }
+        s.type_while_checking("baye ");
+        proceed.send(()).unwrap();
+        if reset == "none" {
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "data base ");
+            assert!(s.engine.control.history()[0]
+                .details
+                .contains("Previous word: \"data\""));
+            s.undo();
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), "data baye ");
+            crate::complete::unlist("baye");
+        } else {
+            s.checks_ready();
+            assert!(s.ready.try_recv().is_err(), "{reset}");
+            assert!(s.text().ends_with("baye "), "{reset}");
+        }
+        FOCUS.store(1, Ordering::SeqCst);
     }
 }
 
