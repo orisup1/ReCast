@@ -169,3 +169,27 @@ save exceptions. Removed the unnecessary urgency and aligned all those surfaces
 with session-only suppression and explicit ignoring. README undo guidance now
 matches. Practice progression passed unchanged; shortcuts, correction thresholds,
 and optional practice remain unchanged. Native verification limits still apply.
+
+### Pass 10: final behavior and scope review
+
+Rechecked the complete change against the original constraint: ordinary typing,
+existing shortcuts, optional practice, conservative correction gates, and native
+text verification are preserved. The production changes retain pending words,
+avoid expired searches, serialize worker ownership, and remove misleading undo
+pressure. Additional passes recorded passing behavior rather than inventing new
+features or changing user habits.
+
+Final validation passed:
+
+- `cargo test --locked`: 422 unit tests passed, 12 ignored; all 6 CLI tests passed;
+  macOS input-source main-thread and worker-thread checks passed.
+- `cargo clippy --locked --all-targets -- -D warnings`.
+- `cargo fmt --check` and `git diff --check`.
+- Delayed-focus, automatic-cancellation, and rapid-burst/undo tests each passed
+  10 consecutive targeted runs after the worker-handoff change.
+
+The full suite includes correction accuracy and independent evaluation regression
+checks; passing them does not establish real-world accuracy. Live typing in native
+applications, downloaded-app privacy grants, and Windows/Linux runtime behavior
+were not exercised. Existing unrelated layout and Windows edits remain outside
+these commits. No app installation, deployment, or remote push was performed.
