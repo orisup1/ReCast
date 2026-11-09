@@ -41,6 +41,17 @@ it does not verify native drawing, privacy grants, focus, or display scaling.
 10. Navigate with Tab, Shift+Tab, Space, and arrow keys. Check VoiceOver/Narrator
    labels. Minimize and reopen each window from the tray. Closing a secondary
    window must leave correction running; closing the log must stop logging.
+11. On Windows, rapidly scroll Settings past partially clipped controls, tab to
+    offscreen fields, switch sections after scrolling, and resize repeatedly.
+    Cover and uncover the window. Vacated control areas must repaint with the
+    system form background; no stale text trails or duplicated controls remain.
+
+The Windows GDI regression test checks background erasure and movement of clipped
+and fully offscreen controls without taking focus:
+
+```powershell
+cargo test native_form_erases_stale_pixels_and_moves_offscreen_controls
+```
 
 ## Editing and replay acceptance
 
@@ -115,6 +126,15 @@ read-only rejection. Run in a logged-in Windows desktop and keep it foreground:
 
 ```powershell
 cargo test native_selection_round_trip -- --ignored --nocapture
+```
+
+The layout regression test opens a host that ignores layout requests and an
+embedded Edit control that accepts them. With English and Hebrew installed, it
+checks that layout reads and switches follow the focused control. Keep its window
+foreground until it closes:
+
+```powershell
+cargo test layout_switch_reaches_focused_control_instead_of_host -- --ignored --nocapture
 ```
 
 The Linux/Hyprland replay runner exercises real capture and replacement delivery:

@@ -179,16 +179,50 @@ unsafe fn scroll_to(parent: HWND, position: i32) {
     let old = GetScrollPos(parent, SB_VERT as i32);
     SetScrollPos(parent, SB_VERT as i32, position, 1);
     let current = GetScrollPos(parent, SB_VERT as i32);
-    ScrollWindowEx(
+    move_scrolled_children(parent, old - current);
+}
+
+unsafe fn move_scrolled_children(parent: HWND, delta: i32) {
+    if delta == 0 {
+        return;
+    }
+    // ScrollWindowEx leaves stale pixels for partially clipped child controls.
+    let mut child = GetWindow(parent, GW_CHILD);
+    while !child.is_null() {
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(child, &mut rect) != 0 {
+            MapWindowPoints(
+                std::ptr::null_mut(),
+                parent,
+                &mut rect as *mut _ as *mut POINT,
+                2,
+            );
+            SetWindowPos(
+                child,
+                std::ptr::null_mut(),
+                rect.left,
+                rect.top + delta,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            );
+        }
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+    RedrawWindow(
         parent,
-        0,
-        old - current,
-        std::ptr::null(),
         std::ptr::null(),
         std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
     );
+}
+
+unsafe fn erase_background(parent: HWND, dc: HDC) -> LRESULT {
+    let mut rect: RECT = std::mem::zeroed();
+    if GetClientRect(parent, &mut rect) == 0 {
+        return 0;
+    }
+    FillRect(dc, &rect, GetSysColorBrush(COLOR_BTNFACE)) as LRESULT
 }
 
 unsafe extern "system" fn procedure(
@@ -200,6 +234,10 @@ unsafe extern "system" fn procedure(
     data: usize,
 ) -> LRESULT {
     let callback = &*(data as *const Callback);
+    if message == WM_ERASEBKGND && hwnd == callback.parent {
+        // Tao has no default background brush for these native forms.
+        return erase_background(hwnd, w as HDC);
+    }
     if message == WM_VSCROLL || message == WM_MOUSEWHEEL {
         let mut info: SCROLLINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
@@ -284,6 +322,8 @@ impl Native {
     pub fn new(window: &tao::window::Window, proxy: EventLoopProxy<()>) -> Result<Self, String> {
         unsafe {
             let parent = window.hwnd() as HWND;
+            let style = GetWindowLongPtrW(parent, GWL_STYLE);
+            SetWindowLongPtrW(parent, GWL_STYLE, style | WS_CLIPCHILDREN as isize);
             let mut callback = Box::new(Callback {
                 pending: Mutex::new(VecDeque::new()),
                 proxy,
@@ -337,16 +377,7 @@ impl Native {
             SetScrollInfo(self.parent, SB_VERT as i32, &info, 1);
             let offset = GetScrollPos(self.parent, SB_VERT as i32);
             if old_offset != offset {
-                ScrollWindowEx(
-                    self.parent,
-                    0,
-                    old_offset - offset,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE,
-                );
+                move_scrolled_children(self.parent, old_offset - offset);
             }
             let dpi = (96.0 * scale).round() as u32;
             let scale_changed = dpi != self.dpi;
@@ -591,6 +622,81 @@ impl Drop for Native {
             if !self.heading.is_null() {
                 DeleteObject(self.heading as _);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_form_erases_stale_pixels_and_moves_offscreen_controls() {
+        unsafe {
+            let parent = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("").as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                64,
+                64,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null_mut(),
+            );
+            assert!(!parent.is_null());
+            let children = [16, 80].map(|y| {
+                let child = CreateWindowExW(
+                    0,
+                    wide("STATIC").as_ptr(),
+                    wide("label").as_ptr(),
+                    WS_CHILD | WS_VISIBLE,
+                    8,
+                    y,
+                    20,
+                    20,
+                    parent,
+                    std::ptr::null_mut(),
+                    GetModuleHandleW(std::ptr::null()),
+                    std::ptr::null_mut(),
+                );
+                assert!(!child.is_null());
+                child
+            });
+            let top = |child| {
+                let mut rect: RECT = std::mem::zeroed();
+                assert_ne!(GetWindowRect(child, &mut rect), 0);
+                MapWindowPoints(
+                    std::ptr::null_mut(),
+                    parent,
+                    &mut rect as *mut _ as *mut POINT,
+                    2,
+                );
+                rect.top
+            };
+            move_scrolled_children(parent, -30);
+            assert_eq!(children.map(top), [-14, 50]);
+            move_scrolled_children(parent, 30);
+            assert_eq!(children.map(top), [16, 80]);
+
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            assert!(!dc.is_null());
+            let bitmap = CreateBitmap(64, 64, 1, 32, std::ptr::null());
+            assert!(!bitmap.is_null());
+            let previous = SelectObject(dc, bitmap as _);
+            let color = GetSysColor(COLOR_BTNFACE);
+            let stale = color ^ 0x00ff_ffff;
+            SetPixel(dc, 5, 5, stale);
+            assert_eq!(GetPixel(dc, 5, 5), stale);
+            assert_ne!(erase_background(parent, dc), 0);
+            assert_eq!(GetPixel(dc, 5, 5), color);
+            SelectObject(dc, previous);
+            DeleteObject(bitmap as _);
+            DeleteDC(dc);
+            DestroyWindow(parent);
         }
     }
 }

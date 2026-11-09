@@ -16,13 +16,66 @@ pub(super) struct WordCheck<P: Platform> {
     keys: Vec<Typed<P::Key>>,
     key: P::Key,
     shift: bool,
-    focus: Option<P::Focus>,
+    focus: Option<Arc<P::Focus>>,
     run: crate::dictionary::Run,
     mode: crate::config::AppMode,
     phrase: crate::complete::PhraseContext,
     layout: Option<Language>,
     generation: u64,
     presses: u64,
+}
+
+impl<P: Platform> AppState<P> {
+    fn enqueue_word_check(&mut self, check: WordCheck<P>) {
+        if self.word_checks.len() >= MAX_UNDO_SUFFIX {
+            self.word_checks.pop_front();
+        }
+        self.word_checks.push_back(check);
+    }
+
+    /// Replayed text still needs the ordinary checks its Space presses requested.
+    pub(super) fn recheck_replayed_words(
+        &mut self,
+        text: &[Typed<P::Key>],
+        first_complete: bool,
+        focus: Option<Arc<P::Focus>>,
+        layout: Option<Language>,
+    ) {
+        if self.mode == crate::config::AppMode::ManualOnly
+            || self.focus.as_ref() != focus.as_deref()
+        {
+            return;
+        }
+        let mut start = 0;
+        for (end, typed) in text.iter().enumerate() {
+            if !P::is_terminator(typed.key) {
+                continue;
+            }
+            if P::is_line_break(typed.key) {
+                return;
+            }
+            let following = text.len() - end - 1;
+            if (first_complete || start > 0)
+                && end > start
+                && end - start <= crate::types::MAX_WORD_KEYS
+                && following <= MAX_UNDO_SUFFIX
+            {
+                self.enqueue_word_check(WordCheck {
+                    keys: text[start..end].to_vec(),
+                    key: typed.key,
+                    shift: typed.shift,
+                    focus: focus.clone(),
+                    run: self.history.run(),
+                    mode: self.mode,
+                    phrase: self.phrase.clone(),
+                    layout,
+                    generation: self.generation,
+                    presses: self.press_revision.wrapping_sub(following as u64),
+                });
+            }
+            start = end + 1;
+        }
+    }
 }
 
 pub(super) fn completion_correction(
@@ -215,15 +268,11 @@ impl<P: Platform> Engine<P> {
                 layout,
             });
         }
-        // Keep rapid finished words in order, bounded by the suffix we can verify.
-        if st.word_checks.len() >= MAX_UNDO_SUFFIX {
-            st.word_checks.pop_front();
-        }
         let check = WordCheck {
             keys: st.keys.to_vec(),
             key,
             shift,
-            focus,
+            focus: focus.map(Arc::new),
             run: st.history.run(),
             mode: st.mode,
             phrase: st.phrase.clone(),
@@ -231,7 +280,7 @@ impl<P: Platform> Engine<P> {
             generation: st.generation,
             presses: st.press_revision,
         };
-        st.word_checks.push_back(check);
+        st.enqueue_word_check(check);
         st.keys.clear();
         drop(st);
         self.ensure_word_check_worker();
@@ -422,7 +471,7 @@ impl<P: Platform> Engine<P> {
             return;
         }
         if st.focus != current_focus
-            || current_focus != focus
+            || current_focus.as_ref() != focus.as_deref()
             || st.mode != mode
             || current_layout != layout
             || st.is_replacing

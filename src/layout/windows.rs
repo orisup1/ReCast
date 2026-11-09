@@ -28,31 +28,26 @@ pub fn enabled_languages() -> (bool, bool) {
     }
 }
 
-pub fn query_layout() -> Option<Language> {
-    use std::ffi::c_void;
-    type DWORD = u32;
-    type HKL = isize;
-    type HWND = *mut c_void;
-    extern "system" {
-        fn GetForegroundWindow() -> HWND;
-        fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
-        fn GetCurrentThreadId() -> DWORD;
-        fn GetKeyboardLayout(idThread: DWORD) -> HKL;
-    }
+/// Use the focused control, which can belong to a different thread than its host.
+pub fn focused_target() -> Option<usize> {
+    use winapi::um::winuser::{GetGUIThreadInfo, GUITHREADINFO};
     unsafe {
-        let hwnd = GetForegroundWindow();
-        let tid = if !hwnd.is_null() {
-            let mut pid: DWORD = 0;
-            GetWindowThreadProcessId(hwnd, &mut pid)
-        } else {
-            GetCurrentThreadId()
-        };
-        let langid = (GetKeyboardLayout(tid) as usize & 0xFFFF) as u16;
-        // The low 10 bits are the *primary* language; the high 6 are the
-        // sublanguage (regional variant). Match on the primary id so every
-        // English variant (en-US 0x0409, en-GB 0x0809, …) and every Hebrew
-        // variant counts, instead of only the two canonical US/IL layouts.
-        match langid & 0x03ff {
+        let mut info: GUITHREADINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        (GetGUIThreadInfo(0, &mut info) != 0 && !info.hwndFocus.is_null())
+            .then_some(info.hwndFocus as usize)
+    }
+}
+
+pub fn query_layout() -> Option<Language> {
+    use winapi::um::winuser::{GetKeyboardLayout, GetWindowThreadProcessId};
+    let focus = focused_target()?;
+    unsafe {
+        let tid = GetWindowThreadProcessId(focus as _, std::ptr::null_mut());
+        if tid == 0 {
+            return None;
+        }
+        match GetKeyboardLayout(tid) as usize & 0x03ff {
             0x0d => Some(Language::Hebrew),
             0x09 => Some(Language::English),
             _ => None,
@@ -75,13 +70,10 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     const INPUTLANGCHANGE_SYSCHARSET: WPARAM = 0x0001;
 
     extern "system" {
-        fn GetForegroundWindow() -> HWND;
         fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
-        fn GetCurrentThreadId() -> DWORD;
         fn GetKeyboardLayout(idThread: DWORD) -> HKL;
         fn PostMessageW(hWnd: HWND, Msg: u32, wParam: WPARAM, lParam: LPARAM) -> BOOL;
         fn GetKeyboardLayoutList(nBuff: i32, lpList: *mut HKL) -> i32;
-        fn ActivateKeyboardLayout(hkl: HKL, Flags: u32) -> HKL;
         fn LoadKeyboardLayoutW(pwszKLID: *const u16, Flags: u32) -> HKL;
     }
 
@@ -95,16 +87,16 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
     };
 
     unsafe {
-        // Determine the active keyboard layout of the foreground window's thread.
-        let hwnd = GetForegroundWindow();
-        let tid = if !hwnd.is_null() {
-            let mut pid: DWORD = 0;
-            GetWindowThreadProcessId(hwnd, &mut pid)
-        } else {
-            GetCurrentThreadId()
+        let Some(focus) = focused_target() else {
+            return LayoutSwitch::Failed;
         };
+        let hwnd = focus as HWND;
+        let tid = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        if tid == 0 {
+            return LayoutSwitch::Failed;
+        }
 
-        // Pre-switch check: if the foreground window is already on the
+        // Pre-switch check: if the focused control is already on the
         // requested layout, skip the switch entirely. Mirrors the Linux
         // early-exit so no replacement happens when typing in the correct
         // layout already. Compare on the *primary* language (low 10 bits) so
@@ -151,26 +143,15 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
             return LayoutSwitch::Failed;
         }
 
-        // Prefer notifying the focused window (foreground thread) to switch.
-        // This is more reliable than ActivateKeyboardLayout alone.
-        let posted_ok = if !hwnd.is_null() {
-            PostMessageW(
-                hwnd,
-                WM_INPUTLANGCHANGEREQUEST,
-                INPUTLANGCHANGE_SYSCHARSET,
-                target_hkl as LPARAM,
-            ) != 0
-        } else {
-            false
-        };
-
-        if !posted_ok {
-            // Fallback: activate for current thread (may not affect the
-            // foreground app, but keeps behavior best-effort).
-            let hkl = ActivateKeyboardLayout(target_hkl, KLF_ACTIVATE);
-            if hkl == 0 {
-                return LayoutSwitch::Failed;
-            }
+        // Windows directs this request to the focused control, not its host.
+        if PostMessageW(
+            hwnd,
+            WM_INPUTLANGCHANGEREQUEST,
+            INPUTLANGCHANGE_SYSCHARSET,
+            target_hkl as LPARAM,
+        ) == 0
+        {
+            return LayoutSwitch::Failed;
         }
 
         // Poll for the input subsystem to apply the change instead of a fixed
@@ -178,6 +159,9 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
         let gaps = crate::timing::injection();
         let deadline = std::time::Instant::now() + gaps.layout_confirm;
         loop {
+            if focused_target() != Some(focus) {
+                return LayoutSwitch::Failed;
+            }
             let updated_hkl = GetKeyboardLayout(tid);
             let updated_langid = (updated_hkl as usize & 0xFFFF) as u16;
             if updated_langid & 0x03ff == desired_primary {
@@ -189,5 +173,97 @@ pub fn switch_layout_to(lang: Language) -> LayoutSwitch {
             }
             crate::timing::pause(gaps.layout_poll);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
+    use winapi::shared::windef::HWND;
+    use winapi::um::commctrl::{DefSubclassProc, SetWindowSubclass};
+    use winapi::um::winuser::*;
+
+    unsafe extern "system" fn host(
+        hwnd: HWND,
+        message: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _: usize,
+        _: usize,
+    ) -> LRESULT {
+        if message == WM_INPUTLANGCHANGEREQUEST {
+            return 0; // The host does not handle the embedded control's layout.
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+
+    #[test]
+    #[ignore = "takes desktop focus and requires installed English and Hebrew keyboards"]
+    fn layout_switch_reaches_focused_control_instead_of_host() {
+        use std::time::{Duration, Instant};
+        assert_eq!(enabled_languages(), (true, true));
+        let (ready, receive) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let ui = std::thread::spawn(move || unsafe {
+            let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let parent = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("ReCast layout test").as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                600,
+                300,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null()),
+                std::ptr::null_mut(),
+            );
+            assert!(!parent.is_null());
+            assert_ne!(SetWindowSubclass(parent, Some(host), 1, 0), 0);
+            let child = CreateWindowExW(
+                0,
+                wide("EDIT").as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE,
+                0,
+                0,
+                500,
+                200,
+                parent,
+                std::ptr::null_mut(),
+                winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null()),
+                std::ptr::null_mut(),
+            );
+            assert!(!child.is_null());
+            SetForegroundWindow(parent);
+            SetFocus(child);
+            ready.send(child as usize).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut message = std::mem::zeroed();
+            while stopped.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty)
+                && Instant::now() < deadline
+            {
+                while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            DestroyWindow(parent);
+        });
+        let focus = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            assert_eq!(focused_target(), Some(focus));
+            for language in [Language::English, Language::Hebrew, Language::English] {
+                assert!(switch_layout_to(language).ready());
+                assert_eq!(query_layout(), Some(language));
+            }
+        });
+        let _ = stop.send(());
+        ui.join().unwrap();
+        result.unwrap();
     }
 }

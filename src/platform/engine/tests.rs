@@ -4296,15 +4296,6 @@ fn replacement_replay_keeps_the_latest_finished_word_available() {
         }
     }
     SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
-    let s = Session::new();
-    s.type_text("recieve ");
-    s.pending();
-    s.type_text("keyboad ");
-    s.finish();
-    s.tap(Simulated::SHIFT_LEFT);
-    s.pending();
-    s.finish();
-    assert_eq!(s.text(), "receive keyboard ");
     // Space can finish a completion before its replacement has landed.
     for preview in [false, true] {
         if preview {
@@ -7376,6 +7367,159 @@ fn repeated_undos_do_not_save_word_exceptions() {
         assert!(crate::complete::suppressed("recieve"));
         assert!(!crate::complete::learned("recieve"));
         assert_eq!(std::fs::read(&path).ok(), before);
+    }
+}
+
+#[test]
+fn words_finished_during_replacement_correct_without_pausing() {
+    const CHILD: &str = "RECAST_REPLAY_CORRECTION_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::words_finished_during_replacement_correct_without_pausing",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for (layout, typo, corrected, next) in [
+        (0, "recieve", "receive", "next"),
+        (1, "תודדה", "תודה", "שלום"),
+    ] {
+        SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+        let physical = |text: &str| {
+            if layout == 1 {
+                crate::keymap::convert_selection(text)
+            } else {
+                text.to_owned()
+            }
+        };
+        let word = physical(typo);
+        for split in [0, 3, word.len()] {
+            let s = Session::new();
+            let (ready, reached) = mpsc::sync_channel(0);
+            let (proceed, resume) = mpsc::channel();
+            *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+                ready,
+                proceed: resume,
+            });
+            s.type_while_checking(&format!("{word} "));
+            reached.recv_timeout(Duration::from_secs(3)).unwrap();
+            s.type_while_checking(&word[..split]);
+            proceed.send(()).unwrap();
+            s.pending();
+            s.type_text(&format!("{}  {word}  {}", &word[split..], physical(next)));
+            s.proceed.send(()).unwrap();
+            for _ in 0..2 {
+                s.pending();
+                s.proceed.send(()).unwrap();
+            }
+            s.idle();
+            s.checks_ready();
+            assert_eq!(
+                s.text(),
+                format!("{corrected} {corrected}  {corrected}  {next}")
+            );
+            assert_eq!(s.engine.control.fixed_count(), 3);
+            s.undo();
+            s.pending();
+            s.finish();
+            assert_eq!(s.text(), format!("{corrected} {corrected}  {typo}  {next}"));
+            crate::complete::unlist(typo);
+        }
+    }
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.type_text("(keyboad,)  recieve! ");
+    s.proceed.send(()).unwrap();
+    for _ in 0..2 {
+        s.pending();
+        s.proceed.send(()).unwrap();
+    }
+    s.idle();
+    s.checks_ready();
+    assert_eq!(s.text(), "receive (keyboard,)  receive! ");
+
+    // Returning to the original text remains a choice, even with another typo queued.
+    let s = Session::new();
+    s.type_text("recieve");
+    s.tap(Simulated::SHIFT_LEFT);
+    s.pending();
+    s.finish();
+    let choices = s
+        .engine
+        .lock()
+        .cycle
+        .as_ref()
+        .unwrap()
+        .candidates
+        .len()
+        .min(crate::complete::MAX_CANDIDATES);
+    for step in 0..choices {
+        s.tap(Simulated::SHIFT_LEFT);
+        s.pending();
+        if step + 1 == choices {
+            s.type_text(" keyboad ");
+            s.proceed.send(()).unwrap();
+            s.pending();
+        }
+        s.finish();
+    }
+    s.checks_ready();
+    assert_eq!(s.text(), "recieve keyboard ");
+
+    // Replayed checks retain cancellation while waiting behind the first correction.
+    for cancel in [
+        "enter",
+        "click",
+        "navigation",
+        "focus",
+        "layout",
+        "secure",
+        "disabled",
+        "excluded",
+    ] {
+        let s = Session::new();
+        s.type_text("recieve ");
+        s.pending();
+        s.type_text("keyboad recieve ");
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        s.proceed.send(()).unwrap();
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        match cancel {
+            "enter" => s.type_while_checking("\n"),
+            "click" => s.engine.mouse_click(),
+            "navigation" => s.tap('\x10'),
+            "focus" => FOCUS.store(2, Ordering::SeqCst),
+            "layout" => SIMULATED_LAYOUT.store(1, Ordering::SeqCst),
+            "secure" => INPUT_ALLOWED.store(false, Ordering::SeqCst),
+            "disabled" => s.engine.control.set_enabled(false),
+            _ => *lock_forgiving(&s.engine.control.excluded_apps) = vec!["editor".into()],
+        }
+        let expected = s.text();
+        proceed.send(()).unwrap();
+        s.checks_ready();
+        assert!(s.ready.try_recv().is_err(), "{cancel}");
+        assert_eq!(s.text(), expected, "{cancel}");
+        assert_eq!(s.engine.control.fixed_count(), 1, "{cancel}");
+        FOCUS.store(1, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        INPUT_ALLOWED.store(true, Ordering::SeqCst);
     }
 }
 

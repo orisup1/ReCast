@@ -59,10 +59,11 @@ app disablement. No settings or shortcuts change.
 
 ## Remaining limits
 
-The queue improves words finished during search. Whole words typed during the
-native replacement itself still use the existing replay bookkeeping; this change
-does not add automatic checks for every replayed word. Delayed spelling fixes also
-require supported native verification once non-space text follows, and abandon
+The queue now also checks finished words preserved by a successful replacement,
+including words started before that replacement. Explicitly chosen text and
+unknown editing fragments are not automatically reconsidered on acceptance.
+Delayed spelling fixes still require supported native verification once non-space
+text follows, and abandon
 checks beyond the existing 32-character suffix limit. Unsupported controls and
 layout-changing delayed fixes can therefore still miss corrections.
 
@@ -193,3 +194,30 @@ checks; passing them does not establish real-world accuracy. Live typing in nati
 applications, downloaded-app privacy grants, and Windows/Linux runtime behavior
 were not exercised. Existing unrelated layout and Windows edits remain outside
 these commits. No app installation, deployment, or remote push was performed.
+
+### Pass 11: continuous typing during replacement
+
+Reproduced a second timing gap: `recieve keyboad recieve ` corrected only the
+first word when the other words finished while its replacement was pending.
+Those Space presses buffered text but did not request word checks. The successful
+replacement now returns finished replayed words to the same bounded FIFO. One
+shared focus snapshot covers the batch; native queries remain outside the typing
+lock. Checks retain their original ordering and exact following-text verification.
+
+Regression coverage includes English and Hebrew, words split between search and
+replacement, punctuation, extra spaces, unfinished subsequent text, latest-only
+undo, and keeping an original suggestion while the next typo corrects. Pending
+replay checks cancel on submission, click, navigation, changed focus/layout,
+secure input, disablement, and exclusions. Existing tests continue to cover
+unknown fragments, overlong input, and preserving buffered text across layout undo.
+
+Validation: `cargo test --locked` passed (423 unit tests, 12 ignored; 6 CLI tests;
+macOS input-source checks on main and worker threads). Clippy with warnings denied,
+formatting, and whitespace checks passed. This remains simulated typing coverage;
+the installed app was not replaced and live native editing was not exercised.
+
+Native follow-up: in disposable editor and chat drafts, type several typos at
+ordinary speed, continue into the next word, and undo the latest correction.
+Repeat after clicking into existing text and during manual editing. Record missed
+corrections separately from text damage. No deliberate delay, extra separator,
+or rehearsed mistake should be required.

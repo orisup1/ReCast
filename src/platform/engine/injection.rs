@@ -335,6 +335,7 @@ impl<P: Platform> Engine<P> {
         // panic — `is_replacing` and the injecting gate are cleared, rather than
         // leaving the listener shut for the rest of the session.
         let gate = ReplaceGuard::new(&self.state, P::injecting_flag(&self.injector));
+        let automatic = matches!(&commit, Some(Commit::Fix { rule: Some(_), .. }));
 
         if !self.replacement_valid(generation) {
             self.abort_before_injection(generation, retry);
@@ -379,6 +380,11 @@ impl<P: Platform> Engine<P> {
             }
             return;
         };
+        let replay_context = (!verified_layout_undo
+            && buffered.iter().any(|typed| P::is_terminator(typed.key))
+            && ((automatic && !keep.is_empty())
+                || buffered.iter().any(|typed| !P::is_terminator(typed.key))))
+        .then(|| (P::focus().map(Arc::new), P::current_layout()));
         let (practice, mode) = {
             let mut st = self.lock();
             if st.generation != generation {
@@ -530,6 +536,8 @@ impl<P: Platform> Engine<P> {
             let whole_first_word = !finished.is_empty()
                 || undo.as_ref().is_some_and(|fix| fix.terminator.is_some())
                 || (undo.is_none() && !st.no_fix);
+            // A completed explicit choice must not be reconsidered on acceptance.
+            let check_first_word = whole_first_word && (finished.is_empty() || automatic);
             finished.extend_from_slice(&buffered);
             let finished_word = finished
                 .iter()
@@ -704,6 +712,9 @@ impl<P: Platform> Engine<P> {
                 }
             }
             st.last_key = None;
+            if let Some((focus, layout)) = replay_context {
+                st.recheck_replayed_words(&finished, check_first_word, focus, layout);
+            }
         }
         gate.finish(&mut st);
         drop(st);

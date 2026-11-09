@@ -87,7 +87,7 @@ impl Platform for Windows {
         Some(injector)
     }
     fn focus() -> Option<Focus> {
-        focused_target()
+        crate::layout::focused_target()
     }
     fn is_own_focus(focus: &Focus) -> bool {
         let mut pid = 0;
@@ -683,17 +683,6 @@ fn vk_of(key: Key) -> Option<u16> {
 }
 
 type Focus = usize;
-fn focused_target() -> Option<Focus> {
-    use winapi::um::winuser::{GetGUIThreadInfo, GUITHREADINFO};
-    unsafe {
-        let mut info: GUITHREADINFO = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
-        // Thread zero asks about the foreground queue, not our tray thread.
-        (GetGUIThreadInfo(0, &mut info) != 0 && !info.hwndFocus.is_null())
-            .then_some(info.hwndFocus as usize)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
