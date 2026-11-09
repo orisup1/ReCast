@@ -4776,7 +4776,7 @@ fn automatic_search_cancels_unsafe_suffixes_and_preserves_finished_words() {
         s.type_while_checking(&format!("{earlier} "));
         reached.recv_timeout(Duration::from_secs(3)).unwrap();
         s.type_while_checking("old keyboad ");
-        assert!(s.engine.lock().word_check.is_some());
+        assert!(!s.engine.lock().word_checks.is_empty());
         proceed.send(()).unwrap();
         s.checks_ready();
         s.pending();
@@ -7375,5 +7375,100 @@ fn repeated_undos_do_not_save_word_exceptions() {
         assert!(crate::complete::suppressed("recieve"));
         assert!(!crate::complete::learned("recieve"));
         assert_eq!(std::fs::read(&path).ok(), before);
+    }
+}
+
+#[test]
+fn rapid_finished_words_each_get_checked() {
+    const CHILD: &str = "RECAST_RAPID_WORDS_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::rapid_finished_words_each_get_checked",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for (first, middle) in [
+        ("keyboard", String::new()),
+        ("recieve", String::new()),
+        ("keyboard", "a ".repeat(40)),
+    ] {
+        let s = Session::new();
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        s.type_while_checking(&format!("{first} "));
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.type_while_checking(&format!("{middle}keyboad recieve "));
+        assert!(s.engine.lock().word_checks.len() <= super::word_buffer::MAX_UNDO_SUFFIX);
+        proceed.send(()).unwrap();
+        let count = if first == "recieve" { 3 } else { 2 };
+        for _ in 0..count {
+            s.pending();
+            s.proceed.send(()).unwrap();
+        }
+        s.idle();
+        s.checks_ready();
+        assert_eq!(
+            s.text(),
+            format!(
+                "{} {middle}keyboard receive ",
+                if first == "recieve" { "receive" } else { first }
+            )
+        );
+        assert_eq!(s.engine.control.fixed_count(), count);
+    }
+    for cancel in [
+        "enter",
+        "click",
+        "navigation",
+        "focus",
+        "layout",
+        "secure",
+        "disabled",
+    ] {
+        let s = Session::new();
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *CHECK_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        s.type_while_checking("recieve ");
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.type_while_checking("keyboad recieve ");
+        match cancel {
+            "enter" => s.type_while_checking("\n"),
+            "click" => s.engine.mouse_click(),
+            "navigation" => s.tap('\x10'),
+            "focus" => FOCUS.store(2, Ordering::SeqCst),
+            "layout" => SIMULATED_LAYOUT.store(1, Ordering::SeqCst),
+            "secure" => INPUT_ALLOWED.store(false, Ordering::SeqCst),
+            _ => {
+                s.engine.control.set_enabled(false);
+            }
+        }
+        let expected = s.text();
+        proceed.send(()).unwrap();
+        s.checks_ready();
+        assert!(s.ready.try_recv().is_err(), "{cancel}");
+        assert_eq!(s.text(), expected, "{cancel}");
+        assert_eq!(s.engine.control.fixed_count(), 0, "{cancel}");
+        FOCUS.store(1, Ordering::SeqCst);
+        SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+        INPUT_ALLOWED.store(true, Ordering::SeqCst);
     }
 }

@@ -250,7 +250,7 @@ pub struct AppState<P: Platform> {
     pub cycle: Option<Cycle<P>>,
     pub(super) suggestion_requests: VecDeque<bool>,
     pub(super) suggestion_worker: bool,
-    pub(super) word_check: Option<super::correction_pipeline::WordCheck<P>>,
+    pub(super) word_checks: VecDeque<super::correction_pipeline::WordCheck<P>>,
     pub(super) word_check_worker: bool,
     /// Non-Shift presses, Shift chords, and deliberate taps; typing Shift adds no text event.
     pub(super) press_revision: u64,
@@ -311,7 +311,7 @@ impl<P: Platform> AppState<P> {
             cycle: None,
             suggestion_requests: VecDeque::new(),
             suggestion_worker: false,
-            word_check: None,
+            word_checks: VecDeque::new(),
             word_check_worker: false,
             press_revision: 0,
             pending_learning: None,
@@ -448,7 +448,7 @@ impl<P: Platform> AppState<P> {
         self.generation = self.generation.wrapping_add(1);
         self.keys.clear();
         self.buffered_keys.clear();
-        self.word_check = None;
+        self.word_checks.clear();
         self.forget_gestures();
         self.pending_learning = None;
         self.deletion_tail = None;

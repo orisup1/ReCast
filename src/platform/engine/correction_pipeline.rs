@@ -215,10 +215,11 @@ impl<P: Platform> Engine<P> {
                 layout,
             });
         }
-        // One waiting check at a time; an older check whose following text
-        // was tracked lands first and preserves the newest word for its own
-        // check (see preserved_word_tail).
-        st.word_check = Some(WordCheck {
+        // Keep rapid finished words in order, bounded by the suffix we can verify.
+        if st.word_checks.len() >= MAX_UNDO_SUFFIX {
+            st.word_checks.pop_front();
+        }
+        let check = WordCheck {
             keys: st.keys.to_vec(),
             key,
             shift,
@@ -229,7 +230,8 @@ impl<P: Platform> Engine<P> {
             layout,
             generation: st.generation,
             presses: st.press_revision,
-        });
+        };
+        st.word_checks.push_back(check);
         st.keys.clear();
         drop(st);
         self.ensure_word_check_worker();
@@ -237,7 +239,7 @@ impl<P: Platform> Engine<P> {
 
     pub(crate) fn ensure_word_check_worker(self: &Arc<Self>) {
         let mut st = self.lock();
-        if st.word_check_worker || st.word_check.is_none() {
+        if st.word_check_worker || st.word_checks.is_empty() || st.is_replacing {
             return;
         }
         st.word_check_worker = true;
@@ -245,7 +247,11 @@ impl<P: Platform> Engine<P> {
         let engine = Arc::clone(self);
         std::thread::spawn(move || loop {
             let mut st = engine.lock();
-            let Some(check) = st.word_check.take() else {
+            if st.is_replacing {
+                st.word_check_worker = false;
+                return;
+            }
+            let Some(check) = st.word_checks.pop_front() else {
                 st.word_check_worker = false;
                 return;
             };
@@ -362,8 +368,8 @@ impl<P: Platform> Engine<P> {
         };
         if !current(&st) {
             if st.is_replacing && st.generation == generation {
-                // An earlier correction preserving this finished word verbatim
-                // will restore its tail; defer instead of discarding it.
+                // An earlier correction may preserve several queued words verbatim.
+                // Defer checks whose captured text or reconstructed tail still matches.
                 let preserved = st.preserved_word_tail.as_ref().map(|tail| {
                     let end = tail
                         .iter()
@@ -375,8 +381,8 @@ impl<P: Platform> Engine<P> {
                             .zip(&keys)
                             .all(|(a, b)| a.key == b.key && a.shift == b.shift)
                 });
-                if preserved == Some(true) && st.word_check.is_none() {
-                    st.word_check = Some(WordCheck {
+                if preserved == Some(true) || following_of(&st).is_some() {
+                    st.word_checks.push_front(WordCheck {
                         keys,
                         key,
                         shift,

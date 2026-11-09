@@ -17,7 +17,9 @@ Automatic searches run off the keyboard capture thread, so a slow lookup does no
 hold up your next keystroke. Supported macOS, Windows, and Linux AT-SPI fields can apply a
 same-layout spelling fix after up to 32 following characters, preserving that text
 and undo; the full suffix must still match. Extra spaces also preserve pending
-correction. Navigation, submission, and layout changes still cancel stale work.
+correction. Words finished while a search is running keep their checks in typing
+order, within the same bounded suffix, instead of replacing an earlier pending check.
+Navigation, submission, and layout changes still cancel stale work.
 It uses the current keyboard layout, dictionary matches, and word frequency to decide
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
 the terminator are preserved. Same-layout corrections keep an unchanged prefix
