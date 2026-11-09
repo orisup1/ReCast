@@ -101,3 +101,14 @@ long-burst overflow case. Existing verified-undo tests also passed for continued
 typing, word-boundary recovery, and text typed under a different layout. No new
 undo gesture or acceptance action is needed. Validation: the burst regression
 and both `verified_undo` tests passed.
+
+### Pass 4: punctuation and capitalization
+
+Repeated the review for sentence-like typing rather than bare demonstration
+words. Inspected punctuation framing and unchanged-prefix replacement, then ran
+13 punctuation tests and the capitalized-continuation engine regression; all
+passed. Quotes, brackets, apostrophes, and shifted punctuation survive supported
+corrections. Capitalizing the next word with either Shift keeps a pending fix
+alive and does not request suggestions. No additional production change was
+justified; punctuation-triggered asynchronous edits would need their own safety
+contract, so Space remains the automatic boundary.
