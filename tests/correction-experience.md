@@ -145,3 +145,15 @@ rollover but reject actual chords; cycling to original text protects that choice
 without disabling the next word; previews leave text unchanged until accepted
 and reject stale context. Ordinary Shift capitalization remains covered by pass 4.
 No new shortcut, automatic completion, or forced acceptance step was added.
+
+### Pass 8: slow replies and worker ownership
+
+Repeated the review with delayed focus responses and overlapping replacements.
+A targeted run exposed a test waiting for an idle gap between consecutive edits;
+consecutive queued edits need no such gap, so those tests now release the first
+edit and await the second explicitly. Code inspection also found that a deferred
+check could publish worker availability before its worker exited. Removed that
+early release: only the worker loop relinquishes ownership under the state lock.
+This prevents a replacement restart from creating two active search workers.
+Validation: stale-query and responsive-suggestion regressions passed; delayed
+focus, automatic cancellation, and burst/undo regressions each passed 10 runs.

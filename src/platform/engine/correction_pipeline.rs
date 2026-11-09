@@ -263,9 +263,6 @@ impl<P: Platform> Engine<P> {
             }
             drop(st);
             engine.check_word(check);
-            if !engine.lock().word_check_worker {
-                return;
-            }
         });
     }
 
@@ -400,7 +397,6 @@ impl<P: Platform> Engine<P> {
                         generation,
                         presses,
                     });
-                    st.word_check_worker = false;
                 }
             }
             return;

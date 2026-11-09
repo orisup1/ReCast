@@ -4780,7 +4780,7 @@ fn automatic_search_cancels_unsafe_suffixes_and_preserves_finished_words() {
         proceed.send(()).unwrap();
         s.checks_ready();
         s.pending();
-        s.finish();
+        s.proceed.send(()).unwrap();
         let (expected, fixed) = if earlier == "recieve" {
             // Both finished words correct without pausing between them:
             // the first preserves the second verbatim, then the second lands.
@@ -4790,6 +4790,7 @@ fn automatic_search_cancels_unsafe_suffixes_and_preserves_finished_words() {
         } else {
             ("keyboard old keyboard ", 1)
         };
+        s.idle();
         assert_eq!(s.text(), expected);
         assert_eq!(s.engine.control.fixed_count(), fixed);
     }
@@ -4934,9 +4935,9 @@ fn late_correction_focus_check_preserves_next_word() {
             s.pending();
         } else {
             // The finished second word is preserved by the first correction,
-            // then its own check lands after it.
+            // then its own check lands after it without an idle gap.
             s.pending();
-            s.finish();
+            s.proceed.send(()).unwrap();
             s.pending();
         }
         s.finish();
