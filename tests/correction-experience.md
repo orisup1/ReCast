@@ -124,3 +124,14 @@ exercises 240 correction/deletion cycles without an empty-field probe. All three
 regressions passed. Clarified the review's distinction between fresh capture after
 a click and unknown text after navigation/paste; no warm-up word, extra space,
 or new editing habit is introduced.
+
+### Pass 6: bilingual correction and failed switches
+
+Repeated the review for layout correction, same-layout spelling, combined repairs,
+and restoration of the original language. Inspected deferred layout confirmation
+and pre-injection failure recovery. Both retained-bilingual-repair and failed-
+preparation regressions passed: successful repairs keep the intended language;
+a proven failure before editing restores the layout and allows the next ordinary
+word to correct. Delayed layout-changing fixes still abstain after following text,
+because silently reinterpreting those keys would risk corrupting user text. No
+manual keyboard-switching ritual was added; native support remains the next step.
