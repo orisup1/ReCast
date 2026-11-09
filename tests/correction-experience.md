@@ -91,3 +91,13 @@ checks from an obsolete generation or beyond the existing suffix limit before
 search. The overflow regression covers bounded storage, expired work, and two
 recent corrections. No timing requirement or additional user action is introduced.
 Validation: the rapid-word, overflow, and cancellation regression passed.
+
+### Pass 3: undo after a correction burst
+
+Repeated the review around recovery from unwanted fixes. Added an end-to-end
+assertion that, after two or three queued corrections, undo restores only the
+latest original word and leaves earlier corrected words intact, including the
+long-burst overflow case. Existing verified-undo tests also passed for continued
+typing, word-boundary recovery, and text typed under a different layout. No new
+undo gesture or acceptance action is needed. Validation: the burst regression
+and both `verified_undo` tests passed.

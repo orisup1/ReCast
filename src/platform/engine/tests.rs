@@ -7422,14 +7422,22 @@ fn rapid_finished_words_each_get_checked() {
         }
         s.idle();
         s.checks_ready();
+        let expected = format!(
+            "{} {middle}keyboard receive ",
+            if first == "recieve" { "receive" } else { first }
+        );
+        assert_eq!(s.text(), expected);
+        assert_eq!(s.engine.control.fixed_count(), count);
+        // Undo must restore only the most recent correction after draining the queue.
+        s.undo();
+        s.pending();
+        s.finish();
         assert_eq!(
             s.text(),
-            format!(
-                "{} {middle}keyboard receive ",
-                if first == "recieve" { "receive" } else { first }
-            )
+            format!("{}recieve ", expected.strip_suffix("receive ").unwrap())
         );
-        assert_eq!(s.engine.control.fixed_count(), count);
+        assert_eq!(s.engine.control.undo_count(), 1);
+        crate::complete::unlist("recieve");
     }
     for cancel in [
         "enter",
