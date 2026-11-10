@@ -74,6 +74,20 @@ impl<P: Platform> Engine<P> {
         false
     }
 
+    /// A presentation failure leaves the captured typing context valid.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn cancel_preview(self: &Arc<Self>, generation: u64) {
+        let mut st = self.lock();
+        if st.generation == generation && st.cycle.as_ref().is_some_and(|cycle| cycle.preview) {
+            P::hide_preview();
+            st.cycle = None;
+        } else {
+            return;
+        }
+        drop(st);
+        self.ensure_word_check_worker();
+    }
+
     #[cfg(target_os = "macos")]
     pub fn has_ready_preview(&self) -> bool {
         self.lock()

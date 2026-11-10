@@ -128,7 +128,7 @@ pub(super) fn show(engine: Arc<Engine<Mac>>, generation: u64, choices: Vec<Strin
         }
         let Some(anchor) = caret() else {
             if EPOCH.load(Ordering::SeqCst) == ticket {
-                engine.forget_everything();
+                engine.cancel_preview(generation);
             }
             return;
         };
@@ -136,10 +136,10 @@ pub(super) fn show(engine: Arc<Engine<Mac>>, generation: u64, choices: Vec<Strin
             == Some("com.apple.Spotlight");
         dispatch::Queue::main().exec_async(move || unsafe {
             if STOPPED.load(Ordering::Acquire) || EPOCH.load(Ordering::SeqCst) != ticket || !engine.replacement_valid(generation) { return; }
-            if choices.is_empty() { engine.forget_everything(); return; }
+            if choices.is_empty() { engine.cancel_preview(generation); return; }
             let screens: id = msg_send![class!(NSScreen), screens];
             let count: usize = msg_send![screens, count];
-            if count == 0 { engine.forget_everything(); return; }
+            if count == 0 { engine.cancel_preview(generation); return; }
             let first: id = msg_send![screens, objectAtIndex: 0usize];
             let primary: NSRect = msg_send![first, frame];
             let point = NSPoint::new(anchor.origin.x, primary.size.height - anchor.origin.y - anchor.size.height);
@@ -151,7 +151,7 @@ pub(super) fn show(engine: Arc<Engine<Mac>>, generation: u64, choices: Vec<Strin
                     bounds = Some(msg_send![screen, visibleFrame]); break;
                 }
             }
-            let Some(bounds) = bounds else { engine.forget_everything(); return; };
+            let Some(bounds) = bounds else { engine.cancel_preview(generation); return; };
             // Cycling keeps the same focus context; reuse its native observers.
             let watching = WATCH.with(|slot| {
                 let mut slot = slot.borrow_mut();
@@ -160,7 +160,7 @@ pub(super) fn show(engine: Arc<Engine<Mac>>, generation: u64, choices: Vec<Strin
                 }
                 slot.is_some()
             });
-            if !watching { engine.forget_everything(); return; }
+            if !watching { engine.cancel_preview(generation); return; }
             if !engine.preview_ready(generation) { return; }
             PANEL.with(|slot| {
                 let mut panel = slot.get();

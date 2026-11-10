@@ -614,7 +614,6 @@ impl<P: Platform> Engine<P> {
         }
         if st.is_replacing {
             if !st.selection_replacing
-                && st.cycle.is_some()
                 && (key == P::SHIFT_LEFT
                     || key == P::SHIFT_RIGHT
                     || P::QUEUE_UNDO_DURING_REPLACEMENT)
@@ -623,8 +622,16 @@ impl<P: Platform> Engine<P> {
             }
             return;
         }
+        self.queue_suggestion(st, is_correction);
+    }
+
+    pub(super) fn queue_suggestion(
+        self: &Arc<Self>,
+        mut st: MutexGuard<'_, AppState<P>>,
+        correction: bool,
+    ) {
         if st.suggestion_requests.len() < 32 {
-            st.suggestion_requests.push_back(is_correction);
+            st.suggestion_requests.push_back(correction);
         }
         if st.suggestion_worker {
             return;
@@ -636,6 +643,8 @@ impl<P: Platform> Engine<P> {
             let mut st = engine.lock();
             let Some(correction) = st.suggestion_requests.pop_front() else {
                 st.suggestion_worker = false;
+                drop(st);
+                engine.ensure_word_check_worker();
                 return;
             };
             engine.request_suggestion(st, correction);

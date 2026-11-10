@@ -222,11 +222,11 @@ Repeat after clicking into existing text and during manual editing. Record misse
 corrections separately from text damage. No deliberate delay, extra separator,
 or rehearsed mistake should be required.
 
-## Ten-pass follow-up review
+## Follow-up review
 
-These ten passes review distinct parts of the correction experience. Changes are
-grouped by related behavior rather than committing every test run. Evidence is
-source inspection and simulated typing; this is not a native usability study.
+These passes review the correction experience, grouping related fixes into a few
+commits. Evidence is source inspection and simulated typing; this is not a native
+usability study.
 
 ### 1. Recovery after a failed correction
 
@@ -253,3 +253,58 @@ and no context leakage across Enter, clicks, or focus changes.
 Validation for passes 1–2: 425 unit tests passed, 12 ignored; all 6 CLI tests and
 the macOS input-source wrapper passed. Clippy with warnings denied, formatting,
 and whitespace checks passed. Live application editing was not exercised.
+
+### 3. Suggestions, completion, and preview failures
+
+Holding an automatic replacement reproduced the first completion or spelling tap
+being discarded when no suggestion cycle existed. The same tap now queues until
+the replacement finishes, using the existing background suggestion worker. Typing
+after the tap cancels it. Both direct replacements and passive previews are tested,
+including acceptance with ordinary Space and undo that restores only the requested
+word. Native keycode modifier restrictions remain in force.
+
+The macOS presenter also discarded the entire typing context when no caret anchor,
+screen, or observer was available. Those presentation failures now cancel only the
+matching preview. Simulated failure verifies that ordinary Space still corrects
+the captured typo, and a late failure cannot dismiss a newer field's preview.
+Actual focus/cursor changes still invalidate text. No new gesture or fallback
+popup was introduced.
+
+The integrated review reproduced one additional handoff case: a queued suggestion
+with no candidates left automatic word checks waiting. The suggestion worker now
+wakes those checks when its request queue drains. The regression verifies that an
+earlier buffered typo still corrects even when the last word has no suggestions.
+Automatic checks pause while an explicit search or offer is active, so waking the
+queue cannot overwrite a passive preview. That finished-word preview and ordinary
+Space acceptance are also covered by the regression.
+
+### 4. Integrated correction experience
+
+Rechecked automatic spelling, wrong-layout and combined repairs, suggestions,
+completion, undo, ordinary editing, and setup/help. Protected-word and independent
+evaluation regressions retain their existing expectations. Language restoration,
+exact following-text undo, ignored words, original choices, and submission safety
+remain covered. Ten targeted undo/editing regressions passed, including 240
+delete/retype cycles without an empty-field probe. Suggestions, passive acceptance,
+gesture rollover, stale searches, and screen-edge placement also passed focused
+checks.
+
+Setup still requires only platform permissions and both keyboards; practice remains
+optional. The one-time correction hint asks users to keep typing normally. Fixed
+one stale Settings label that still implied repeated undo saves word exceptions.
+The runtime and other help already describe session-only suppression correctly.
+
+Remaining limits: native application acceptance and Windows/Linux runtime behavior
+were not exercised. Delayed layout-changing fixes still decline following text;
+unsupported controls and suffixes beyond 32 characters can miss fixes. Inspection
+also found a possible first-word capture gap when a click starts a new field before
+an old replacement worker finishes. That overlap was not reproduced here and needs
+separate capture ownership before safely changing the native replacement gate.
+Do not ask users to pause or type a warmup word to compensate for it.
+
+Final validation: `cargo test --locked --quiet` passed with 427 unit tests,
+12 ignored tests, all 6 CLI tests, and macOS main/worker input-source checks.
+`cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`, and
+`git diff --check` passed. The resumed checkout was revalidated before committing.
+No app installation, deployment, live typing, or Windows/Linux runtime testing
+was performed.

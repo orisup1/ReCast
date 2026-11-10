@@ -726,7 +726,7 @@ impl<P: Platform> Engine<P> {
             && matches!(st.last_action, Some(LastAction::Fixed(_))))
         .then(|| st.last_action.take())
         .flatten();
-        let suggestion = if st.generation == generation && !st.is_replacing && st.cycle.is_some() {
+        let suggestion = if st.generation == generation && !st.is_replacing {
             st.pending_suggestion.take()
         } else {
             None
@@ -738,7 +738,7 @@ impl<P: Platform> Engine<P> {
                 self.undo_fix(st, fix, retry);
             }
         } else if let Some(correction) = suggestion {
-            self.request_suggestion(st, correction);
+            self.queue_suggestion(st, correction);
         } else {
             drop(st);
             self.ensure_word_check_worker();

@@ -288,7 +288,14 @@ impl<P: Platform> Engine<P> {
 
     pub(crate) fn ensure_word_check_worker(self: &Arc<Self>) {
         let mut st = self.lock();
-        if st.word_check_worker || st.word_checks.is_empty() || st.is_replacing {
+        // Explicit requests and visible offers take priority over automatic checks.
+        if st.word_check_worker
+            || st.word_checks.is_empty()
+            || st.is_replacing
+            || st.suggestion_worker
+            || st.pending_suggestion.is_some()
+            || st.cycle.is_some()
+        {
             return;
         }
         st.word_check_worker = true;
@@ -296,7 +303,11 @@ impl<P: Platform> Engine<P> {
         let engine = Arc::clone(self);
         std::thread::spawn(move || loop {
             let mut st = engine.lock();
-            if st.is_replacing {
+            if st.is_replacing
+                || st.suggestion_worker
+                || st.pending_suggestion.is_some()
+                || st.cycle.is_some()
+            {
                 st.word_check_worker = false;
                 return;
             }
@@ -659,7 +670,7 @@ impl<P: Platform> Engine<P> {
         }
         if st.is_replacing {
             let mut st = st;
-            if !st.selection_replacing && st.cycle.is_some() {
+            if !st.selection_replacing {
                 st.pending_suggestion = Some(correction);
             }
             return;

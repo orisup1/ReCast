@@ -64,7 +64,11 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
         std::env::var_os("RECAST_PREVIEW_TEST").is_some()
     }
     fn show_preview(engine: Arc<Engine<Self>>, generation: u64, _: Vec<String>) {
-        engine.preview_ready(generation);
+        if std::env::var_os("RECAST_PREVIEW_FAILURE_TEST").is_some() {
+            engine.cancel_preview(generation);
+        } else {
+            engine.preview_ready(generation);
+        }
     }
     type Key = char;
     type Retype = String;
@@ -7616,6 +7620,192 @@ fn words_finished_during_replacement_correct_without_pausing() {
         SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
         INPUT_ALLOWED.store(true, Ordering::SeqCst);
     }
+}
+
+#[test]
+fn first_suggestion_tap_survives_an_automatic_replacement() {
+    const CHILD: &str = "RECAST_FIRST_QUEUED_SUGGESTION_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::first_suggestion_tap_survives_an_automatic_replacement",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for preview in [false, true] {
+        if preview {
+            std::env::set_var("RECAST_PREVIEW_TEST", "1");
+        }
+        for (key, prefix) in [
+            (Simulated::SHIFT_RIGHT, "keyb"),
+            (Simulated::SHIFT_LEFT, "keyboad"),
+        ] {
+            for cancel in [false, true] {
+                let s = Session::new();
+                s.type_text("recieve ");
+                s.pending();
+                s.type_text(prefix);
+                s.tap(key);
+                assert_eq!(
+                    s.engine.lock().pending_suggestion,
+                    Some(key == Simulated::SHIFT_LEFT)
+                );
+                if cancel {
+                    s.type_text("x");
+                    s.finish();
+                    assert!(s.ready.try_recv().is_err());
+                    assert_eq!(s.text(), format!("receive {prefix}x"));
+                } else {
+                    s.proceed.send(()).unwrap();
+                    let separators = if preview { " " } else { "" };
+                    if preview {
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !s
+                            .engine
+                            .lock()
+                            .cycle
+                            .as_ref()
+                            .is_some_and(|cycle| cycle.preview_ready)
+                        {
+                            assert!(Instant::now() < deadline, "queued preview did not appear");
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        s.suggestions_ready();
+                        s.type_text(" ");
+                    }
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("receive keyboard{separators}"));
+                    s.undo();
+                    s.pending();
+                    s.finish();
+                    assert_eq!(s.text(), format!("receive {prefix}{separators}"));
+                    crate::complete::unlist(prefix);
+                }
+            }
+        }
+        std::env::remove_var("RECAST_PREVIEW_TEST");
+    }
+
+    // A request with no offers must still release the automatic correction queue.
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.type_text("keyboad qzxjqzqzxjqz ");
+    s.tap(Simulated::SHIFT_RIGHT);
+    s.proceed.send(()).unwrap();
+    s.pending();
+    s.finish();
+    s.checks_ready();
+    assert_eq!(s.text(), "receive keyboard qzxjqzqzxjqz ");
+
+    // A finished word stays unchanged while the user is only previewing choices.
+    std::env::set_var("RECAST_PREVIEW_TEST", "1");
+    let s = Session::new();
+    s.type_text("recieve ");
+    s.pending();
+    s.type_text("keyboad ");
+    s.tap(Simulated::SHIFT_LEFT);
+    s.proceed.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !s
+        .engine
+        .lock()
+        .cycle
+        .as_ref()
+        .is_some_and(|cycle| cycle.preview_ready)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "finished-word preview did not appear"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    s.suggestions_ready();
+    s.checks_ready();
+    assert!(
+        !s.engine.lock().is_replacing,
+        "automatic check overrode a preview"
+    );
+    assert_eq!(s.text(), "receive keyboad ");
+    s.type_text(" ");
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive keyboard  ");
+    std::env::remove_var("RECAST_PREVIEW_TEST");
+}
+
+#[test]
+fn unavailable_preview_preserves_typing_and_automatic_correction() {
+    const CHILD: &str = "RECAST_PREVIEW_FAILURE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::engine::tests::unavailable_preview_preserves_typing_and_automatic_correction",
+            ])
+            .env(CHILD, "1")
+            .env("RECAST_PREVIEW_TEST", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let s = Session::new();
+    s.type_text("recieve");
+    let generation = s.engine.lock().generation;
+    s.tap(Simulated::SHIFT_LEFT);
+    {
+        let st = s.engine.lock();
+        assert_eq!(st.generation, generation);
+        assert_eq!(reading::<Simulated>(&st.keys, Language::English), "recieve");
+        assert!(!st.no_fix);
+        assert!(st.cycle.is_none());
+    }
+    s.type_text(" ");
+    s.pending();
+    s.finish();
+    assert_eq!(s.text(), "receive ");
+
+    // A late presentation failure must not dismiss a newer field's preview.
+    std::env::remove_var(CHILD);
+    let s = Session::new();
+    s.type_text("keyb");
+    let old_generation = s.engine.lock().generation;
+    s.engine.mouse_click();
+    s.engine.injector.text.lock().unwrap().clear();
+    s.type_text("keyb");
+    s.tap(Simulated::SHIFT_RIGHT);
+    s.engine.cancel_preview(old_generation);
+    assert!(s
+        .engine
+        .lock()
+        .cycle
+        .as_ref()
+        .is_some_and(|cycle| cycle.preview_ready));
+    let generation = s.engine.lock().generation;
+    s.engine.cancel_preview(generation);
+    assert!(s.engine.lock().cycle.is_none());
+    assert_eq!(
+        reading::<Simulated>(&s.engine.lock().keys, Language::English),
+        "keyb"
+    );
+    assert!(!s.engine.lock().no_fix);
 }
 
 #[test]

@@ -406,7 +406,7 @@ impl Window {
                         K::Label,
                         [
                             "Words ReCast should leave unchanged.",
-                            "Saved exceptions from repeated undos.",
+                            "Previously saved exceptions. Undo does not add words.",
                             "Custom shortcuts and their expansions.",
                         ][index],
                         [24.0, y + 40.0, content, 44.0],
