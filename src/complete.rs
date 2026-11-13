@@ -1235,11 +1235,25 @@ fn read_user_file(name: &str) -> String {
 /// took back with a gesture minutes ago, and a reload is a statement about the
 /// files, not about that.
 pub fn reload_user_files() {
+    let read = |name| {
+        let path = user_path(name)?;
+        match read_rules(&path) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                eprintln!("{error}; keeping loaded {name} rules.");
+                None
+            }
+        }
+    };
     if let Ok(mut table) = abbreviations().lock() {
-        *table = parse_abbreviations(&read_user_file("abbrev.txt"));
+        if let Some(text) = read("abbrev.txt") {
+            *table = parse_abbreviations(&text);
+        }
     }
     if let Ok(mut list) = ignore_list().lock() {
-        *list = parse_ignore_list(&read_user_file("ignore.txt"));
+        if let Some(text) = read("ignore.txt") {
+            *list = parse_ignore_list(&text);
+        }
     }
 }
 
@@ -3236,7 +3250,13 @@ pub struct RuleEditor {
 fn read_rules(path: &std::path::Path) -> Result<String, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(path)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(String::new())
+        }
         Err(e) => Err(format!("Could not read word rules: {e}")),
     }
 }
@@ -3343,6 +3363,65 @@ impl RuleEditor {
 #[cfg(test)]
 mod rule_editor_tests {
     use super::*;
+
+    #[test]
+    fn reload_preserves_rules_on_read_errors_but_applies_deletions() {
+        const CHILD: &str = "RECAST_RULE_RELOAD_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "complete::rule_editor_tests::reload_preserves_rules_on_read_errors_but_applies_deletions"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = config_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let ignore = dir.join("ignore.txt");
+        let abbrev = dir.join("abbrev.txt");
+        std::fs::write(&ignore, "recieve\n").unwrap();
+        std::fs::write(&abbrev, "btw = by the way\n").unwrap();
+        reload_user_files();
+        assert!(ignored("recieve"));
+        assert_eq!(expand("btw").as_deref(), Some("by the way"));
+
+        for path in [&ignore, &abbrev] {
+            std::fs::write(path, [0xff]).unwrap();
+        }
+        reload_user_files();
+        assert!(
+            ignored("recieve"),
+            "an unreadable file must retain word protections"
+        );
+        assert_eq!(expand("btw").as_deref(), Some("by the way"));
+
+        std::fs::write(&ignore, "keybord\n").unwrap();
+        std::fs::write(&abbrev, "btw = back to work\n").unwrap();
+        reload_user_files();
+        assert!(!ignored("recieve") && ignored("keybord"));
+        assert_eq!(expand("btw").as_deref(), Some("back to work"));
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&ignore).unwrap();
+            std::os::unix::fs::symlink(dir.join("missing-ignore.txt"), &ignore).unwrap();
+            reload_user_files();
+            assert!(
+                ignored("keybord"),
+                "a missing symlink target is a read error"
+            );
+            assert!(RuleEditor::open(RuleKind::Ignored).is_err());
+        }
+        std::fs::remove_file(ignore).unwrap();
+        std::fs::remove_file(abbrev).unwrap();
+        reload_user_files();
+        assert!(!ignored("keybord"));
+        assert_eq!(expand("btw"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn history_ignore_is_reversible_and_failed_saves_leave_live_rules_unchanged() {

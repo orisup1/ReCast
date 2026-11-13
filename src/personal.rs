@@ -544,12 +544,26 @@ pub(crate) fn record_explicit_confusion(typed: &str, corrected: &str) {
     record_confusion_with_weight(typed, corrected, 3);
 }
 
+/// Learned pairs use the same unwrapped word that the planner looks up.
+pub(crate) fn correction_word(text: &str) -> String {
+    let text = text.trim().to_lowercase();
+    let language = if text.chars().any(|c| ('א'..='ת').contains(&c)) {
+        crate::types::Language::Hebrew
+    } else {
+        crate::types::Language::English
+    };
+    let (start, end) = crate::dictionary::frame_bounds_for_layout(&text, language);
+    let word: String = text.chars().skip(start).take(end - start).collect();
+    word.trim_end_matches(|c: char| !c.is_alphanumeric() && !crate::spell::hebrew::is_mark(c))
+        .to_owned()
+}
+
 fn record_confusion_with_weight(typed: &str, corrected: &str, weight: u64) {
     if !enabled() {
         return;
     }
-    let typed = typed.trim().to_lowercase();
-    let corrected = corrected.trim().to_lowercase();
+    let typed = correction_word(typed);
+    let corrected = correction_word(corrected);
     if typed.is_empty() || corrected.is_empty() || typed == corrected {
         return;
     }
@@ -618,8 +632,8 @@ pub(crate) fn reject_confusion(typed: &str, corrected: &str) {
     }
     if let Ok(mut map) = confusions_map().lock() {
         if let Some(evidence) = map
-            .get_mut(&typed.to_lowercase())
-            .and_then(|inner| inner.get_mut(&corrected.to_lowercase()))
+            .get_mut(&correction_word(typed))
+            .and_then(|inner| inner.get_mut(&correction_word(corrected)))
         {
             evidence.decay(confusion_time());
             evidence.count = evidence.count.saturating_sub(3);
@@ -641,7 +655,7 @@ pub(crate) fn personal_candidate(typed: &str) -> Option<(String, f32)> {
     if !enabled() {
         return None;
     }
-    let typed = typed.trim().to_lowercase();
+    let typed = correction_word(typed);
     let map = confusions_map().lock().ok()?;
     let inner = map.get(&typed)?;
     let now = confusion_time();
@@ -1003,6 +1017,21 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn correction_words_preserve_internal_punctuation_and_hebrew_marks() {
+        for (text, expected) in [
+            (" (Watre), ", "watre"),
+            ("'teacher's'", "teacher's"),
+            ("צה\"ל,", "צה\"ל"),
+            ("[מִקְלֶדֶת]", "מִקְלֶדֶת"),
+            ("'שלום", "'שלום"),
+            ("API_URL", "api_url"),
+            ("...", ""),
+        ] {
+            assert_eq!(correction_word(text), expected, "{text}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn personal_saves_preserve_unrelated_symlink_targets() {
@@ -1237,6 +1266,18 @@ mod tests {
             confusions_map().lock().unwrap()["typo"]["chosen"].count,
             u64::MAX
         );
+
+        // Sentence punctuation must not make retained word pairs unreachable.
+        for (typed, corrected, word, target) in [
+            ("(watre),", "(water),", "watre", "water"),
+            ("מחבש,", "מחשב,", "מחבש", "מחשב"),
+        ] {
+            record_confusion(typed, corrected);
+            record_confusion(typed, corrected);
+            assert_eq!(personal_correction(word).as_deref(), Some(target));
+            reject_confusion(typed, corrected);
+            assert_eq!(personal_correction(word), None);
+        }
     }
 
     #[test]

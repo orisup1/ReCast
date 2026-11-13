@@ -72,7 +72,7 @@ pub(super) fn reviewed_misspelling(word: &str) -> Option<&'static str> {
 
 /// Reuse reviewed errors in regular inflections, requiring a real target word.
 /// This does not make arbitrary dictionary entries into reviewed misspellings.
-pub(super) fn reviewed_repair(word: &str, dict: Dict) -> Option<String> {
+pub(crate) fn reviewed_repair(word: &str, dict: Dict) -> Option<String> {
     if let Some(target) = reviewed_misspelling(word) {
         return Some(target.into());
     }

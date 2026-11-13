@@ -9,8 +9,10 @@ application acceptance test.
 
 The core experience should require only ordinary typing. Space already triggers
 layout and spelling checks, including punctuation-framed words. Search runs away
-from capture, and same-layout spelling replacements retain the unchanged prefix.
-These choices reduce typing stalls and visible deletion without teaching a new habit.
+from capture, and spelling replacements now match the whole original word.
+This prevents suffix-only matching from merging a correction with text already
+changed by the host application. macOS keyboard fallback requires the same exact
+text and caret match, and physical input is deferred before layout switching.
 
 A reproducible gap made this experience depend on timing: only one waiting word
 check survived while another search ran. Typing `keyboard keyboad recieve ` during

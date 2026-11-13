@@ -2,6 +2,44 @@ use std::process::Command;
 
 #[cfg(unix)]
 #[test]
+fn stop_reports_pidfile_read_errors() {
+    let binary = isolated_binary("stop-errors");
+    let dir = std::env::temp_dir().join(format!("recast-stop-errors-{}", std::process::id()));
+    let cache = if cfg!(target_os = "macos") {
+        dir.join("Library/Caches/recast")
+    } else {
+        dir.join("recast")
+    };
+    std::fs::create_dir_all(&cache).unwrap();
+    let pidfile = cache.join("pid");
+    let stop = || {
+        Command::new(&binary)
+            .arg("--stop")
+            .env("HOME", &dir)
+            .env("XDG_CACHE_HOME", &dir)
+            .output()
+            .unwrap()
+    };
+    assert!(stop().status.success(), "a missing pidfile is harmless");
+    std::fs::create_dir(&pidfile).unwrap();
+    let output = stop();
+    assert!(
+        !output.status.success(),
+        "an unreadable pidfile is not evidence that ReCast stopped"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Failed to stop ReCast"));
+    std::fs::remove_dir(&pidfile).unwrap();
+    std::fs::write(&pidfile, [0xff]).unwrap();
+    assert!(
+        !stop().status.success(),
+        "invalid UTF-8 must report a read error"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(binary.parent().unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn language_preference_supports_file_environment_status_and_preview() {
     let binary = isolated_binary("prefer");
     let dir = std::env::temp_dir().join(format!("recast-prefer-{}", std::process::id()));

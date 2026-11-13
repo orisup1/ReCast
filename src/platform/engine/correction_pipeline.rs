@@ -78,21 +78,6 @@ impl<P: Platform> AppState<P> {
     }
 }
 
-pub(super) fn completion_correction(
-    from: &str,
-    to: &str,
-    original: Language,
-    candidate: Language,
-) -> Option<(String, String)> {
-    (original == Language::English
-        && candidate == Language::English
-        && to.len() <= from.len()
-        && !to.eq_ignore_ascii_case(from)
-        && from.bytes().all(|c| c.is_ascii_alphabetic())
-        && to.bytes().all(|c| c.is_ascii_alphabetic()))
-    .then(|| (from.to_lowercase(), to.to_lowercase()))
-}
-
 /// Undo exceptions use the same word boundaries as automatic correction.
 fn undo_word(text: &str, language: Language) -> Option<String> {
     let (start, end) = crate::dictionary::frame_bounds_for_layout(text, language);
@@ -115,6 +100,41 @@ fn undo_word(text: &str, language: Language) -> Option<String> {
 }
 
 impl<P: Platform> Engine<P> {
+    pub(super) fn completion_correction(
+        &self,
+        from: &str,
+        to: &str,
+        original: Language,
+        candidate: Language,
+        correction: bool,
+    ) -> Option<(String, String)> {
+        let from = crate::personal::correction_word(from);
+        let to = crate::personal::correction_word(to);
+        let dict = if original == Language::English {
+            self.en_dict
+        } else {
+            self.he_dict
+        };
+        let protected = dict.contains(&from)
+            && (original != Language::English
+                || crate::spell::reviewed_repair(&from, dict).is_none());
+        let letters = |word: &str| {
+            !word.is_empty()
+                && word.chars().all(|c| match original {
+                    Language::English => c.is_ascii_alphabetic(),
+                    Language::Hebrew => ('א'..='ת').contains(&c),
+                })
+        };
+        // Finishing a prefix is not a spelling vote; explicit repairs may add letters.
+        (original == candidate
+            && (correction || to.chars().count() <= from.chars().count())
+            && !(correction && protected)
+            && to != from
+            && letters(&from)
+            && letters(&to))
+        .then_some((from, to))
+    }
+
     /// Space checks a finished word; Enter accepts an offer and clears context.
     pub(super) fn word_finished(
         self: &Arc<Self>,
@@ -1123,31 +1143,15 @@ impl<P: Platform> Engine<P> {
         } else {
             Vec::new()
         };
-        // Cycling only changes the visible suffix; undo has its own original prefix.
         let target = if back_to_typed {
             &was
         } else {
             &candidates[index]
         };
-        let prefix = current
-            .chars()
-            .zip(target.chars())
-            .take_while(|(current, target)| current == target)
-            .count();
-        let undo_prefix = was
-            .chars()
-            .zip(target.chars())
-            .take_while(|(original, target)| original == target)
-            .count();
-        let Some(mut suffix) = P::retype_completion(
-            &target.chars().skip(prefix).collect::<String>(),
-            target_lang,
-        ) else {
-            st.cycle = switched;
-            return;
-        };
+        let on_screen = P::retype_len(&retype);
+        let mut retype = retype;
         P::append_retype(
-            &mut suffix,
+            &mut retype,
             P::retype_original(&trailing_spaces, target_lang),
         );
         // A completion can be taken back with the undo gesture too — except
@@ -1156,7 +1160,7 @@ impl<P: Platform> Engine<P> {
         let undo = (!back_to_typed).then(|| LastFix {
             expected: format!(
                 "{}{}",
-                target.chars().skip(undo_prefix).collect::<String>(),
+                target,
                 reading::<P>(
                     &trailing_spaces.iter().take(1).copied().collect::<Vec<_>>(),
                     target_lang
@@ -1165,9 +1169,8 @@ impl<P: Platform> Engine<P> {
             visible,
             visible_layout: target_lang,
             manual_conversion: false,
-            on_screen: P::retype_len(&retype) - undo_prefix
-                + usize::from(!trailing_spaces.is_empty()),
-            restore: typed[undo_prefix..].to_vec(),
+            on_screen: on_screen + usize::from(!trailing_spaces.is_empty()),
+            restore: typed.clone(),
             restore_layout: original_lang,
             trailing_spaces: trailing_spaces.iter().skip(1).copied().collect(),
             terminator: trailing_spaces.first().map(|typed| typed.key),
@@ -1177,11 +1180,13 @@ impl<P: Platform> Engine<P> {
             } else {
                 Vec::new()
             },
-            learning_pair: if correction && self.en_dict.contains(&was.to_lowercase()) {
-                None
-            } else {
-                completion_correction(&was, target, original_lang, target_lang)
-            },
+            learning_pair: self.completion_correction(
+                &was,
+                target,
+                original_lang,
+                target_lang,
+                correction,
+            ),
             suppress: undo_word(&was, original_lang),
             rule: None,
             suffix: reading::<P>(
@@ -1204,23 +1209,19 @@ impl<P: Platform> Engine<P> {
             candidate_langs,
             index,
             resume_index,
-            on_screen: P::retype_len(&retype),
+            on_screen,
             lang: active_lang,
             original_lang,
             correction,
         });
-        // The gesture types nothing. Replace the word suffix and replay only
+        // The gesture types nothing. Match the whole visible word and replay only
         // the separators we already tracked at this cursor.
         self.start_replacement(
             st,
             Plan {
-                expected: format!(
-                    "{}{}",
-                    current.chars().skip(prefix).collect::<String>(),
-                    reading::<P>(&trailing_spaces, active_lang)
-                ),
-                erase: erase - prefix + trailing_spaces.len(),
-                retype: suffix,
+                expected: format!("{}{}", current, reading::<P>(&trailing_spaces, active_lang)),
+                erase: erase + trailing_spaces.len(),
+                retype,
                 terminator: None,
                 verify: None,
             },
@@ -1454,25 +1455,15 @@ pub(super) fn replacement<P: Platform>(
             target_layout: lang,
             original_start: 0,
         }),
-        Fix::Spelling { text, lang } => {
-            // Keep the identical prefix on screen. This saves paced backspaces
-            // and focus queries on macOS, for corrections and their undo alike.
-            let original = reading::<P>(keys, lang);
-            let prefix = original
-                .chars()
-                .zip(text.chars())
-                .take_while(|(a, b)| a == b)
-                .count();
-            let suffix: String = text.chars().skip(prefix).collect();
-            Some(Replacement {
-                erase: keys.len() - prefix,
-                retype: P::retype_completion(&suffix, lang)?,
-                text: suffix,
-                previous_layout: None,
-                target_layout: lang,
-                original_start: 0,
-            })
-        }
+        // Match the whole word: a shared suffix can also match a host's own correction.
+        Fix::Spelling { text, lang } => Some(Replacement {
+            erase: keys.len(),
+            retype: P::retype_completion(&text, lang)?,
+            text,
+            previous_layout: None,
+            target_layout: lang,
+            original_start: 0,
+        }),
     }
 }
 

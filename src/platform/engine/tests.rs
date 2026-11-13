@@ -23,6 +23,7 @@ static CAPTURE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 static CAPTURE_OBSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PREPARE_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static EDIT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static INJECT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REJECT_UNICODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EMPTY_INPUT_SUPPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -258,6 +259,7 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
         plan: Plan<Self>,
         generation: u64,
     ) -> Option<Vec<Typed<char>>> {
+        INJECT_CALLS.fetch_add(1, Ordering::SeqCst);
         if !EDIT_STARTED.load(Ordering::SeqCst) {
             return None;
         }
@@ -280,8 +282,8 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> Platform
             reading::<Self>(&buffered, plan.verify.or_else(Self::current_layout)?)
         };
         let mut screen = engine.injector.text.lock().unwrap();
-        if plan.verify.is_some()
-            && (!VERIFY || !screen.ends_with(&format!("{}{suffix}", plan.expected)))
+        if (plan.verify.is_some() && !VERIFY)
+            || (VERIFY && !screen.ends_with(&format!("{}{suffix}", plan.expected)))
         {
             return None;
         }
@@ -862,6 +864,45 @@ fn replay_snapshot_waits_for_keys_added_during_release() {
 type Session = SessionWithPolicy<true>;
 
 #[test]
+fn layout_changes_preserve_buffered_text_only_with_native_verification() {
+    use Language::{English, Hebrew};
+    for (source, target, letters_allowed) in [
+        (None, None, true),
+        (None, Some(English), false),
+        (Some(English), Some(English), true),
+        (Some(English), Some(Hebrew), false),
+        (Some(Hebrew), Some(English), false),
+        (Some(Hebrew), Some(Hebrew), true),
+    ] {
+        for (keys, allowed) in [
+            ("", true),
+            ("   ", true),
+            ("next", letters_allowed),
+            (" next ", letters_allowed),
+        ] {
+            let buffered: Vec<_> = keys
+                .chars()
+                .map(|key| Typed { key, shift: false })
+                .collect();
+            for verify in [None, Some(English), Some(Hebrew)] {
+                let plan = Plan::<Simulated> {
+                    expected: "akuo ".into(),
+                    erase: 5,
+                    retype: "שלום ".into(),
+                    terminator: None,
+                    verify,
+                };
+                assert_eq!(
+                    plan.preserves_buffered_layout(&buffered, source, target),
+                    verify.is_some() || allowed,
+                    "{source:?} to {target:?}, buffered {keys:?}, verified {verify:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "microbenchmark; run alone with `make bench`"]
 fn benchmark_engine_typing() {
     use std::hint::black_box;
@@ -998,8 +1039,10 @@ impl<const QUEUE_UNDO: bool, const VERIFY: bool> SessionWithPolicy<QUEUE_UNDO, V
         self.tap(Simulated::BACKSPACE);
     }
     fn pending(&self) {
+        // A queued suggestion searches before injection, using the same debug budget as direct taps.
+        let seconds = if cfg!(debug_assertions) { 10 } else { 3 };
         self.ready
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(seconds))
             .expect("no correction scheduled");
     }
     fn finish(&self) {
@@ -2858,15 +2901,69 @@ fn merged_tokens_reinsert_only_the_final_word_and_undo_restores_both() {
 }
 
 #[test]
-fn spelling_rewrites_only_the_changed_suffix_and_undo_learns_the_whole_word() {
-    for (before, after, erase) in [
-        ("keyboad", "keyboard", 1),
-        ("recieve", "receive", 4),
-        ("Recieve,", "Receive,", 5),
-        ("abc", "abcdef", 0),
-        ("abc", "ab", 1),
-        ("ab", "世界", 2),
-        ("hélo", "héllo", 1),
+fn automatic_corrections_preserve_host_edits_and_neighboring_words() {
+    const CHILD: &str = "RECAST_HOST_EDIT_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "platform::engine::tests::automatic_corrections_preserve_host_edits_and_neighboring_words", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    ALLOW_LAYOUT_SWITCH.store(true, Ordering::SeqCst);
+    for (layout, typed, host_word) in [
+        (0, "keyboad", "keyboard"),
+        (0, "recieve", "receive"),
+        (0, "akuo", "שלום"),
+        (1, "hello", "hello"),
+    ] {
+        SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+        let s = Session::new();
+        *s.engine.injector.text.lock().unwrap() = "previous 🙂 ".into();
+        s.type_text(&format!("{typed} "));
+        s.pending();
+        let visible = format!("previous 🙂 {host_word} ");
+        *s.engine.injector.text.lock().unwrap() = visible.clone();
+        s.finish();
+        assert_eq!(s.text(), visible, "host changed {typed}");
+        assert_eq!(s.engine.control.fixed_count(), 0);
+    }
+    SIMULATED_LAYOUT.store(0, Ordering::SeqCst);
+    for (typed, host_word) in [("keyb", "keyboard"), ("recie", "receive")] {
+        let s = Session::new();
+        *s.engine.injector.text.lock().unwrap() = "previous 🙂 ".into();
+        s.type_text(typed);
+        s.tap(Simulated::SHIFT_RIGHT);
+        s.pending();
+        let visible = format!("previous 🙂 {host_word}");
+        *s.engine.injector.text.lock().unwrap() = visible.clone();
+        s.finish();
+        assert_eq!(
+            s.text(),
+            visible,
+            "host changed the completion prefix {typed}"
+        );
+        assert_eq!(s.engine.control.fixed_count(), 0);
+    }
+}
+
+#[test]
+fn spelling_matches_the_whole_word_and_undo_learns_the_whole_word() {
+    for (before, after) in [
+        ("keyboad", "keyboard"),
+        ("recieve", "receive"),
+        ("Recieve,", "Receive,"),
+        ("abc", "abcdef"),
+        ("abc", "ab"),
+        ("ab", "世界"),
+        ("hélo", "héllo"),
     ] {
         let keys: Vec<_> = before
             .chars()
@@ -2880,7 +2977,7 @@ fn spelling_rewrites_only_the_changed_suffix_and_undo_learns_the_whole_word() {
             }),
         )
         .unwrap();
-        assert_eq!(rep.erase, erase, "{before}");
+        assert_eq!(rep.erase, before.chars().count(), "{before}");
         let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
         let prefix: String = before.chars().take(keys.len() - rep.erase).collect();
         assert_eq!(format!("{prefix}{}", rep.retype), after);
@@ -2897,7 +2994,7 @@ fn spelling_rewrites_only_the_changed_suffix_and_undo_learns_the_whole_word() {
 }
 
 #[test]
-fn hebrew_spelling_preserves_prefix_language_and_undo() {
+fn hebrew_spelling_preserves_language_and_exact_undo() {
     let before = "שלומ";
     let keys: Vec<_> = crate::keymap::convert_selection(before)
         .chars()
@@ -2909,14 +3006,14 @@ fn hebrew_spelling_preserves_prefix_language_and_undo() {
     };
     assert_eq!(note_of::<Simulated>(&keys, &fix).0, before);
     let rep = replacement::<Simulated>(&keys, Some(fix)).unwrap();
-    assert_eq!(rep.erase, 1);
-    assert_eq!(rep.retype, "ם");
+    assert_eq!(rep.erase, 4);
+    assert_eq!(rep.retype, "שלום");
     let undo = undo_of::<Simulated>(&keys, &rep, Some(' '));
     assert_eq!(
         Simulated::retype_original(&undo.restore, undo.restore_layout),
-        "מ"
+        before
     );
-    assert_eq!(undo.on_screen, 2);
+    assert_eq!(undo.on_screen, 5);
     assert_eq!(undo.visible_layout, Language::Hebrew);
     assert_eq!(undo.layout, None);
     assert_eq!(undo.suppress.as_deref(), Some(before));
@@ -3354,7 +3451,12 @@ fn explicit_feedback_requires_acceptance_and_trusted_focus() {
 
     fn offer(original: &str, wanted: &str) -> Session {
         let session = Session::new();
-        session.type_text(original);
+        let physical = if SIMULATED_LAYOUT.load(Ordering::SeqCst) == 1 {
+            crate::keymap::convert_selection(original)
+        } else {
+            original.to_owned()
+        };
+        session.type_text(&physical);
         assert!(!session.engine.lock().is_replacing);
         session.tap(Simulated::SHIFT_LEFT);
         session.pending();
@@ -3369,7 +3471,7 @@ fn explicit_feedback_requires_acceptance_and_trusted_focus() {
             .position(|word| word == wanted)
             .expect("explicit correction missing");
         session.finish();
-        for _ in 0..index {
+        for _ in 0..index + index / crate::complete::MAX_CANDIDATES {
             session.tap(Simulated::SHIFT_LEFT);
             session.pending();
             session.finish();
@@ -3421,6 +3523,41 @@ fn explicit_feedback_requires_acceptance_and_trusted_focus() {
         Some("water")
     );
     assert_eq!(crate::personal::personal_count("water"), Some(1));
+
+    // Explicit spelling repairs may add letters and train either language.
+    for (layout, original, wanted) in [
+        (0, "keybord", "keyboard"),
+        (0, "(langauge),", "(language),"),
+        (1, "מחבש", "מחשב"),
+        (1, "תודדה ", "תודה"),
+        (1, "תודדה,", "תודה,"),
+    ] {
+        SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+        let session = offer(original, wanted);
+        let source_word = original.trim_matches(|c: char| !c.is_alphanumeric());
+        let target_word = wanted.trim_matches(|c: char| !c.is_alphanumeric());
+        assert_eq!(crate::personal::personal_correction(source_word), None);
+        session.type_text(" ");
+        assert_eq!(
+            crate::personal::personal_correction(source_word).as_deref(),
+            Some(target_word),
+            "retained explicit repair: {original}"
+        );
+        session.undo();
+        session.pending();
+        session.finish();
+        assert_eq!(session.text().trim_end(), original.trim());
+        assert_eq!(crate::personal::personal_correction(source_word), None);
+    }
+
+    // Reconsidering a valid word must not teach an automatic replacement.
+    for (layout, original, wanted) in [(0, "hello", "help"), (1, "שלום", "חלום")] {
+        SIMULATED_LAYOUT.store(layout, Ordering::SeqCst);
+        let session = offer(original, wanted);
+        session.type_text(" ");
+        assert_eq!(crate::personal::personal_correction(original), None);
+        assert_eq!(crate::personal::personal_count(wanted), Some(1));
+    }
 }
 
 #[test]
@@ -3582,7 +3719,7 @@ fn completions_and_learning_require_retained_choices() {
     s.pending();
     s.finish();
     assert!(s.text().starts_with("שלו") && s.text().chars().count() > 3);
-    assert_eq!(*s.engine.injector.erasures.lock().unwrap(), [0]);
+    assert_eq!(*s.engine.injector.erasures.lock().unwrap(), [3]);
     assert_eq!(
         reading::<Simulated>(&s.engine.lock().keys, Language::Hebrew),
         s.text()
@@ -5578,8 +5715,8 @@ fn typing_correction_undo_and_interrupted_replacements() {
     assert!(s.text().starts_with("hel") && s.text().len() > 3);
     assert_eq!(
         *s.engine.injector.erasures.lock().unwrap(),
-        [0],
-        "first completion must append without deleting the prefix"
+        [3],
+        "completion must match the whole edited prefix"
     );
     let count = s
         .engine
@@ -5601,11 +5738,10 @@ fn typing_correction_undo_and_interrupted_replacements() {
         "completion cycle restores the exact prefix"
     );
 
-    // Adjacent offers can share more text than the original input. Preserve it
-    // while cycling, but still undo to the original input after every offer.
+    // Shared text must not turn cycling or undo into a partial-word match.
     for (typed, offers, erasures) in [
-        ("keyb", ["keyboard", "keyboards", "keyboard"], [0, 0, 1]),
-        ("recie", ["receive", "receiver", "receive"], [2, 0, 1]),
+        ("keyb", ["keyboard", "keyboards", "keyboard"], [4, 8, 9]),
+        ("recie", ["receive", "receiver", "receive"], [5, 7, 8]),
     ] {
         for undo_at in 0..3 {
             let cycle_session = Session::new();
@@ -7215,6 +7351,29 @@ fn preparation_and_unedited_failure_do_not_leave_layout_only_corrections() {
             Some(LastAction::Unchanged { .. })
         ));
         assert!(!s.engine.lock().no_fix);
+    }
+    // Typing while layout confirmation blocks must cancel before any injector runs.
+    PREPARE_ALLOWED.store(true, Ordering::SeqCst);
+    for (source, word) in [(0, "akuo "), (1, "hello ")] {
+        SIMULATED_LAYOUT.store(source, Ordering::SeqCst);
+        INJECT_CALLS.store(0, Ordering::SeqCst);
+        let s = Session::new();
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (proceed, resume) = mpsc::channel();
+        *LAYOUT_GATE.lock().unwrap() = Some(FocusGate {
+            ready,
+            proceed: resume,
+        });
+        s.type_while_checking(word);
+        reached.recv_timeout(Duration::from_secs(3)).unwrap();
+        s.type_while_checking("next");
+        let before = s.text();
+        proceed.send(()).unwrap();
+        s.checks_ready();
+        s.idle();
+        assert_eq!(s.text(), before);
+        assert_eq!(SIMULATED_LAYOUT.load(Ordering::SeqCst), source);
+        assert_eq!(INJECT_CALLS.load(Ordering::SeqCst), 0);
     }
     // A proven pre-edit failure must not suppress the next ordinary word.
     PREPARE_ALLOWED.store(true, Ordering::SeqCst);

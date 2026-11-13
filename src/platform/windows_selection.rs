@@ -36,24 +36,14 @@ fn writable(focus: usize) -> bool {
         }
 }
 
-/// A failed native attempt must not turn a host selection into counted
-/// Backspaces. Password/read-only controls must not receive fallback edits.
+/// Native controls expose protection flags without a blocking accessibility query.
+pub(super) fn input_allowed(focus: usize) -> bool {
+    !native_edit(focus) || writable(focus)
+}
+
+/// A failed native match must never fall through to counted Backspaces.
 pub(super) fn keyboard_fallback_allowed(focus: usize) -> bool {
-    if !native_edit(focus) {
-        return true;
-    }
-    if !writable(focus) {
-        return false;
-    }
-    let (mut start, mut end) = (0u32, 0u32);
-    message(
-        focus,
-        EM_GETSEL as u32,
-        &mut start as *mut u32 as usize,
-        &mut end as *mut u32 as isize,
-    )
-    .is_some()
-        && start == end
+    !native_edit(focus)
 }
 
 fn message(focus: usize, message: u32, wparam: usize, lparam: isize) -> Option<usize> {
@@ -95,6 +85,7 @@ pub(super) fn replace_expected_suffix(
     expected: &str,
     replacement: &str,
     valid: impl Fn() -> bool,
+    start_edit: impl FnOnce(),
 ) -> Option<()> {
     let units: Vec<u16> = expected.encode_utf16().collect();
     let replacement_wide: Vec<u16> = replacement.encode_utf16().chain(Some(0)).collect();
@@ -128,6 +119,7 @@ pub(super) fn replace_expected_suffix(
     }
     let begin = caret - units.len();
     let new_caret = begin + replacement.encode_utf16().count();
+    start_edit();
     message(focus, EM_SETSEL as u32, begin, caret as isize)?;
     let (mut selected_start, mut selected_end) = (0u32, 0u32);
     message(
@@ -247,6 +239,55 @@ fn replace_verified(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_fields_block_password_capture_and_failed_match_fallback() {
+        unsafe {
+            let class: Vec<_> = "EDIT\0".encode_utf16().collect();
+            for (style, enabled, allowed) in [
+                (0, true, true),
+                (ES_PASSWORD, true, false),
+                (ES_READONLY, true, false),
+                (0, false, false),
+            ] {
+                let hwnd = CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    std::ptr::null(),
+                    WS_POPUP | style,
+                    0,
+                    0,
+                    100,
+                    100,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null()),
+                    std::ptr::null_mut(),
+                );
+                assert!(!hwnd.is_null());
+                EnableWindow(hwnd, i32::from(enabled));
+                let focus = hwnd as usize;
+                let capture = input_allowed(focus);
+                let fallback = keyboard_fallback_allowed(focus);
+                let mut began = false;
+                assert!(replace_expected_suffix(
+                    focus,
+                    "stale ",
+                    "replacement ",
+                    || true,
+                    || began = true
+                )
+                .is_none());
+                DestroyWindow(hwnd);
+                assert_eq!(capture, allowed, "style {style}, enabled {enabled}");
+                assert!(
+                    !fallback,
+                    "rejected native matches must not emit Backspaces"
+                );
+                assert!(!began, "a pre-edit refusal must permit layout restoration");
+            }
+        }
+    }
 
     #[test]
     #[ignore = "opens a disposable native Windows Edit control and takes focus"]

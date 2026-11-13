@@ -1,6 +1,5 @@
 //! Replacement workers, guarded injection, replay, and retry context.
 
-use super::correction_pipeline::completion_correction;
 use super::word_buffer::{PendingLearning, MAX_UNDO_SPACES, MAX_UNDO_SUFFIX};
 use super::{
     reading, AppState, Cycle, Engine, LastAction, LastFix, LastSkip, Platform, Typed,
@@ -102,6 +101,24 @@ pub struct Plan<P: Platform> {
     /// even when undo changes the live layout. None allows keyboard fallback;
     /// backends without native verification must refuse Some rather than erase.
     pub verify: Option<Language>,
+}
+
+impl<P: Platform> Plan<P> {
+    /// Only a verified native edit can preserve letters across a layout change.
+    pub fn preserves_buffered_layout(
+        &self,
+        buffered: &[Typed<P::Key>],
+        source: Option<Language>,
+        target: Option<Language>,
+    ) -> bool {
+        self.verify.is_some()
+            || target.is_none_or(|target| {
+                source == Some(target)
+                    || buffered
+                        .iter()
+                        .all(|typed| P::is_terminator(typed.key) && !P::is_line_break(typed.key))
+            })
+    }
 }
 
 impl<P: Platform> AppState<P> {
@@ -354,7 +371,9 @@ impl<P: Platform> Engine<P> {
             return;
         }
         let previous_layout = P::current_layout();
-        if !self.confirm_replacement_layout(commit.as_ref(), generation) {
+        if !self.confirm_replacement_layout(commit.as_ref(), generation)
+            || !plan.preserves_buffered_layout(&self.buffered(), previous_layout, target_layout)
+        {
             self.restore_unedited_layout(generation, previous_layout);
             self.abort_before_injection(generation, retry, gate);
             return;
@@ -508,19 +527,13 @@ impl<P: Platform> Engine<P> {
                     from: None,
                     to: to.clone(),
                     phrase_boundary: false,
-                    manual_pair: {
-                        let from = reading::<P>(&cycle.typed, cycle.original_lang);
-                        if cycle.correction && self.en_dict.contains(&from.to_lowercase()) {
-                            None
-                        } else {
-                            completion_correction(
-                                &from,
-                                to,
-                                cycle.original_lang,
-                                cycle.candidate_langs[cycle.index],
-                            )
-                        }
-                    },
+                    manual_pair: self.completion_correction(
+                        &reading::<P>(&cycle.typed, cycle.original_lang),
+                        to,
+                        cycle.original_lang,
+                        cycle.candidate_langs[cycle.index],
+                        cycle.correction,
+                    ),
                 })
             } else {
                 pending_learning

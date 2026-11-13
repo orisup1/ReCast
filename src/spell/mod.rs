@@ -73,6 +73,7 @@
 
 pub(crate) mod hebrew;
 mod lexicon;
+pub(crate) use lexicon::reviewed_repair;
 mod rules;
 
 use std::collections::HashSet;

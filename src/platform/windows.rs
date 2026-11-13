@@ -6,7 +6,7 @@ use rdev::Key;
 use std::cell::RefCell;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use winapi::ctypes::c_int;
 use winapi::shared::minwindef::{LPARAM, LRESULT, WPARAM};
@@ -17,9 +17,8 @@ use winapi::um::winuser::{
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, INPUT, INPUT_KEYBOARD,
     KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LLKHF_EXTENDED,
     LLKHF_INJECTED, MSG, VK_BACK, VK_CAPITAL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
-    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
 };
 type Typed = engine::Typed<Key>;
 const RECAST_EVENT: usize = 0x5243_5354;
@@ -31,11 +30,18 @@ thread_local! {
 }
 
 pub struct Windows;
+
+#[derive(Default)]
+pub struct Injector {
+    pub(super) injecting: AtomicBool,
+    source_layout: Mutex<Option<Language>>,
+}
+
 impl Platform for Windows {
     const VERIFIED_REPLACEMENT: bool = true;
     type Key = Key;
     type Retype = String;
-    type Injector = AtomicBool;
+    type Injector = Injector;
     type Focus = Focus;
     const REQUIRES_FOCUS: bool = true;
     const SHIFT_LEFT: Key = textkeys::SHIFT_LEFT;
@@ -83,8 +89,27 @@ impl Platform for Windows {
     fn buffer_after(text: &String) -> Vec<Typed> {
         textkeys::buffer_after(text)
     }
-    fn injecting_flag(injector: &AtomicBool) -> Option<&AtomicBool> {
-        Some(injector)
+    fn injecting_flag(injector: &Injector) -> Option<&AtomicBool> {
+        Some(&injector.injecting)
+    }
+    fn injection_started(injector: &Injector) -> bool {
+        injector.injecting.load(Ordering::Relaxed)
+    }
+    fn prepare_injection(
+        engine: &Engine<Self>,
+        plan: &Plan<Self>,
+        _: u64,
+        target: Option<Language>,
+    ) -> bool {
+        let source = Self::current_layout();
+        *crate::types::lock_forgiving(&engine.injector.source_layout) = source;
+        plan.preserves_buffered_layout(&engine.buffered(), source, target)
+    }
+    fn input_allowed() -> bool {
+        Self::focus().is_some_and(super::windows_selection::input_allowed)
+    }
+    fn input_block_reason() -> &'static str {
+        "Protected or unavailable text field — correction resumes in an editable field."
     }
     fn focus() -> Option<Focus> {
         crate::layout::focused_target()
@@ -253,7 +278,7 @@ pub fn start(en: Dict, he: Dict, control: Arc<AppControl>, with_gui: bool) {
 }
 
 pub fn run(en_dict: Dict, he_dict: Dict, control: Arc<AppControl>) {
-    let engine = Engine::<Windows>::new(en_dict, he_dict, control.clone(), AtomicBool::new(false));
+    let engine = Engine::<Windows>::new(en_dict, he_dict, control.clone(), Injector::default());
     if let Err(err) = listen(engine, &control) {
         let _ = writeln!(
             std::io::stderr(),
@@ -358,7 +383,13 @@ unsafe extern "system" fn keyboard_callback(code: c_int, message: WPARAM, data: 
             CAPTURE_ENGINE.with(|slot| {
                 if let Some(engine) = slot.borrow().as_ref() {
                     match event {
-                        CapturedKey::Press(key) => engine.key_press(key),
+                        CapturedKey::Press(key) => {
+                            if Windows::input_allowed() || Windows::is_modifier(key) {
+                                engine.key_press(key);
+                            } else {
+                                engine.forget_everything();
+                            }
+                        }
                         CapturedKey::Release(key) => engine.key_release(key),
                         CapturedKey::External => engine.forget_everything(),
                     }
@@ -568,6 +599,11 @@ fn send(inputs: &mut [INPUT]) -> Option<()> {
 }
 
 fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Option<Vec<Typed>> {
+    let buf = engine.buffered();
+    let source = *crate::types::lock_forgiving(&engine.injector.source_layout);
+    if !plan.preserves_buffered_layout(&buf, source, Windows::current_layout()) {
+        return None;
+    }
     let Plan {
         erase,
         retype: text,
@@ -582,16 +618,18 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
     if !engine.replacement_valid(generation) {
         return None;
     }
-    engine.injector.store(true, Ordering::Relaxed);
-    let buf = engine.buffered();
     if let Some(source_layout) = verify {
         let suffix = engine::reading::<Windows>(&buf, source_layout);
         let expected = format!("{expected}{suffix}");
         let replacement = format!("{text}{suffix}");
         let focus = Windows::focus()?;
-        super::windows_selection::replace_expected_suffix(focus, &expected, &replacement, || {
-            engine.replacement_valid(generation) && engine.buffered().len() == buf.len()
-        })?;
+        super::windows_selection::replace_expected_suffix(
+            focus,
+            &expected,
+            &replacement,
+            || engine.replacement_valid(generation) && engine.buffered().len() == buf.len(),
+            || engine.injector.injecting.store(true, Ordering::Relaxed),
+        )?;
         return Some(buf);
     }
     if let Some(layout) = Windows::current_layout() {
@@ -602,9 +640,13 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
         );
         let expected = format!("{expected}{suffix}");
         let focus = Windows::focus()?;
-        if super::windows_selection::replace_expected_suffix(focus, &expected, &replacement, || {
-            engine.replacement_valid(generation) && engine.buffered().len() == buf.len()
-        })
+        if super::windows_selection::replace_expected_suffix(
+            focus,
+            &expected,
+            &replacement,
+            || engine.replacement_valid(generation) && engine.buffered().len() == buf.len(),
+            || engine.injector.injecting.store(true, Ordering::Relaxed),
+        )
         .is_some()
         {
             return Some(buf);
@@ -614,12 +656,18 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
     if !super::windows_selection::keyboard_fallback_allowed(focus) {
         return None;
     }
-    let mut inputs = replacement_inputs(erase, &text, terminator, &buf);
+    let suffix = if buf.is_empty() {
+        String::new()
+    } else {
+        engine::reading::<Windows>(&buf, source?)
+    };
+    let mut inputs = replacement_inputs(erase, &text, terminator, &suffix);
     if !engine.replacement_valid(generation) || engine.buffered().len() != buf.len() {
         return None;
     }
     // Deletion, replacement, and the deleted suffix must be submitted together.
     // A cancellation between separate sends could otherwise lose that suffix.
+    engine.injector.injecting.store(true, Ordering::Relaxed);
     send(&mut inputs)?;
 
     crate::timing::pause(gaps.settle);
@@ -629,10 +677,10 @@ fn replacement_inputs(
     erase: usize,
     text: &str,
     terminator: Option<Key>,
-    buffered: &[Typed],
+    buffered: &str,
 ) -> Vec<INPUT> {
-    let delete_count = erase + buffered.len();
-    let mut inputs = Vec::with_capacity((delete_count + text.len() + 1) * 2 + buffered.len() * 4);
+    let delete_count = erase + buffered.chars().count();
+    let mut inputs = Vec::with_capacity((delete_count + text.len() + 1 + buffered.len()) * 2);
     for _ in 0..delete_count {
         press(VK_BACK as u16, &mut inputs);
     }
@@ -641,45 +689,9 @@ fn replacement_inputs(
     if terminator.is_some() {
         type_text(" ", &mut inputs);
     }
-    // Buffered keys are physical positions. Preserve their Shift state in the
-    // same transaction that erases their already-visible original characters.
-    for t in buffered {
-        let Some(vk) = vk_of(t.key) else { continue };
-        if t.shift {
-            inputs.push(key_input(VK_SHIFT as u16, None, false));
-            press(vk, &mut inputs);
-            inputs.push(key_input(VK_SHIFT as u16, None, true));
-        } else {
-            press(vk, &mut inputs);
-        }
-    }
+    // Literal replay preserves captured case even while Caps Lock or Shift is active.
+    type_text(buffered, &mut inputs);
     inputs
-}
-
-fn vk_of(key: Key) -> Option<u16> {
-    use winapi::um::winuser::{
-        VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA,
-        VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS,
-    };
-    match key {
-        Key::Space => Some(VK_SPACE as u16),
-        Key::Return => Some(VK_RETURN as u16),
-        other => Some(match textkeys::english_char_plain(other)? {
-            ';' => VK_OEM_1 as u16,
-            '/' => VK_OEM_2 as u16,
-            '`' => VK_OEM_3 as u16,
-            '[' => VK_OEM_4 as u16,
-            '\\' => VK_OEM_5 as u16,
-            ']' => VK_OEM_6 as u16,
-            '\'' => VK_OEM_7 as u16,
-            ',' => VK_OEM_COMMA as u16,
-            '-' => VK_OEM_MINUS as u16,
-            '.' => VK_OEM_PERIOD as u16,
-            '=' => VK_OEM_PLUS as u16,
-            c if c.is_ascii_alphanumeric() => c.to_ascii_uppercase() as u16,
-            _ => return None,
-        }),
-    }
 }
 
 type Focus = usize;
@@ -781,10 +793,26 @@ mod tests {
         ] {
             assert_eq!(key_from_code(vk, scan, flags), expected);
         }
-        for text in "abcdefghijklmnopqrstuvwxyz0123456789`-=[]\\;',./ ".chars() {
+        for (vk, text) in (0x41..=0x5a)
+            .zip('a'..='z')
+            .chain((0x30..=0x39).zip('0'..='9'))
+            .chain([
+                (0x20, ' '),
+                (0xba, ';'),
+                (0xbb, '='),
+                (0xbc, ','),
+                (0xbd, '-'),
+                (0xbe, '.'),
+                (0xbf, '/'),
+                (0xc0, '`'),
+                (0xdb, '['),
+                (0xdc, '\\'),
+                (0xdd, ']'),
+                (0xde, '\''),
+            ])
+        {
             let (expected, _) = crate::keymap::english_char_to_key(text).unwrap();
-            let vk = vk_of(expected).unwrap();
-            assert_eq!(key_from_code(vk.into(), 0, 0), expected, "{text}");
+            assert_eq!(key_from_code(vk, 0, 0), expected, "{text}");
         }
         for (vk, expected) in [
             (0x08, Key::Backspace),
@@ -820,8 +848,10 @@ mod tests {
                 shift: false,
             },
         ];
+        let suffix = engine::reading::<Windows>(&buffered, Language::English);
+        assert_eq!(suffix, "A; ");
         for terminator in [None, Some(Key::Space)] {
-            let inputs = replacement_inputs(2, "ש🙂", terminator, &buffered);
+            let inputs = replacement_inputs(2, "ש🙂", terminator, &suffix);
             let events: Vec<_> = inputs
                 .iter()
                 .map(|input| unsafe {
@@ -831,49 +861,42 @@ mod tests {
                 })
                 .collect();
             // The exact payload passed to the single SendInput call contains
-            // every erased buffered character, including Shift and punctuation.
+            // every erased buffered character, with case and punctuation intact.
             let mut expected =
                 [(VK_BACK as u16, 0, 0), (VK_BACK as u16, 0, KEYEVENTF_KEYUP)].repeat(5);
             for unit in "ש🙂"
                 .encode_utf16()
                 .chain(terminator.map(|_| u16::from(b' ')))
+                .chain(suffix.encode_utf16())
             {
                 expected.push((0, unit, KEYEVENTF_UNICODE));
                 expected.push((0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
             }
-            expected.extend([
-                (VK_SHIFT as u16, 0, 0),
-                (0x41, 0, 0),
-                (0x41, 0, KEYEVENTF_KEYUP),
-                (VK_SHIFT as u16, 0, KEYEVENTF_KEYUP),
-                (0xba, 0, 0),
-                (0xba, 0, KEYEVENTF_KEYUP),
-                (VK_SPACE as u16, 0, 0),
-                (VK_SPACE as u16, 0, KEYEVENTF_KEYUP),
-            ]);
             assert_eq!(events, expected);
         }
     }
 
     #[test]
-    fn buffered_punctuation_uses_virtual_keys_not_ascii_control_codes() {
-        for (text, expected) in [
-            (';', 0xba),
-            ('=', 0xbb),
-            (',', 0xbc),
-            ('-', 0xbd),
-            ('.', 0xbe),
-            ('/', 0xbf),
-            ('`', 0xc0),
-            ('[', 0xdb),
-            ('\\', 0xdc),
-            (']', 0xdd),
-            ('\'', 0xde),
-            ('a', 0x41),
-            ('1', 0x31),
-        ] {
-            let (key, _) = crate::keymap::english_char_to_key(text).unwrap();
-            assert_eq!(super::vk_of(key), Some(expected), "{text}");
+    fn buffered_text_is_replayed_without_case_or_layout_sensitive_keys() {
+        for suffix in ["Next", "nEXT", "שלום", "12:;?! "] {
+            let inputs = replacement_inputs(0, "", None, suffix);
+            let mut units = Vec::new();
+            let mut deletions = 0;
+            for input in inputs {
+                let key = unsafe { input.u.ki() };
+                if key.dwFlags & KEYEVENTF_KEYUP != 0 {
+                    continue;
+                }
+                if key.wVk == VK_BACK as u16 {
+                    deletions += 1;
+                } else {
+                    assert_eq!(key.wVk, 0);
+                    assert_eq!(key.dwFlags, KEYEVENTF_UNICODE);
+                    units.push(key.wScan);
+                }
+            }
+            assert_eq!(deletions, suffix.chars().count());
+            assert_eq!(String::from_utf16(&units).unwrap(), suffix);
         }
     }
 }

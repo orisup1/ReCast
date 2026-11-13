@@ -110,7 +110,8 @@ $(BIN_SRC): $(SRC)
 clean:
 	$(CARGO) clean
 
-rebuild: clean build
+rebuild: clean
+	$(MAKE) build
 
 # Install the binary directly to $(BINDIR). No data dir, no wrapper:
 # dictionaries are baked into the binary, so it runs identically no matter
@@ -130,7 +131,8 @@ uninstall:
 	@rm -f $(BIN_DST)
 	@echo "Removed $(BIN_DST)"
 
-deploy: clean install
+deploy: clean
+	$(MAKE) install
 
 run: build
 	$(CARGO) run --release -- $(ARGS)

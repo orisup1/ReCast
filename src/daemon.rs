@@ -305,8 +305,12 @@ pub fn stop_daemon() -> std::io::Result<Stopped> {
             "Unable to locate cache directory",
         )
     })?;
-    let Ok(contents) = fs::read_to_string(&pidfile) else {
-        return Ok(Stopped::NotRunning);
+    let contents = match fs::read_to_string(&pidfile) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Stopped::NotRunning);
+        }
+        Err(error) => return Err(error),
     };
     let pid: u32 = contents.trim().parse().map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid PID in pidfile")

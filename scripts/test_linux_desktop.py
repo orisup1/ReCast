@@ -1,6 +1,6 @@
 """Selection safety checks without GI, a desktop, or user text."""
 import unittest
-from linux_desktop import replace_selection, replace_suffix
+from linux_desktop import replace_selection, replace_suffix, replacement_target
 
 
 class Target:
@@ -27,6 +27,20 @@ class Target:
     def select(self, start, end):
         self.selected = (start, end-start, self.value[start:end])
         return True
+
+
+class CapabilityTests(unittest.TestCase):
+    def test_password_refusal_cannot_turn_into_keyboard_fallback(self):
+        def protected():
+            raise PermissionError('Password fields cannot be edited')
+        self.assertEqual(replacement_target(lambda: {'id': 'password'}, protected), {'blocked': True})
+
+    def test_supported_target_requires_stable_focus(self):
+        focus = {'id': 'field', 'app': 'editor'}
+        self.assertEqual(replacement_target(lambda: focus, lambda: None), focus)
+        changes = iter([focus, {'id': 'other', 'app': 'editor'}])
+        self.assertIsNone(replacement_target(lambda: next(changes), lambda: None))
+        self.assertIsNone(replacement_target(lambda: None, lambda: self.fail('no focus')))
 
 
 class SelectionTests(unittest.TestCase):

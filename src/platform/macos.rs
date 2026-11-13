@@ -73,6 +73,20 @@ impl Platform for Mac {
     fn injecting_flag(injector: &AtomicBool) -> Option<&AtomicBool> {
         Some(injector)
     }
+    fn injection_started(injector: &AtomicBool) -> bool {
+        injector.load(Ordering::Relaxed)
+    }
+    fn prepare_injection(
+        engine: &Engine<Self>,
+        plan: &Plan<Self>,
+        generation: u64,
+        target_layout: Option<Language>,
+    ) -> bool {
+        if begin_injection(engine, generation).is_none() {
+            return false;
+        }
+        plan.preserves_buffered_layout(&engine.buffered(), Self::current_layout(), target_layout)
+    }
     fn injection_finished() -> bool {
         // Reserved before deletion starts, so releasing input cannot fail to allocate.
         let input = crate::types::lock_forgiving(deferred_input());
@@ -550,7 +564,6 @@ fn arm_deferred_input(engine: &Engine<Mac>, generation: u64) -> Option<()> {
     let event = keyboard_event_with_tag(0, false, false, tag)?;
     input.input.begin();
     input.finish = Some(DeferredEvent { kind: 0, event });
-    engine.injector.store(true, Ordering::Relaxed);
     Some(())
 }
 
@@ -1271,7 +1284,6 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     if !engine.replacement_valid(generation) {
         return None;
     }
-    begin_injection(engine, generation)?;
     let buf = engine.buffered();
     if let Some(source_layout) = verify {
         let suffix = engine::reading::<Mac>(&buf, source_layout);
@@ -1288,23 +1300,18 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         return Some(buf);
     }
     // Prefer a single native text edit when the control exposes a writable range.
-    if let Some(layout) = Mac::current_layout() {
-        let suffix = engine::reading::<Mac>(&buf, layout);
-        let replacement = format!(
-            "{text}{}{suffix}",
-            if terminator.is_some() { " " } else { "" }
-        );
-        let expected = format!("{expected}{suffix}");
-        if replace_expected_suffix(engine, &focus, &expected, &replacement, generation).is_some() {
-            return Some(buf);
-        }
-        if !engine.replacement_valid(generation) {
-            return None;
-        }
+    let layout = Mac::current_layout()?;
+    let suffix = engine::reading::<Mac>(&buf, layout);
+    let replacement = format!(
+        "{text}{}{suffix}",
+        if terminator.is_some() { " " } else { "" }
+    );
+    let expected = format!("{expected}{suffix}");
+    if replace_expected_suffix(engine, &focus, &expected, &replacement, generation).is_some() {
+        return Some(buf);
     }
-    // A host selection is not a counted run of characters: its first Backspace
-    // would delete the selection rather than one character of our tracked word.
-    if selected_range(&focus).is_some_and(|range| range.length != 0) {
+    // A failed native match must never become blind deletion of neighboring text.
+    if !engine.replacement_valid(generation) || !matches_expected_suffix(&focus, &expected) {
         return None;
     }
     // Press + release a single key with pacing that macOS won't drop. Only the
@@ -1319,6 +1326,10 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
     };
 
     let delete_count = erase + buf.len();
+    if expected.chars().count() != delete_count {
+        return None;
+    }
+    engine.injector.store(true, Ordering::Relaxed);
     for _ in 0..delete_count {
         if !engine.replacement_valid(generation) {
             return None;
@@ -1801,7 +1812,9 @@ mod setup_tests {
 
 mod candidate_strip;
 mod spotlight;
-use spotlight::{replace_expected_suffix, replace_spotlight_query, selected_range};
+use spotlight::{
+    matches_expected_suffix, replace_expected_suffix, replace_spotlight_query, selected_range,
+};
 
 pub(crate) fn dismiss_candidates() {
     if let Some(engine) = CTX.get() {

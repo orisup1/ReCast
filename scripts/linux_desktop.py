@@ -15,6 +15,18 @@ MAX_TEXT = 65536
 MAX_REQUEST = 524288
 
 
+def replacement_target(snapshot, target):
+    """Keep a protected field distinct from unavailable native editing support."""
+    before = snapshot()
+    if before is None:
+        return None
+    try:
+        target()
+    except PermissionError:
+        return {'blocked': True}
+    return before if snapshot() == before else None
+
+
 def replace_selection(target, expected, replacement, valid):
     """Insert before deleting: failed insertion can never erase the original."""
     # shortcut: AT-SPI edits are not atomic; use a native transaction if one becomes available.
@@ -194,12 +206,8 @@ def main():
         if action == 'focus':
             return snapshot()
         if action == 'replacement_target':
-            before = snapshot()
-            if before is None:
-                return None
             # Capability checks only: no text, selection, or caret reads.
-            Target(current())
-            return before if snapshot() == before else None
+            return replacement_target(snapshot, lambda: Target(current()))
         expected_id = request['focus']
         before = snapshot()
         if before is None or before['id'] != expected_id:

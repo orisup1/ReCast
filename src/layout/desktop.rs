@@ -160,7 +160,15 @@ pub fn focus() -> Option<super::Focus> {
 
 /// Probe editable-text capability without reading the control's contents.
 /// A prepared native edit can bypass waits needed only by keycode replay.
-pub fn replacement_target() -> Option<String> {
+pub enum ReplacementTarget {
+    Native(String),
+    Blocked,
+}
+
+pub fn replacement_target() -> Option<ReplacementTarget> {
     let value = request(json!({"action":"replacement_target"}))?;
-    Some(value["id"].as_str()?.to_owned())
+    if value["blocked"].as_bool() == Some(true) {
+        return Some(ReplacementTarget::Blocked);
+    }
+    Some(ReplacementTarget::Native(value["id"].as_str()?.to_owned()))
 }

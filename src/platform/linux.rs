@@ -388,17 +388,19 @@ impl Platform for Linux {
             return false;
         }
         if let Some(target) = crate::layout::desktop::replacement_target() {
+            let crate::layout::desktop::ReplacementTarget::Native(target) = target else {
+                return false;
+            };
             // Native text edits do not press Space or replacement letters.
             // Pin this choice before switching layouts: if the control later
             // refuses the edit, it must never fall back to unprepared keycodes.
             *crate::types::lock_forgiving(&engine.injector.route) = InjectionRoute::Native(target);
             let buffered = engine.buffered();
-            if target_layout.is_some_and(|target| Self::current_layout() != Some(target))
-                && buffered.iter().any(|typed| !Self::is_terminator(typed.key))
-            {
-                return false;
-            }
-            return engine.replacement_valid(generation);
+            return plan.preserves_buffered_layout(
+                &buffered,
+                Self::current_layout(),
+                target_layout,
+            ) && engine.replacement_valid(generation);
         }
         if plan.verify.is_some() {
             return false;
@@ -415,12 +417,7 @@ impl Platform for Linux {
                 return false;
             };
             let target = target_layout.unwrap_or(source);
-            if target != source
-                && engine
-                    .buffered()
-                    .iter()
-                    .any(|typed| !Self::is_terminator(typed.key))
-            {
+            if !plan.preserves_buffered_layout(&engine.buffered(), Some(source), Some(target)) {
                 return false;
             }
             *crate::types::lock_forgiving(&engine.injector.route) =
@@ -440,9 +437,7 @@ impl Platform for Linux {
         };
         // These keys already reached the app under the old layout. Switching
         // now and replaying their positions would silently change the suffix.
-        if target_layout.is_some_and(|target| Self::current_layout() != Some(target))
-            && buffered.iter().any(|typed| !Self::is_terminator(typed.key))
-        {
+        if !plan.preserves_buffered_layout(&buffered, Self::current_layout(), target_layout) {
             return false;
         }
         engine.replacement_valid(generation)

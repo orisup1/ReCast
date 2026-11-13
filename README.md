@@ -23,10 +23,15 @@ started before a replacement and finished during it; no pause between words is n
 Navigation, submission, and layout changes still cancel stale work.
 It uses the current keyboard layout, dictionary matches, and word frequency to decide
 whether to rewrite them. Each word gets one rewrite or none; capitalization and
-the terminator are preserved. Same-layout corrections keep an unchanged prefix
-on screen and rewrite only the remaining suffix, reducing visible deletion.
-Cycling suggestions also preserves all text shared by consecutive offers;
-undo still restores exactly what you typed.
+the terminator are preserved. Spelling corrections match the whole original word
+so a host application's own correction cannot be mistaken for the tracked typo.
+On macOS, keyboard fallback also requires an exact text match at the caret;
+unreadable or changed text is left untouched.
+Windows native Edit/RichEdit controls also decline keyboard fallback after a
+failed native match. Linux honors an explicit password-field refusal from its
+accessibility helper instead of falling through to keyboard injection.
+Cycling suggestions and undo also match the whole word; undo restores exactly
+what you typed.
 Enter accepts an already selected suggestion and clears typing context. It never
 starts an automatic rewrite or replays Enter, because that key may send a message
 or execute a command instead of inserting a line break.
@@ -912,6 +917,8 @@ make bench
 
 See [PERFORMANCE.md](PERFORMANCE.md) for search optimizations, benchmark scope,
 and further latency opportunities.
+See [cross-platform verification](tests/cross-platform-validation.md) for executed
+checks, feature coverage, known accuracy limits, and native acceptance still needed.
 
 The shared correction planner is in [src/dictionary/mod.rs](src/dictionary/mod.rs), with
 spelling in [src/spell/mod.rs](src/spell/mod.rs) and completion/lists in

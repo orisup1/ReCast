@@ -21,10 +21,13 @@ pub(super) fn selected_range(focus: &Focus) -> Option<CFRange> {
     Some(range)
 }
 
-fn suffix_range(value: &str, caret: isize, expected: &str) -> Option<CFRange> {
+fn suffix_range(value: &str, range: CFRange, expected: &str) -> Option<CFRange> {
+    if range.length != 0 || value.len() > engine::MAX_SELECTION_BYTES {
+        return None;
+    }
     let units: Vec<_> = value.encode_utf16().collect();
     let suffix: Vec<_> = expected.encode_utf16().collect();
-    let caret = usize::try_from(caret).ok()?;
+    let caret = usize::try_from(range.location).ok()?;
     let start = caret.checked_sub(suffix.len())?;
     if suffix.is_empty() || units.get(start..caret)? != suffix {
         return None;
@@ -35,23 +38,96 @@ fn suffix_range(value: &str, caret: isize, expected: &str) -> Option<CFRange> {
     })
 }
 
+pub(super) fn matches_expected_suffix(focus: &Focus, expected: &str) -> bool {
+    let Some(value) = ax_attribute(focus, "AXValue").and_then(|v| v.downcast::<CFString>()) else {
+        return false;
+    };
+    if value.char_len() > engine::MAX_SELECTION_BYTES as isize {
+        return false;
+    }
+    selected_range(focus)
+        .and_then(|range| suffix_range(&value.to_string(), range, expected))
+        .is_some()
+}
+
 #[test]
 fn suffix_ranges_use_utf16_offsets_and_require_exact_text() {
-    let range = suffix_range("🙂 receive שלום tail", 15, "receive שלום").unwrap();
+    let caret = |location| CFRange {
+        location,
+        length: 0,
+    };
+    let range = suffix_range("🙂 receive שלום tail", caret(15), "receive שלום").unwrap();
     assert_eq!((range.location, range.length), (3, 12));
-    for (caret, expected) in [
+    for (location, expected) in [
         (2, "🙂"),
         (-1, "receive"),
         (100, "receive"),
         (15, "recieve שלום"),
         (15, ""),
     ] {
-        if caret == 2 {
-            assert_eq!(suffix_range("🙂", caret, expected).unwrap().length, 2);
+        if location == 2 {
+            assert_eq!(
+                suffix_range("🙂", caret(location), expected)
+                    .unwrap()
+                    .length,
+                2
+            );
         } else {
-            assert!(suffix_range("🙂 receive שלום tail", caret, expected).is_none());
+            assert!(suffix_range("🙂 receive שלום tail", caret(location), expected).is_none());
         }
     }
+}
+
+#[test]
+fn fallback_rejects_stale_words_selections_and_unreadable_carets() {
+    for (value, location, length, expected) in [
+        ("previous receive ", 17, 0, "recieve "),
+        ("previous keyboard ", 18, 0, "keyboad "),
+        ("previous שלום ", 14, 0, "akuo "),
+        ("previous akuo ", 14, 0, "שלום "),
+        ("previous recieve next", 21, 0, "recieve "),
+        ("previous recieve ", 17, 1, "recieve "),
+        ("previous recieve ", 17, -1, "recieve "),
+        ("previous recieve ", -1, 0, "recieve "),
+        ("previous recieve ", 99, 0, "recieve "),
+        ("previous recieve ", 17, 0, ""),
+    ] {
+        assert!(
+            suffix_range(value, CFRange { location, length }, expected).is_none(),
+            "must not erase {expected:?} from {value:?}"
+        );
+    }
+    for expected in ["recieve ", "keyboad ", "akuo ", "שלום "] {
+        let value = format!("previous 🙂 {expected}next");
+        let location = format!("previous 🙂 {expected}").encode_utf16().count() as isize;
+        let range = suffix_range(
+            &value,
+            CFRange {
+                location,
+                length: 0,
+            },
+            expected,
+        )
+        .unwrap();
+        let mut units: Vec<_> = value.encode_utf16().collect();
+        units.splice(
+            range.location as usize..location as usize,
+            "corrected ".encode_utf16(),
+        );
+        assert_eq!(
+            String::from_utf16(&units).unwrap(),
+            "previous 🙂 corrected next"
+        );
+    }
+    assert!(suffix_range(
+        &"x".repeat(engine::MAX_SELECTION_BYTES + 1),
+        CFRange {
+            location: 1,
+            length: 0
+        },
+        "x"
+    )
+    .is_none());
 }
 
 /// Replace exactly the `expected` suffix standing immediately before the
@@ -91,10 +167,7 @@ pub(super) fn replace_expected_suffix(
             return None;
         }
         let range = selected_range(focus)?;
-        if range.length != 0 {
-            return None;
-        }
-        let suffix_range = suffix_range(&original_value.to_string(), range.location, expected)?;
+        let suffix_range = suffix_range(&original_value.to_string(), range, expected)?;
         let start = suffix_range.location as usize;
         let selected = AXValueCreate(4, (&suffix_range as *const CFRange).cast());
         if selected.is_null() {
@@ -118,6 +191,7 @@ pub(super) fn replace_expected_suffix(
         {
             return None;
         }
+        engine.injector.store(true, Ordering::Relaxed);
         if AXUIElementSetAttributeValue(
             focus.0,
             range_attribute.as_concrete_TypeRef(),
@@ -244,6 +318,7 @@ pub(super) fn replace_spotlight_query(
         {
             return None;
         }
+        engine.injector.store(true, Ordering::Relaxed);
         if AXUIElementSetAttributeValue(
             focus.0,
             value_attribute.as_concrete_TypeRef(),
