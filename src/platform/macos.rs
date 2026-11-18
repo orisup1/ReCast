@@ -295,7 +295,7 @@ extern "C" {
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
 
-    // Text injection (see `paste_text`). A keyboard event carrying a Unicode
+    // Text injection (see `text_events`). A keyboard event carrying a Unicode
     // string inserts the whole string at once, independent of the active
     // layout — the OS treats it as typed text rather than key positions.
     fn CGEventCreateKeyboardEvent(
@@ -307,6 +307,13 @@ extern "C" {
         event: CGEventRef,
         string_length: usize,
         unicode_string: *const u16,
+    );
+    #[cfg(test)]
+    fn CGEventKeyboardGetUnicodeString(
+        event: CGEventRef,
+        max_length: usize,
+        actual_length: *mut usize,
+        text: *mut u16,
     );
     fn CGEventPost(tap: u32, event: CGEventRef);
 }
@@ -1247,26 +1254,35 @@ fn keyboard_event_with_tag(code: u16, down: bool, shift: bool, tag: i64) -> Opti
     }
 }
 
-fn post_key(key: Key, down: bool, shift: bool) -> Option<()> {
-    let code = (0..128).find(|&code| key_from_code(code) == key)?;
-    let event = keyboard_event(code, down, shift)?;
-    unsafe {
-        CGEventPost(KCG_HID_EVENT_TAP, event);
-        CFRelease(event as _);
-    }
-    Some(())
-}
-
-fn paste_text(text: &str) -> Option<()> {
+// Allocate the entire fallback before selecting any text.
+fn text_events(text: &str) -> Option<Vec<DeferredEvent>> {
+    let mut events = Vec::new();
     super::unicode_text_events(text, |utf16, down| unsafe {
-        // A press/release pair: some applications only act on one of the two,
-        // and the string is attached to both so either order works.
         let event = keyboard_event(0, down, false)?;
         CGEventKeyboardSetUnicodeString(event, utf16.len(), utf16.as_ptr());
-        CGEventPost(KCG_HID_EVENT_TAP, event);
-        CFRelease(event as *const c_void);
+        events.push(DeferredEvent {
+            kind: if down {
+                KCG_EVENT_KEY_DOWN
+            } else {
+                KCG_EVENT_KEY_UP
+            },
+            event,
+        });
         Some(())
-    })
+    })?;
+    Some(events)
+}
+
+fn post_events(events: &[DeferredEvent]) {
+    let timing = crate::timing::injection();
+    for event in events {
+        unsafe { CGEventPost(KCG_HID_EVENT_TAP, event.event) };
+        crate::timing::pause(if event.kind == KCG_EVENT_KEY_DOWN {
+            timing.press_gap
+        } else {
+            timing.inter_key_gap
+        });
+    }
 }
 
 fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<Typed>> {
@@ -1277,8 +1293,7 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         terminator,
         verify,
     } = plan;
-    let gaps = crate::timing::injection();
-    if terminator == Some(Key::Return) {
+    if terminator == Some(Key::Return) || expected.chars().count() != erase {
         return None;
     }
     if !engine.replacement_valid(generation) {
@@ -1307,62 +1322,8 @@ fn inject(engine: &Engine<Mac>, plan: Plan<Mac>, generation: u64) -> Option<Vec<
         if terminator.is_some() { " " } else { "" }
     );
     let expected = format!("{expected}{suffix}");
-    if replace_expected_suffix(engine, &focus, &expected, &replacement, generation).is_some() {
-        return Some(buf);
-    }
-    // A failed native match must never become blind deletion of neighboring text.
-    if !engine.replacement_valid(generation) || !matches_expected_suffix(&focus, &expected) {
-        return None;
-    }
-    // Press + release a single key with pacing that macOS won't drop. Only the
-    // backspaces and the odd replayed key go through this; the replacement
-    // text uses bounded Unicode event payloads.
-    let tap_key = |k: Key, shift: bool| {
-        post_key(k, true, shift)?;
-        crate::timing::pause(gaps.press_gap);
-        post_key(k, false, shift)?;
-        crate::timing::pause(gaps.inter_key_gap);
-        Some(())
-    };
+    replace_expected_suffix(engine, &focus, &expected, &replacement, generation)?;
 
-    let delete_count = erase + buf.len();
-    if expected.chars().count() != delete_count {
-        return None;
-    }
-    engine.injector.store(true, Ordering::Relaxed);
-    for _ in 0..delete_count {
-        if !engine.replacement_valid(generation) {
-            return None;
-        }
-        tap_key(Key::Backspace, false)?;
-    }
-    if !engine.replacement_valid(generation) {
-        return None;
-    }
-    match terminator {
-        // The trailing space is part of the same paste, so nothing has to be
-        // pressed at all.
-        Some(_) => {
-            paste_text(&format!("{text} "))?;
-        }
-        // Explicit offers already include any tracked trailing spaces.
-        None => {
-            paste_text(&text)?;
-        }
-    }
-    // Keys the user managed to type while we were replacing: replayed as keys
-    // (they are physical key positions, not text) once the word is back, with
-    // the shift the user held so a capital stays a capital.
-    for t in buf.iter() {
-        if !engine.replacement_valid(generation) {
-            return None;
-        }
-        tap_key(t.key, t.shift)?;
-    }
-
-    // The last injected key already paid `inter_key_gap`, and settling is the
-    // same kind of wait for the same events — so only the difference is owed.
-    crate::timing::pause(gaps.settle.saturating_sub(gaps.inter_key_gap));
     Some(buf)
 }
 
@@ -1484,6 +1445,7 @@ fn replace_selected_text(
         string::CFString,
     };
     use core_foundation_sys::base::CFRange;
+    begin_injection(engine, generation)?;
     let text_attribute = CFString::new("AXSelectedText");
     let range_attribute = CFString::new("AXSelectedTextRange");
     unsafe {
@@ -1515,6 +1477,7 @@ fn replace_selected_text(
         }
         // Write just the selection. Unsupported controls are left unchanged;
         // never fall back to replacing the entire document.
+        engine.injector.store(true, Ordering::Relaxed);
         if AXUIElementSetAttributeValue(
             focus.0,
             text_attribute.as_concrete_TypeRef(),
@@ -1732,6 +1695,31 @@ mod setup_tests {
                 }
             }
         }
+        for text in ["receive ".to_owned(), "שלום 🙂 ".repeat(8)] {
+            let events = text_events(&text).unwrap();
+            for kind in [KCG_EVENT_KEY_DOWN, KCG_EVENT_KEY_UP] {
+                let mut received = Vec::new();
+                for event in events.iter().filter(|event| event.kind == kind) {
+                    let mut units = [0; 20];
+                    let mut count = 0;
+                    unsafe {
+                        assert_eq!(CGEventGetFlags(event.event), 0);
+                        assert_eq!(
+                            CGEventGetIntegerValueField(event.event, EVENT_USER_DATA),
+                            RECAST_EVENT
+                        );
+                        CGEventKeyboardGetUnicodeString(
+                            event.event,
+                            units.len(),
+                            &mut count,
+                            units.as_mut_ptr(),
+                        );
+                    }
+                    received.extend_from_slice(&units[..count]);
+                }
+                assert_eq!(String::from_utf16(&received).unwrap(), text);
+            }
+        }
         for ticket in [1, u32::MAX] {
             let value = FINISH_EVENT | i64::from(ticket);
             let marker = keyboard_event_with_tag(0, false, false, value).unwrap();
@@ -1812,9 +1800,7 @@ mod setup_tests {
 
 mod candidate_strip;
 mod spotlight;
-use spotlight::{
-    matches_expected_suffix, replace_expected_suffix, replace_spotlight_query, selected_range,
-};
+use spotlight::{replace_expected_suffix, replace_spotlight_query, selected_range};
 
 pub(crate) fn dismiss_candidates() {
     if let Some(engine) = CTX.get() {

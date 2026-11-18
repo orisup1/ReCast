@@ -1,9 +1,10 @@
 //! Every delay the correction path takes, in one place.
 //!
 //! Correction delivery differs by backend. Windows submits one `SendInput`
-//! transaction. macOS paces fallback backspaces because tightly posted events
-//! can be dropped. Linux prefers verified AT-SPI text edits, then optional
-//! compositor virtual-keyboard input, then bounded `uinput` writes.
+//! transaction. macOS prefers native range edits. Its keyboard fallback confirms
+//! every Backspace before inserting Unicode text, then verifies text and caret.
+//! Linux prefers verified
+//! AT-SPI edits, then optional compositor input, then bounded `uinput` writes.
 //!
 //! Linux native edits do not press physical keys. Compositor input assigns text
 //! to printable positions that are not physically held. Neither route needs to
@@ -24,11 +25,9 @@ use std::time::Duration;
 pub struct Injection {
     /// Gap between a synthetic key-down and its matching key-up.
     ///
-    /// macOS only — the other two platforms submit press and release together
-    /// and never sleep between them. 50 µs was measured to be too short: a
-    /// backspace would go missing (leaving the original first letter behind) or
-    /// a retyped key would be lost entirely. The floor is somewhere between
-    /// that and here, and is a property of the machine, not of the code.
+    /// macOS fallback keyboard events only; native range edits need no key pacing.
+    /// Keystroke injection previously lost events at 50 µs, so retain the
+    /// calibrated gaps when the selected text must be replaced through Quartz.
     pub press_gap: Duration,
 
     /// Gap between one injected key and the next, for the same reason as
@@ -130,9 +129,8 @@ pub struct Injection {
 
 /// The shipped policy for this platform.
 ///
-/// The per-key gaps are macOS's, because macOS is the only platform that paces
-/// keys at all; the other two leave them unread rather than pretend to a
-/// different value.
+/// The per-key gaps pace macOS fallback text events. Native range edits instead
+/// wait for the application to confirm its text and caret.
 pub const DEFAULTS: Injection = Injection {
     press_gap: Duration::from_micros(700),
     inter_key_gap: Duration::from_micros(700),
