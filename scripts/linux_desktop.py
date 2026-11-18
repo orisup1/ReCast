@@ -27,24 +27,29 @@ def replacement_target(snapshot, target):
     return before if snapshot() == before else None
 
 
+def range_matches(target, start, expected, valid):
+    # The provider can block long enough for focus or the request deadline to change.
+    return valid() and target.text(start, start + len(expected)) == expected and valid()
+
+
 def replace_selection(target, expected, replacement, valid):
     """Insert before deleting: failed insertion can never erase the original."""
     # shortcut: AT-SPI edits are not atomic; use a native transaction if one becomes available.
     start, length, original = expected
-    if not valid() or target.selection() != expected:
+    if not valid() or target.selection() != expected or not valid():
         return False
     if not target.insert(start, replacement):
         return False
     inserted = len(replacement)
     # Check the exact affected range before any deletion. A concurrent editor
     # change or failed read stops here, retaining the original text.
-    if not valid() or target.text(start, start + inserted + length) != replacement + original:
+    if not range_matches(target, start, replacement + original, valid):
         return False
     if not target.delete(start + inserted, start + inserted + length):
         # Roll back only the verified inserted prefix, never guessed offsets.
-        if valid() and target.text(start, start + inserted + length) == replacement + original:
-            target.delete(start, start + inserted)
-            target.select(start, start + length)
+        if range_matches(target, start, replacement + original, valid):
+            if target.delete(start, start + inserted) and valid():
+                target.select(start, start + length)
         return False
     return valid() and target.select(start, start + inserted)
 
@@ -61,7 +66,7 @@ def replace_suffix(target, expected, replacement, valid, begin=lambda: None):
     if (not expected or not replacement or start < 0 or target.has_selection()
             or not valid() or target.text(start, caret) != expected):
         return False
-    if not valid() or target.caret() != caret or target.has_selection():
+    if target.caret() != caret or target.has_selection() or not valid():
         return False
     begin()
     if not target.insert(start, replacement):
@@ -71,15 +76,15 @@ def replace_suffix(target, expected, replacement, valid, begin=lambda: None):
     # Accept both unchanged and shifted positions, but never a third position.
     if (not valid() or target.has_selection()
             or target.caret() not in (caret, caret + inserted)
-            or target.text(start, caret + inserted) != replacement + expected):
+            or not range_matches(target, start, replacement + expected, valid)):
         # Continued typing can move the caret past the inserted range. Roll
         # back only our still-verifiable prefix, preserving the original and
         # anything the user added. Never delete against a changed focus/range.
-        if valid() and target.text(start, caret + inserted) == replacement + expected:
+        if range_matches(target, start, replacement + expected, valid):
             target.delete(start, start + inserted)
         return False
     if not target.delete(start + inserted, caret + inserted):
-        if valid() and target.text(start, caret + inserted) == replacement + expected:
+        if range_matches(target, start, replacement + expected, valid):
             target.delete(start, start + inserted)
         return False
     return valid() and target.set_caret(start + inserted)

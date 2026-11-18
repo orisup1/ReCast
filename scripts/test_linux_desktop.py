@@ -74,8 +74,8 @@ class SelectionTests(unittest.TestCase):
 
     def test_focus_change_after_insert_retains_original(self):
         target = Target()
-        states = iter([True, False])
-        self.assertFalse(replace_selection(target, target.selection(), 'שלום', lambda: next(states)))
+        self.assertFalse(replace_selection(target, target.selection(), 'שלום',
+                                           lambda: target.value == 'left akuo right'))
         self.assertEqual(target.value, 'left שלוםakuo right')
         self.assertEqual(target.deleted, [])
 
@@ -120,6 +120,22 @@ class SuffixTests(unittest.TestCase):
         self.assertTrue(replace_suffix(target, 'recieve', 'receive', lambda: True))
         self.assertEqual(target.value, 'left receive right')
         self.assertEqual(target.caret(), len('left receive'))
+
+    def test_focus_lost_during_provider_read_prevents_deletion(self):
+        target = SuffixTarget()
+        read = target.text
+        focused = True
+
+        def slow_read(start, end):
+            nonlocal focused
+            if 'receive' in target.value:
+                focused = False
+            return read(start, end)
+
+        target.text = slow_read
+        self.assertFalse(replace_suffix(target, 'recieve Next', 'receive Next', lambda: focused))
+        self.assertEqual(target.deleted, [])
+        self.assertIn('recieve Next', target.value)
 
     def test_mismatch_selection_and_stale_context_never_edit(self):
         for expected, selected, valid in [('wrong', None, True), ('Next', (0, 1, 'l'), True),
