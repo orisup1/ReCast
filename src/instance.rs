@@ -169,7 +169,6 @@ fn forget_pidfile(pid: u32) {
 mod imp {
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
-    use std::os::unix::fs::MetadataExt;
 
     pub const STOP_SERVICE: &str = "systemctl --user stop recast";
 
@@ -179,18 +178,8 @@ mod imp {
     /// the daemon — an instance running a TUI or a control window writes none,
     /// and those are exactly the duplicates a user creates by accident.
     ///
-    /// The owner check is not a formality. Identity here comes from
-    /// `/proc/<pid>/comm`, which is a *name*, and names are not unique across
-    /// users; matching on one alone is how a stop turns into signalling
-    /// somebody else's process. It is also free: the directory is owned by the
-    /// process's real UID.
     pub fn peers() -> Vec<u32> {
         let me = std::process::id();
-        // Read the same way as everyone else's, out of `/proc`, so the two
-        // sides of the comparison cannot come from different notions of "user".
-        let Ok(mine) = std::fs::metadata("/proc/self").map(|m| m.uid()) else {
-            return Vec::new();
-        };
         let Ok(entries) = std::fs::read_dir("/proc") else {
             return Vec::new();
         };
@@ -199,9 +188,6 @@ mod imp {
                 let entry = entry.ok()?;
                 let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
                 if pid == me {
-                    return None;
-                }
-                if entry.metadata().ok()?.uid() != mine {
                     return None;
                 }
                 crate::daemon::is_our_process(pid).then_some(pid)
@@ -407,7 +393,9 @@ mod imp {
     pub fn peers() -> Vec<u32> {
         let me = std::process::id();
         let ours = our_name();
-        let mine = session_of(unsafe { GetCurrentProcessId() });
+        let Some(mine) = session_of(unsafe { GetCurrentProcessId() }) else {
+            return Vec::new();
+        };
         let mut found = Vec::new();
 
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -426,7 +414,7 @@ mod imp {
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..end]).to_lowercase();
             let pid = entry.th32ProcessID;
-            if pid != me && pid != 0 && name == ours && session_of(pid) == mine {
+            if pid != me && pid != 0 && name == ours && session_of(pid) == Some(mine) {
                 found.push(pid);
             }
             more = unsafe { Process32NextW(snapshot, &mut entry) };

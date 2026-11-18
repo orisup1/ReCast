@@ -129,7 +129,10 @@ pub fn is_our_process(pid: u32) -> bool {
     let Ok(current) = std::env::current_exe() else {
         return false;
     };
+    use std::os::unix::fs::MetadataExt;
     linux_executable_matches(&executable, &current)
+        && fs::metadata(format!("/proc/{pid}"))
+            .is_ok_and(|metadata| metadata.uid() == unsafe { nix::libc::getuid() })
 }
 
 #[cfg(target_os = "linux")]
@@ -147,8 +150,7 @@ fn linux_executable_matches(executable: &std::path::Path, current: &std::path::P
 /// The macOS half of the same question, asked of `libproc` because there is no
 /// `/proc` to read.
 ///
-/// `proc_pidpath` refuses a process belonging to another user, which is the
-/// ownership check the Linux side has to make explicitly in `instance`.
+/// A readable executable path does not establish ownership on macOS.
 ///
 /// This lives here rather than in `instance` so that both callers — the stop
 /// path below and the duplicate-instance sweep — ask the same question of the
@@ -172,19 +174,37 @@ pub fn is_our_process(pid: u32) -> bool {
         return false; // no such process, or it is not ours to look at
     }
     buf.truncate(written as usize);
-    let Ok(path) = String::from_utf8(buf) else {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&buf));
+    let Ok(current) = std::env::current_exe() else {
         return false;
     };
-    std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .is_some_and(|name| name == our_name())
+    path.file_name().is_some()
+        && path.file_name() == current.file_name()
+        && mac_process_owned_by(pid, unsafe { nix::libc::getuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn mac_process_owned_by(pid: u32, uid: u32) -> bool {
+    use nix::libc::{proc_bsdinfo, proc_pidinfo, PROC_PIDTBSDINFO};
+    let mut info = std::mem::MaybeUninit::<proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<proc_bsdinfo>() as i32;
+    unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        ) == size
+            && info.assume_init().pbi_ruid == uid
+    }
 }
 
 /// The file name of our own executable, which is what a process is recognised
 /// by. Taken from the running binary rather than hardcoded, so a renamed copy
 /// still recognises earlier instances using that name.
-#[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
+#[cfg(all(target_os = "linux", test))]
 fn our_name() -> String {
     std::env::current_exe()
         .ok()
@@ -365,6 +385,15 @@ pub fn stop_daemon() -> std::io::Result<Stopped> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn matching_executable_requires_the_same_user() {
+        let pid = std::process::id();
+        let uid = unsafe { nix::libc::getuid() };
+        assert!(is_our_process(pid));
+        assert!(!mac_process_owned_by(pid, uid.wrapping_add(1)));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
