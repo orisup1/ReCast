@@ -67,6 +67,11 @@ jobs:
           node scripts/test_gnome_extension.cjs
           node scripts/test_native_editing.cjs
 
+      - name: Windows installer fixture
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test_deploy.ps1
+
       - name: Test
         run: cargo test --locked
 

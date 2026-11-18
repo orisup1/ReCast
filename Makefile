@@ -41,7 +41,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
 
 # Linux service path
-SYSTEMD_DIR  := $(HOME)/.config/systemd/user
+SYSTEMD_DIR  := $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/systemd/user
 SYSTEMD_UNIT := $(SYSTEMD_DIR)/recast.service
 
 # macOS service path
@@ -71,6 +71,7 @@ NOTARY_PROFILE ?= recast-notary
 BIN_NAME := recast
 BIN_SRC  := target/release/$(BIN_NAME)
 BIN_DST  := $(BINDIR)/$(BIN_NAME)
+export BINDIR BIN_DST SYSTEMD_DIR SYSTEMD_UNIT LAUNCHD_DIR LAUNCHD_PLIST
 
 # Sources that should retrigger a build of $(BIN_SRC). Listed explicitly so
 # the file-target dependency does the right thing — `cargo build` itself is
@@ -117,19 +118,19 @@ rebuild: clean
 # dictionaries are baked into the binary, so it runs identically no matter
 # what cwd it is launched from.
 install: $(BIN_SRC)
-	@mkdir -p $(BINDIR)
-	$(INSTALL) -m 755 $(BIN_SRC) $(BIN_DST)
+	@mkdir -p "$$BINDIR"
+	$(INSTALL) -m 755 "$(BIN_SRC)" "$$BIN_DST"
 	@echo
 	@echo "Installed for $(OS_NAME):"
-	@echo "  $(BIN_DST)"
+	@echo "  $$BIN_DST"
 	@echo
-	@echo "Make sure $(BINDIR) is on your PATH, then run: $(BIN_NAME)"
+	@echo "Make sure $$BINDIR is on your PATH, then run: $(BIN_NAME)"
 	@echo "$(PERM_HINT_1)"
 	@echo $(PERM_HINT_2)
 
 uninstall:
-	@rm -f $(BIN_DST)
-	@echo "Removed $(BIN_DST)"
+	@rm -f "$$BIN_DST"
+	@echo "Removed $$BIN_DST"
 
 deploy: clean
 	$(MAKE) install
@@ -148,8 +149,10 @@ service-uninstall: $(SERVICE_UNINSTALL_TARGET)
 
 # ─── Linux: systemd --user ────────────────────────────────────────────────
 service-linux: install setup-input-group
-	@mkdir -p $(SYSTEMD_DIR)
-	@printf '%s\n' \
+	@mkdir -p "$$SYSTEMD_DIR"
+	@case "$$BIN_DST" in /*) bin_path="$$BIN_DST";; *) bin_path="$$PWD/$$BIN_DST";; esac; \
+	  unit_bin=$$(printf '%s' "$$bin_path" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g') && \
+	  printf '%s\n' \
 	  '[Unit]' \
 	  'Description=recast keyboard layout corrector' \
 	  'After=graphical-session.target' \
@@ -157,13 +160,13 @@ service-linux: install setup-input-group
 	  '' \
 	  '[Service]' \
 	  'Type=simple' \
-	  'ExecStart=$(BIN_DST)' \
+	  "ExecStart=\"$$unit_bin\"" \
 	  'Restart=on-failure' \
 	  'RestartSec=2' \
 	  '' \
 	  '[Install]' \
 	  'WantedBy=graphical-session.target' \
-	  > $(SYSTEMD_UNIT)
+	  > "$$SYSTEMD_UNIT"
 	systemctl --user daemon-reload
 	systemctl --user enable --now recast.service
 	@echo
@@ -184,14 +187,16 @@ setup-input-group:
 
 service-uninstall-linux:
 	-systemctl --user disable --now recast.service
-	@rm -f $(SYSTEMD_UNIT)
+	@rm -f "$$SYSTEMD_UNIT"
 	systemctl --user daemon-reload
 	@echo "systemd --user service stopped and removed"
 
 # ─── macOS: launchd LaunchAgent ───────────────────────────────────────────
 service-macos: install
-	@mkdir -p $(LAUNCHD_DIR)
-	@printf '%s\n' \
+	@mkdir -p "$$LAUNCHD_DIR"
+	@case "$$BIN_DST" in /*) bin_path="$$BIN_DST";; *) bin_path="$$PWD/$$BIN_DST";; esac; \
+	  xml_bin=$$(printf '%s' "$$bin_path" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g') && \
+	  printf '%s\n' \
 	  '<?xml version="1.0" encoding="UTF-8"?>' \
 	  '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
 	  '<plist version="1.0">' \
@@ -199,7 +204,7 @@ service-macos: install
 	  '    <key>Label</key><string>$(LAUNCHD_LABEL)</string>' \
 	  '    <key>ProgramArguments</key>' \
 	  '    <array>' \
-	  '        <string>$(BIN_DST)</string>' \
+	  "        <string>$$xml_bin</string>" \
 	  '    </array>' \
 	  '    <key>RunAtLoad</key><true/>' \
 	  '    <key>KeepAlive</key><true/>' \
@@ -207,18 +212,18 @@ service-macos: install
 	  '    <key>StandardErrorPath</key><string>/tmp/recast.err.log</string>' \
 	  '</dict>' \
 	  '</plist>' \
-	  > $(LAUNCHD_PLIST)
-	-launchctl unload "$(LAUNCHD_PLIST)" 2>/dev/null
-	launchctl load -w "$(LAUNCHD_PLIST)"
+	  > "$$LAUNCHD_PLIST"
+	-launchctl unload "$$LAUNCHD_PLIST" 2>/dev/null
+	launchctl load -w "$$LAUNCHD_PLIST"
 	@echo
 	@echo "launchd LaunchAgent installed and started."
-	@echo "  plist:  $(LAUNCHD_PLIST)"
+	@echo "  plist:  $$LAUNCHD_PLIST"
 	@echo "  status: launchctl list | grep $(LAUNCHD_LABEL)"
 	@echo "  logs:   tail -f /tmp/recast.err.log"
 
 service-uninstall-macos:
-	-launchctl unload "$(LAUNCHD_PLIST)" 2>/dev/null
-	@rm -f $(LAUNCHD_PLIST)
+	-launchctl unload "$$LAUNCHD_PLIST" 2>/dev/null
+	@rm -f "$$LAUNCHD_PLIST"
 	@echo "launchd LaunchAgent stopped and removed"
 
 service-unsupported:

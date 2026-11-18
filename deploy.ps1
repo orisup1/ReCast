@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 $BinName  = 'recast.exe'
 $BinSrc   = Join-Path 'target\release' $BinName
-$BinDir   = $Prefix
+$BinDir   = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Prefix)
 $BinDst   = Join-Path $BinDir $BinName
 $TaskName = 'recast'
 $RunSubkey = 'Software\Microsoft\Windows\CurrentVersion\Run'
@@ -67,10 +67,10 @@ function Invoke-Rebuild {
 function Invoke-Install {
     Invoke-Build
 
-    if (-not (Test-Path $BinDir)) { New-Item -ItemType Directory -Path $BinDir | Out-Null }
+    if (-not (Test-Path -LiteralPath $BinDir)) { New-Item -ItemType Directory -Path $BinDir | Out-Null }
 
     Write-Step "Installing to $BinDst"
-    Copy-Item -Force -Path $BinSrc -Destination $BinDst
+    Copy-Item -Force -LiteralPath $BinSrc -Destination $BinDst
 
     Write-Host ""
     Write-Host "Installed:"
@@ -81,8 +81,8 @@ function Invoke-Install {
 }
 
 function Invoke-Uninstall {
-    if (Test-Path $BinDst) {
-        Remove-Item -Force $BinDst
+    if (Test-Path -LiteralPath $BinDst) {
+        Remove-Item -Force -LiteralPath $BinDst
         Write-Host "Removed $BinDst"
     } else {
         Write-Host "Nothing to remove at $BinDst"
@@ -121,11 +121,6 @@ function Invoke-ServiceInstall {
     Write-Step "Registering Scheduled Task '$TaskName' (runs at logon)"
 
     Invoke-WithoutRunRegistration {
-        # Tear down any prior version so we always end up with a fresh definition.
-        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        }
-
         $action    = New-ScheduledTaskAction -Execute $BinDst
         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
         $principal = New-ScheduledTaskPrincipal `
@@ -144,7 +139,7 @@ function Invoke-ServiceInstall {
             -Action    $action `
             -Trigger   $trigger `
             -Principal $principal `
-            -Settings  $settings | Out-Null
+            -Settings  $settings -Force | Out-Null
     }
 
     Start-ScheduledTask -TaskName $TaskName
@@ -171,6 +166,7 @@ function Invoke-Run {
     Invoke-Build
     Write-Step 'cargo run --release'
     & cargo run --release
+    if ($LASTEXITCODE -ne 0) { throw "cargo run failed (exit $LASTEXITCODE)" }
 }
 
 function Invoke-Help {
@@ -204,15 +200,20 @@ For Linux / macOS hosts, use the Makefile in this directory instead.
 "@
 }
 
-switch ($Target) {
-    'build'             { Invoke-Build }
-    'clean'             { Invoke-Clean }
-    'rebuild'           { Invoke-Rebuild }
-    'install'           { Invoke-Install }
-    'uninstall'         { Invoke-Uninstall }
-    'deploy'            { Invoke-Deploy }
-    'service'           { Invoke-ServiceInstall }
-    'service-uninstall' { Invoke-ServiceUninstall }
-    'run'               { Invoke-Run }
-    'help'              { Invoke-Help }
+Push-Location -LiteralPath $PSScriptRoot
+try {
+    switch ($Target) {
+        'build'             { Invoke-Build }
+        'clean'             { Invoke-Clean }
+        'rebuild'           { Invoke-Rebuild }
+        'install'           { Invoke-Install }
+        'uninstall'         { Invoke-Uninstall }
+        'deploy'            { Invoke-Deploy }
+        'service'           { Invoke-ServiceInstall }
+        'service-uninstall' { Invoke-ServiceUninstall }
+        'run'               { Invoke-Run }
+        'help'              { Invoke-Help }
+    }
+} finally {
+    Pop-Location
 }
