@@ -41,6 +41,15 @@ pub fn file_path() -> Option<PathBuf> {
     crate::complete::user_path("config.toml")
 }
 
+/// Windows text editors can prefix UTF-8 settings and word lists with a BOM.
+pub(crate) fn read_user_text(path: &std::path::Path) -> std::io::Result<String> {
+    let mut text = std::fs::read_to_string(path)?;
+    if text.starts_with('\u{feff}') {
+        text.remove(0);
+    }
+    Ok(text)
+}
+
 /// Save a menu setting before applying it, so a failed save cannot look successful.
 pub fn set_live(control: &crate::types::AppControl, key: &str, value: &str) -> Result<(), String> {
     if std::env::var_os(format!("RECAST_{}", key.to_uppercase())).is_some() {
@@ -113,7 +122,7 @@ fn save_values(path: &std::path::Path, values: &[(&str, &str)]) -> std::io::Resu
             "Settings is a symlink; edit its target instead",
         ));
     }
-    let previous = match std::fs::read_to_string(path) {
+    let previous = match read_user_text(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
@@ -266,7 +275,7 @@ fn parsed() -> &'static Parsed {
 }
 
 fn load_file(path: &std::path::Path) -> Parsed {
-    match std::fs::read_to_string(path) {
+    match read_user_text(path) {
         Ok(text) => parse(&text),
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
@@ -929,6 +938,23 @@ mod tests {
         assert!(set_live(&control, "spell", "false").is_err());
         assert!(crate::config::Config::global().spell_enabled);
         std::fs::remove_file(file_path().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn windows_utf8_files_keep_the_first_setting_on_read_and_save() {
+        let path = std::env::temp_dir().join(format!("recast-bom-{}.toml", std::process::id()));
+        std::fs::write(&path, "\u{feff}spell = false\r\ncomplete = true\r\n").unwrap();
+        assert_eq!(load_file(&path).settings["spell"], "false");
+        save_value(&path, "spell", "true").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("spell =")
+                .count(),
+            1
+        );
+        assert_eq!(load_file(&path).settings["complete"], "true");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

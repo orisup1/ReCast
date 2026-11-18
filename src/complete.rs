@@ -946,7 +946,7 @@ fn remove_from_ignore_file(word: &str) {
 
 #[cfg(test)]
 fn remove_from_ignore_path(path: &std::path::Path, word: &str) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = crate::settings::read_user_text(path) else {
         return;
     };
     // Preserve managed symlinks and never follow an existing temporary file.
@@ -1225,7 +1225,7 @@ fn abbreviations() -> &'static Mutex<HashMap<String, String>> {
 /// The text of one of the user's list files, or empty if it isn't there.
 fn read_user_file(name: &str) -> String {
     user_path(name)
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|p| crate::settings::read_user_text(&p).ok())
         .unwrap_or_default()
 }
 
@@ -1485,7 +1485,7 @@ fn parse_abbreviations(text: &str) -> HashMap<String, String> {
             continue;
         };
         let (key, value) = (key.trim(), value.trim());
-        if key.is_empty() || value.is_empty() {
+        if key.is_empty() || value.is_empty() || line.contains('\0') {
             continue;
         }
         table.insert(key.to_lowercase(), value.to_string());
@@ -2893,6 +2893,13 @@ mod tests {
     }
 
     #[test]
+    fn abbreviations_reject_nul_without_discarding_other_rules() {
+        let table = parse_abbreviations("bad = before\0after\ngood = שלום🙂\nbad\0key = text\n");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get("good").map(String::as_str), Some("שלום🙂"));
+    }
+
+    #[test]
     fn parses_the_abbreviation_file() {
         let table = parse_abbreviations(
             "# my shortcuts\n\
@@ -3248,7 +3255,7 @@ pub struct RuleEditor {
 }
 
 fn read_rules(path: &std::path::Path) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
+    match crate::settings::read_user_text(path) {
         Ok(text) => Ok(text),
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
@@ -3383,8 +3390,8 @@ mod rule_editor_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let ignore = dir.join("ignore.txt");
         let abbrev = dir.join("abbrev.txt");
-        std::fs::write(&ignore, "recieve\n").unwrap();
-        std::fs::write(&abbrev, "btw = by the way\n").unwrap();
+        std::fs::write(&ignore, "\u{feff}recieve\r\n").unwrap();
+        std::fs::write(&abbrev, "\u{feff}btw = by the way\r\n").unwrap();
         reload_user_files();
         assert!(ignored("recieve"));
         assert_eq!(expand("btw").as_deref(), Some("by the way"));
