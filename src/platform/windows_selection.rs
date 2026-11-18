@@ -62,7 +62,7 @@ fn message(focus: usize, message: u32, wparam: usize, lparam: isize) -> Option<u
         .then_some(result)
 }
 
-fn range(focus: usize) -> Option<(u32, u32)> {
+fn selection_offsets(focus: usize) -> Option<(u32, u32)> {
     let (mut start, mut end) = (0u32, 0u32);
     message(
         focus,
@@ -70,14 +70,28 @@ fn range(focus: usize) -> Option<(u32, u32)> {
         &mut start as *mut u32 as usize,
         &mut end as *mut u32 as isize,
     )?;
+    Some((start, end))
+}
+
+fn range(focus: usize) -> Option<(u32, u32)> {
+    let (start, end) = selection_offsets(focus)?;
     (end > start && end - start <= MAX_SELECTION_BYTES as u32).then_some((start, end))
+}
+
+fn suffix_start(text: &[u16], caret: usize, expected: &[u16]) -> Option<usize> {
+    let prefix = text.get(..caret)?;
+    // RichEdit may expose different newline widths in WM_GETTEXT and EM_GETSEL.
+    if caret != text.len() && text.iter().any(|unit| matches!(unit, 10 | 13)) {
+        return None;
+    }
+    prefix.ends_with(expected).then(|| caret - expected.len())
 }
 
 /// Replace the exact `expected` suffix standing immediately before the
 /// caret, preserving everything before and after it.
 ///
 /// Alignment is only trusted where `EM_GETSEL` and `WM_GETTEXT` necessarily
-/// agree — the caret at the very end of the control — so anything ambiguous
+/// agree (single-line text or the caret at the end), so anything ambiguous
 /// (a selection, multi-line offset drift, unreadable text) fails closed and
 /// changes nothing. Edit and RichEdit controls only.
 pub(super) fn replace_expected_suffix(
@@ -89,19 +103,17 @@ pub(super) fn replace_expected_suffix(
 ) -> Option<()> {
     let units: Vec<u16> = expected.encode_utf16().collect();
     let replacement_wide: Vec<u16> = replacement.encode_utf16().chain(Some(0)).collect();
-    if units.is_empty() || replacement.is_empty() || replacement_wide.len() > MAX_SELECTION_BYTES {
+    if units.is_empty()
+        || replacement.is_empty()
+        || replacement.contains('\0')
+        || replacement_wide.len() > MAX_SELECTION_BYTES
+    {
         return None;
     }
     if !writable(focus) || !valid() {
         return None;
     }
-    let (mut start, mut end) = (0u32, 0u32);
-    message(
-        focus,
-        EM_GETSEL as u32,
-        &mut start as *mut u32 as usize,
-        &mut end as *mut u32 as isize,
-    )?;
+    let (start, end) = selection_offsets(focus)?;
     if start != end {
         // A selection is not ours to collapse.
         return None;
@@ -113,21 +125,21 @@ pub(super) fn replace_expected_suffix(
     }
     let mut text = vec![0u16; length + 1];
     let copied = message(focus, WM_GETTEXT, length + 1, text.as_mut_ptr() as isize)?;
-    text.truncate(copied);
-    if caret != text.len() || !text.ends_with(&units) || !valid() {
+    if copied > length || message(focus, WM_GETTEXTLENGTH, 0, 0)? != length {
         return None;
     }
-    let begin = caret - units.len();
+    text.truncate(copied);
+    let begin = suffix_start(&text, caret, &units)?;
+    if (caret < copied && unsafe { IsWindowUnicode(focus as _) } == 0)
+        || selection_offsets(focus)? != (start, end)
+        || !valid()
+    {
+        return None;
+    }
     let new_caret = begin + replacement.encode_utf16().count();
     start_edit();
     message(focus, EM_SETSEL as u32, begin, caret as isize)?;
-    let (mut selected_start, mut selected_end) = (0u32, 0u32);
-    message(
-        focus,
-        EM_GETSEL as u32,
-        &mut selected_start as *mut u32 as usize,
-        &mut selected_end as *mut u32 as isize,
-    )?;
+    let (selected_start, selected_end) = selection_offsets(focus)?;
     if !valid()
         || Windows::focus() != Some(focus)
         || selected_start as usize != begin
@@ -147,8 +159,7 @@ pub(super) fn replace_expected_suffix(
         1,
         replacement_wide.as_ptr() as isize,
     )?;
-    message(focus, EM_SETSEL as u32, new_caret, new_caret as isize)?;
-    Some(())
+    (selection_offsets(focus)? == (new_caret as u32, new_caret as u32)).then_some(())
 }
 
 pub(super) fn selection(focus: usize) -> Option<Selection> {
@@ -239,6 +250,19 @@ fn replace_verified(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn exact_suffix_handles_utf16_carets_and_rejects_multiline_offset_drift() {
+        let wide = |s: &str| s.encode_utf16().collect::<Vec<_>>();
+        let text = wide("🙂 שלום right");
+        let caret = wide("🙂 שלום").len();
+        assert_eq!(suffix_start(&text, caret, &wide("שלום")), Some(3));
+        assert_eq!(suffix_start(&text, caret - 1, &wide("שלום")), None);
+        assert_eq!(suffix_start(&text, text.len() + 1, &wide("right")), None);
+        let lines = wide("left\r\nשלום right");
+        assert_eq!(suffix_start(&lines, 10, &wide("שלום")), None);
+        assert_eq!(suffix_start(&lines, lines.len(), &wide("right")), Some(11));
+    }
 
     #[test]
     fn native_fields_block_password_capture_and_failed_match_fallback() {
@@ -333,6 +357,11 @@ mod tests {
             !keyboard_fallback_allowed(focus),
             "a native selection must not be erased by fallback"
         );
+        message(focus, EM_SETSEL as u32, 9, 9).unwrap();
+        for (expected, replacement) in [("akuo", "שלום🙂"), ("שלום🙂", "akuo")] {
+            replace_expected_suffix(focus, expected, replacement, || true, || {}).unwrap();
+        }
+        message(focus, EM_SETSEL as u32, 5, 9).unwrap();
         let before = selection(focus)
             .expect("native Edit must expose its selected text; keep this test in foreground");
         assert_eq!(before.text, "akuo");

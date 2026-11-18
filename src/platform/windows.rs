@@ -653,7 +653,9 @@ fn inject(engine: &Engine<Windows>, plan: Plan<Windows>, generation: u64) -> Opt
         }
     }
     let focus = Windows::focus()?;
-    if !super::windows_selection::keyboard_fallback_allowed(focus) {
+    if Windows::injection_started(&engine.injector)
+        || !super::windows_selection::keyboard_fallback_allowed(focus)
+    {
         return None;
     }
     let suffix = if buf.is_empty() {
